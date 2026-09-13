@@ -24,6 +24,7 @@ unsafe extern "C" {
         bias: *const c_void,
         output: *mut c_void,
         output_is_f16: c_int,
+        swiglu: c_int,
         m: c_int,
         n: c_int,
         k: c_int,
@@ -33,6 +34,7 @@ unsafe extern "C" {
         adapter_scale: f32,
         stream: *mut c_void,
     ) -> c_int;
+    fn mmh3_interleave_swiglu_rows(source: *const c_void, destination: *mut c_void, rows: c_int, row_bytes: c_int, stream: *mut c_void) -> c_int;
 }
 
 /// Raw form of `rotate_quantize`, for BF16 or FP16 input.
@@ -94,18 +96,32 @@ pub(crate) struct AdapterPointers {
     pub(crate) scale: f32,
 }
 
-/// Where the INT8 GEMM writes its result: BF16 or FP16 `[m, n]`, after adding an optional f32 bias `[n]`.
+/// Where the INT8 GEMM writes its result: BF16 or FP16 `[m, n]`, after adding an optional f32 bias `[n]`, or
+/// `silu(gate) · up` as `[m, n / 2]` with `swiglu`.
 #[derive(Clone, Copy)]
 pub(crate) struct Int8Output {
     pub(crate) pointer: *mut c_void,
     pub(crate) f16: bool,
     pub(crate) bias: *const c_void,
+    pub(crate) swiglu: bool,
 }
 
 impl Int8Output {
     pub(crate) fn bf16(pointer: *mut c_void) -> Self {
-        Int8Output { pointer, f16: false, bias: ptr::null() }
+        Int8Output { pointer, f16: false, bias: ptr::null(), swiglu: false }
     }
+}
+
+/// Returns the rows of a `[rows, row_bytes]` matrix whose first half are SwiGLU gates and second half the matching up
+/// projections, reordered so that each group of eight rows holds the gates of four features followed by their up
+/// projections. The INT8 GEMM's SwiGLU output needs the weights, weight scales, bias and adapter up weights of the
+/// layer in this order.
+pub fn interleave_swiglu_rows(source: &DeviceBuffer, rows: usize, row_bytes: usize) -> Result<DeviceBuffer, CudaError> {
+    assert!(source.bytes() >= rows * row_bytes, "the matrix is smaller than rows × row_bytes");
+    let destination = DeviceBuffer::new(rows * row_bytes)?;
+    // SAFETY: both buffers hold `rows × row_bytes` bytes, checked above.
+    check(unsafe { mmh3_interleave_swiglu_rows(source.pointer(), destination.pointer(), rows as c_int, row_bytes as c_int, ptr::null_mut()) })?;
+    Ok(destination)
 }
 
 /// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows, such as prompts,
@@ -157,6 +173,7 @@ unsafe fn int8_config(
             output.bias,
             output.pointer,
             output.f16 as c_int,
+            output.swiglu as c_int,
             m as c_int,
             n as c_int,
             k as c_int,
@@ -169,11 +186,13 @@ unsafe fn int8_config(
     })
 }
 
-/// Where `int8` writes its result, `[m, n]` in BF16 or FP16, after adding an optional f32 bias `[n]`.
+/// Where `int8` writes its result, `[m, n]` in BF16 or FP16, after adding an optional f32 bias `[n]`, or
+/// `silu(gate) · up` as `[m, n / 2]` with `swiglu` for operands in the order of `interleave_swiglu_rows`.
 pub struct Output<'a> {
     pub buffer: &'a mut DeviceBuffer,
     pub f16: bool,
     pub bias: Option<&'a DeviceBuffer>,
+    pub swiglu: bool,
 }
 
 /// output[m, n] = round(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] · weight_scales[n] + the adapter
@@ -198,7 +217,7 @@ pub fn int8(
     assert!(weights.bytes() >= n * k, "weights are smaller than n × k");
     assert!(activation_scales.bytes() >= m * 4, "activation scales are smaller than m");
     assert!(weight_scales.bytes() >= n * 4, "weight scales are smaller than n");
-    assert!(output.buffer.bytes() >= m * n * 2, "output is smaller than m × n");
+    assert!(output.buffer.bytes() >= m * n * if output.swiglu { 1 } else { 2 }, "output is smaller than its m rows");
     if let Some(bias) = output.bias {
         assert!(bias.bytes() >= n * 4, "bias is smaller than n");
     }
@@ -216,6 +235,7 @@ pub fn int8(
         pointer: output.buffer.pointer(),
         f16: output.f16,
         bias: output.bias.map_or(ptr::null(), |bias| bias.pointer().cast_const()),
+        swiglu: output.swiglu,
     };
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
     unsafe {

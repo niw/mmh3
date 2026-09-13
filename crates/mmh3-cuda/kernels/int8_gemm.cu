@@ -11,7 +11,8 @@
 //                        + adapter_scale * sum_r adapter_down[m, r] * adapter_up[n, r] + bias[n])
 // rounded to BF16 or FP16, where the low-rank adapter and the bias are optional. Activations and weights are
 // row-major with K contiguous. N must be a multiple of the block width and K a multiple of 128, which every H3 linear
-// layer satisfies. Only M may be ragged.
+// layer satisfies. Only M may be ragged. For SwiGLU layers whose weight rows went through interleave_swiglu_rows, the
+// kernel can instead write silu(gate) · up, [m, n / 2].
 //
 // NOTE: A persistent grid of one CTA per SM walks the output tiles. TMA copies 128-byte K slices of both operands
 // into a two-stage ring with the 128B swizzle, and eight warps multiply their parts of the tile with mma.sync. There
@@ -211,6 +212,22 @@ __device__ __forceinline__ uint32_t pack(__half*, float low, float high) {
     return *reinterpret_cast<uint32_t*>(&value);
 }
 
+__device__ __forceinline__ float2 unpack(__nv_bfloat16*, uint32_t word) {
+    return __bfloat1622float2(*reinterpret_cast<__nv_bfloat162*>(&word));
+}
+
+__device__ __forceinline__ float2 unpack(__half*, uint32_t word) {
+    return __half22float2(*reinterpret_cast<__half2*>(&word));
+}
+
+// silu(gate) · up of two features, rounded like a separate SwiGLU pass over the rounded products.
+template <typename Output>
+__device__ __forceinline__ uint32_t swiglu_pair(Output* output, uint32_t gate_word, uint32_t up_word) {
+    const float2 gate = unpack(output, gate_word);
+    const float2 up = unpack(output, up_word);
+    return pack(output, gate.x / (1.0f + __expf(-gate.x)) * up.x, gate.y / (1.0f + __expf(-gate.y)) * up.y);
+}
+
 // Ring position of a warp, shared by the INT8 and adapter blocks.
 struct Ring {
     int stage = 0;
@@ -226,7 +243,7 @@ struct Ring {
     }
 };
 
-template <typename Config, typename Output>
+template <typename Config, typename Output, bool SWIGLU>
 __global__ void __launch_bounds__(WARPS * 32, 1)
     int8_gemm_kernel(const __grid_constant__ TensorMaps maps, const float* __restrict__ activation_scales,
                      const float* __restrict__ weight_scales, const float* __restrict__ bias, Output* __restrict__ output,
@@ -410,8 +427,15 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
                     }
                     const int row = tile_m * Config::block_m + warp_row + m_tile * 16 + half * 8 + group_id;
                     if (row < m) {
-                        *reinterpret_cast<uint4*>(output + static_cast<size_t>(row) * n + column) =
-                            make_uint4(words[0], words[1], words[2], words[3]);
+                        if constexpr (SWIGLU) {
+                            // The lane's eight columns hold the gates of features column / 2 to column / 2 + 3, then
+                            // their up projections.
+                            *reinterpret_cast<uint2*>(output + static_cast<size_t>(row) * (n / 2) + column / 2) =
+                                make_uint2(swiglu_pair(output, words[0], words[2]), swiglu_pair(output, words[1], words[3]));
+                        } else {
+                            *reinterpret_cast<uint4*>(output + static_cast<size_t>(row) * n + column) =
+                                make_uint4(words[0], words[1], words[2], words[3]);
+                        }
                     }
                 }
             }
@@ -473,7 +497,7 @@ struct Adapter {
     float scale;
 };
 
-template <typename Config, typename Output>
+template <typename Config, typename Output, bool SWIGLU>
 int launch(const int8_t* activations, const int8_t* weights, const float* activation_scales,
            const float* weight_scales, const float* bias, Output* output, int m, int n, int k, Adapter adapter,
            cudaStream_t stream) {
@@ -501,7 +525,7 @@ int launch(const int8_t* activations, const int8_t* weights, const float* activa
     }
     static bool configured = false;
     if (!configured) {
-        cudaError_t status = cudaFuncSetAttribute(int8_gemm_kernel<Config, Output>,
+        cudaError_t status = cudaFuncSetAttribute(int8_gemm_kernel<Config, Output, SWIGLU>,
                                                   cudaFuncAttributeMaxDynamicSharedMemorySize, Config::shared_bytes);
         if (status != cudaSuccess) {
             return static_cast<int>(status);
@@ -513,25 +537,50 @@ int launch(const int8_t* activations, const int8_t* weights, const float* activa
     if (processors == 0) {
         return static_cast<int>(cudaErrorInvalidDevice);
     }
-    int8_gemm_kernel<Config, Output>
+    int8_gemm_kernel<Config, Output, SWIGLU>
         <<<tiles < processors ? tiles : processors, WARPS * 32, Config::shared_bytes, stream>>>(
             maps, activation_scales, weight_scales, bias, output, m, n, k, adapter_blocks, adapter.scale);
     return static_cast<int>(cudaGetLastError());
 }
 
-template <typename Output>
+template <typename Output, bool SWIGLU>
 int launch_config(int config, const int8_t* activations, const int8_t* weights, const float* activation_scales,
                   const float* weight_scales, const float* bias, Output* output, int m, int n, int k, Adapter adapter,
                   cudaStream_t stream) {
     switch (config) {
         case 0:
-            return launch<TallTile>(activations, weights, activation_scales, weight_scales, bias, output, m, n, k,
-                                    adapter, stream);
+            return launch<TallTile, Output, SWIGLU>(activations, weights, activation_scales, weight_scales, bias, output,
+                                                    m, n, k, adapter, stream);
         case 1:
-            return launch<WideTile>(activations, weights, activation_scales, weight_scales, bias, output, m, n, k,
-                                    adapter, stream);
+            return launch<WideTile, Output, SWIGLU>(activations, weights, activation_scales, weight_scales, bias, output,
+                                                    m, n, k, adapter, stream);
         default:
             return static_cast<int>(cudaErrorInvalidValue);
+    }
+}
+
+template <typename Output>
+int launch_output(int config, const int8_t* activations, const int8_t* weights, const float* activation_scales,
+                  const float* weight_scales, const float* bias, Output* output, bool swiglu, int m, int n, int k,
+                  Adapter adapter, cudaStream_t stream) {
+    if (swiglu) {
+        return launch_config<Output, true>(config, activations, weights, activation_scales, weight_scales, bias, output,
+                                           m, n, k, adapter, stream);
+    }
+    return launch_config<Output, false>(config, activations, weights, activation_scales, weight_scales, bias, output,
+                                        m, n, k, adapter, stream);
+}
+
+// Row r of the interleaved matrix is row 4g + p of the gates for p < 4 and row 4g + p - 4 of the up projections
+// otherwise, with g = r / 8 and p = r % 8.
+__global__ void interleave_swiglu_rows_kernel(const uint32_t* __restrict__ source, uint32_t* __restrict__ destination,
+                                              int rows, int row_words) {
+    const int row = blockIdx.x;
+    const int group = row / 8;
+    const int position = row % 8;
+    const int source_row = position < 4 ? group * 4 + position : rows / 2 + group * 4 + position - 4;
+    for (int index = threadIdx.x; index < row_words; index += blockDim.x) {
+        destination[static_cast<size_t>(row) * row_words + index] = source[static_cast<size_t>(source_row) * row_words + index];
     }
 }
 
@@ -546,23 +595,36 @@ extern "C" int mmh3_int8_gemm_config_count() {
 extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t* activations, const int8_t* weights,
                                    const float* activation_scales, const float* weight_scales, __nv_bfloat16* output,
                                    int m, int n, int k, cudaStream_t stream) {
-    return launch_config(config, activations, weights, activation_scales, weight_scales, nullptr, output, m, n, k,
-                         Adapter{nullptr, nullptr, 0, 0.0f}, stream);
+    return launch_config<__nv_bfloat16, false>(config, activations, weights, activation_scales, weight_scales, nullptr,
+                                               output, m, n, k, Adapter{nullptr, nullptr, 0, 0.0f}, stream);
 }
 
 // The same product with an optional FP32 bias [n], BF16 or FP16 output, and an optional adapter
 // adapter_scale · adapter_down · adapter_upᵀ with adapter_down [m, rank] and adapter_up [n, rank] in BF16 and the rank
-// a multiple of 64. The result is rounded once.
+// a multiple of 64. The result is rounded once. With `swiglu`, the output is silu(gate) · up, [m, n / 2], for weights,
+// weight scales, bias and adapter_up whose rows went through mmh3_interleave_swiglu_rows.
 extern "C" int mmh3_int8_gemm(int config, const int8_t* activations, const int8_t* weights,
                               const float* activation_scales, const float* weight_scales, const float* bias,
-                              void* output, int output_is_f16, int m, int n, int k,
+                              void* output, int output_is_f16, int swiglu, int m, int n, int k,
                               const __nv_bfloat16* adapter_down, const __nv_bfloat16* adapter_up, int rank,
                               float adapter_scale, cudaStream_t stream) {
     const Adapter adapter{adapter_down, adapter_up, rank, adapter_scale};
     if (output_is_f16) {
-        return launch_config(config, activations, weights, activation_scales, weight_scales, bias,
-                             static_cast<__half*>(output), m, n, k, adapter, stream);
+        return launch_output(config, activations, weights, activation_scales, weight_scales, bias,
+                             static_cast<__half*>(output), swiglu != 0, m, n, k, adapter, stream);
     }
-    return launch_config(config, activations, weights, activation_scales, weight_scales, bias,
-                         static_cast<__nv_bfloat16*>(output), m, n, k, adapter, stream);
+    return launch_output(config, activations, weights, activation_scales, weight_scales, bias,
+                         static_cast<__nv_bfloat16*>(output), swiglu != 0, m, n, k, adapter, stream);
+}
+
+// Reorders the rows of a [rows, row_bytes] matrix whose first half are SwiGLU gates and second half the matching up
+// projections, so that each group of eight rows holds the gates of four features followed by their up projections.
+extern "C" int mmh3_interleave_swiglu_rows(const void* source, void* destination, int rows, int row_bytes,
+                                           cudaStream_t stream) {
+    if (rows % 8 != 0 || row_bytes % 4 != 0 || rows <= 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    interleave_swiglu_rows_kernel<<<rows, 128, 0, stream>>>(static_cast<const uint32_t*>(source),
+                                                             static_cast<uint32_t*>(destination), rows, row_bytes / 4);
+    return static_cast<int>(cudaGetLastError());
 }

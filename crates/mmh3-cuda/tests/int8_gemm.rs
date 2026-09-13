@@ -1,4 +1,4 @@
-use mmh3_core::numeric::{bf16_to_f32, f16_to_f32, f32_to_bf16};
+use mmh3_core::numeric::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 use mmh3_cuda::DeviceBuffer;
 use mmh3_cuda::gemm::{self, Adapter, Output};
 
@@ -78,7 +78,7 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, f16_with_bias: 
             &weight_buffer,
             &activation_scale_buffer,
             &weight_scale_buffer,
-            Output { buffer: &mut output, f16: f16_with_bias, bias: f16_with_bias.then_some(&bias_buffer) },
+            Output { buffer: &mut output, f16: f16_with_bias, bias: f16_with_bias.then_some(&bias_buffer), swiglu: false },
             m,
             n,
             k,
@@ -123,4 +123,75 @@ fn adds_a_low_rank_adapter() {
 #[test]
 fn writes_fp16_with_a_bias() {
     check_every_config(600, 3072, 256, 0, true, 11);
+}
+
+/// Rounds an f64 to BF16 or FP16 and back.
+fn round_output(value: f64, f16: bool) -> f32 {
+    if f16 { f16_to_f32(f32_to_f16(value as f32)) } else { bf16_to_f32(f32_to_bf16(value as f32)) }
+}
+
+#[test]
+fn writes_swiglu_of_interleaved_rows() {
+    let (m, features, k, rank) = (300, 1024, 256, 128);
+    let n = 2 * features;
+    for (f16, seed) in [(false, 12), (true, 13)] {
+        let mut random = Random(seed);
+        let activations: Vec<i8> = (0..m * k).map(|_| random.int8()).collect();
+        let weights: Vec<i8> = (0..n * k).map(|_| random.int8()).collect();
+        let activation_scales: Vec<f32> = (0..m).map(|_| random.uniform(0.5, 1.5)).collect();
+        let weight_scales: Vec<f32> = (0..n).map(|_| random.uniform(0.00002, 0.0001)).collect();
+        let bias: Vec<f32> = (0..n).map(|_| random.uniform(-2.0, 2.0)).collect();
+        let down: Vec<u16> = (0..m * rank).map(|_| random.bf16(-0.5, 0.5)).collect();
+        let up: Vec<u16> = (0..n * rank).map(|_| random.bf16(-0.5, 0.5)).collect();
+        let adapter_scale = 0.75f32;
+
+        let interleave = |buffer: DeviceBuffer, row_bytes: usize| gemm::interleave_swiglu_rows(&buffer, n, row_bytes).unwrap();
+        let activation_buffer = upload(&activations.iter().map(|&value| value as u8).collect::<Vec<_>>());
+        let weight_buffer = interleave(upload(&weights.iter().map(|&value| value as u8).collect::<Vec<_>>()), k);
+        let activation_scale_buffer = upload(&f32_bytes(&activation_scales));
+        let weight_scale_buffer = interleave(upload(&f32_bytes(&weight_scales)), 4);
+        let bias_buffer = interleave(upload(&f32_bytes(&bias)), 4);
+        let down_buffer = upload(&u16_bytes(&down));
+        let up_buffer = interleave(upload(&u16_bytes(&up)), rank * 2);
+        let adapter = Adapter { down: &down_buffer, up: &up_buffer, rank, scale: adapter_scale };
+
+        let mut output = DeviceBuffer::new(m * features * 2).unwrap();
+        gemm::int8(
+            0,
+            &activation_buffer,
+            &weight_buffer,
+            &activation_scale_buffer,
+            &weight_scale_buffer,
+            Output { buffer: &mut output, f16, bias: Some(&bias_buffer), swiglu: true },
+            m,
+            n,
+            k,
+            Some(&adapter),
+        )
+        .unwrap();
+        let mut output_bytes = vec![0; m * features * 2];
+        output.copy_to_host(&mut output_bytes).unwrap();
+
+        let product = |row: usize, column: usize| -> f32 {
+            let dot: i32 = (0..k).map(|index| activations[row * k + index] as i32 * weights[column * k + index] as i32).sum();
+            let low_rank: f64 = (0..rank)
+                .map(|index| bf16_to_f32(down[row * rank + index]) as f64 * bf16_to_f32(up[column * rank + index]) as f64)
+                .sum();
+            let value = dot as f64 * activation_scales[row] as f64 * weight_scales[column] as f64 + adapter_scale as f64 * low_rank + bias[column] as f64;
+            round_output(value, f16)
+        };
+        for row in 0..m {
+            for feature in 0..features {
+                let (gate, up) = (product(row, feature), product(row, features + feature));
+                let expected = round_output((gate / (1.0 + (-gate).exp()) * up) as f64, f16) as f64;
+                let index = row * features + feature;
+                let bits = u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]]);
+                let actual = if f16 { f16_to_f32(bits) } else { bf16_to_f32(bits) } as f64;
+                assert!(
+                    (actual - expected).abs() <= expected.abs() / 64.0 + 1e-3,
+                    "f16 {f16}, row {row}, feature {feature}: expected {expected}, got {actual}"
+                );
+            }
+        }
+    }
 }

@@ -4,6 +4,7 @@
 //! quantized weights and through cuBLASLt for BF16 and FP32 weights.
 
 use crate::attention::{AttentionLayout, HEAD_DIM, SparseWorkspace, dense_bf16_pointers, sparse_pointers};
+use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
 use crate::model::{DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer};
 use crate::{CudaError, DeviceBuffer, check};
@@ -97,7 +98,8 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(config: &DitConfig, tokens: usize, adapter_rank: usize) -> Result<Self, CudaError> {
+    /// `expanded_rows` rows of the gate and up projections are enough when the INT8 MLPs write SwiGLU directly.
+    fn new(config: &DitConfig, tokens: usize, expanded_rows: usize, adapter_rank: usize) -> Result<Self, CudaError> {
         let (hidden, inner, ffn) = (config.hidden, config.inner(), config.ffn);
         Ok(Workspace {
             residual: DeviceBuffer::zeroed(tokens * hidden * 4)?,
@@ -106,7 +108,7 @@ impl Workspace {
             qkv: DeviceBuffer::new(tokens * 3 * inner * 2)?,
             attention: DeviceBuffer::new(tokens * inner * 2)?,
             delta: DeviceBuffer::new(tokens * hidden * 2)?,
-            expanded: DeviceBuffer::new(tokens * 2 * ffn * 2)?,
+            expanded: DeviceBuffer::new(expanded_rows.max(1) * 2 * ffn * 2)?,
             activated: DeviceBuffer::new(tokens * ffn * 2)?,
             quantized: DeviceBuffer::new(tokens * hidden.max(inner).max(ffn))?,
             scales: DeviceBuffer::new(tokens * 4)?,
@@ -169,6 +171,13 @@ impl CudaDit {
             tensors.insert(name, file, info, &mut uploader)?;
         }
         uploader.run()?;
+        for layer in 0..config.layers {
+            let fc1 = format!("blocks.{layer}.mlp.fc1");
+            if tensors.is_int8(&fc1) {
+                tensors.interleave_swiglu(&format!("{fc1}.weight"))?;
+                tensors.interleave_swiglu(&format!("{fc1}.weight_scale"))?;
+            }
+        }
         Ok(CudaDit {
             config,
             tensors,
@@ -220,6 +229,11 @@ impl CudaDit {
             adapters.push((layer.to_owned(), adapter));
         }
         uploader.run()?;
+        for (layer, adapter) in &mut adapters {
+            if layer.ends_with(".mlp.fc1") && self.tensors.is_int8(layer) {
+                adapter.up = interleave_swiglu_rows(&adapter.up, adapter.outputs, adapter.rank * 2)?;
+            }
+        }
         let added = adapters.len();
         self.adapters.extend(adapters);
         Ok(added)
@@ -375,11 +389,17 @@ impl CudaDit {
         self.add_residual(workspace, tokens, gate(2))?;
 
         self.normalize(&format!("{prefix}.norm2.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(3, 4))?;
-        self.linear(&format!("{prefix}.mlp.fc1"), workspace.normalized.pointer(), workspace.expanded.pointer(), tokens, workspace)?;
-        // SAFETY: expanded holds `tokens × 2 × ffn` values and activated `tokens × ffn`.
-        check(unsafe {
-            mmh3_swiglu(workspace.expanded.pointer(), workspace.activated.pointer(), tokens as c_int, config.ffn as c_int, ptr::null_mut())
-        })?;
+        let fc1 = format!("{prefix}.mlp.fc1");
+        if self.tensors.is_int8(&fc1) {
+            let adapter = self.adapters.get(&fc1).map(|adapter| (adapter, &workspace.adapter));
+            self.tensors.linear_swiglu(&fc1, workspace.normalized.pointer(), workspace.activated.pointer(), tokens, &workspace.quantized, &workspace.scales, adapter)?;
+        } else {
+            self.linear(&fc1, workspace.normalized.pointer(), workspace.expanded.pointer(), tokens, workspace)?;
+            // SAFETY: expanded holds `tokens × 2 × ffn` values and activated `tokens × ffn`.
+            check(unsafe {
+                mmh3_swiglu(workspace.expanded.pointer(), workspace.activated.pointer(), tokens as c_int, config.ffn as c_int, ptr::null_mut())
+            })?;
+        }
         self.linear(&format!("{prefix}.mlp.fc2"), workspace.activated.pointer(), workspace.delta.pointer(), tokens, workspace)?;
         self.add_residual(workspace, tokens, gate(5))
     }
@@ -412,7 +432,9 @@ impl CudaDit {
         let timesteps = StepTimesteps::new(inputs.sigma, inputs.shift_video, inputs.shift_audio);
         let steps = timesteps.values.len();
         let adapter_rank = self.adapters.values().map(|adapter| adapter.rank).max().unwrap_or(0);
-        let workspace = Workspace::new(config, tokens, adapter_rank)?;
+        // The refiner's MLPs still write the gate and up projections for the text tokens.
+        let fused = (0..config.layers).all(|layer| self.tensors.is_int8(&format!("blocks.{layer}.mlp.fc1")));
+        let workspace = Workspace::new(config, tokens, if fused { text_tokens } else { tokens }, adapter_rank)?;
 
         let block_rows = i32_buffer(&layout.modulation_rows(&timesteps))?;
         let final_rows: Vec<usize> =

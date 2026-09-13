@@ -1,6 +1,6 @@
 //! Pieces shared by the model runners: errors, checkpoint tensors on the device and cuBLASLt linear layers.
 
-use crate::gemm::{AdapterPointers, Int8Output, int8_pointers, rotate_quantize_pointers};
+use crate::gemm::{AdapterPointers, Int8Output, int8_pointers, interleave_swiglu_rows, rotate_quantize_pointers};
 use crate::loader::{LoadError, Uploader};
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::json;
@@ -106,6 +106,74 @@ impl DeviceTensors {
     pub(crate) fn pointer(&self, name: &str) -> Result<*const c_void, Error> {
         Ok(self.get(name)?.buffer.pointer())
     }
+
+    /// Reorders the rows of `name` for the INT8 GEMM's SwiGLU output, see `interleave_swiglu_rows`.
+    pub(crate) fn interleave_swiglu(&mut self, name: &str) -> Result<(), Error> {
+        let tensor = self.0.get_mut(name).ok_or_else(|| Error::Model(format!("missing tensor {name}")))?;
+        let rows = tensor.shape[0];
+        tensor.buffer = interleave_swiglu_rows(&tensor.buffer, rows, tensor.buffer.bytes() / rows)?;
+        Ok(())
+    }
+
+    /// Whether `{name}.weight` is INT8, so that `linear_swiglu` applies once its rows are interleaved.
+    pub(crate) fn is_int8(&self, name: &str) -> bool {
+        self.optional(&format!("{name}.weight")).is_some_and(|weight| weight.dtype == DType::I8)
+    }
+
+    /// Applies the INT8 ConvRot layer `name`, whose weights, weight scales and adapter up weights went through
+    /// `interleave_swiglu`, and writes `silu(gate) · up` as `rows × outputs / 2` BF16 values.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_swiglu(
+        &self,
+        name: &str,
+        input: *const c_void,
+        output: *mut c_void,
+        rows: usize,
+        quantized: &DeviceBuffer,
+        activation_scales: &DeviceBuffer,
+        adapter: Option<(&LowRank, &DeviceBuffer)>,
+    ) -> Result<(), Error> {
+        let mut output = Int8Output::bf16(output);
+        output.swiglu = true;
+        self.int8_linear(name, input, output, rows, quantized, activation_scales, adapter)
+    }
+
+    /// The INT8 ConvRot path of `linear`: quantizes the BF16 input and runs the INT8 GEMM, with the adapter inside it
+    /// when its rank is a multiple of 64.
+    #[allow(clippy::too_many_arguments)]
+    fn int8_linear(
+        &self,
+        name: &str,
+        input: *const c_void,
+        output: Int8Output,
+        rows: usize,
+        quantized: &DeviceBuffer,
+        activation_scales: &DeviceBuffer,
+        adapter: Option<(&LowRank, &DeviceBuffer)>,
+    ) -> Result<(), Error> {
+        let weight = self.get(&format!("{name}.weight"))?;
+        let (outputs, features) = (weight.shape[0], weight.shape[1]);
+        let weight_scales = self.get(&format!("{name}.weight_scale"))?;
+        if weight.dtype != DType::I8 || features % CONVROT_GROUP != 0 || self.optional(&format!("{name}.bias")).is_some() {
+            return Err(Error::Model(format!("{name}: unsupported INT8 layer")));
+        }
+        assert!(quantized.bytes() >= rows * features && activation_scales.bytes() >= rows * 4, "{name}: quantization buffers are too small");
+        // SAFETY: `quantized` holds `rows × features` values and `activation_scales` `rows`, checked above. The
+        // adapter reads the BF16 input and writes `rows × rank` values into its scratch buffer.
+        unsafe {
+            let fused = match adapter {
+                Some((low_rank, scratch)) if low_rank.rank % 64 == 0 => Some(low_rank.project_down(input, rows, scratch)?),
+                Some(_) if output.swiglu => return Err(Error::Model(format!("{name}: the adapter rank must be a multiple of 64"))),
+                _ => None,
+            };
+            rotate_quantize_pointers(input, false, quantized.pointer(), activation_scales.pointer(), rows, features)?;
+            int8_pointers(quantized.pointer(), weight.buffer.pointer(), activation_scales.pointer(), weight_scales.buffer.pointer(), output, rows, outputs, features, fused)?;
+            if let (None, Some((low_rank, scratch))) = (fused, adapter) {
+                low_rank.apply(input, output.pointer, rows, scratch)?;
+            }
+        }
+        Ok(())
+    }
     /// Applies `{name}.weight` (and `{name}.bias` when present) to `rows` rows, plus a low-rank adapter with a
     /// scratch buffer of `rows × rank` BF16 values. The input and output types follow the weight: BF16 for BF16 and
     /// INT8 ConvRot weights, FP32 for FP32 weights. INT8 ConvRot layers quantize the rotated input into `quantized` and
@@ -125,36 +193,7 @@ impl DeviceTensors {
         let (outputs, features) = (weight.shape[0], weight.shape[1]);
         let bias = self.optional(&format!("{name}.bias")).map_or(ptr::null(), |bias| bias.buffer.pointer().cast_const());
         match weight.dtype {
-            DType::I8 => {
-                let weight_scales = self.get(&format!("{name}.weight_scale"))?;
-                if features % CONVROT_GROUP != 0 || !bias.is_null() {
-                    return Err(Error::Model(format!("{name}: unsupported INT8 layer")));
-                }
-                assert!(quantized.bytes() >= rows * features && activation_scales.bytes() >= rows * 4, "{name}: quantization buffers are too small");
-                // SAFETY: `quantized` holds `rows × features` values and `activation_scales` `rows`, checked above. The
-                // adapter reads the BF16 input and writes `rows × rank` values into its scratch buffer.
-                unsafe {
-                    let fused = match adapter {
-                        Some((low_rank, scratch)) if low_rank.rank % 64 == 0 => Some(low_rank.project_down(input, rows, scratch)?),
-                        _ => None,
-                    };
-                    rotate_quantize_pointers(input, false, quantized.pointer(), activation_scales.pointer(), rows, features)?;
-                    int8_pointers(
-                        quantized.pointer(),
-                        weight.buffer.pointer(),
-                        activation_scales.pointer(),
-                        weight_scales.buffer.pointer(),
-                        Int8Output::bf16(output),
-                        rows,
-                        outputs,
-                        features,
-                        fused,
-                    )?;
-                    if let (None, Some((low_rank, scratch))) = (fused, adapter) {
-                        low_rank.apply(input, output, rows, scratch)?;
-                    }
-                }
-            }
+            DType::I8 => self.int8_linear(name, input, Int8Output::bf16(output), rows, quantized, activation_scales, adapter)?,
             DType::BF16 | DType::F32 => {
                 let kind = if weight.dtype == DType::BF16 { LinearKind::Bf16 } else { LinearKind::F32 };
                 // SAFETY: the caller passes buffers of `rows × features` inputs and `rows × outputs` outputs, and the
