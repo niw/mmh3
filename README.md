@@ -7,6 +7,53 @@ Qwen3-VL text encoder, the diffusion transformer, the sampler and both VAE decod
 in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints from
 [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
 
+## Getting started
+
+The fastest configuration measured so far uses the INT8 ConvRot DiT, text encoder and video VAE,
+the FP32 audio VAE, and the 768p Turbo LoRA. With four steps, INT8/FP8 attention and Sol-Attn from
+the first step, it generated a 768p video with audio in about **98 seconds** on a DGX Spark
+([measurement details](#performance)).
+
+With the [requirements](#requirements) and the Hugging Face CLI (`hf`) installed, run these commands
+from the repository directory. Download only these models; the FP16 video VAE is not needed:
+
+```sh
+cargo build --release --features cuda
+
+hf download Comfy-Org/MiniMax-H3 --local-dir models \
+  diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
+  text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
+  vae/minimax_h3_audio_vae_fp32.safetensors
+hf download MiniMaxAI/MiniMax-H3 tokenizer/tokenizer.json --local-dir models
+hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
+  --local-dir models/vae
+hf download lightx2v/Minimax-h3-Turbo \
+  minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
+  --local-dir models/loras
+```
+
+Generate a 1344×768, 124-frame video (about 5.2 seconds) with the fastest measured settings:
+
+```sh
+target/release/mmh3 generate --models models --out out.y4m \
+  --prompt "A woman in a yellow raincoat opens a clear umbrella on a neon-lit Tokyo street at night. Rain patters on the umbrella, with distant traffic and soft piano music." \
+  --width 1344 --height 768 --frames 124 --seed 1 \
+  --steps 4 --shift-video 6 --shift-audio 3 \
+  --attention sol --attention-precision int8-fp8 --sparse-start 0 --sparse-tau 1.3 \
+  --video-vae models/vae/minimax_h3_video_vae_int8_convrot.safetensors \
+  --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
+```
+
+This writes `out.y4m` and `out.wav`. To encode them as an MP4 with audio:
+
+```sh
+ffmpeg -i out.y4m -i out.wav -c:v libx264 -crf 18 -pix_fmt yuv420p \
+  -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 192k -shortest out.mp4
+```
+
+Generation time depends on the prompt. Quantized attention and starting sparse attention at the
+first step change image details and can change the composition; see [Usage](#usage) for the other settings.
+
 ## Status
 
 - Text to video with audio (T2VA) works end to end, one video at a time.
@@ -87,8 +134,13 @@ command offers just `inspect`.
 ## Models
 
 mmh3 finds each checkpoint under its ComfyUI name inside a models directory laid out like ComfyUI's
-`models` folder. A ComfyUI installation's `models` directory works as is. To download the files, for
-example with the Hugging Face CLI:
+`models` folder. A ComfyUI installation's `models` directory works as is.
+
+If you use the INT8 ConvRot video VAE, you do not need to download the FP16 video VAE. Omit
+`vae/minimax_h3_video_vae_fp16.safetensors` from the first command below and download
+`minimax_h3_video_vae_int8_convrot.safetensors` with the last command instead.
+
+To download the files, for example with the Hugging Face CLI:
 
 ```sh
 hf download Comfy-Org/MiniMax-H3 --local-dir models \
