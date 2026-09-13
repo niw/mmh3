@@ -125,7 +125,7 @@ pub fn interleave_swiglu_rows(source: &DeviceBuffer, rows: usize, row_bytes: usi
 }
 
 /// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows, such as prompts,
-/// and 256 × 128 otherwise.
+/// and for reductions longer than 8,192, and 256 × 128 otherwise.
 ///
 /// # Safety
 /// The pointers must cover the extents described for `int8_bf16`.
@@ -141,7 +141,9 @@ pub(crate) unsafe fn int8_pointers(
     k: usize,
     adapter: Option<AdapterPointers>,
 ) -> Result<(), CudaError> {
-    let config = if m < 256 && n % 256 == 0 { 1 } else { 0 };
+    // NOTE: in the DiT at 768p, the MLP down projection (K = 14,336) takes 35 ms per layer with 128 × 256 tiles and
+    // 47 ms with 256 × 128 tiles, although both take about 31 ms when timed alone.
+    let config = if (m < 256 || k > 8192) && n % 256 == 0 { 1 } else { 0 };
     // SAFETY: the caller guarantees the extents.
     unsafe { int8_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k, adapter) }
 }
