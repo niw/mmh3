@@ -119,7 +119,7 @@ make
 mmh3 finds each checkpoint under its ComfyUI name in a models directory laid out like ComfyUI's
 `models` folder, so a ComfyUI installation's `models` directory works as is. `mmh3` takes the
 directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `--text-encoder`,
-`--video-vae`, `--audio-vae` and `--tokenizer`.
+`--video-vae` and `--audio-vae`.
 
 `make download-models` runs `tools/download-models.sh`, which downloads these files into `models`:
 
@@ -130,7 +130,6 @@ directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `
 | `vae/minimax_h3_audio_vae_fp32.safetensors` | Comfy-Org/MiniMax-H3 |
 | `vae/minimax_h3_video_vae_int8_convrot.safetensors` | Kijai/MiniMax-H3-experimental |
 | `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` | lightx2v/Minimax-h3-Turbo |
-| `tokenizer/tokenizer.json` | MiniMaxAI/MiniMax-H3 |
 
 With `--precision fp16`, the script downloads the FP16 video VAE,
 `vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
@@ -224,8 +223,7 @@ cargo test --release --workspace --features cuda -- --test-threads=1
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results
 and CPU references. They run one at a time, because loading a model during another test's DiT
-forward pass can corrupt that forward pass. The tokenizer test needs the MiniMax H3 `tokenizer.json` from
-`MMH3_TOKENIZER` or the `MMH3_MODELS` directory, and is skipped without it.
+forward pass can corrupt that forward pass.
 
 ## License
 

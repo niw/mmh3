@@ -8,7 +8,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.y4m> [--models DIR]
                 [--width N] [--height N] [--frames N] [--steps N] [--seed N] [--shift-video X] [--shift-audio X]
-                [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE] [--tokenizer FILE]
+                [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--lora FILE] [--lora-strength X] [--attention dense|sol] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X]
   mmh3 inspect <file.safetensors> [--all]
   mmh3 device
@@ -22,7 +22,7 @@ const USAGE: &str = "usage:
                     [--attention dense|sol] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X]
   mmh3 check video-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3 check audio-vae --golden <directory> [--models DIR] [--weights FILE]
-  mmh3 check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE] [--tokenizer FILE]
+  mmh3 check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
 
 Checkpoints default to their ComfyUI names inside a models directory laid out like ComfyUI's models folder and the
 Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
@@ -30,7 +30,6 @@ Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
   text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
   vae/minimax_h3_video_vae_fp16.safetensors
   vae/minimax_h3_audio_vae_fp32.safetensors
-  tokenizer/tokenizer.json (from MiniMaxAI/MiniMax-H3)
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
 directory has it.";
 
@@ -447,7 +446,6 @@ fn generate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "video-vae",
             "audio-vae",
             "text-encoder",
-            "tokenizer",
             "lora",
             "lora-strength",
             "attention",
@@ -482,7 +480,7 @@ fn generate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let context = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
             let started = Instant::now();
-            let ids = Tokenizer::load_h3(Path::new(&option_path(&options, "tokenizer", TOKENIZER_FILE)?))?.encode(&prompt);
+            let ids = Tokenizer::h3().encode(&prompt);
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
             let encoder = CudaTextEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
             let context = encoder.encode(&ids, &[])?.context;
@@ -604,8 +602,6 @@ const VIDEO_VAE_INT8_FILE: &str = "vae/minimax_h3_video_vae_int8_convrot.safeten
 const AUDIO_VAE_FILE: &str = "vae/minimax_h3_audio_vae_fp32.safetensors";
 #[cfg(feature = "cuda")]
 const TEXT_ENCODER_FILE: &str = "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
-#[cfg(feature = "cuda")]
-const TOKENIZER_FILE: &str = "tokenizer/tokenizer.json";
 
 /// Loads the DiT from `--weights` or `--dit`, whichever `name` says, with the LoRA of `--lora` when given.
 #[cfg(feature = "cuda")]
@@ -920,13 +916,12 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::text_encoder::CudaTextEncoder;
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights", "tokenizer"])?;
+    let options = parse_options(arguments, &["golden", "models", "weights"])?;
     let golden = GoldenFile(SafeTensors::open(Path::new(options.get("golden").ok_or(USAGE)?))?);
     let prompt = golden.metadata("prompt")?;
     let id_info = golden.0.get("token_ids").ok_or("golden data lacks token_ids")?;
     let expected_ids: Vec<u32> = golden.0.data(id_info).chunks_exact(8).map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()) as u32).collect();
-    let tokenizer = Tokenizer::load_h3(Path::new(&option_path(&options, "tokenizer", TOKENIZER_FILE)?))?;
-    let ids = tokenizer.encode(&prompt);
+    let ids = Tokenizer::h3().encode(&prompt);
     if ids != expected_ids {
         return Err(format!("token ids differ from the golden data:\n  expected {expected_ids:?}\n  actual   {ids:?}").into());
     }

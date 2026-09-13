@@ -9,7 +9,7 @@ usage: $0 [--precision int8|fp16] [--lora | --no-lora] [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf). By default
 it downloads the ones for the fastest generation: the INT8 ConvRot DiT, text encoder and video VAE,
-the FP32 audio VAE, the tokenizer and the lightx2v 4-step Turbo LoRA.
+the FP32 audio VAE and the lightx2v 4-step Turbo LoRA.
 
   --precision int8  The INT8 ConvRot video VAE from Kijai/MiniMax-H3-experimental (default).
   --precision fp16  The FP16 video VAE from Comfy-Org/MiniMax-H3 instead. The DiT and the text
@@ -78,7 +78,6 @@ if [[ $precision == fp16 ]]; then
   files+=(vae/minimax_h3_video_vae_fp16.safetensors)
 fi
 hf download Comfy-Org/MiniMax-H3 "${files[@]}" --local-dir "$models"
-hf download MiniMaxAI/MiniMax-H3 tokenizer/tokenizer.json --local-dir "$models"
 if [[ $precision == int8 ]]; then
   hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
     --local-dir "$models/vae"

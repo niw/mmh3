@@ -1,4 +1,4 @@
-//! A minimal JSON parser for safetensors headers, model configs and tokenizer files.
+//! A minimal JSON parser for safetensors headers and model configs.
 
 use std::fmt;
 

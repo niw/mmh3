@@ -64,12 +64,18 @@ from the Unicode Character Database, through Python's unicodedata module.
     dealings in these Data Files or Software without prior written
     authorization of the copyright holder.
 
-1.3 Qwen tokenizer
+1.3 Qwen tokenizer (Apache License, Version 2.0)
 
-The pre-tokenization pattern quoted in `crates/mmh3-core/src/tokenizer/pretokenize.rs`
-and the byte-level BPE in `crates/mmh3-core/src/tokenizer/mod.rs` reproduce the
-behavior of the Qwen2 tokenizer (Apache License, Version 2.0), which builds on
-GPT-2's byte-level BPE by OpenAI.
+`crates/mmh3-core/src/tokenizer/merges.txt` is `merges.txt` of the Qwen3-VL
+tokenizer, unchanged, and `crates/mmh3-core/src/tokenizer/mod.rs` lists its
+added tokens. The pre-tokenization pattern quoted in
+`crates/mmh3-core/src/tokenizer/pretokenize.rs` and the byte-level BPE in
+`crates/mmh3-core/src/tokenizer/mod.rs` reproduce the behavior of the Qwen2
+tokenizer, which builds on GPT-2's byte-level BPE by OpenAI.
+
+    Qwen3-VL by the Qwen team, Alibaba Cloud
+    https://huggingface.co/Qwen/Qwen3-VL-32B-Instruct
+    Licensed under the Apache License, Version 2.0: https://www.apache.org/licenses/LICENSE-2.0
 
 `tests/fixtures/tokenizer_cases.json` holds the token ids that Hugging Face
 tokenizers produces with the MiniMax H3 tokenizer.
@@ -85,8 +91,7 @@ outputs ComfyUI's implementation computes for them, written by the tools in `too
 Model weights.
 mmh3 loads checkpoints that users download themselves, each under its own license:
 MiniMax H3 by MiniMax as repackaged for ComfyUI by Comfy-Org, the text encoder
-derived from Qwen3-VL, the tokenizer files of the MiniMax H3 release, and
-optional LoRAs such as lightx2v's MiniMax-H3 Turbo LoRA.
+derived from Qwen3-VL, and optional LoRAs such as lightx2v's MiniMax-H3 Turbo LoRA.
 
 ComfyUI (GPL-3.0).
 mmh3 was checked against ComfyUI's MiniMax H3 implementation and contains none

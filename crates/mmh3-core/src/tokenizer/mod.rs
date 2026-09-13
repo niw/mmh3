@@ -1,4 +1,4 @@
-//! The byte-level BPE tokenizer of Qwen2 and Qwen3, read from a Hugging Face `tokenizer.json`.
+//! The byte-level BPE tokenizer of Qwen2 and Qwen3, with the merges of the Qwen3-VL tokenizer built in.
 //!
 //! Encoding splits the text on added tokens, applies NFC to the rest, splits it with the Qwen2 pre-tokenizer, maps
 //! every byte to its printable stand-in and merges the pieces by rank. No special tokens are added around the text.
@@ -10,9 +10,41 @@ mod unicode_tables;
 pub use pretokenize::pretokenize;
 pub use unicode::{is_letter, nfc};
 
-use crate::json::{self, Value};
 use std::collections::HashMap;
-use std::path::Path;
+
+/// The merges of the Qwen3-VL tokenizer, one pair per line in rank order.
+const QWEN_MERGES: &str = include_str!("merges.txt");
+
+/// The added tokens of the Qwen3 tokenizer, whose ids follow the BPE vocabulary from [`QWEN_FIRST_ADDED_ID`].
+const QWEN_ADDED_TOKENS: [&str; 26] = [
+    "<|endoftext|>",
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|object_ref_start|>",
+    "<|object_ref_end|>",
+    "<|box_start|>",
+    "<|box_end|>",
+    "<|quad_start|>",
+    "<|quad_end|>",
+    "<|vision_start|>",
+    "<|vision_end|>",
+    "<|vision_pad|>",
+    "<|image_pad|>",
+    "<|video_pad|>",
+    "<tool_call>",
+    "</tool_call>",
+    "<|fim_prefix|>",
+    "<|fim_middle|>",
+    "<|fim_suffix|>",
+    "<|fim_pad|>",
+    "<|repo_name|>",
+    "<|file_sep|>",
+    "<tool_response>",
+    "</tool_response>",
+    "<think>",
+    "</think>",
+];
+const QWEN_FIRST_ADDED_ID: u32 = 151_643;
 
 /// Tokens MiniMax H3 adds to the Qwen3 vocabulary, with the ids of the released tokenizer.
 pub const H3_EXTRA_TOKENS: [(&str, u32); 7] = [
@@ -54,64 +86,47 @@ pub struct Tokenizer {
 }
 
 impl Tokenizer {
-    pub fn load(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|error| format!("{}: {error}", path.display()))?;
-        Self::from_json(&text)
-    }
-
-    /// The MiniMax H3 tokenizer: `tokenizer.json` of Qwen3 plus [`H3_EXTRA_TOKENS`].
-    pub fn load_h3(path: &Path) -> Result<Self, String> {
-        let mut tokenizer = Self::load(path)?;
+    /// The MiniMax H3 tokenizer: the Qwen3 tokenizer plus [`H3_EXTRA_TOKENS`].
+    pub fn h3() -> Self {
+        let mut tokenizer = Self::from_merges(QWEN_MERGES).expect("the built-in merges form a vocabulary");
+        for (index, content) in QWEN_ADDED_TOKENS.into_iter().enumerate() {
+            tokenizer.add_token(content, QWEN_FIRST_ADDED_ID + index as u32);
+        }
         for (content, id) in H3_EXTRA_TOKENS {
             tokenizer.add_token(content, id);
         }
-        Ok(tokenizer)
+        tokenizer
     }
 
-    pub fn from_json(text: &str) -> Result<Self, String> {
-        let root = json::parse(text).map_err(|error| format!("tokenizer.json: {error}"))?;
-        let model = root.get("model").ok_or("tokenizer.json has no model")?;
-        if model.get("type").and_then(Value::as_str) != Some("BPE") {
-            return Err("only BPE tokenizers are supported".into());
-        }
-        let mut vocabulary = HashMap::new();
-        for (token, id) in model.get("vocab").and_then(Value::as_object).ok_or("the model has no vocab")? {
-            let id = id.as_u64().ok_or("vocab ids must be integers")? as u32;
-            vocabulary.insert(token.clone(), id);
-        }
-        let tokens: HashMap<u32, String> = vocabulary.iter().map(|(token, &id)| (id, token.clone())).collect();
+    /// A byte-level BPE from its merges, one pair per line in rank order. The 256 byte tokens take the ids 0 to 255 in
+    /// the order of their printable stand-ins, and each merge adds the next id, as in the GPT-2 and Qwen vocabularies.
+    fn from_merges(text: &str) -> Result<Self, String> {
+        let characters = byte_characters();
+        let mut stand_ins = characters;
+        stand_ins.sort_unstable();
+        let mut vocabulary: HashMap<String, u32> = stand_ins.iter().enumerate().map(|(id, character)| (character.to_string(), id as u32)).collect();
 
         let mut merges = HashMap::new();
-        for (rank, merge) in model.get("merges").and_then(Value::as_array).ok_or("the model has no merges")?.iter().enumerate() {
-            let (left, right) = match merge {
-                Value::String(pair) => pair.split_once(' ').ok_or("a merge is not a pair")?,
-                Value::Array(pair) if pair.len() == 2 => {
-                    (pair[0].as_str().ok_or("a merge is not a pair")?, pair[1].as_str().ok_or("a merge is not a pair")?)
-                }
-                _ => return Err("a merge is not a pair".into()),
-            };
-            let id = |token: &str| vocabulary.get(token).copied().ok_or_else(|| format!("merge part {token:?} is not in the vocab"));
-            let merged = id(&format!("{left}{right}"))?;
-            merges.entry((id(left)?, id(right)?)).or_insert((rank as u32, merged));
+        for (rank, line) in text.lines().enumerate() {
+            let (left, right) = line.split_once(' ').ok_or_else(|| format!("merge {rank} is not a pair"))?;
+            let id = |token: &str| vocabulary.get(token).copied().ok_or_else(|| format!("merge {rank} joins {token:?}, which is not a token yet"));
+            let pair = (id(left)?, id(right)?);
+            let token = format!("{left}{right}");
+            if vocabulary.contains_key(&token) {
+                return Err(format!("merge {rank} makes {token:?} again"));
+            }
+            let merged = vocabulary.len() as u32;
+            vocabulary.insert(token, merged);
+            merges.insert(pair, (rank as u32, merged));
         }
+        let tokens = vocabulary.iter().map(|(token, &id)| (id, token.clone())).collect();
 
-        let characters = byte_characters();
-        let mut byte_tokens = [0; 256];
-        for (byte, character) in characters.iter().enumerate() {
-            byte_tokens[byte] = *vocabulary.get(&character.to_string()).ok_or("the vocab lacks a byte token")?;
-        }
+        let byte_tokens = characters.map(|character| vocabulary[&character.to_string()]);
         let character_bytes = characters.iter().enumerate().map(|(byte, &character)| (character, byte as u8)).collect();
-
-        let mut tokenizer = Tokenizer { vocabulary, tokens, merges, added: Vec::new(), byte_tokens, character_bytes };
-        for added in root.get("added_tokens").and_then(Value::as_array).unwrap_or(&[]) {
-            let content = added.get("content").and_then(Value::as_str).ok_or("an added token has no content")?;
-            let id = added.get("id").and_then(Value::as_u64).ok_or("an added token has no id")? as u32;
-            tokenizer.add_token(content, id);
-        }
-        Ok(tokenizer)
+        Ok(Tokenizer { vocabulary, tokens, merges, added: Vec::new(), byte_tokens, character_bytes })
     }
 
-    /// Adds a token that is matched verbatim in the input, like the special tokens of `tokenizer.json`.
+    /// Adds a token that is matched verbatim in the input, like the special tokens of the Qwen tokenizer.
     pub fn add_token(&mut self, content: &str, id: u32) {
         self.added.retain(|(existing, _)| existing != content);
         self.added.push((content.to_owned(), id));
@@ -205,46 +220,35 @@ impl Tokenizer {
 mod tests {
     use super::*;
 
-    /// A vocabulary of the 256 byte tokens plus "ab", "abc" and " a", in the order of their merges.
+    /// The 256 byte tokens plus "ab", "abc" and " a", in the order of their merges, and the added token "<|x|>".
     fn tiny_tokenizer() -> Tokenizer {
-        let characters = byte_characters();
-        let mut entries: Vec<(String, u32)> = characters.iter().enumerate().map(|(byte, character)| (character.to_string(), byte as u32)).collect();
-        let space = characters[b' ' as usize];
-        entries.push(("ab".into(), 256));
-        entries.push(("abc".into(), 257));
-        entries.push((format!("{space}a"), 258));
-        let vocab_json: Vec<String> = entries.iter().map(|(token, id)| format!("{}: {id}", json_string(token))).collect();
-        let merges = [json_string("a b"), json_string("ab c"), json_string(&format!("{space} a"))];
-        let text = format!(
-            r#"{{"model": {{"type": "BPE", "vocab": {{{}}}, "merges": [{}]}}, "added_tokens": [{{"id": 300, "content": "<|x|>"}}]}}"#,
-            vocab_json.join(", "),
-            merges.join(", ")
-        );
-        Tokenizer::from_json(&text).unwrap()
-    }
-
-    fn json_string(text: &str) -> String {
-        let mut quoted = String::from("\"");
-        for character in text.chars() {
-            match character {
-                '"' => quoted.push_str("\\\""),
-                '\\' => quoted.push_str("\\\\"),
-                character if (character as u32) < 0x20 => quoted.push_str(&format!("\\u{:04x}", character as u32)),
-                character => quoted.push(character),
-            }
-        }
-        quoted.push('"');
-        quoted
+        let space = byte_characters()[b' ' as usize];
+        let mut tokenizer = Tokenizer::from_merges(&format!("a b\nab c\n{space} a\n")).unwrap();
+        tokenizer.add_token("<|x|>", 300);
+        tokenizer
     }
 
     #[test]
     fn merges_by_rank_and_splits_added_tokens() {
         let tokenizer = tiny_tokenizer();
+        let byte = |value: u8| tokenizer.byte_tokens[value as usize];
         assert_eq!(tokenizer.encode("abc"), [257]);
         assert_eq!(tokenizer.encode("abab"), [256, 256]);
-        assert_eq!(tokenizer.encode("x ac"), [b'x' as u32, 258, b'c' as u32]);
-        assert_eq!(tokenizer.encode("x abc"), [b'x' as u32, b' ' as u32, 257]);
-        assert_eq!(tokenizer.encode("ab<|x|>c"), [256, 300, b'c' as u32]);
+        assert_eq!(tokenizer.encode("x ac"), [byte(b'x'), 258, byte(b'c')]);
+        assert_eq!(tokenizer.encode("x abc"), [byte(b'x'), byte(b' '), 257]);
+        assert_eq!(tokenizer.encode("ab<|x|>c"), [256, 300, byte(b'c')]);
         assert_eq!(tokenizer.decode(&tokenizer.encode("x abc<|x|>é")), "x abc<|x|>é");
+    }
+
+    #[test]
+    fn numbers_bytes_like_gpt2() {
+        let tokenizer = tiny_tokenizer();
+        assert_eq!((tokenizer.byte_tokens[b'!' as usize], tokenizer.byte_tokens[0], tokenizer.byte_tokens[b' ' as usize]), (0, 188, 220));
+    }
+
+    #[test]
+    fn rejects_merges_of_unknown_tokens() {
+        assert!(Tokenizer::from_merges("ab c\n").is_err());
+        assert!(Tokenizer::from_merges("a b\na b\n").is_err());
     }
 }
