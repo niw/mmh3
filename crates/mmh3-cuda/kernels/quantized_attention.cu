@@ -22,16 +22,22 @@ constexpr int HEAD_DIM = 128;
 constexpr int BLOCK_M = 64;
 constexpr int WARPS = BLOCK_M / 16;
 constexpr int THREADS = WARPS * 32;
-constexpr int SHARED_BYTES = 49152;
+constexpr int SHARED_BYTES = 32768;
 using Element = __nv_bfloat16;
 using QKAccumulator = int32_t;
 
-// A stage holds an 8 KiB key tile and a 16 KiB transposed value tile. The value rows
-// are padded to 128 bytes for the shared-memory swizzle. Two stages fit in 48 KiB.
+// A stage holds an 8 KiB key tile and an 8 KiB transposed value tile of 64-byte rows. Two stages take 32 KiB, so that
+// three CTAs share an SM.
 struct QuantizedTiles {
     static constexpr int tile_bytes = 8192;
-    static constexpr int stage_bytes = 24576;
+    static constexpr int stage_bytes = 16384;
 };
+
+// Swizzling the 16-byte chunk of a 64-byte value row by (row / 2) % 4 spreads every ldmatrix phase over eight
+// distinct bank groups.
+__device__ __forceinline__ int value_offset(int row, int chunk) {
+    return row * 64 + ((chunk ^ ((row >> 1) & 3)) << 4);
+}
 static_assert(BLOCK_M * HEAD_DIM <= QuantizedTiles::stage_bytes, "the query tile borrows one stage");
 
 __device__ __forceinline__ void mma_qk(QKAccumulator (&c)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
@@ -50,6 +56,14 @@ __device__ __forceinline__ void mma_pv(float (&c)[4], const uint32_t (&a)[4], ui
         : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
 }
 
+// exp2f without its handling of results below 2^-126, which it flushes to zero. Probabilities and corrections that
+// small vanish in FP8 and against the row sums, which reach at least one.
+__device__ __forceinline__ float exp2_flushed(float value) {
+    float result;
+    asm("ex2.approx.ftz.f32 %0, %1;" : "=f"(result) : "f"(value));
+    return result;
+}
+
 __device__ void load_qk8(uint32_t destination, const uint8_t* source, int64_t stride,
                          int first, int count, int tokens) {
     using Q = Tiles<64>;
@@ -59,15 +73,6 @@ __device__ void load_qk8(uint32_t destination, const uint8_t* source, int64_t st
         const bool valid = first + row < tokens;
         copy_async_16(destination + Q::offset(row, chunk),
                       source + (valid ? static_cast<int64_t>(first + row) * stride : 0) + chunk * 16, valid);
-    }
-}
-
-__device__ void load_value8(uint32_t destination, const uint8_t* source, int padded, int block) {
-    for (int index = threadIdx.x; index < HEAD_DIM * 4; index += THREADS) {
-        const int dimension = index / 4;
-        const int chunk = index % 4;
-        copy_async_16(destination + Tiles<64>::offset(dimension, chunk),
-                      source + static_cast<int64_t>(dimension) * padded + block * 64 + chunk * 16, true);
     }
 }
 
@@ -183,7 +188,7 @@ __global__ void quantize_qk(const __nv_bfloat16* query, const __nv_bfloat16* key
 }
 
 template <bool SPARSE>
-__global__ void __launch_bounds__(THREADS, 2)
+__global__ void __launch_bounds__(THREADS, 3)
     attention_kernel(const uint8_t* __restrict__ query, const uint8_t* __restrict__ key,
                      const uint8_t* __restrict__ value, Element* __restrict__ output, int tokens,
                      Mmh3AttentionLayout layout, float scale_log2, const float* q_scales, const float* k_scales,
@@ -214,10 +219,34 @@ __global__ void __launch_bounds__(THREADS, 2)
     const uint8_t* value_head = value + static_cast<int64_t>(head) * HEAD_DIM * padded_tokens;
 
     auto stage_address = [&](int stage) { return shared_base + stage * T::stage_bytes; };
+    // Every thread copies the same 16-byte chunks of each key and value tile, so their offsets are computed once.
+    constexpr int CHUNKS = BLOCK_N * 8 / THREADS;
+    uint32_t key_shared[CHUNKS], value_shared[CHUNKS];
+    int64_t key_offsets[CHUNKS];
+    int key_rows[CHUNKS], value_offsets[CHUNKS];
+#pragma unroll
+    for (int chunk = 0; chunk < CHUNKS; chunk++) {
+        const int index = threadIdx.x + chunk * THREADS;
+        key_rows[chunk] = index / 8;
+        key_shared[chunk] = Q::offset(index / 8, index % 8);
+        key_offsets[chunk] = static_cast<int64_t>(index / 8) * layout.token_stride[KEY] + (index % 8) * 16;
+        value_shared[chunk] = T::tile_bytes + value_offset(index / 4, index % 4);
+        value_offsets[chunk] = (index / 4) * padded_tokens + (index % 4) * 16;
+    }
     auto load_key_value_block = [&](int entry, int stage) {
         const int block = SPARSE ? workspace.routes[route_row * route_blocks + entry] : entry;
-        load_qk8(stage_address(stage), key_head, layout.token_stride[KEY], block * BLOCK_N, BLOCK_N, tokens);
-        load_value8(stage_address(stage) + T::tile_bytes, value_head, padded_tokens, block);
+        const uint8_t* key_block = key_head + static_cast<int64_t>(block) * BLOCK_N * layout.token_stride[KEY];
+        const uint8_t* value_block = value_head + block * BLOCK_N;
+        const uint32_t base = stage_address(stage);
+#pragma unroll
+        for (int chunk = 0; chunk < CHUNKS; chunk++) {
+            const bool valid = block * BLOCK_N + key_rows[chunk] < tokens;
+            copy_async_16(base + key_shared[chunk], valid ? key_block + key_offsets[chunk] : key_head, valid);
+        }
+#pragma unroll
+        for (int chunk = 0; chunk < CHUNKS; chunk++) {
+            copy_async_16(base + value_shared[chunk], value_block + value_offsets[chunk], true);
+        }
     };
 
     // The query tile borrows stage 1 until it has been copied into registers.
@@ -301,7 +330,7 @@ __global__ void __launch_bounds__(THREADS, 2)
             block_max[half] = fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
             block_max[half] = fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 2));
             float new_max = fmaxf(row_max[half], block_max[half]);
-            correction[half] = exp2f(row_max[half] - new_max);
+            correction[half] = exp2_flushed(row_max[half] - new_max);
             row_max[half] = new_max;
             row_sum[half] *= correction[half];
         }
@@ -309,7 +338,7 @@ __global__ void __launch_bounds__(THREADS, 2)
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
 #pragma unroll
             for (int element = 0; element < 4; element++) {
-                float probability = exp2f(scores[key_tile_index][element] - row_max[element / 2]);
+                float probability = exp2_flushed(scores[key_tile_index][element] - row_max[element / 2]);
                 scores[key_tile_index][element] = probability;
                 row_sum[element / 2] += probability;
             }
@@ -348,7 +377,7 @@ __global__ void __launch_bounds__(THREADS, 2)
                 const int row = dimension_pair * 16 + (matrix / 2) * 8 + matrix_row;
                 const int chunk = key_step * 2 + matrix % 2;
                 uint32_t registers[4];
-                load_matrix_x4(registers, value_tile + Q::offset(row, chunk));
+                load_matrix_x4(registers, value_tile + value_offset(row, chunk));
                 mma_pv(output_accumulators[dimension_pair * 2], probability_fragment, registers[0], registers[1]);
                 mma_pv(output_accumulators[dimension_pair * 2 + 1], probability_fragment, registers[2], registers[3]);
             }
