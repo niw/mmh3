@@ -544,12 +544,11 @@ fn generate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if Path::new(&int8_path).exists() { int8_path } else { option_path(&options, "video-vae", VIDEO_VAE_FILE)? }
         }
     };
-    let pixels = CudaVideoDecoder::load(&SafeTensors::open(Path::new(&path))?, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
-        .decode(&video, false)?
-        .pixels;
+    let yuv = CudaVideoDecoder::load(&SafeTensors::open(Path::new(&path))?, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
+        .decode_yuv420(&video)?;
     println!("decoded the video with {path} in {:.1} s", started.elapsed().as_secs_f64());
     let mut writer = BufWriter::new(File::create(&video_path)?);
-    write_y4m(&mut writer, &pixels, FPS)?;
+    write_y4m(&mut writer, &yuv, FPS)?;
     writer.flush()?;
 
     let started = Instant::now();

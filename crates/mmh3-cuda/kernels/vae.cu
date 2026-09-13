@@ -257,6 +257,60 @@ unsigned grid_for(size_t count) {
     return static_cast<unsigned>(blocks < 16384 ? blocks : 16384);
 }
 
+// BT.709 luma weights of red and blue.
+constexpr float LUMA_RED = 0.2126f;
+constexpr float LUMA_BLUE = 0.0722f;
+
+__device__ __forceinline__ uint8_t limited_range(float value, float offset, float scale) {
+    return static_cast<uint8_t>(fminf(fmaxf(roundf(__fadd_rn(offset, __fmul_rn(scale, value))), 0.0f), 255.0f));
+}
+
+__device__ __forceinline__ float luma(float red, float green, float blue, float luma_green) {
+    return __fadd_rn(__fadd_rn(__fmul_rn(LUMA_RED, red), __fmul_rn(luma_green, green)), __fmul_rn(LUMA_BLUE, blue));
+}
+
+__device__ __forceinline__ float block_average(const float* values, int top_left, int width) {
+    return __fdiv_rn(__fadd_rn(__fadd_rn(__fadd_rn(values[top_left], values[top_left + 1]), values[top_left + width]),
+                               values[top_left + width + 1]),
+                     4.0f);
+}
+
+// Converts pixels [3, frames, height, width] in [0, 1] into 4:2:0 BT.709 limited-range YUV, per frame the Y plane,
+// then Cb, then Cr. Each thread converts one 2 × 2 block. The _rn intrinsics keep the rounding of every operation of
+// mmh3_core::media::Yuv420::from_pixels, which the compiler would otherwise fuse into multiply-adds.
+__global__ void yuv420_kernel(const float* __restrict__ pixels, uint8_t* __restrict__ output, int frames, int height,
+                              int width) {
+    const int half_height = height / 2;
+    const int half_width = width / 2;
+    const size_t plane = static_cast<size_t>(height) * width;
+    const size_t blocks = static_cast<size_t>(frames) * half_height * half_width;
+    const float luma_green = __fsub_rn(__fsub_rn(1.0f, LUMA_RED), LUMA_BLUE);
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < blocks; index += stride) {
+        const int x = static_cast<int>(index % half_width);
+        const int y = static_cast<int>(index / half_width % half_height);
+        const size_t frame = index / (static_cast<size_t>(half_width) * half_height);
+        const float* red = pixels + frame * plane;
+        const float* green = pixels + (frames + frame) * plane;
+        const float* blue = pixels + (2 * static_cast<size_t>(frames) + frame) * plane;
+        uint8_t* frame_output = output + frame * plane * 3 / 2;
+        const int top_left = 2 * y * width + 2 * x;
+        for (const int corner : {top_left, top_left + 1, top_left + width, top_left + width + 1}) {
+            frame_output[corner] = limited_range(luma(red[corner], green[corner], blue[corner], luma_green), 16.0f, 219.0f);
+        }
+        const float red_average = block_average(red, top_left, width);
+        const float blue_average = block_average(blue, top_left, width);
+        const float luma_average = luma(red_average, block_average(green, top_left, width), blue_average, luma_green);
+        const size_t chroma = static_cast<size_t>(y) * half_width + x;
+        frame_output[plane + chroma] =
+            limited_range(__fdiv_rn(__fsub_rn(blue_average, luma_average), __fmul_rn(2.0f, __fsub_rn(1.0f, LUMA_BLUE))),
+                          128.0f, 224.0f);
+        frame_output[plane + plane / 4 + chroma] =
+            limited_range(__fdiv_rn(__fsub_rn(red_average, luma_average), __fmul_rn(2.0f, __fsub_rn(1.0f, LUMA_RED))),
+                          128.0f, 224.0f);
+    }
+}
+
 }  // namespace
 
 extern "C" int mmh3_vae_norm(const float* input, const __half* weight, const __half* bias, __half* output, int tokens,
@@ -320,5 +374,15 @@ extern "C" int mmh3_vae_save_overlap(const float* canvas, int canvas_frames, int
                                      int plane, cudaStream_t stream) {
     const size_t total = static_cast<size_t>(3) * count * plane;
     save_overlap_kernel<<<grid_for(total), ROW_THREADS, 0, stream>>>(canvas, canvas_frames, first, count, overlap, plane);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int mmh3_yuv420(const float* pixels, uint8_t* output, int frames, int height, int width,
+                           cudaStream_t stream) {
+    if (height % 2 != 0 || width % 2 != 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const size_t blocks = static_cast<size_t>(frames) * (height / 2) * (width / 2);
+    yuv420_kernel<<<grid_for(blocks), ROW_THREADS, 0, stream>>>(pixels, output, frames, height, width);
     return static_cast<int>(cudaGetLastError());
 }

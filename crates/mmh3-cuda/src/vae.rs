@@ -8,8 +8,9 @@ use crate::attention::{AttentionLayout, Element, attention_pointers};
 use crate::loader::Uploader;
 use crate::gemm::{Int8Output, int8_pointers, rotate_quantize_pointers};
 use crate::model::{CONVROT_GROUP, DeviceTensors, Error, LinearKind, check_quantization, cublaslt_linear, host_tensor, i32_buffer};
-use crate::{DeviceBuffer, check};
+use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::numeric::{f16_to_f32, f32_to_f16};
+use mmh3_core::media::Yuv420;
 use mmh3_core::safetensors::{DType, SafeTensors};
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vae::{
@@ -49,6 +50,7 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_vae_swiglu(input: *const c_void, output: *mut c_void, tokens: c_int, width: c_int, stream: *mut c_void) -> c_int;
+    fn mmh3_yuv420(pixels: *const c_void, output: *mut c_void, frames: c_int, height: c_int, width: c_int, stream: *mut c_void) -> c_int;
     fn mmh3_vae_embed_suffix(
         embedded: *const c_void,
         registers: *const c_void,
@@ -209,6 +211,18 @@ impl TileGrid {
     fn latent_width(&self) -> usize {
         self.columns.length / SPATIAL_RATIO
     }
+}
+
+/// Converts pixels `[3, frames, height, width]` in [0, 1] on the device into 4:2:0 BT.709 limited-range video with
+/// the arithmetic of `Yuv420::from_pixels`. Height and width must be even.
+pub fn yuv420(pixels: &DeviceBuffer, frames: usize, height: usize, width: usize) -> Result<Yuv420, CudaError> {
+    assert!(pixels.bytes() >= OUTPUT_CHANNELS * frames * height * width * 4, "pixels are smaller than their shape");
+    let output = DeviceBuffer::new(frames * Yuv420::frame_bytes(height, width))?;
+    // SAFETY: the pixels hold the shape, checked above, and the output one YUV frame per frame.
+    check(unsafe { mmh3_yuv420(pixels.pointer(), output.pointer(), frames as c_int, height as c_int, width as c_int, ptr::null_mut()) })?;
+    let mut data = vec![0u8; output.bytes()];
+    output.copy_to_host(&mut data)?;
+    Ok(Yuv420 { frames, height, width, data })
 }
 
 pub struct CudaVideoDecoder {
@@ -549,6 +563,19 @@ impl CudaVideoDecoder {
     /// Decodes a normalized latent `[channels, frames, height, width]` into pixels `[3, frames, height, width]` in
     /// [0, 1]. A latent of `f > 1` frames decodes in overlapping chunks of 7 latent frames.
     pub fn decode(&self, latent: &Tensor, capture_first_tile: bool) -> Result<VideoDecoding, Error> {
+        let (pixels, [frames, height, width], first_tile) = self.decode_on_device(latent, capture_first_tile)?;
+        Ok(VideoDecoding { pixels: Tensor::new(vec![OUTPUT_CHANNELS, frames, height, width], pixels.to_f32()?), first_tile })
+    }
+
+    /// Decodes a latent into 4:2:0 BT.709 limited-range video, converted on the GPU. The bytes match
+    /// `Yuv420::from_pixels` of `decode`'s pixels.
+    pub fn decode_yuv420(&self, latent: &Tensor) -> Result<Yuv420, Error> {
+        let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false)?;
+        Ok(yuv420(&pixels, frames, height, width)?)
+    }
+
+    /// Decodes a latent into pixels `[3, frames, height, width]` on the device and returns them with their shape.
+    fn decode_on_device(&self, latent: &Tensor, capture_first_tile: bool) -> Result<(DeviceBuffer, [usize; 3], Option<Tensor>), Error> {
         let config = &self.config;
         let &[channels, latent_frames, latent_height, latent_width] = latent.shape.as_slice() else {
             return Err(Error::Model(format!("latent shape {:?} is not [channels, frames, height, width]", latent.shape)));
@@ -671,6 +698,6 @@ impl CudaVideoDecoder {
                 position = write(tail_first, tail_count, false, position)?;
             }
         }
-        Ok(VideoDecoding { pixels: Tensor::new(vec![OUTPUT_CHANNELS, output_frames, height, width], output.to_f32()?), first_tile })
+        Ok((output, [output_frames, height, width], first_tile))
     }
 }

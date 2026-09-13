@@ -11,41 +11,67 @@ fn limited_range(value: f32, offset: f32, scale: f32) -> u8 {
     (offset + scale * value).round().clamp(0.0, 255.0) as u8
 }
 
-/// Writes pixels `[3, frames, height, width]` in [0, 1] as 4:2:0 YUV4MPEG2 with BT.709 limited-range colors.
-/// Chroma is the average of each 2 × 2 block. Height and width must be even.
-pub fn write_y4m(writer: &mut impl Write, pixels: &Tensor, fps: usize) -> io::Result<()> {
-    let &[channels, frames, height, width] = pixels.shape.as_slice() else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "pixels must be [3, frames, height, width]"));
-    };
-    if channels != 3 || height % 2 != 0 || width % 2 != 0 {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "pixels must be RGB with an even height and width"));
+/// 4:2:0 video with BT.709 limited-range colors, stored per frame as the Y plane, then Cb, then Cr.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Yuv420 {
+    pub frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub data: Vec<u8>,
+}
+
+impl Yuv420 {
+    /// Bytes of one frame.
+    pub fn frame_bytes(height: usize, width: usize) -> usize {
+        height * width * 3 / 2
+    }
+
+    /// Converts pixels `[3, frames, height, width]` in [0, 1]. Chroma is the average of each 2 × 2 block. Height and
+    /// width must be even.
+    pub fn from_pixels(pixels: &Tensor) -> io::Result<Self> {
+        let &[channels, frames, height, width] = pixels.shape.as_slice() else {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pixels must be [3, frames, height, width]"));
+        };
+        if channels != 3 || height % 2 != 0 || width % 2 != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "pixels must be RGB with an even height and width"));
+        }
+        let plane = height * width;
+        let luma_green = 1.0 - LUMA_RED - LUMA_BLUE;
+        let mut data = Vec::with_capacity(frames * Self::frame_bytes(height, width));
+        for frame in 0..frames {
+            let channel = |index: usize| &pixels.data[(index * frames + frame) * plane..][..plane];
+            let (r, g, b) = (channel(0), channel(1), channel(2));
+            data.extend((0..plane).map(|index| limited_range(LUMA_RED * r[index] + luma_green * g[index] + LUMA_BLUE * b[index], 16.0, 219.0)));
+            let mut blue = vec![0u8; plane / 4];
+            let mut red = vec![0u8; plane / 4];
+            for y in 0..height / 2 {
+                for x in 0..width / 2 {
+                    let corners = [2 * y * width + 2 * x, 2 * y * width + 2 * x + 1, (2 * y + 1) * width + 2 * x, (2 * y + 1) * width + 2 * x + 1];
+                    let average = |values: &[f32]| corners.iter().map(|&index| values[index]).sum::<f32>() / 4.0;
+                    let (red_value, green_value, blue_value) = (average(r), average(g), average(b));
+                    let luma_value = LUMA_RED * red_value + luma_green * green_value + LUMA_BLUE * blue_value;
+                    blue[y * width / 2 + x] = limited_range((blue_value - luma_value) / (2.0 * (1.0 - LUMA_BLUE)), 128.0, 224.0);
+                    red[y * width / 2 + x] = limited_range((red_value - luma_value) / (2.0 * (1.0 - LUMA_RED)), 128.0, 224.0);
+                }
+            }
+            data.extend_from_slice(&blue);
+            data.extend_from_slice(&red);
+        }
+        Ok(Yuv420 { frames, height, width, data })
+    }
+}
+
+/// Writes 4:2:0 video as YUV4MPEG2.
+pub fn write_y4m(writer: &mut impl Write, video: &Yuv420, fps: usize) -> io::Result<()> {
+    let (width, height) = (video.width, video.height);
+    let frame_bytes = Yuv420::frame_bytes(height, width);
+    if video.data.len() != video.frames * frame_bytes {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "the video data does not match its frames"));
     }
     write!(writer, "YUV4MPEG2 W{width} H{height} F{fps}:1 Ip A1:1 C420jpeg XCOLORRANGE=LIMITED\n")?;
-    let plane = height * width;
-    let luma_green = 1.0 - LUMA_RED - LUMA_BLUE;
-    let mut luma = vec![0u8; plane];
-    let mut blue = vec![0u8; plane / 4];
-    let mut red = vec![0u8; plane / 4];
-    for frame in 0..frames {
-        let channel = |index: usize| &pixels.data[(index * frames + frame) * plane..][..plane];
-        let (r, g, b) = (channel(0), channel(1), channel(2));
-        for index in 0..plane {
-            luma[index] = limited_range(LUMA_RED * r[index] + luma_green * g[index] + LUMA_BLUE * b[index], 16.0, 219.0);
-        }
-        for y in 0..height / 2 {
-            for x in 0..width / 2 {
-                let corners = [2 * y * width + 2 * x, 2 * y * width + 2 * x + 1, (2 * y + 1) * width + 2 * x, (2 * y + 1) * width + 2 * x + 1];
-                let average = |values: &[f32]| corners.iter().map(|&index| values[index]).sum::<f32>() / 4.0;
-                let (red_value, green_value, blue_value) = (average(r), average(g), average(b));
-                let luma_value = LUMA_RED * red_value + luma_green * green_value + LUMA_BLUE * blue_value;
-                blue[y * width / 2 + x] = limited_range((blue_value - luma_value) / (2.0 * (1.0 - LUMA_BLUE)), 128.0, 224.0);
-                red[y * width / 2 + x] = limited_range((red_value - luma_value) / (2.0 * (1.0 - LUMA_RED)), 128.0, 224.0);
-            }
-        }
+    for frame in video.data.chunks_exact(frame_bytes) {
         writer.write_all(b"FRAME\n")?;
-        writer.write_all(&luma)?;
-        writer.write_all(&blue)?;
-        writer.write_all(&red)?;
+        writer.write_all(frame)?;
     }
     Ok(())
 }
@@ -91,7 +117,7 @@ mod tests {
             data[(channel * 2 + 1) * 4..][..4].fill(0.0);
         }
         let mut bytes = Vec::new();
-        write_y4m(&mut bytes, &Tensor::new(vec![3, 2, 2, 2], data), 24).unwrap();
+        write_y4m(&mut bytes, &Yuv420::from_pixels(&Tensor::new(vec![3, 2, 2, 2], data)).unwrap(), 24).unwrap();
         let header = b"YUV4MPEG2 W2 H2 F24:1 Ip A1:1 C420jpeg XCOLORRANGE=LIMITED\n";
         assert_eq!(&bytes[..header.len()], header);
         let frames = &bytes[header.len()..];
