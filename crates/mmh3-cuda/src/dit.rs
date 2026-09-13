@@ -3,7 +3,7 @@
 //! The residual stream stays in FP32. Linear layers take BF16 inputs and run through the INT8 ConvRot GEMM for
 //! quantized weights and through cuBLASLt for BF16 and FP32 weights.
 
-use crate::attention::{AttentionLayout, HEAD_DIM, SparseWorkspace, dense_bf16_pointers, sparse_pointers};
+use crate::attention::{AttentionLayout, AttentionPrecision, HEAD_DIM, QuantizedWorkspace, SparseWorkspace, dense_bf16_pointers, dense_quantized_pointers, sparse_pointers};
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
 use crate::model::{DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer};
@@ -101,6 +101,7 @@ const FINAL_CHUNKS: usize = 2;
 
 /// Buffers sized for one sequence length.
 struct Workspace {
+    attention_quantized: Option<QuantizedWorkspace>,
     residual: DeviceBuffer,
     normalized: DeviceBuffer,
     projected: DeviceBuffer,
@@ -117,9 +118,10 @@ struct Workspace {
 
 impl Workspace {
     /// `expanded_rows` rows of the gate and up projections are enough when the INT8 MLPs write SwiGLU directly.
-    fn new(config: &DitConfig, tokens: usize, expanded_rows: usize, adapter_rank: usize) -> Result<Self, CudaError> {
+    fn new(config: &DitConfig, tokens: usize, expanded_rows: usize, adapter_rank: usize, quantized_attention: bool) -> Result<Self, CudaError> {
         let (hidden, inner, ffn) = (config.hidden, config.inner(), config.ffn);
         Ok(Workspace {
+            attention_quantized: if quantized_attention { Some(QuantizedWorkspace::new(tokens, config.heads)?) } else { None },
             residual: DeviceBuffer::zeroed(tokens * hidden * 4)?,
             normalized: DeviceBuffer::new(tokens * hidden * 2)?,
             projected: DeviceBuffer::new(tokens * hidden * 4)?,
@@ -157,6 +159,7 @@ struct SparsePass<'a> {
 }
 
 pub struct CudaDit {
+    attention_precision: AttentionPrecision,
     config: DitConfig,
     tensors: DeviceTensors,
     /// Low-rank adapters by layer name.
@@ -197,12 +200,18 @@ impl CudaDit {
             }
         }
         Ok(CudaDit {
+            attention_precision: AttentionPrecision::Bf16,
             config,
             tensors,
             adapters: HashMap::new(),
             adaln_table: host_tensor(file, &format!("{prefix}adaln_t_table"))?,
             inverse_frequencies: host_tensor(file, &format!("{prefix}rope.inv_freq"))?.data,
         })
+    }
+
+    /// Selects quantized attention for the main DiT blocks. The text refiner stays in BF16.
+    pub fn set_attention_precision(&mut self, precision: AttentionPrecision) {
+        self.attention_precision = precision;
     }
 
     pub fn config(&self) -> &DitConfig {
@@ -429,7 +438,12 @@ impl CudaDit {
             ))?;
             let scale = 1.0 / (config.head_dim as f32).sqrt();
             match sparse {
-                None => dense_bf16_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), tokens, config.heads, scale)?,
+                None => {
+                    match workspace.attention_quantized.as_ref().filter(|_| modulation.is_some()) {
+                        Some(quantized) => dense_quantized_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), scale, quantized)?,
+                        None => dense_bf16_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), tokens, config.heads, scale)?,
+                    }
+                }
                 Some(pass) => {
                     let inner = config.inner();
                     let layout = AttentionLayout {
@@ -505,7 +519,9 @@ impl CudaDit {
         let adapter_rank = self.adapters.values().map(|adapter| adapter.rank).max().unwrap_or(0);
         // The refiner's MLPs still write the gate and up projections for the text tokens.
         let fused = (0..config.layers).all(|layer| self.tensors.is_int8(&format!("blocks.{layer}.mlp.fc1")));
-        let workspace = Workspace::new(config, tokens, if fused { text_tokens } else { tokens }, adapter_rank)?;
+        let use_sparse = sparse.is_some_and(|settings| tokens >= settings.min_tokens);
+        let quantized_dense = self.attention_precision == AttentionPrecision::Int8Fp8 && !use_sparse;
+        let workspace = Workspace::new(config, tokens, if fused { text_tokens } else { tokens }, adapter_rank, quantized_dense)?;
 
         let block_rows = i32_buffer(&layout.modulation_rows(&timesteps))?;
         let final_rows: Vec<usize> =
@@ -525,7 +541,7 @@ impl CudaDit {
         self.linear("video_patch_proj", video_rows.pointer(), workspace.residual.pointer_at(video.start * hidden * 4), video.len(), &workspace)?;
 
         let sparse_workspace = match sparse {
-            Some(settings) if tokens >= settings.min_tokens => Some((SparseWorkspace::new(tokens, config.heads)?, settings.tau)),
+            Some(settings) if tokens >= settings.min_tokens => Some((SparseWorkspace::with_precision(tokens, config.heads, self.attention_precision)?, settings.tau)),
             _ => None,
         };
         let sparse_pass = sparse_workspace.as_ref().map(|(workspace, tau)| SparsePass { workspace, tau: *tau, sinks: SparseSinks::for_layout(&layout) });

@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 
 #include "tensor_core.cuh"
+#include "attention_workspace.cuh"
 
 // Sol-Attn block-sparse attention for BF16 heads of 128 (see mmh3-core's dit/sparse.rs for the algorithm).
 //
@@ -14,20 +15,6 @@
 //    pooled tail of the rest as an online-softmax state (max, weighted sum, weighted values).
 // 4. row_offsets: per token and head, q · key mean, which centers the keys of the token-level scores.
 // 5. sparse_attention: FlashAttention over the routed key blocks of each query block, merged with its tail.
-
-struct Mmh3SparseWorkspace {
-    float* centroids;       // [heads, blocks, 128]
-    float* block_keys;      // [heads, blocks, 128], centered by center_keys
-    float* value_sums;      // [heads, blocks, 128]
-    float* key_mean;        // [heads, 128]
-    float* key_variance;    // [heads, 128]
-    float* row_offsets;     // [heads, tokens]
-    uint16_t* routes;       // [heads, blocks, blocks], the first route_counts entries of each row are used
-    int32_t* route_counts;  // [heads, blocks]
-    float* tail_max;        // [heads, blocks]
-    float* tail_sum;        // [heads, blocks]
-    float* tail_values;     // [heads, blocks, 128]
-};
 
 namespace {
 
@@ -433,7 +420,7 @@ __global__ void __launch_bounds__(THREADS, 2)
 extern "C" int mmh3_sparse_attention(const void* query, const void* key, const void* value, void* output, int tokens,
                                      int heads, const Mmh3AttentionLayout* layout, float scale, float tau,
                                      int sink_key_start, int sink_key_end, int sink_query_start, int sink_query_end,
-                                     const Mmh3SparseWorkspace* workspace, cudaStream_t stream) {
+                                     const Mmh3SparseWorkspace* workspace, const Mmh3QuantizedWorkspace* quantized, cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -464,6 +451,9 @@ extern "C" int mmh3_sparse_attention(const void* query, const void* key, const v
     row_offsets_kernel<<<static_cast<unsigned>((items + 7) / 8), 256, 0, stream>>>(q, tokens, heads, *layout,
                                                                                   workspace->key_mean, log2_scale,
                                                                                   workspace->row_offsets);
+    if (quantized != nullptr) {
+        return mmh3_attention_quantized(query, key, value, output, tokens, heads, layout, scale, workspace, quantized, stream);
+    }
     sparse_attention_kernel<<<dim3(blocks, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
         q, k, v, static_cast<__nv_bfloat16*>(output), tokens, *layout, blocks, *workspace, log2_scale);
     return static_cast<int>(cudaGetLastError());

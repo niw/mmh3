@@ -9,7 +9,7 @@ const USAGE: &str = "usage:
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.y4m> [--models DIR]
                 [--width N] [--height N] [--frames N] [--steps N] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE] [--tokenizer FILE]
-                [--lora FILE] [--lora-strength X] [--attention dense|sol] [--sparse-tau X] [--sparse-start X]
+                [--lora FILE] [--lora-strength X] [--attention dense|sol] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X]
   mmh3 inspect <file.safetensors> [--all]
   mmh3 device
   mmh3 bench gemm [--tokens N] [--iterations N] [--kinds bf16,fp8,int8,nvfp4,int8-mmh3]
@@ -17,9 +17,9 @@ const USAGE: &str = "usage:
   mmh3 bench mma [--iterations N]
   mmh3 bench attention [--tokens N] [--heads N] [--iterations N]
   mmh3 check dit --golden <directory> [--models DIR] [--weights FILE] [--lora FILE] [--lora-strength X]
-                 [--attention dense|sol] [--sparse-tau X]
+                 [--attention dense|sol] [--attention-precision bf16|int8-fp8] [--sparse-tau X]
   mmh3 check sample --golden <directory> [--models DIR] [--weights FILE] [--lora FILE] [--lora-strength X]
-                    [--attention dense|sol] [--sparse-tau X] [--sparse-start X]
+                    [--attention dense|sol] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X]
   mmh3 check video-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3 check audio-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3 check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE] [--tokenizer FILE]
@@ -451,6 +451,7 @@ fn generate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "lora",
             "lora-strength",
             "attention",
+            "attention-precision",
             "sparse-tau",
             "sparse-start",
         ],
@@ -611,9 +612,15 @@ const TOKENIZER_FILE: &str = "tokenizer/tokenizer.json";
 fn load_dit(options: &HashMap<&str, &str>, name: &str) -> Result<mmh3_cuda::dit::CudaDit, Box<dyn Error>> {
     use std::time::Instant;
 
+    let precision = match options.get("attention-precision").copied().unwrap_or("bf16") {
+        "bf16" => mmh3_cuda::attention::AttentionPrecision::Bf16,
+        "int8-fp8" => mmh3_cuda::attention::AttentionPrecision::Int8Fp8,
+        other => return Err(format!("--attention-precision must be bf16 or int8-fp8, not {other}").into()),
+    };
     let started = Instant::now();
     let path = option_path(options, name, DIT_FILE)?;
     let mut dit = mmh3_cuda::dit::CudaDit::load(&SafeTensors::open(Path::new(&path))?, "")?;
+    dit.set_attention_precision(precision);
     println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
     if let Some(lora) = options.get("lora") {
         let strength = option_float(options, "lora-strength", 1.0)?;
@@ -701,7 +708,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights", "lora", "lora-strength", "attention", "sparse-tau"])?;
+    let options = parse_options(arguments, &["golden", "models", "weights", "lora", "lora-strength", "attention", "attention-precision", "sparse-tau"])?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
     let text_file = GoldenFile::open(golden, "text.safetensors")?;
@@ -776,7 +783,7 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::sampler::{Schedule, euler_step};
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights", "lora", "lora-strength", "attention", "sparse-tau", "sparse-start"])?;
+    let options = parse_options(arguments, &["golden", "models", "weights", "lora", "lora-strength", "attention", "attention-precision", "sparse-tau", "sparse-start"])?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
     let text_file = GoldenFile::open(golden, "text.safetensors")?;

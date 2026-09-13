@@ -4,6 +4,7 @@ use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use mmh3_cuda::dit::CudaDit;
+use mmh3_cuda::attention::AttentionPrecision;
 use std::path::Path;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/dit_tiny.safetensors");
@@ -32,10 +33,10 @@ fn assert_close(name: &str, actual: &[f32], expected: &[f32]) {
     assert!(cosine > 0.9995 && worst <= scale * 0.03, "{name}: cosine {cosine}, max error {worst}, scale {scale}");
 }
 
-#[test]
-fn matches_comfyui_golden_forward() {
+fn check_forward(precision: AttentionPrecision) {
     let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
-    let dit = CudaDit::load(&file, "weight.").unwrap();
+    let mut dit = CudaDit::load(&file, "weight.").unwrap();
+    dit.set_attention_precision(precision);
     let inputs = DitInputs {
         video: unbatched(tensor(&file, "input.video")),
         audio: unbatched(tensor(&file, "input.audio")),
@@ -51,4 +52,14 @@ fn matches_comfyui_golden_forward() {
     }
     assert_close("video", &outputs.video, &tensor(&file, "output.video").data);
     assert_close("audio", &outputs.audio, &tensor(&file, "output.audio").data);
+}
+
+#[test]
+fn matches_comfyui_golden_forward() {
+    check_forward(AttentionPrecision::Bf16);
+}
+
+#[test]
+fn quantized_matches_golden_with_the_same_bounds() {
+    check_forward(AttentionPrecision::Int8Fp8);
 }

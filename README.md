@@ -18,7 +18,8 @@ in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints f
 
 ## Performance
 
-On a DGX Spark at 1344×768 for 124 frames (5.2 s, 37,729 tokens):
+On a DGX Spark at 1344×768 for 124 frames (5.2 s, 37,729 tokens). The DiT stage timings below
+use BF16 attention:
 
 | Stage | mmh3 | ComfyUI |
 | --- | ---: | ---: |
@@ -30,8 +31,11 @@ On a DGX Spark at 1344×768 for 124 frames (5.2 s, 37,729 tokens):
 | Text encoder load and encode | 3.4 s | |
 | DiT load | 2.5 s | |
 
-With the 4-step Turbo LoRA and Sol-Attn, a whole generation from the prompt to the video and audio
-files takes about 2 minutes with the INT8 video VAE.
+With the 4-step Turbo LoRA, INT8/FP8 attention, Sol-Attn from the first step and the INT8 video VAE,
+a whole generation from the prompt to the video and audio files takes about **98 seconds**. This
+configuration was measured at 98.04 s in one run with the Tokyo rain prompt and seed 1, including
+model loading and Y4M/WAV writing, excluding MP4 encoding. BF16 attention with the first step
+dense took about 122 s.
 
 ## Accuracy
 
@@ -130,13 +134,21 @@ ffmpeg -i out.y4m -i out.wav -c:v libx264 -crf 18 -pix_fmt yuv420p \
   -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 192k -shortest out.mp4
 ```
 
-The fast setting uses the Turbo LoRA with the shifts it was trained with, and Sol-Attn:
+The fast setting uses the Turbo LoRA with the shifts it was trained with, INT8/FP8 attention,
+and Sol-Attn from the first step:
 
 ```sh
 target/release/mmh3 generate --prompt-file prompt.txt --out out.y4m \
   --steps 4 --shift-video 6 --shift-audio 3 --attention sol \
+  --attention-precision int8-fp8 --sparse-start 0 \
   --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
 ```
+
+INT8/FP8 attention needs about 0.76 GiB of extra scratch memory at this sequence length and changes
+image details. Using `--sparse-start 0` can also change the composition. To keep the first of four
+steps dense, use `--sparse-start 0.2`; that setting took 108.51 s with INT8/FP8 attention. Visual
+comparison so far covers sampled frames from one prompt and seed. The text refiner, text encoder
+and VAEs keep their existing attention precision.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -147,6 +159,7 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.y4m \
 | `--seed N` | 0 | Seed of the initial noise. |
 | `--shift-video X`, `--shift-audio X` | 12, 3 | Sigma shifts of the two schedules. The 768p Turbo LoRA wants 6 and 3. |
 | `--attention dense\|sol` | `dense` | Sol-Attn switches to block-sparse attention. |
+| `--attention-precision bf16\|int8-fp8` | `bf16` | INT8 QK / FP8 PV in the DiT, with FP32 softmax and accumulation. Changes generated details. |
 | `--sparse-tau X` | 1.3 | Sol-Attn's routing threshold. Higher is sparser. |
 | `--sparse-start X` | 0.2 | Fraction of the steps that stay dense before Sol-Attn starts. |
 | `--lora FILE`, `--lora-strength X` | none, 1.0 | A ComfyUI LoRA for the DiT. |

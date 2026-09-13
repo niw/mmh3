@@ -35,6 +35,71 @@ pub struct AttentionOffsets {
     pub output: usize,
 }
 
+/// Arithmetic used by the DiT's attention. Quantization changes generated details.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AttentionPrecision {
+    #[default]
+    Bf16,
+    /// INT8 QK, FP8 E4M3 PV, FP32 softmax and accumulation, BF16 output.
+    Int8Fp8,
+}
+
+#[repr(C)]
+struct RawQuantizedWorkspace {
+    query: *mut c_void,
+    key: *mut c_void,
+    value: *mut c_void,
+    query_scales: *mut c_void,
+    key_scales: *mut c_void,
+    value_scales: *mut c_void,
+    value_maxima: *mut c_void,
+}
+
+/// Scratch for one sequence of INT8/FP8 attention. Reused across layers.
+pub struct QuantizedWorkspace {
+    tokens: usize,
+    heads: usize,
+    query: DeviceBuffer,
+    key: DeviceBuffer,
+    value: DeviceBuffer,
+    query_scales: DeviceBuffer,
+    key_scales: DeviceBuffer,
+    value_scales: DeviceBuffer,
+    value_maxima: DeviceBuffer,
+}
+
+impl QuantizedWorkspace {
+    pub fn new(tokens: usize, heads: usize) -> Result<Self, CudaError> {
+        assert!(tokens > 0 && tokens <= (i32::MAX - 63) as usize && heads > 0 && heads <= u16::MAX as usize, "invalid attention shape");
+        let blocks = tokens.div_ceil(SPARSE_BLOCK);
+        let rows = tokens.checked_mul(heads).and_then(|n| n.checked_mul(HEAD_DIM)).expect("attention shape overflow");
+        let scales = heads.checked_mul(blocks).and_then(|n| n.checked_mul(4)).expect("attention scale shape overflow");
+        Ok(Self {
+            tokens,
+            heads,
+            query: DeviceBuffer::new(rows)?,
+            key: DeviceBuffer::new(rows)?,
+            value: DeviceBuffer::new(blocks * SPARSE_BLOCK * heads * HEAD_DIM)?,
+            query_scales: DeviceBuffer::new(scales)?,
+            key_scales: DeviceBuffer::new(scales)?,
+            value_scales: DeviceBuffer::new(heads * 4)?,
+            value_maxima: DeviceBuffer::new(scales)?,
+        })
+    }
+
+    fn raw(&self) -> RawQuantizedWorkspace {
+        RawQuantizedWorkspace {
+            query: self.query.pointer(),
+            key: self.key.pointer(),
+            value: self.value.pointer(),
+            query_scales: self.query_scales.pointer(),
+            key_scales: self.key_scales.pointer(),
+            value_scales: self.value_scales.pointer(),
+            value_maxima: self.value_maxima.pointer(),
+        }
+    }
+}
+
 /// Device pointers of the Sol-Attn scratch buffers, see kernels/sparse_attention.cu.
 #[repr(C)]
 struct RawSparseWorkspace {
@@ -52,6 +117,19 @@ struct RawSparseWorkspace {
 }
 
 unsafe extern "C" {
+    fn mmh3_attention_quantized(
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        output: *mut c_void,
+        tokens: c_int,
+        heads: c_int,
+        layout: *const AttentionLayout,
+        scale: f32,
+        sparse: *const RawSparseWorkspace,
+        workspace: *const RawQuantizedWorkspace,
+        stream: *mut c_void,
+    ) -> c_int;
     #[allow(clippy::too_many_arguments)]
     fn mmh3_sparse_attention(
         query: *const c_void,
@@ -68,6 +146,7 @@ unsafe extern "C" {
         sink_query_start: c_int,
         sink_query_end: c_int,
         workspace: *const RawSparseWorkspace,
+        quantized: *const RawQuantizedWorkspace,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_attention(
@@ -236,8 +315,48 @@ pub fn dense_bf16(
     unsafe { dense_bf16_pointers(qkv.pointer(), output.pointer(), tokens, heads, scale) }
 }
 
+/// Dense bidirectional attention over the DiT's BF16 qkv layout, with INT8 QK and FP8 PV.
+/// This approximation retains FP32 softmax/accumulation and writes BF16 output.
+pub fn dense_quantized(
+    qkv: &DeviceBuffer,
+    output: &mut DeviceBuffer,
+    scale: f32,
+    workspace: &QuantizedWorkspace,
+) -> Result<(), CudaError> {
+    let elements = workspace.tokens * workspace.heads * HEAD_DIM;
+    assert!(qkv.bytes() >= elements * 6 && output.bytes() >= elements * 2, "attention buffers are too small");
+    // SAFETY: both buffers cover the workspace's sequence, checked above.
+    unsafe { dense_quantized_pointers(qkv.pointer(), output.pointer(), scale, workspace) }
+}
+
+/// # Safety
+/// qkv and output must cover the workspace's sequence in the fused BF16 qkv and contiguous output layouts.
+pub(crate) unsafe fn dense_quantized_pointers(
+    qkv: *const c_void,
+    output: *mut c_void,
+    scale: f32,
+    workspace: &QuantizedWorkspace,
+) -> Result<(), CudaError> {
+    let inner = workspace.heads * HEAD_DIM;
+    let layout = AttentionLayout {
+        token_stride: [(3 * inner) as i64, (3 * inner) as i64, (3 * inner) as i64, inner as i64],
+        head_stride: [HEAD_DIM as i64; 4],
+        ..AttentionLayout::default()
+    };
+    let raw = workspace.raw();
+    let base = qkv.cast::<u16>();
+    // SAFETY: the caller guarantees the buffer extents and the workspace owns all quantization scratch.
+    check(unsafe {
+        mmh3_attention_quantized(
+            base.cast(), base.add(inner).cast(), base.add(2 * inner).cast(), output,
+            workspace.tokens as c_int, workspace.heads as c_int, &layout, scale, ptr::null(), &raw, ptr::null_mut(),
+        )
+    })
+}
+
 /// Scratch buffers of Sol-Attn for one sequence length and head count of 128-wide heads.
 pub struct SparseWorkspace {
+    quantized: Option<QuantizedWorkspace>,
     tokens: usize,
     heads: usize,
     blocks: usize,
@@ -256,9 +375,18 @@ pub struct SparseWorkspace {
 
 impl SparseWorkspace {
     pub fn new(tokens: usize, heads: usize) -> Result<Self, CudaError> {
+        Self::with_precision(tokens, heads, AttentionPrecision::Bf16)
+    }
+
+    /// Keeps BF16 routing and the FP32 pooled tail; quantizes the routed products when requested.
+    pub fn with_precision(tokens: usize, heads: usize, precision: AttentionPrecision) -> Result<Self, CudaError> {
         let blocks = tokens.div_ceil(SPARSE_BLOCK);
         let per_block = heads * blocks * HEAD_DIM * 4;
         Ok(SparseWorkspace {
+            quantized: match precision {
+                AttentionPrecision::Bf16 => None,
+                AttentionPrecision::Int8Fp8 => Some(QuantizedWorkspace::new(tokens, heads)?),
+            },
             tokens,
             heads,
             blocks,
@@ -326,6 +454,7 @@ pub(crate) unsafe fn sparse_pointers(
 ) -> Result<(), CudaError> {
     assert!(workspace.tokens == tokens && workspace.heads == heads, "the sparse workspace has another shape");
     let raw = workspace.raw();
+    let quantized = workspace.quantized.as_ref().map(QuantizedWorkspace::raw);
     // SAFETY: the caller guarantees the extents, and the workspace matches the shape, checked above.
     check(unsafe {
         mmh3_sparse_attention(
@@ -343,6 +472,7 @@ pub(crate) unsafe fn sparse_pointers(
             sinks.query_blocks.0 as c_int,
             sinks.query_blocks.1 as c_int,
             &raw,
+            quantized.as_ref().map_or(ptr::null(), |raw| raw),
             ptr::null_mut(),
         )
     })
