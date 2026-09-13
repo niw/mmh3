@@ -11,7 +11,7 @@ in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints f
 
 The fastest configuration measured so far uses the INT8 ConvRot DiT, text encoder and video VAE,
 the FP32 audio VAE, and the 768p Turbo LoRA. With four steps, INT8/FP8 attention and Sol-Attn from
-the first step, it generated a 768p video with audio in about **98 seconds** on a DGX Spark
+the first step, it generated a 768p video with audio in about **87 seconds** on a DGX Spark
 ([measurement details](#performance)).
 
 With the [requirements](#requirements) and the Hugging Face CLI (`hf`) installed, run these commands
@@ -65,24 +65,26 @@ first step change image details and can change the composition; see [Usage](#usa
 
 ## Performance
 
-On a DGX Spark at 1344×768 for 124 frames (5.2 s, 37,729 tokens). The DiT stage timings below
-use BF16 attention:
+On a DGX Spark at 1344×768 for 124 frames (5.2 s), with the Tokyo rain prompt (37,770 tokens) and the
+Turbo LoRA. ComfyUI's timings come from random inputs with 1,000 text tokens (38,710 tokens):
 
 | Stage | mmh3 | ComfyUI |
 | --- | ---: | ---: |
-| DiT step, dense attention | 38.2 s | 49.7 s |
-| DiT step, Sol-Attn | 16.9 s | 23.0 s |
+| DiT step, dense BF16 attention | 38.7 s | 49.7 s |
+| DiT step, dense INT8/FP8 attention | 26.7 s | |
+| DiT step, Sol-Attn in BF16 | 16.5 s | 23.0 s |
+| DiT step, Sol-Attn in INT8/FP8 | 14.6 s | |
 | Video VAE decode, FP16 VAE | 30.9 s | 59.2 s |
-| Video VAE decode, INT8 ConvRot VAE | 20.1 s | |
+| Video VAE decode, INT8 ConvRot VAE | 20.2 s | |
 | Audio VAE decode | 0.3 s | |
 | Text encoder load and encode | 3.4 s | |
-| DiT load | 2.5 s | |
+| DiT load | 2.9 s | |
 
 With the 4-step Turbo LoRA, INT8/FP8 attention, Sol-Attn from the first step and the INT8 video VAE,
-a whole generation from the prompt to the video and audio files takes about **98 seconds**. This
-configuration was measured at 98.04 s in one run with the Tokyo rain prompt and seed 1, including
-model loading and Y4M/WAV writing, excluding MP4 encoding. BF16 attention with the first step
-dense took about 122 s.
+a whole generation from the prompt to the video and audio files takes about **87 seconds**. This
+configuration was measured at 86.76 s in one run with the Tokyo rain prompt and seed 1, including
+model loading and Y4M/WAV writing, excluding MP4 encoding. With the first step dense it took 98.98 s,
+and with BF16 attention and the first step dense 116.20 s.
 
 ## Accuracy
 
@@ -103,6 +105,11 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
   with a dedicated INT8 GEMM that loads its operands with TMA, FlashAttention-2 style attention,
   and an FP32 residual stream.
 - Sol-Attn, a training-free block-sparse attention (arXiv:2607.24027), for the long video sequences.
+- Optional INT8 QK and FP8 PV attention in the DiT, for dense attention and Sol-Attn alike, with
+  FP32 softmax and accumulation.
+- Kernels fused for H3's shapes: the residual add, normalization and quantization of every layer
+  input in one pass, SwiGLU and LoRA up-projections in the INT8 GEMM's epilogue, and the q and k
+  normalization together with the attention's per-block preparation.
 - LoRAs applied at run time on top of the INT8 weights without requantizing them, added inside the
   INT8 GEMM, including the [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
   for 4-step generation.
@@ -198,7 +205,7 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.y4m \
 
 INT8/FP8 attention needs about 0.76 GiB of extra scratch memory at this sequence length and changes
 image details. Using `--sparse-start 0` can also change the composition. To keep the first of four
-steps dense, use `--sparse-start 0.2`; that setting took 108.51 s with INT8/FP8 attention. Visual
+steps dense, use `--sparse-start 0.2`; that setting took 98.98 s with INT8/FP8 attention. Visual
 comparison so far covers sampled frames from one prompt and seed. The text refiner, text encoder
 and VAEs keep their existing attention precision.
 
@@ -249,11 +256,12 @@ Other commands:
 ## Tests
 
 ```sh
-cargo test --release --workspace --features cuda
+cargo test --release --workspace --features cuda -- --test-threads=1
 ```
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results
-and CPU references. The tokenizer test also needs the MiniMax H3 `tokenizer.json`, from
+and CPU references. They run one at a time because a model loading in one test thread while another
+thread runs a DiT forward pass can corrupt that forward pass. The tokenizer test also needs the MiniMax H3 `tokenizer.json`, from
 `MMH3_TOKENIZER` or from the `MMH3_MODELS` directory, and is skipped without it.
 
 ## License
