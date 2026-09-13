@@ -9,50 +9,30 @@ in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints f
 
 ## Getting started
 
-The fastest configuration measured so far uses the INT8 ConvRot DiT, text encoder and video VAE,
-the FP32 audio VAE, and the 768p Turbo LoRA. With four steps, INT8/FP8 attention and Sol-Attn from
-the first step, it generated a 768p video with audio in about **87 seconds** on a DGX Spark
-([measurement details](#performance)).
-
-With the [requirements](#requirements) and the Hugging Face CLI (`hf`) installed, run these commands
-from the repository directory. Download only these models; the FP16 video VAE is not needed:
+With the [requirements](#requirements) installed, run these commands from the repository directory:
 
 ```sh
-cargo build --release --features cuda
-
-hf download Comfy-Org/MiniMax-H3 --local-dir models \
-  diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-  text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
-  vae/minimax_h3_audio_vae_fp32.safetensors
-hf download MiniMaxAI/MiniMax-H3 tokenizer/tokenizer.json --local-dir models
-hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
-  --local-dir models/vae
-hf download lightx2v/Minimax-h3-Turbo \
-  minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
-  --local-dir models/loras
+make
+make download-models
+make generate
 ```
 
-Generate a 1344×768, 124-frame video (about 5.2 seconds) with the fastest measured settings:
+`make` builds mmh3, `make download-models` downloads the models into `models`, and `make generate`
+generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.y4m`,
+`out.wav` and `out.mp4`. On a DGX Spark, the generation takes about **87 seconds**
+([details](#performance)). The targets stop with a message when cargo, `hf` or ffmpeg is missing.
+
+`PROMPT`, `SEED`, `OUT` and `MODELS` change the prompt, the seed, the output files and the models
+directory. This writes `panda.y4m`, `panda.wav` and `panda.mp4`:
 
 ```sh
-target/release/mmh3 generate --models models --out out.y4m \
-  --prompt "A woman in a yellow raincoat opens a clear umbrella on a neon-lit Tokyo street at night. Rain patters on the umbrella, with distant traffic and soft piano music." \
-  --width 1344 --height 768 --frames 124 --seed 1 \
-  --steps 4 --shift-video 6 --shift-audio 3 \
-  --attention sol --attention-precision int8-fp8 --sparse-start 0 --sparse-tau 1.3 \
-  --video-vae models/vae/minimax_h3_video_vae_int8_convrot.safetensors \
-  --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
+make generate PROMPT="A red panda sips tea on a sunny wooden porch while birds chirp in the garden." \
+  SEED=2 OUT=panda.y4m
 ```
 
-This writes `out.y4m` and `out.wav`. To encode them as an MP4 with audio:
-
-```sh
-ffmpeg -i out.y4m -i out.wav -c:v libx264 -crf 18 -pix_fmt yuv420p \
-  -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 192k -shortest out.mp4
-```
-
-Generation time depends on the prompt. Quantized attention and starting sparse attention at the
-first step change image details and can change the composition; see [Usage](#usage) for the other settings.
+`make generate` uses the fastest settings measured so far: the INT8 video VAE, the 4-step Turbo
+LoRA, INT8/FP8 attention and Sol-Attn from the first step. Compared with mmh3's defaults, they can
+change image details and the composition. See [Usage](#usage) for the other settings.
 
 ## Status
 
@@ -65,8 +45,9 @@ first step change image details and can change the composition; see [Usage](#usa
 
 ## Performance
 
-On a DGX Spark at 1344×768 for 124 frames (5.2 s), with the Tokyo rain prompt (37,770 tokens) and the
-Turbo LoRA. ComfyUI's timings come from random inputs with 1,000 text tokens (38,710 tokens):
+The times below are from a DGX Spark at 1344×768 and 124 frames (5.2 s), with the Tokyo rain prompt
+and the Turbo LoRA (37,770 tokens in all). ComfyUI's times come from random inputs with 1,000 text
+tokens (38,710 tokens in all):
 
 | Stage | mmh3 | ComfyUI |
 | --- | ---: | ---: |
@@ -80,11 +61,9 @@ Turbo LoRA. ComfyUI's timings come from random inputs with 1,000 text tokens (38
 | Text encoder load and encode | 3.4 s | |
 | DiT load | 2.9 s | |
 
-With the 4-step Turbo LoRA, INT8/FP8 attention, Sol-Attn from the first step and the INT8 video VAE,
-a whole generation from the prompt to the video and audio files takes about **87 seconds**. This
-configuration was measured at 86.76 s in one run with the Tokyo rain prompt and seed 1, including
-model loading and Y4M/WAV writing, excluding MP4 encoding. With the first step dense it took 98.98 s,
-and with BF16 attention and the first step dense 116.20 s.
+The settings of `make generate` took 86.76 s in one run with seed 1, from the prompt to the Y4M and
+WAV files, including model loading. With the first step dense it took 98.98 s, and with BF16
+attention and the first step dense 116.20 s.
 
 ## Accuracy
 
@@ -101,22 +80,17 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 
 ## Features
 
-- INT8 ConvRot linear layers (activations rotated by a Hadamard transform and quantized per row)
-  with a dedicated INT8 GEMM that loads its operands with TMA, FlashAttention-2 style attention,
-  and an FP32 residual stream.
+- INT8 ConvRot linear layers (activations rotated by a Hadamard transform and quantized per row) on
+  a dedicated INT8 GEMM, FlashAttention-2 style attention, and an FP32 residual stream.
 - Sol-Attn, a training-free block-sparse attention (arXiv:2607.24027), for the long video sequences.
-- Optional INT8 QK and FP8 PV attention in the DiT, for dense attention and Sol-Attn alike, with
-  FP32 softmax and accumulation.
-- Kernels fused for H3's shapes: the residual add, normalization and quantization of every layer
-  input in one pass, SwiGLU and LoRA up-projections in the INT8 GEMM's epilogue, and the q and k
-  normalization together with the attention's per-block preparation.
-- LoRAs applied at run time on top of the INT8 weights without requantizing them, added inside the
-  INT8 GEMM, including the [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
-  for 4-step generation.
-- The video VAE decoder with FP16 weights or with the INT8 ConvRot weights of its transformer.
+- Optional INT8/FP8 attention in the DiT, with FP32 softmax and accumulation.
+- Kernels fused for H3's shapes, such as the normalization and quantization of each layer input in
+  one pass, and SwiGLU and LoRA inside the INT8 GEMM.
+- LoRAs such as the [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo) for
+  4-step generation, applied on top of the INT8 weights at run time without requantizing them.
+- The video VAE decoder with FP16 weights, or with INT8 ConvRot weights in its transformer.
 - The official per-stream Euler schedules for video and audio.
-- Weights stream from disk to the GPU through direct reads into pinned buffers, without filling the
-  page cache.
+- Weights stream from disk to the GPU with direct reads, without filling the page cache.
 - Output as YUV4MPEG2 video and WAV audio, written without external libraries.
 
 ## Requirements
@@ -124,57 +98,47 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - Linux with an NVIDIA Blackwell GPU (developed on aarch64).
 - The CUDA toolkit with `nvcc` and cuBLASLt (developed with CUDA 13.0).
 - Rust with edition 2024 support (developed with 1.98).
-- About 54 GB of disk for the checkpoints, 56 GB with the Turbo LoRA. The command loads one model at
-  a time, and the largest stage is the DiT with 21 GB of weights plus activations. So far it has
-  only run on the DGX Spark's 128 GB of unified memory.
+- The Hugging Face CLI (`hf`) to download the models, for example installed with
+  `uv tool install huggingface_hub`.
+- ffmpeg for the MP4 of `make generate`. mmh3 itself does not need it.
+- About 54 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
+  21 GB of weights plus activations.
 
 ## Build
 
 ```sh
-cargo build --release --features cuda
+make
 ```
 
-`CUDA_HOME` points at the CUDA toolkit (default `/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU
-architecture (default `sm_120f`). Without `--features cuda`, only the CPU-side crates build and the
-command offers just `inspect`.
+`make` runs `cargo build --release --features cuda`. `CUDA_HOME` points at the CUDA toolkit (default
+`/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU architecture (default `sm_120f`). Without
+`--features cuda`, only the CPU-side crates build and the command offers just `inspect`.
 
 ## Models
 
-mmh3 finds each checkpoint under its ComfyUI name inside a models directory laid out like ComfyUI's
-`models` folder. A ComfyUI installation's `models` directory works as is.
+mmh3 finds each checkpoint under its ComfyUI name in a models directory laid out like ComfyUI's
+`models` folder, so a ComfyUI installation's `models` directory works as is. `mmh3` takes the
+directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `--text-encoder`,
+`--video-vae`, `--audio-vae` and `--tokenizer`.
 
-If you use the INT8 ConvRot video VAE, you do not need to download the FP16 video VAE. Omit
-`vae/minimax_h3_video_vae_fp16.safetensors` from the first command below and download
-`minimax_h3_video_vae_int8_convrot.safetensors` with the last command instead.
+`make download-models` runs `tools/download-models.sh`, which downloads these files into `models`:
 
-To download the files, for example with the Hugging Face CLI:
+| File | From |
+| --- | --- |
+| `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Comfy-Org/MiniMax-H3 |
+| `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Comfy-Org/MiniMax-H3 |
+| `vae/minimax_h3_audio_vae_fp32.safetensors` | Comfy-Org/MiniMax-H3 |
+| `vae/minimax_h3_video_vae_int8_convrot.safetensors` | Kijai/MiniMax-H3-experimental |
+| `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` | lightx2v/Minimax-h3-Turbo |
+| `tokenizer/tokenizer.json` | MiniMaxAI/MiniMax-H3 |
 
-```sh
-hf download Comfy-Org/MiniMax-H3 --local-dir models \
-  diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors \
-  text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors \
-  vae/minimax_h3_video_vae_fp16.safetensors \
-  vae/minimax_h3_audio_vae_fp32.safetensors
-hf download MiniMaxAI/MiniMax-H3 tokenizer/tokenizer.json --local-dir models
+With `--precision fp16`, the script downloads the FP16 video VAE,
+`vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
+`--no-lora` skips the LoRA, and `--models DIR` downloads into another directory.
 
-# Optional, for 4-step generation.
-hf download lightx2v/Minimax-h3-Turbo \
-  minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
-  --local-dir models/loras
-
-# Optional, a faster video VAE decoder.
-hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
-  --local-dir models/vae
-```
-
-Pass the directory with `--models DIR` or set `MMH3_MODELS`. Flags such as `--dit`,
-`--text-encoder`, `--video-vae`, `--audio-vae` and `--tokenizer` point at individual files instead.
-
-When the models directory has `vae/minimax_h3_video_vae_int8_convrot.safetensors`, the video VAE
-with INT8 ConvRot weights in its transformer from Kijai/MiniMax-H3-experimental, `generate` decodes
-with it instead of the FP16 VAE. It is faster, and its pixels are about 51 dB PSNR from the FP16
-decode, as far as ComfyUI's own INT8 and FP16 decodes are from each other. `--video-vae` picks
-either file.
+`generate` decodes with the INT8 video VAE when the models directory has it, and with the FP16 one
+otherwise. The INT8 one is faster, and its output is about 51 dB PSNR from the FP16 decode, as close
+as ComfyUI's own INT8 and FP16 decodes are to each other.
 
 ## Usage
 
@@ -185,16 +149,16 @@ target/release/mmh3 generate --out out.y4m \
   --prompt "A red panda sips tea on a sunny wooden porch while birds chirp in the garden."
 ```
 
-This writes `out.y4m` and `out.wav`. mmh3 does not encode MP4 itself. ffmpeg, for example, can mux
-the two:
+This writes `out.y4m` and `out.wav`. mmh3 does not encode MP4 itself. `make generate` muxes the two
+with ffmpeg like this:
 
 ```sh
-ffmpeg -i out.y4m -i out.wav -c:v libx264 -crf 18 -pix_fmt yuv420p \
+ffmpeg -i out.y4m -i out.wav -c:v libx264 -crf 18 \
   -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 192k -shortest out.mp4
 ```
 
-The fast setting uses the Turbo LoRA with the shifts it was trained with, INT8/FP8 attention,
-and Sol-Attn from the first step:
+The fast settings of `make generate` use the Turbo LoRA with the shifts it was trained with,
+INT8/FP8 attention, and Sol-Attn from the first step:
 
 ```sh
 target/release/mmh3 generate --prompt-file prompt.txt --out out.y4m \
@@ -203,11 +167,9 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.y4m \
   --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
 ```
 
-INT8/FP8 attention needs about 0.76 GiB of extra scratch memory at this sequence length and changes
-image details. Using `--sparse-start 0` can also change the composition. To keep the first of four
-steps dense, use `--sparse-start 0.2`; that setting took 98.98 s with INT8/FP8 attention. Visual
-comparison so far covers sampled frames from one prompt and seed. The text refiner, text encoder
-and VAEs keep their existing attention precision.
+INT8/FP8 attention changes image details and needs about 0.76 GiB more memory. `--sparse-start 0`
+can also change the composition. `--sparse-start 0.2` keeps the first step dense and took 98.98 s.
+So far these settings have been compared visually on one prompt and seed only.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
@@ -250,6 +212,7 @@ Other commands:
   them.
 - `crates/mmh3-cpu`: an FP32 CPU reference of the DiT for tests.
 - `tests/fixtures`: small random models with outputs computed by ComfyUI's implementation.
+- `tools/download-models.sh`: the model downloader that `make download-models` runs.
 - `tools/golden`: development tools that write golden data with a ComfyUI checkout.
 - `tools/unicode`: the generator of the tokenizer's Unicode tables.
 
@@ -260,9 +223,9 @@ cargo test --release --workspace --features cuda -- --test-threads=1
 ```
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results
-and CPU references. They run one at a time because a model loading in one test thread while another
-thread runs a DiT forward pass can corrupt that forward pass. The tokenizer test also needs the MiniMax H3 `tokenizer.json`, from
-`MMH3_TOKENIZER` or from the `MMH3_MODELS` directory, and is skipped without it.
+and CPU references. They run one at a time, because loading a model during another test's DiT
+forward pass can corrupt that forward pass. The tokenizer test needs the MiniMax H3 `tokenizer.json` from
+`MMH3_TOKENIZER` or the `MMH3_MODELS` directory, and is skipped without it.
 
 ## License
 
