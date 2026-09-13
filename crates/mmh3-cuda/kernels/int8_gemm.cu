@@ -3,19 +3,21 @@
 #include <cuda.h>
 #include <cudaTypedefs.h>
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// Scaled INT8 GEMM for the DiT and text encoder linear layers:
-//   output[m, n] = bf16(sum_k activations[m, k] * weights[n, k] * activation_scales[m] * weight_scales[n]
-//                       + adapter_scale * sum_r adapter_down[m, r] * adapter_up[n, r])
-// where the low-rank adapter term is optional. Activations and weights are row-major with K contiguous. N must be a
-// multiple of the block width and K a multiple of 128, which every H3 linear layer satisfies. Only M may be ragged.
+// Scaled INT8 GEMM for the DiT, text encoder and video VAE linear layers:
+//   output[m, n] = round(sum_k activations[m, k] * weights[n, k] * activation_scales[m] * weight_scales[n]
+//                        + adapter_scale * sum_r adapter_down[m, r] * adapter_up[n, r] + bias[n])
+// rounded to BF16 or FP16, where the low-rank adapter and the bias are optional. Activations and weights are
+// row-major with K contiguous. N must be a multiple of the block width and K a multiple of 128, which every H3 linear
+// layer satisfies. Only M may be ragged.
 //
 // NOTE: A persistent grid of one CTA per SM walks the output tiles. TMA copies 128-byte K slices of both operands
 // into a two-stage ring with the 128B swizzle, and eight warps multiply their parts of the tile with mma.sync. There
 // is no producer warp because a ninth warp would limit every warp to 168 registers. Instead, the warp that releases
 // a stage last issues the copies that refill it. An adapter adds stages of 64 ranks of its BF16 operands after the K
-// blocks of each tile, multiplied with BF16 MMAs into the scaled FP32 result before the single rounding to BF16.
+// blocks of each tile, multiplied with BF16 MMAs into the scaled FP32 result before the single rounding.
 
 namespace {
 
@@ -199,6 +201,16 @@ __device__ __forceinline__ void multiply_stage(Accumulator (&accumulators)[Confi
     }
 }
 
+__device__ __forceinline__ uint32_t pack(__nv_bfloat16*, float low, float high) {
+    __nv_bfloat162 value = __floats2bfloat162_rn(low, high);
+    return *reinterpret_cast<uint32_t*>(&value);
+}
+
+__device__ __forceinline__ uint32_t pack(__half*, float low, float high) {
+    __half2 value = __floats2half2_rn(low, high);
+    return *reinterpret_cast<uint32_t*>(&value);
+}
+
 // Ring position of a warp, shared by the INT8 and adapter blocks.
 struct Ring {
     int stage = 0;
@@ -214,11 +226,11 @@ struct Ring {
     }
 };
 
-template <typename Config>
+template <typename Config, typename Output>
 __global__ void __launch_bounds__(WARPS * 32, 1)
     int8_gemm_kernel(const __grid_constant__ TensorMaps maps, const float* __restrict__ activation_scales,
-                     const float* __restrict__ weight_scales, __nv_bfloat16* __restrict__ output, int m, int n, int k,
-                     int adapter_blocks, float adapter_scale) {
+                     const float* __restrict__ weight_scales, const float* __restrict__ bias, Output* __restrict__ output,
+                     int m, int n, int k, int adapter_blocks, float adapter_scale) {
     extern __shared__ __align__(1024) uint8_t shared_memory[];
     const uint32_t shared_base = (shared_address(shared_memory) + 1023) & ~1023u;
     const uint32_t barriers = shared_base + STAGES * Config::stage_bytes;
@@ -348,6 +360,25 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             }
         }
 
+        if (bias != nullptr) {
+#pragma unroll
+            for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
+                const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
+#pragma unroll
+                for (int slot = 0; slot < 4; slot++) {
+                    const float2 column_bias = *reinterpret_cast<const float2*>(bias + column + ((slot + quad_lane) & 3) * 2);
+#pragma unroll
+                    for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
+#pragma unroll
+                        for (int half = 0; half < 2; half++) {
+                            values[m_tile][quad * 4 + slot][half * 2] += column_bias.x;
+                            values[m_tile][quad * 4 + slot][half * 2 + 1] += column_bias.y;
+                        }
+                    }
+                }
+            }
+        }
+
 #pragma unroll
         for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
             const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
@@ -359,8 +390,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
 #pragma unroll
                     for (int slot = 0; slot < 4; slot++) {
                         const float* scaled = values[m_tile][quad * 4 + slot] + half * 2;
-                        __nv_bfloat162 value = __floats2bfloat162_rn(scaled[0], scaled[1]);
-                        words[slot] = *reinterpret_cast<uint32_t*>(&value);
+                        words[slot] = pack(output, scaled[0], scaled[1]);
                     }
                     // Rotate the slots right by t to put the columns in order.
                     if (quad_lane & 1) {
@@ -443,9 +473,9 @@ struct Adapter {
     float scale;
 };
 
-template <typename Config>
+template <typename Config, typename Output>
 int launch(const int8_t* activations, const int8_t* weights, const float* activation_scales,
-           const float* weight_scales, __nv_bfloat16* output, int m, int n, int k, Adapter adapter,
+           const float* weight_scales, const float* bias, Output* output, int m, int n, int k, Adapter adapter,
            cudaStream_t stream) {
     const bool has_adapter = adapter.down != nullptr && adapter.up != nullptr && adapter.scale != 0.0f;
     const int adapter_blocks = has_adapter ? adapter.rank * 2 / BLOCK_K : 0;
@@ -471,8 +501,8 @@ int launch(const int8_t* activations, const int8_t* weights, const float* activa
     }
     static bool configured = false;
     if (!configured) {
-        cudaError_t status = cudaFuncSetAttribute(int8_gemm_kernel<Config>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                  Config::shared_bytes);
+        cudaError_t status = cudaFuncSetAttribute(int8_gemm_kernel<Config, Output>,
+                                                  cudaFuncAttributeMaxDynamicSharedMemorySize, Config::shared_bytes);
         if (status != cudaSuccess) {
             return static_cast<int>(status);
         }
@@ -483,21 +513,23 @@ int launch(const int8_t* activations, const int8_t* weights, const float* activa
     if (processors == 0) {
         return static_cast<int>(cudaErrorInvalidDevice);
     }
-    int8_gemm_kernel<Config><<<tiles < processors ? tiles : processors, WARPS * 32, Config::shared_bytes, stream>>>(
-        maps, activation_scales, weight_scales, output, m, n, k, adapter_blocks, adapter.scale);
+    int8_gemm_kernel<Config, Output>
+        <<<tiles < processors ? tiles : processors, WARPS * 32, Config::shared_bytes, stream>>>(
+            maps, activation_scales, weight_scales, bias, output, m, n, k, adapter_blocks, adapter.scale);
     return static_cast<int>(cudaGetLastError());
 }
 
+template <typename Output>
 int launch_config(int config, const int8_t* activations, const int8_t* weights, const float* activation_scales,
-                  const float* weight_scales, __nv_bfloat16* output, int m, int n, int k, Adapter adapter,
+                  const float* weight_scales, const float* bias, Output* output, int m, int n, int k, Adapter adapter,
                   cudaStream_t stream) {
     switch (config) {
         case 0:
-            return launch<TallTile>(activations, weights, activation_scales, weight_scales, output, m, n, k, adapter,
-                                    stream);
+            return launch<TallTile>(activations, weights, activation_scales, weight_scales, bias, output, m, n, k,
+                                    adapter, stream);
         case 1:
-            return launch<WideTile>(activations, weights, activation_scales, weight_scales, output, m, n, k, adapter,
-                                    stream);
+            return launch<WideTile>(activations, weights, activation_scales, weight_scales, bias, output, m, n, k,
+                                    adapter, stream);
         default:
             return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -514,17 +546,23 @@ extern "C" int mmh3_int8_gemm_config_count() {
 extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t* activations, const int8_t* weights,
                                    const float* activation_scales, const float* weight_scales, __nv_bfloat16* output,
                                    int m, int n, int k, cudaStream_t stream) {
-    return launch_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k,
+    return launch_config(config, activations, weights, activation_scales, weight_scales, nullptr, output, m, n, k,
                          Adapter{nullptr, nullptr, 0, 0.0f}, stream);
 }
 
-// The same product plus adapter_scale · adapter_down · adapter_upᵀ, with adapter_down [m, rank] and adapter_up
-// [n, rank] in BF16 and the rank a multiple of 64, rounded to BF16 once.
-extern "C" int mmh3_int8_gemm_bf16_adapter(int config, const int8_t* activations, const int8_t* weights,
-                                           const float* activation_scales, const float* weight_scales,
-                                           __nv_bfloat16* output, int m, int n, int k,
-                                           const __nv_bfloat16* adapter_down, const __nv_bfloat16* adapter_up,
-                                           int rank, float adapter_scale, cudaStream_t stream) {
-    return launch_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k,
-                         Adapter{adapter_down, adapter_up, rank, adapter_scale}, stream);
+// The same product with an optional FP32 bias [n], BF16 or FP16 output, and an optional adapter
+// adapter_scale · adapter_down · adapter_upᵀ with adapter_down [m, rank] and adapter_up [n, rank] in BF16 and the rank
+// a multiple of 64. The result is rounded once.
+extern "C" int mmh3_int8_gemm(int config, const int8_t* activations, const int8_t* weights,
+                              const float* activation_scales, const float* weight_scales, const float* bias,
+                              void* output, int output_is_f16, int m, int n, int k,
+                              const __nv_bfloat16* adapter_down, const __nv_bfloat16* adapter_up, int rank,
+                              float adapter_scale, cudaStream_t stream) {
+    const Adapter adapter{adapter_down, adapter_up, rank, adapter_scale};
+    if (output_is_f16) {
+        return launch_config(config, activations, weights, activation_scales, weight_scales, bias,
+                             static_cast<__half*>(output), m, n, k, adapter, stream);
+    }
+    return launch_config(config, activations, weights, activation_scales, weight_scales, bias,
+                         static_cast<__nv_bfloat16*>(output), m, n, k, adapter, stream);
 }

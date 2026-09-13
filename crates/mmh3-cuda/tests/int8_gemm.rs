@@ -1,6 +1,6 @@
-use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
+use mmh3_core::numeric::{bf16_to_f32, f16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
-use mmh3_cuda::gemm::{self, Adapter};
+use mmh3_cuda::gemm::{self, Adapter, Output};
 
 struct Random(u64);
 
@@ -38,8 +38,8 @@ fn u16_bytes(values: &[u16]) -> Vec<u8> {
 }
 
 /// Runs every config on random operands, with a random adapter of `rank` when it is not zero, and compares the output
-/// with an f64 reference within BF16 rounding.
-fn check_every_config(m: usize, n: usize, k: usize, rank: usize, seed: u64) {
+/// with an f64 reference within BF16 rounding. `f16_with_bias` switches to FP16 output with a random bias.
+fn check_every_config(m: usize, n: usize, k: usize, rank: usize, f16_with_bias: bool, seed: u64) {
     let mut random = Random(seed);
     let activations: Vec<i8> = (0..m * k).map(|_| random.int8()).collect();
     let weights: Vec<i8> = (0..n * k).map(|_| random.int8()).collect();
@@ -49,6 +49,7 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, seed: u64) {
     let down: Vec<u16> = (0..m * rank).map(|_| random.bf16(-2.0, 2.0)).collect();
     let up: Vec<u16> = (0..n * rank).map(|_| random.bf16(-2.0, 2.0)).collect();
     let adapter_scale = 1.5f32;
+    let bias: Vec<f32> = (0..n).map(|_| if f16_with_bias { random.uniform(-20.0, 20.0) } else { 0.0 }).collect();
 
     let activation_buffer = upload(&activations.iter().map(|&value| value as u8).collect::<Vec<_>>());
     let weight_buffer = upload(&weights.iter().map(|&value| value as u8).collect::<Vec<_>>());
@@ -56,6 +57,7 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, seed: u64) {
     let weight_scale_buffer = upload(&f32_bytes(&weight_scales));
     let (down_buffer, up_buffer) = (upload(&u16_bytes(&down)), upload(&u16_bytes(&up)));
     let adapter = Adapter { down: &down_buffer, up: &up_buffer, rank, scale: adapter_scale };
+    let bias_buffer = upload(&f32_bytes(&bias));
 
     let expected: Vec<f64> = (0..m)
         .flat_map(|row| (0..n).map(move |column| (row, column)))
@@ -64,19 +66,19 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, seed: u64) {
             let low_rank: f64 = (0..rank)
                 .map(|index| bf16_to_f32(down[row * rank + index]) as f64 * bf16_to_f32(up[column * rank + index]) as f64)
                 .sum();
-            dot as f64 * activation_scales[row] as f64 * weight_scales[column] as f64 + adapter_scale as f64 * low_rank
+            dot as f64 * activation_scales[row] as f64 * weight_scales[column] as f64 + adapter_scale as f64 * low_rank + bias[column] as f64
         })
         .collect();
 
     for config in 0..gemm::int8_config_count() {
         let mut output = DeviceBuffer::new(m * n * 2).unwrap();
-        gemm::int8_bf16(
+        gemm::int8(
             config,
             &activation_buffer,
             &weight_buffer,
             &activation_scale_buffer,
             &weight_scale_buffer,
-            &mut output,
+            Output { buffer: &mut output, f16: f16_with_bias, bias: f16_with_bias.then_some(&bias_buffer) },
             m,
             n,
             k,
@@ -87,7 +89,8 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, seed: u64) {
         output.copy_to_host(&mut output_bytes).unwrap();
 
         for (index, &expected) in expected.iter().enumerate() {
-            let actual = bf16_to_f32(u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]])) as f64;
+            let bits = u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]]);
+            let actual = if f16_with_bias { f16_to_f32(bits) } else { bf16_to_f32(bits) } as f64;
             let tolerance = expected.abs() / 256.0 + 1e-4;
             assert!(
                 (actual - expected).abs() <= tolerance,
@@ -101,18 +104,23 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, seed: u64) {
 
 #[test]
 fn matches_cpu_reference_for_every_config() {
-    check_every_config(300, 512, 384, 0, 7);
+    check_every_config(300, 512, 384, 0, false, 7);
 }
 
 #[test]
 fn matches_cpu_reference_over_several_tiles_per_block() {
     // 192 tiles, more than a Blackwell GPU has SMs, with a ragged last row of tiles and an odd number of K blocks.
-    check_every_config(2000, 3072, 384, 0, 8);
+    check_every_config(2000, 3072, 384, 0, false, 8);
 }
 
 #[test]
 fn adds_a_low_rank_adapter() {
-    check_every_config(300, 512, 256, 128, 9);
+    check_every_config(300, 512, 256, 128, false, 9);
     // The rank of the fused qkv adapters, and more tiles than SMs.
-    check_every_config(600, 3072, 256, 384, 10);
+    check_every_config(600, 3072, 256, 384, false, 10);
+}
+
+#[test]
+fn writes_fp16_with_a_bias() {
+    check_every_config(600, 3072, 256, 0, true, 11);
 }

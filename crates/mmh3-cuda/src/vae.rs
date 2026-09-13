@@ -1,12 +1,13 @@
 //! Video VAE decoding on the GPU.
 //!
 //! Every spatial tile of a temporal chunk runs through the ViT decoder as one batch. The residual stream stays in
-//! FP32 and the linear layers run in FP16 through cuBLASLt. Tiles and chunks are blended in FP32 into pixels in
-//! [0, 1].
+//! FP32 and the linear layers take FP16 activations: FP16 weights run through cuBLASLt, and the INT8 ConvRot weights
+//! of the quantized checkpoint through the INT8 GEMM. Tiles and chunks are blended in FP32 into pixels in [0, 1].
 
 use crate::attention::{AttentionLayout, Element, attention_pointers};
 use crate::loader::Uploader;
-use crate::model::{DeviceTensors, Error, LinearKind, cublaslt_linear, host_tensor, i32_buffer};
+use crate::gemm::{Int8Output, int8_pointers, rotate_quantize_pointers};
+use crate::model::{CONVROT_GROUP, DeviceTensors, Error, LinearKind, check_quantization, cublaslt_linear, host_tensor, i32_buffer};
 use crate::{DeviceBuffer, check};
 use mmh3_core::numeric::{f16_to_f32, f32_to_f16};
 use mmh3_core::safetensors::{DType, SafeTensors};
@@ -145,11 +146,15 @@ struct Workspace {
     expanded: DeviceBuffer,
     activated: DeviceBuffer,
     projected: DeviceBuffer,
+    /// Rotated INT8 activations and their row scales for INT8 layers.
+    quantized: DeviceBuffer,
+    scales: DeviceBuffer,
 }
 
 impl Workspace {
-    fn new(config: &VideoDecoderConfig, tokens: usize) -> Result<Self, Error> {
+    fn new(config: &VideoDecoderConfig, tokens: usize, quantized: bool) -> Result<Self, Error> {
         let dim = config.dim;
+        let quantized_rows = if quantized { tokens } else { 1 };
         Ok(Workspace {
             latent_rows: DeviceBuffer::new(tokens * config.latent_channels * 2)?,
             residual: DeviceBuffer::new(tokens * dim * 4)?,
@@ -160,6 +165,8 @@ impl Workspace {
             expanded: DeviceBuffer::new(tokens * 2 * config.ffn * 2)?,
             activated: DeviceBuffer::new(tokens * config.ffn * 2)?,
             projected: DeviceBuffer::new(tokens * PATCH_FEATURES * 2)?,
+            quantized: DeviceBuffer::new(quantized_rows * dim.max(config.ffn))?,
+            scales: DeviceBuffer::new(quantized_rows * 4)?,
         })
     }
 }
@@ -206,6 +213,8 @@ impl TileGrid {
 pub struct CudaVideoDecoder {
     config: VideoDecoderConfig,
     tensors: DeviceTensors,
+    /// Whether any linear layer has INT8 ConvRot weights.
+    quantized: bool,
     /// `post_quant_conv` folded into `x_embedder`, FP16 `[dim, latent channels]` and `[dim]`.
     embed_weight: DeviceBuffer,
     embed_bias: DeviceBuffer,
@@ -243,6 +252,7 @@ impl CudaVideoDecoder {
 
         let mut tensors = DeviceTensors::default();
         let mut uploader = Uploader::new(file);
+        let mut quantized = false;
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(prefix).and_then(|name| name.strip_prefix("decoder.")) else {
                 continue;
@@ -250,10 +260,31 @@ impl CudaVideoDecoder {
             if name.starts_with("x_embedder.") || name == "mask_token" {
                 continue;
             }
-            if info.dtype != DType::F16 {
-                return Err(Error::Model(format!("decoder.{name}: unsupported dtype {}", info.dtype)));
+            if name.ends_with(".comfy_quant") {
+                check_quantization(name, file.data(info))?;
+                continue;
             }
-            tensors.insert(name, file, info, &mut uploader)?;
+            match info.dtype {
+                DType::F16 | DType::I8 => tensors.insert(name, file, info, &mut uploader)?,
+                DType::F32 if name.ends_with(".weight_scale") => tensors.insert(name, file, info, &mut uploader)?,
+                DType::F32 => {
+                    // NOTE: ComfyUI runs this decoder in FP16 and casts every unquantized tensor to FP16, the biases
+                    // of INT8 layers included. Those stay FP32 here for the INT8 GEMM's epilogue, rounded through FP16.
+                    let values = Tensor::load(file, info).map_err(Error::Model)?.data;
+                    let int8_layer = name
+                        .strip_suffix(".bias")
+                        .and_then(|layer| file.get(&format!("{prefix}decoder.{layer}.weight")))
+                        .is_some_and(|weight| weight.dtype == DType::I8);
+                    if int8_layer {
+                        let rounded: Vec<f32> = values.iter().map(|&value| f16_to_f32(f32_to_f16(value))).collect();
+                        tensors.insert_buffer(name, DeviceBuffer::from_f32(&rounded)?, DType::F32, info.shape.clone());
+                    } else {
+                        tensors.insert_buffer(name, f16_buffer(&values)?, DType::F16, info.shape.clone());
+                    }
+                }
+                other => return Err(Error::Model(format!("decoder.{name}: unsupported dtype {other}"))),
+            }
+            quantized |= info.dtype == DType::I8;
         }
         uploader.run()?;
 
@@ -281,6 +312,7 @@ impl CudaVideoDecoder {
             latents_std: host_tensor(file, &format!("{prefix}latents_std"))?.data,
             config,
             tensors,
+            quantized,
             tile_size,
             tile_overlap_min,
         })
@@ -290,13 +322,27 @@ impl CudaVideoDecoder {
         &self.config
     }
 
-    fn linear(&self, name: &str, input: &DeviceBuffer, output: &DeviceBuffer, rows: usize) -> Result<(), Error> {
+    fn linear(&self, name: &str, input: &DeviceBuffer, output: &DeviceBuffer, rows: usize, workspace: &Workspace) -> Result<(), Error> {
         let weight = self.tensors.get(&format!("{name}.weight"))?;
         let bias = self.tensors.pointer(&format!("{name}.bias"))?;
         let (outputs, features) = (weight.shape[0], weight.shape[1]);
         assert!(input.bytes() >= rows * features * 2 && output.bytes() >= rows * outputs * 2, "{name}: buffers are too small");
-        // SAFETY: both buffers hold the rows, checked above, and the weight and bias come from the checkpoint.
-        unsafe { cublaslt_linear(LinearKind::F16, input.pointer(), weight.buffer.pointer(), bias, output.pointer(), rows, outputs, features)? };
+        if weight.dtype != DType::I8 {
+            // SAFETY: both buffers hold the rows, checked above, and the weight and bias come from the checkpoint.
+            unsafe { cublaslt_linear(LinearKind::F16, input.pointer(), weight.buffer.pointer(), bias, output.pointer(), rows, outputs, features)? };
+            return Ok(());
+        }
+        if features % CONVROT_GROUP != 0 {
+            return Err(Error::Model(format!("{name}: unsupported INT8 layer")));
+        }
+        assert!(workspace.quantized.bytes() >= rows * features && workspace.scales.bytes() >= rows * 4, "{name}: quantization buffers are too small");
+        let weight_scales = self.tensors.pointer(&format!("{name}.weight_scale"))?;
+        // SAFETY: the quantization buffers hold the rows, checked above, and the bias holds `outputs` f32 values.
+        unsafe {
+            rotate_quantize_pointers(input.pointer(), true, workspace.quantized.pointer(), workspace.scales.pointer(), rows, features)?;
+            let output = Int8Output { pointer: output.pointer(), f16: true, bias };
+            int8_pointers(workspace.quantized.pointer(), weight.buffer.pointer(), workspace.scales.pointer(), weight_scales, output, rows, outputs, features, None)?;
+        }
         Ok(())
     }
 
@@ -382,7 +428,7 @@ impl CudaVideoDecoder {
         for layer in 0..config.layers {
             let prefix = format!("transformer_blocks.{layer}");
             self.normalize(&format!("{prefix}.norm1.weight"), None, workspace, tokens)?;
-            self.linear(&format!("{prefix}.attn.to_qkv"), &workspace.normalized, &workspace.qkv, tokens)?;
+            self.linear(&format!("{prefix}.attn.to_qkv"), &workspace.normalized, &workspace.qkv, tokens, workspace)?;
             let qkv = workspace.qkv.pointer().cast::<u16>();
             // SAFETY: qkv holds `tokens × heads × 3 × 64` values, the angles cover a tile and the layout stays within
             // the `tiles × tile_tokens` rows of qkv and attention.
@@ -411,20 +457,20 @@ impl CudaVideoDecoder {
                     1.0 / (HEAD_DIM as f32).sqrt(),
                 )?;
             }
-            self.linear(&format!("{prefix}.attn.to_out"), &workspace.attention, &workspace.delta, tokens)?;
+            self.linear(&format!("{prefix}.attn.to_out"), &workspace.attention, &workspace.delta, tokens, workspace)?;
             self.add_scaled(&format!("{prefix}.scale1"), workspace, tokens)?;
 
             self.normalize(&format!("{prefix}.norm2.weight"), None, workspace, tokens)?;
-            self.linear(&format!("{prefix}.ff.w1"), &workspace.normalized, &workspace.expanded, tokens)?;
+            self.linear(&format!("{prefix}.ff.w1"), &workspace.normalized, &workspace.expanded, tokens, workspace)?;
             // SAFETY: expanded holds `tokens × 2 × ffn` values and activated `tokens × ffn`.
             check(unsafe {
                 mmh3_vae_swiglu(workspace.expanded.pointer(), workspace.activated.pointer(), tokens as c_int, config.ffn as c_int, ptr::null_mut())
             })?;
-            self.linear(&format!("{prefix}.ff.w2"), &workspace.activated, &workspace.delta, tokens)?;
+            self.linear(&format!("{prefix}.ff.w2"), &workspace.activated, &workspace.delta, tokens, workspace)?;
             self.add_scaled(&format!("{prefix}.scale2"), workspace, tokens)?;
         }
         self.normalize("norm_out.weight", Some("norm_out.bias"), workspace, tokens)?;
-        self.linear("proj_out", &workspace.normalized, &workspace.projected, tokens)
+        self.linear("proj_out", &workspace.normalized, &workspace.projected, tokens, workspace)
     }
 
     /// The latent rows of every tile of one chunk, `[tiles, tile tokens, channels]` in FP16. `latent` is the
@@ -514,7 +560,7 @@ impl CudaVideoDecoder {
         let tile_tokens = patches + config.registers + 1;
         let tokens = tiles * tile_tokens;
 
-        let mut workspace = Workspace::new(config, tokens)?;
+        let mut workspace = Workspace::new(config, tokens, self.quantized)?;
         let angles = DeviceBuffer::from_f32(&rope_angles(
             chunk_frames,
             grid.latent_height(),

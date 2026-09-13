@@ -30,7 +30,9 @@ Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
   text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
   vae/minimax_h3_video_vae_fp16.safetensors
   vae/minimax_h3_audio_vae_fp32.safetensors
-  tokenizer/tokenizer.json (from MiniMaxAI/MiniMax-H3)";
+  tokenizer/tokenizer.json (from MiniMaxAI/MiniMax-H3)
+generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
+directory has it.";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -534,11 +536,18 @@ fn generate(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let started = Instant::now();
-    let path = option_path(&options, "video-vae", VIDEO_VAE_FILE)?;
+    // Without --video-vae, the INT8 ConvRot VAE decodes when the models directory has it, and the FP16 one otherwise.
+    let path = match options.get("video-vae") {
+        Some(path) => (*path).to_owned(),
+        None => {
+            let int8_path = option_path(&options, "video-vae", VIDEO_VAE_INT8_FILE)?;
+            if Path::new(&int8_path).exists() { int8_path } else { option_path(&options, "video-vae", VIDEO_VAE_FILE)? }
+        }
+    };
     let pixels = CudaVideoDecoder::load(&SafeTensors::open(Path::new(&path))?, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
         .decode(&video, false)?
         .pixels;
-    println!("decoded the video in {:.1} s", started.elapsed().as_secs_f64());
+    println!("decoded the video with {path} in {:.1} s", started.elapsed().as_secs_f64());
     let mut writer = BufWriter::new(File::create(&video_path)?);
     write_y4m(&mut writer, &pixels, FPS)?;
     writer.flush()?;
@@ -588,6 +597,9 @@ const MODELS_VARIABLE: &str = "MMH3_MODELS";
 const DIT_FILE: &str = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
 #[cfg(feature = "cuda")]
 const VIDEO_VAE_FILE: &str = "vae/minimax_h3_video_vae_fp16.safetensors";
+/// The faster INT8 ConvRot video VAE, which generate prefers when the models directory has it.
+#[cfg(feature = "cuda")]
+const VIDEO_VAE_INT8_FILE: &str = "vae/minimax_h3_video_vae_int8_convrot.safetensors";
 #[cfg(feature = "cuda")]
 const AUDIO_VAE_FILE: &str = "vae/minimax_h3_audio_vae_fp32.safetensors";
 #[cfg(feature = "cuda")]

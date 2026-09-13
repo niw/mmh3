@@ -23,7 +23,8 @@ It writes up to three files into the output directory:
 - decode.safetensors: video pixels in [0, 1] and the stereo waveform decoded from the final latents, before
   ComfyUI's audio loudness normalization. The waveform comes from ComfyUI's default audio VAE setup as "audio" and
   from strict FP32, with PyTorch's TF32 convolutions turned off, as "audio_float32". --decode-only rewrites this file
-  from an existing dit.safetensors without sampling again.
+  from an existing dit.safetensors without sampling again, and --video-vae picks another video VAE from the models
+  directory, such as vae/minimax_h3_video_vae_int8_convrot.safetensors.
 """
 
 import argparse
@@ -72,6 +73,7 @@ def main():
     parser.add_argument("--block-row-stride", type=int, default=1, help="keep every n-th token of block outputs")
     parser.add_argument("--decode", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--decode-only", action="store_true")
+    parser.add_argument("--video-vae", default=VIDEO_VAE, help="video VAE file in the models directory")
     parser.add_argument("--compute-dtype", choices=["bfloat16", "float32"], default="bfloat16")
     parser.add_argument("--lora", help="LoRA file in models/loras applied to the DiT")
     parser.add_argument("--lora-strength", type=float, default=1.0)
@@ -235,10 +237,11 @@ def decode(arguments, models, device, video, audio, metadata):
     started = time.time()
     decoded = {}
     with torch.inference_mode():
-        video_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(os.path.join(models, VIDEO_VAE)))
+        video_vae = comfy.sd.VAE(sd=comfy.utils.load_torch_file(os.path.join(models, arguments.video_vae)))
         model_management.load_models_gpu([video_vae.patcher], force_full_load=True)
         pixels = video_vae.first_stage_model.decode(video.to(device=device, dtype=video_vae.vae_dtype))
         decoded["video"] = pixels.float().cpu().contiguous()
+        print(f"decode: video with {arguments.video_vae} in {video_vae.vae_dtype}", flush=True)
         del video_vae
         model_management.unload_all_models()
         audio_weights = comfy.utils.load_torch_file(os.path.join(models, AUDIO_VAE))

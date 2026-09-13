@@ -1,6 +1,6 @@
 //! Pieces shared by the model runners: errors, checkpoint tensors on the device and cuBLASLt linear layers.
 
-use crate::gemm::{AdapterPointers, int8_bf16_pointers, rotate_quantize_pointers};
+use crate::gemm::{AdapterPointers, Int8Output, int8_pointers, rotate_quantize_pointers};
 use crate::loader::{LoadError, Uploader};
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::json;
@@ -138,13 +138,13 @@ impl DeviceTensors {
                         Some((low_rank, scratch)) if low_rank.rank % 64 == 0 => Some(low_rank.project_down(input, rows, scratch)?),
                         _ => None,
                     };
-                    rotate_quantize_pointers(input, quantized.pointer(), activation_scales.pointer(), rows, features)?;
-                    int8_bf16_pointers(
+                    rotate_quantize_pointers(input, false, quantized.pointer(), activation_scales.pointer(), rows, features)?;
+                    int8_pointers(
                         quantized.pointer(),
                         weight.buffer.pointer(),
                         activation_scales.pointer(),
                         weight_scales.buffer.pointer(),
-                        output,
+                        Int8Output::bf16(output),
                         rows,
                         outputs,
                         features,

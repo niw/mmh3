@@ -39,8 +39,8 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 
 - The DiT deviates from ComfyUI's default BF16 run by less than ComfyUI's own BF16 and FP32 runs
   deviate from each other.
-- The video VAE decoder matches ComfyUI's decode at 65 dB PSNR, and the audio VAE decoder matches a
-  strict FP32 decode at 108 dB SNR.
+- The video VAE decoder matches ComfyUI's FP16 decode at 65 dB PSNR, and the audio VAE decoder
+  matches a strict FP32 decode at 108 dB SNR.
 - The tokenizer gives the same token ids as Hugging Face tokenizers.
 - Sol-Attn is an approximation by design, and mmh3's differs from dense attention as much as
   ComfyUI's does.
@@ -52,6 +52,7 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - Sol-Attn, a training-free block-sparse attention (arXiv:2607.24027), for the long video sequences.
 - LoRAs applied at run time on top of the INT8 weights, exactly, including the
   [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo) for 4-step generation.
+- The video VAE decoder with FP16 weights or with the INT8 ConvRot weights of its transformer.
 - The official per-stream Euler schedules for video and audio.
 - Weights stream from disk to the GPU through direct reads into pinned buffers, without filling the
   page cache.
@@ -94,10 +95,20 @@ hf download MiniMaxAI/MiniMax-H3 tokenizer/tokenizer.json --local-dir models
 hf download lightx2v/Minimax-h3-Turbo \
   minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
   --local-dir models/loras
+
+# Optional, a faster video VAE decoder.
+hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
+  --local-dir models/vae
 ```
 
 Pass the directory with `--models DIR` or set `MMH3_MODELS`. Flags such as `--dit`,
 `--text-encoder`, `--video-vae`, `--audio-vae` and `--tokenizer` point at individual files instead.
+
+When the models directory has `vae/minimax_h3_video_vae_int8_convrot.safetensors`, the video VAE
+with INT8 ConvRot weights in its transformer from Kijai/MiniMax-H3-experimental, `generate` decodes
+with it instead of the FP16 VAE. It is faster, and its pixels are about 51 dB PSNR from the FP16
+decode, as far as ComfyUI's own INT8 and FP16 decodes are from each other. `--video-vae` picks
+either file.
 
 ## Usage
 

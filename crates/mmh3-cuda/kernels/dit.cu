@@ -208,10 +208,18 @@ __device__ __forceinline__ void rotate_group(float (&values)[8], int lane) {
     }
 }
 
-// Rotates each 256 group of a row, then quantizes the row to INT8 with scale = max |x| / 127, rounding half to even.
-// One block handles one row, and warp w rotates groups w, w + warps and so on.
-template <int GROUPS_PER_WARP>
-__global__ void rotate_quantize_kernel(const __nv_bfloat16* __restrict__ input, int8_t* __restrict__ output,
+__device__ __forceinline__ float2 to_float2(__nv_bfloat162 pair) {
+    return __bfloat1622float2(pair);
+}
+
+__device__ __forceinline__ float2 to_float2(__half2 pair) {
+    return __half22float2(pair);
+}
+
+// Rotates each 256 group of a row of BF16 or FP16 values, then quantizes the row to INT8 with scale = max |x| / 127,
+// rounding half to even. One block handles one row, and warp w rotates groups w, w + warps and so on.
+template <int GROUPS_PER_WARP, typename Pair>
+__global__ void rotate_quantize_kernel(const Pair* __restrict__ input, int8_t* __restrict__ output,
                                        float* __restrict__ scales, int columns) {
     __shared__ float warp_maxima[32];
     const int lane = threadIdx.x % 32;
@@ -226,11 +234,11 @@ __global__ void rotate_quantize_kernel(const __nv_bfloat16* __restrict__ input, 
     for (int slot = 0; slot < GROUPS_PER_WARP; slot++) {
         const int group = warp + slot * warps;
         if (group < groups) {
-            const uint4 packed = *reinterpret_cast<const uint4*>(input + row_offset + group * CONVROT_GROUP + lane * 8);
-            const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&packed);
+            const uint4 packed = *reinterpret_cast<const uint4*>(input + (row_offset + group * CONVROT_GROUP + lane * 8) / 2);
+            const Pair* pairs = reinterpret_cast<const Pair*>(&packed);
 #pragma unroll
             for (int pair = 0; pair < 4; pair++) {
-                const float2 value = __bfloat1622float2(pairs[pair]);
+                const float2 value = to_float2(pairs[pair]);
                 values[slot][pair * 2] = value.x;
                 values[slot][pair * 2 + 1] = value.y;
             }
@@ -344,8 +352,11 @@ extern "C" int mmh3_swiglu(const __nv_bfloat16* input, __nv_bfloat16* output, in
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int mmh3_rotate_quantize(const __nv_bfloat16* input, int8_t* output, float* scales, int tokens, int columns,
-                                    cudaStream_t stream) {
+namespace {
+
+template <typename Pair>
+int launch_rotate_quantize(const Pair* input, int8_t* output, float* scales, int tokens, int columns,
+                           cudaStream_t stream) {
     const int groups = columns / CONVROT_GROUP;
     const int groups_per_warp = (groups + 31) / 32;
     if (columns % CONVROT_GROUP != 0 || groups == 0 || groups_per_warp > MAX_GROUPS_PER_WARP) {
@@ -367,6 +378,16 @@ extern "C" int mmh3_rotate_quantize(const __nv_bfloat16* input, int8_t* output, 
             break;
     }
     return static_cast<int>(cudaGetLastError());
+}
+
+}  // namespace
+
+extern "C" int mmh3_rotate_quantize(const void* input, int input_is_f16, int8_t* output, float* scales, int tokens,
+                                    int columns, cudaStream_t stream) {
+    if (input_is_f16) {
+        return launch_rotate_quantize(static_cast<const __half2*>(input), output, scales, tokens, columns, stream);
+    }
+    return launch_rotate_quantize(static_cast<const __nv_bfloat162*>(input), output, scales, tokens, columns, stream);
 }
 
 extern "C" int mmh3_modulation(const float* time_embedding, const __half* weight, const __half* bias, float* output,

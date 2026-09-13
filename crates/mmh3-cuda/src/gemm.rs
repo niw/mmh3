@@ -7,6 +7,7 @@ use std::ptr;
 unsafe extern "C" {
     fn mmh3_rotate_quantize(
         input: *const c_void,
+        input_is_f16: c_int,
         output: *mut c_void,
         scales: *mut c_void,
         tokens: c_int,
@@ -14,13 +15,15 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_int8_gemm_config_count() -> c_int;
-    fn mmh3_int8_gemm_bf16_adapter(
+    fn mmh3_int8_gemm(
         config: c_int,
         activations: *const c_void,
         weights: *const c_void,
         activation_scales: *const c_void,
         weight_scales: *const c_void,
+        bias: *const c_void,
         output: *mut c_void,
+        output_is_f16: c_int,
         m: c_int,
         n: c_int,
         k: c_int,
@@ -32,19 +35,22 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Raw form of `rotate_quantize`.
+/// Raw form of `rotate_quantize`, for BF16 or FP16 input.
 ///
 /// # Safety
-/// `input` must hold `rows × columns` BF16 values, `output` `rows × columns` bytes and `scales` `rows` f32 values.
+/// `input` must hold `rows × columns` 16-bit values, `output` `rows × columns` bytes and `scales` `rows` f32 values.
 pub(crate) unsafe fn rotate_quantize_pointers(
     input: *const c_void,
+    input_is_f16: bool,
     output: *mut c_void,
     scales: *mut c_void,
     rows: usize,
     columns: usize,
 ) -> Result<(), CudaError> {
     // SAFETY: the caller guarantees the extents.
-    check(unsafe { mmh3_rotate_quantize(input, output, scales, rows as c_int, columns as c_int, ptr::null_mut()) })
+    check(unsafe {
+        mmh3_rotate_quantize(input, input_is_f16 as c_int, output, scales, rows as c_int, columns as c_int, ptr::null_mut())
+    })
 }
 
 /// Prepares the activations of an INT8 ConvRot layer: rotates every group of 256 columns of the BF16 rows by the
@@ -61,7 +67,7 @@ pub fn rotate_quantize(
     assert!(output.bytes() >= rows * columns, "output is smaller than rows × columns");
     assert!(scales.bytes() >= rows * 4, "scales are smaller than rows");
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
-    unsafe { rotate_quantize_pointers(input.pointer(), output.pointer(), scales.pointer(), rows, columns) }
+    unsafe { rotate_quantize_pointers(input.pointer(), false, output.pointer(), scales.pointer(), rows, columns) }
 }
 
 /// Number of tile configurations the INT8 GEMM kernel is compiled for.
@@ -88,18 +94,32 @@ pub(crate) struct AdapterPointers {
     pub(crate) scale: f32,
 }
 
+/// Where the INT8 GEMM writes its result: BF16 or FP16 `[m, n]`, after adding an optional f32 bias `[n]`.
+#[derive(Clone, Copy)]
+pub(crate) struct Int8Output {
+    pub(crate) pointer: *mut c_void,
+    pub(crate) f16: bool,
+    pub(crate) bias: *const c_void,
+}
+
+impl Int8Output {
+    pub(crate) fn bf16(pointer: *mut c_void) -> Self {
+        Int8Output { pointer, f16: false, bias: ptr::null() }
+    }
+}
+
 /// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows, such as prompts,
 /// and 256 × 128 otherwise.
 ///
 /// # Safety
 /// The pointers must cover the extents described for `int8_bf16`.
 #[allow(clippy::too_many_arguments)]
-pub(crate) unsafe fn int8_bf16_pointers(
+pub(crate) unsafe fn int8_pointers(
     activations: *const c_void,
     weights: *const c_void,
     activation_scales: *const c_void,
     weight_scales: *const c_void,
-    output: *mut c_void,
+    output: Int8Output,
     m: usize,
     n: usize,
     k: usize,
@@ -107,19 +127,19 @@ pub(crate) unsafe fn int8_bf16_pointers(
 ) -> Result<(), CudaError> {
     let config = if m < 256 && n % 256 == 0 { 1 } else { 0 };
     // SAFETY: the caller guarantees the extents.
-    unsafe { int8_bf16_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k, adapter) }
+    unsafe { int8_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k, adapter) }
 }
 
 /// # Safety
 /// The pointers must cover the extents described for `int8_bf16`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn int8_bf16_config(
+unsafe fn int8_config(
     config: usize,
     activations: *const c_void,
     weights: *const c_void,
     activation_scales: *const c_void,
     weight_scales: *const c_void,
-    output: *mut c_void,
+    output: Int8Output,
     m: usize,
     n: usize,
     k: usize,
@@ -128,13 +148,15 @@ unsafe fn int8_bf16_config(
     let adapter = adapter.unwrap_or(AdapterPointers { down: ptr::null(), up: ptr::null(), rank: 0, scale: 0.0 });
     // SAFETY: the caller guarantees the extents.
     check(unsafe {
-        mmh3_int8_gemm_bf16_adapter(
+        mmh3_int8_gemm(
             config as c_int,
             activations,
             weights,
             activation_scales,
             weight_scales,
-            output,
+            output.bias,
+            output.pointer,
+            output.f16 as c_int,
             m as c_int,
             n as c_int,
             k as c_int,
@@ -147,18 +169,26 @@ unsafe fn int8_bf16_config(
     })
 }
 
-/// output[m, n] = bf16(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] · weight_scales[n] + the adapter).
+/// Where `int8` writes its result, `[m, n]` in BF16 or FP16, after adding an optional f32 bias `[n]`.
+pub struct Output<'a> {
+    pub buffer: &'a mut DeviceBuffer,
+    pub f16: bool,
+    pub bias: Option<&'a DeviceBuffer>,
+}
+
+/// output[m, n] = round(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] · weight_scales[n] + the adapter
+/// + the bias).
 ///
 /// Activations and weights are row-major INT8 with K contiguous, scales are f32. K must be a multiple of 128 and N
 /// a multiple of the config's tile width, 128 for config 0 and 256 for config 1.
 #[allow(clippy::too_many_arguments)]
-pub fn int8_bf16(
+pub fn int8(
     config: usize,
     activations: &DeviceBuffer,
     weights: &DeviceBuffer,
     activation_scales: &DeviceBuffer,
     weight_scales: &DeviceBuffer,
-    output: &mut DeviceBuffer,
+    output: Output,
     m: usize,
     n: usize,
     k: usize,
@@ -168,7 +198,10 @@ pub fn int8_bf16(
     assert!(weights.bytes() >= n * k, "weights are smaller than n × k");
     assert!(activation_scales.bytes() >= m * 4, "activation scales are smaller than m");
     assert!(weight_scales.bytes() >= n * 4, "weight scales are smaller than n");
-    assert!(output.bytes() >= m * n * 2, "output is smaller than m × n");
+    assert!(output.buffer.bytes() >= m * n * 2, "output is smaller than m × n");
+    if let Some(bias) = output.bias {
+        assert!(bias.bytes() >= n * 4, "bias is smaller than n");
+    }
     if let Some(adapter) = adapter {
         assert!(adapter.down.bytes() >= m * adapter.rank * 2, "adapter down activations are smaller than m × rank");
         assert!(adapter.up.bytes() >= n * adapter.rank * 2, "adapter up weights are smaller than n × rank");
@@ -179,19 +212,13 @@ pub fn int8_bf16(
         rank: adapter.rank,
         scale: adapter.scale,
     });
+    let output = Int8Output {
+        pointer: output.buffer.pointer(),
+        f16: output.f16,
+        bias: output.bias.map_or(ptr::null(), |bias| bias.pointer().cast_const()),
+    };
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
     unsafe {
-        int8_bf16_config(
-            config,
-            activations.pointer(),
-            weights.pointer(),
-            activation_scales.pointer(),
-            weight_scales.pointer(),
-            output.pointer(),
-            m,
-            n,
-            k,
-            adapter,
-        )
+        int8_config(config, activations.pointer(), weights.pointer(), activation_scales.pointer(), weight_scales.pointer(), output, m, n, k, adapter)
     }
 }
