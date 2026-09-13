@@ -20,6 +20,7 @@ use mmh3_core::dit::timestep::{MODALITY_COUNT, StepTimesteps};
 use mmh3_core::numeric::f32_to_bf16;
 use mmh3_core::safetensors::{DType, SafeTensors};
 use mmh3_core::tensor::Tensor;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -105,8 +106,18 @@ const MLP_GATE_CHUNK: usize = 5;
 /// Final layer modulation vectors per row: shift and scale.
 const FINAL_CHUNKS: usize = 2;
 
+/// What a workspace is sized for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkspaceShape {
+    tokens: usize,
+    /// Rows of the gate and up projections, which INT8 MLPs need only for the text tokens as they write SwiGLU directly.
+    expanded_rows: usize,
+    adapter_rank: usize,
+}
+
 /// Buffers sized for one sequence length.
 struct Workspace {
+    shape: WorkspaceShape,
     attention_quantized: Option<QuantizedWorkspace>,
     residual: DeviceBuffer,
     normalized: DeviceBuffer,
@@ -123,11 +134,12 @@ struct Workspace {
 }
 
 impl Workspace {
-    /// `expanded_rows` rows of the gate and up projections are enough when the INT8 MLPs write SwiGLU directly.
-    fn new(config: &DitConfig, tokens: usize, expanded_rows: usize, adapter_rank: usize, quantized_attention: bool) -> Result<Self, CudaError> {
+    fn new(config: &DitConfig, shape: WorkspaceShape) -> Result<Self, CudaError> {
         let (hidden, inner, ffn) = (config.hidden, config.inner(), config.ffn);
+        let WorkspaceShape { tokens, expanded_rows, adapter_rank } = shape;
         Ok(Workspace {
-            attention_quantized: if quantized_attention { Some(QuantizedWorkspace::new(tokens, config.heads)?) } else { None },
+            shape,
+            attention_quantized: None,
             residual: DeviceBuffer::zeroed(tokens * hidden * 4)?,
             normalized: DeviceBuffer::new(tokens * hidden * 2)?,
             projected: DeviceBuffer::new(tokens * hidden * 4)?,
@@ -141,6 +153,14 @@ impl Workspace {
             adapter: DeviceBuffer::new(tokens * adapter_rank.max(1) * 2)?,
         })
     }
+}
+
+/// Buffers that one call leaves to the next. The steps of a generation share one sequence length, so they allocate
+/// these gigabytes once, which saves about 0.3 s per step at 768p.
+#[derive(Default)]
+struct ForwardBuffers {
+    workspace: Option<Workspace>,
+    sparse: Option<(AttentionPrecision, SparseWorkspace)>,
 }
 
 /// Outputs of one call and the states captured along the way.
@@ -172,6 +192,7 @@ pub struct CudaDit {
     adapters: HashMap<String, LowRank>,
     adaln_table: Tensor,
     inverse_frequencies: Vec<f32>,
+    buffers: RefCell<ForwardBuffers>,
 }
 
 impl CudaDit {
@@ -212,6 +233,7 @@ impl CudaDit {
             adapters: HashMap::new(),
             adaln_table: host_tensor(file, &format!("{prefix}adaln_t_table"))?,
             inverse_frequencies: host_tensor(file, &format!("{prefix}rope.inv_freq"))?.data,
+            buffers: RefCell::default(),
         })
     }
 
@@ -560,9 +582,34 @@ impl CudaDit {
         let adapter_rank = self.adapters.values().map(|adapter| adapter.rank).max().unwrap_or(0);
         // The refiner's MLPs still write the gate and up projections for the text tokens.
         let fused = (0..config.layers).all(|layer| self.tensors.is_int8(&format!("blocks.{layer}.mlp.fc1")));
-        let use_sparse = sparse.is_some_and(|settings| tokens >= settings.min_tokens);
-        let quantized_dense = self.attention_precision == AttentionPrecision::Int8Fp8 && !use_sparse;
-        let workspace = Workspace::new(config, tokens, if fused { text_tokens } else { tokens }, adapter_rank, quantized_dense)?;
+        let sparse_tau = sparse.filter(|settings| tokens >= settings.min_tokens).map(|settings| settings.tau);
+        let quantized_dense = self.attention_precision == AttentionPrecision::Int8Fp8 && sparse_tau.is_none();
+
+        let mut buffers = self.buffers.borrow_mut();
+        let ForwardBuffers { workspace: cached_workspace, sparse: cached_sparse } = &mut *buffers;
+        let shape = WorkspaceShape { tokens, expanded_rows: if fused { text_tokens } else { tokens }, adapter_rank };
+        let workspace = match cached_workspace.take() {
+            Some(mut workspace) if workspace.shape == shape => {
+                workspace.residual.fill_f32(0.0)?;
+                workspace
+            }
+            _ => Workspace::new(config, shape)?,
+        };
+        let workspace = cached_workspace.insert(workspace);
+        match (quantized_dense, workspace.attention_quantized.is_some()) {
+            (true, false) => workspace.attention_quantized = Some(QuantizedWorkspace::new(tokens, config.heads)?),
+            (false, true) => workspace.attention_quantized = None,
+            _ => {}
+        }
+        let workspace = &*workspace;
+        match sparse_tau {
+            Some(_) if cached_sparse.as_ref().is_some_and(|(precision, sparse)| *precision == self.attention_precision && sparse.tokens() == tokens) => {}
+            Some(_) => {
+                *cached_sparse = None;
+                *cached_sparse = Some((self.attention_precision, SparseWorkspace::with_precision(tokens, config.heads, self.attention_precision)?));
+            }
+            None => *cached_sparse = None,
+        }
 
         let block_rows = i32_buffer(&layout.modulation_rows(&timesteps))?;
         let final_rows: Vec<usize> =
@@ -571,21 +618,17 @@ impl CudaDit {
         let angles = DeviceBuffer::from_f32(&layout.rope_angles(&self.inverse_frequencies))?;
         let time_embedding = DeviceBuffer::from_f32(&timesteps.time_embedding(&self.adaln_table))?;
 
-        self.refine_text(&inputs.context, &workspace)?;
+        self.refine_text(&inputs.context, workspace)?;
         let text_states = workspace.residual.to_f32_range(0, text_tokens * hidden)?;
 
         let audio = layout.segment(SegmentKind::Audio);
         let video = layout.segment(SegmentKind::Video);
         let audio_rows = DeviceBuffer::from_f32(&pack_audio(&inputs.audio))?;
         let video_rows = DeviceBuffer::from_f32(&patchify_video(&inputs.video))?;
-        self.linear("audio_patch_proj", audio_rows.pointer(), workspace.residual.pointer_at(audio.start * hidden * 4), audio.len(), &workspace)?;
-        self.linear("video_patch_proj", video_rows.pointer(), workspace.residual.pointer_at(video.start * hidden * 4), video.len(), &workspace)?;
+        self.linear("audio_patch_proj", audio_rows.pointer(), workspace.residual.pointer_at(audio.start * hidden * 4), audio.len(), workspace)?;
+        self.linear("video_patch_proj", video_rows.pointer(), workspace.residual.pointer_at(video.start * hidden * 4), video.len(), workspace)?;
 
-        let sparse_workspace = match sparse {
-            Some(settings) if tokens >= settings.min_tokens => Some((SparseWorkspace::with_precision(tokens, config.heads, self.attention_precision)?, settings.tau)),
-            _ => None,
-        };
-        let sparse_pass = sparse_workspace.as_ref().map(|(workspace, tau)| SparsePass { workspace, tau: *tau, sinks: SparseSinks::for_layout(&layout) });
+        let sparse_pass = sparse_tau.zip(cached_sparse.as_ref()).map(|(tau, (_, workspace))| SparsePass { workspace, tau, sinks: SparseSinks::for_layout(&layout) });
         let mut routed = 0.0;
         // Each block leaves its gated MLP output to the next, so the tables of two blocks are alive at a time.
         let modulations = [
@@ -598,19 +641,19 @@ impl CudaDit {
             let prefix = format!("blocks.{layer}");
             let modulation = &modulations[layer % 2];
             self.modulation(&format!("{prefix}.adaln_proj.linear"), &time_embedding, steps, modulation)?;
-            self.transformer_block(&prefix, &workspace, tokens, Some(&angles), Some((modulation, &block_rows)), pending, sparse_pass.as_ref())?;
+            self.transformer_block(&prefix, workspace, tokens, Some(&angles), Some((modulation, &block_rows)), pending, sparse_pass.as_ref())?;
             pending = Some(modulation);
             if let Some(pass) = &sparse_pass {
                 routed += pass.workspace.routed_fraction()?;
             }
             if capture.contains(&layer) {
-                self.add_pending(&workspace, tokens, modulation, &block_rows)?;
+                self.add_pending(workspace, tokens, modulation, &block_rows)?;
                 pending = None;
                 blocks.push((layer, workspace.residual.to_f32()?));
             }
         }
         if let Some(modulation) = pending {
-            self.add_pending(&workspace, tokens, modulation, &block_rows)?;
+            self.add_pending(workspace, tokens, modulation, &block_rows)?;
         }
 
         let final_modulation = DeviceBuffer::new(steps * FINAL_CHUNKS * hidden * 4)?;
@@ -625,7 +668,7 @@ impl CudaDit {
         )?;
         let project = |segment: mmh3_core::dit::layout::Segment, head: &str, width: usize| -> Result<Vec<f32>, Error> {
             let output = DeviceBuffer::new(segment.len() * width * 4)?;
-            self.linear(head, workspace.projected.pointer_at(segment.start * hidden * 4), output.pointer(), segment.len(), &workspace)?;
+            self.linear(head, workspace.projected.pointer_at(segment.start * hidden * 4), output.pointer(), segment.len(), workspace)?;
             Ok(output.to_f32()?)
         };
         let video_velocity = project(video, "final_layer.video_out", config.video_patch_features())?;
