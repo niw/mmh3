@@ -22,15 +22,16 @@ On a DGX Spark at 1344×768 for 124 frames (5.2 s, 37,729 tokens):
 
 | Stage | mmh3 | ComfyUI |
 | --- | ---: | ---: |
-| DiT step, dense attention | 42.3 s | 49.7 s |
-| DiT step, Sol-Attn | 22.7 s | 23.0 s |
-| Video VAE decode | 31.4 s | 59.2 s |
+| DiT step, dense attention | 38.2 s | 49.7 s |
+| DiT step, Sol-Attn | 16.9 s | 23.0 s |
+| Video VAE decode, FP16 VAE | 30.9 s | 59.2 s |
+| Video VAE decode, INT8 ConvRot VAE | 20.1 s | |
 | Audio VAE decode | 0.3 s | |
 | Text encoder load and encode | 3.4 s | |
-| DiT load | 2.4 s | |
+| DiT load | 2.5 s | |
 
 With the 4-step Turbo LoRA and Sol-Attn, a whole generation from the prompt to the video and audio
-files takes about three minutes.
+files takes about 2 minutes with the INT8 video VAE.
 
 ## Accuracy
 
@@ -48,10 +49,12 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 ## Features
 
 - INT8 ConvRot linear layers (activations rotated by a Hadamard transform and quantized per row)
-  with a dedicated INT8 GEMM, FlashAttention-2 style attention, and an FP32 residual stream.
+  with a dedicated INT8 GEMM that loads its operands with TMA, FlashAttention-2 style attention,
+  and an FP32 residual stream.
 - Sol-Attn, a training-free block-sparse attention (arXiv:2607.24027), for the long video sequences.
-- LoRAs applied at run time on top of the INT8 weights, exactly, including the
-  [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo) for 4-step generation.
+- LoRAs applied at run time on top of the INT8 weights without requantizing them, added inside the
+  INT8 GEMM, including the [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo)
+  for 4-step generation.
 - The video VAE decoder with FP16 weights or with the INT8 ConvRot weights of its transformer.
 - The official per-stream Euler schedules for video and audio.
 - Weights stream from disk to the GPU through direct reads into pinned buffers, without filling the
