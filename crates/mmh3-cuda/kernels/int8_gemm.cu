@@ -6,14 +6,16 @@
 #include <cuda_runtime.h>
 
 // Scaled INT8 GEMM for the DiT and text encoder linear layers:
-//   output[m, n] = bf16(sum_k activations[m, k] * weights[n, k] * activation_scales[m] * weight_scales[n])
-// Activations and weights are row-major with K contiguous. N must be a multiple of the block width and K a multiple
-// of 128, which every H3 linear layer satisfies. Only M may be ragged.
+//   output[m, n] = bf16(sum_k activations[m, k] * weights[n, k] * activation_scales[m] * weight_scales[n]
+//                       + adapter_scale * sum_r adapter_down[m, r] * adapter_up[n, r])
+// where the low-rank adapter term is optional. Activations and weights are row-major with K contiguous. N must be a
+// multiple of the block width and K a multiple of 128, which every H3 linear layer satisfies. Only M may be ragged.
 //
 // NOTE: A persistent grid of one CTA per SM walks the output tiles. TMA copies 128-byte K slices of both operands
 // into a two-stage ring with the 128B swizzle, and eight warps multiply their parts of the tile with mma.sync. There
 // is no producer warp because a ninth warp would limit every warp to 168 registers. Instead, the warp that releases
-// a stage last issues the copies that refill it.
+// a stage last issues the copies that refill it. An adapter adds stages of 64 ranks of its BF16 operands after the K
+// blocks of each tile, multiplied with BF16 MMAs into the scaled FP32 result before the single rounding to BF16.
 
 namespace {
 
@@ -92,11 +94,34 @@ struct Int8GemmConfig {
     static_assert(warp_m % 16 == 0 && warp_n % 32 == 0, "warp tiles must hold whole groups of four MMA tiles");
 };
 
+__device__ __forceinline__ void mma(int32_t (&accumulator)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    mma_s8(accumulator, a, b0, b1);
+}
+
+__device__ __forceinline__ void mma(float (&accumulator)[4], const uint32_t (&a)[4], uint32_t b0, uint32_t b1) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0, %1, %2, %3}, {%4, %5, %6, %7}, {%8, %9}, "
+        "{%0, %1, %2, %3};\n"
+        : "+f"(accumulator[0]), "+f"(accumulator[1]), "+f"(accumulator[2]), "+f"(accumulator[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+
+// Operands described to TMA. The adapter maps cover the low-rank adapter's down activations [m, rank] and up weights
+// [n, rank] in BF16 and repeat the INT8 maps when there is no adapter.
+struct TensorMaps {
+    CUtensorMap activations;
+    CUtensorMap weights;
+    CUtensorMap adapter_down;
+    CUtensorMap adapter_up;
+};
+
 struct TileGrid {
     int tiles_m;
     int tiles_n;
     int tiles;
     int k_blocks;
+    // K blocks followed by adapter blocks of 64 ranks, one stage each.
+    int blocks_per_tile;
 
     // Tiles go down GROUP_M rows of tiles before moving right, so the CTAs in flight share rows of activations and
     // columns of weights in L2.
@@ -109,27 +134,91 @@ struct TileGrid {
     }
 };
 
-// Fills a stage with the K block of this CTA's `sequence`-th K block over all of its tiles.
+// Fills a stage with this CTA's `sequence`-th block over all of its tiles: a K block of the INT8 operands, or a
+// block of 64 ranks of the adapter operands, which take the same 128 bytes per row.
 template <typename Config>
-__device__ void fill_stage(const TileGrid& grid, int sequence, uint32_t stage, uint32_t barrier,
-                           const CUtensorMap* activation_map, const CUtensorMap* weight_map) {
-    const int tile = blockIdx.x + sequence / grid.k_blocks * gridDim.x;
+__device__ void fill_stage(const TileGrid& grid, int sequence, uint32_t stage, uint32_t barrier, const TensorMaps& maps) {
+    const int tile = blockIdx.x + sequence / grid.blocks_per_tile * gridDim.x;
     if (tile >= grid.tiles) {
         return;
     }
-    const int k_offset = sequence % grid.k_blocks * BLOCK_K;
+    const int block = sequence % grid.blocks_per_tile;
     int tile_m, tile_n;
     grid.coordinates(tile, tile_m, tile_n);
     barrier_expect_bytes(barrier, Config::stage_bytes);
-    copy_tile(stage, activation_map, barrier, k_offset, tile_m * Config::block_m);
-    copy_tile(stage + Config::a_bytes, weight_map, barrier, k_offset, tile_n * Config::block_n);
+    if (block < grid.k_blocks) {
+        copy_tile(stage, &maps.activations, barrier, block * BLOCK_K, tile_m * Config::block_m);
+        copy_tile(stage + Config::a_bytes, &maps.weights, barrier, block * BLOCK_K, tile_n * Config::block_n);
+    } else {
+        const int rank = (block - grid.k_blocks) * BLOCK_K / 2;
+        copy_tile(stage, &maps.adapter_down, barrier, rank, tile_m * Config::block_m);
+        copy_tile(stage + Config::a_bytes, &maps.adapter_up, barrier, rank, tile_n * Config::block_n);
+    }
 }
+
+// Multiplies one stage into the warp's accumulators: INT8 m16n8k32 MMAs for int32 accumulators, BF16 m16n8k16 MMAs
+// for float ones. Both read 32 bytes of K per step, so the fragments load the same way.
+template <typename Config, typename Accumulator>
+__device__ __forceinline__ void multiply_stage(Accumulator (&accumulators)[Config::m_tiles][Config::n_tiles][4],
+                                               uint32_t stage_a, int warp_row, int warp_column, int lane) {
+    const uint32_t stage_b = stage_a + Config::a_bytes;
+    const int matrix = lane / 8;
+    const int matrix_row = lane % 8;
+#pragma unroll
+    for (int k_step = 0; k_step < BLOCK_K / 32; k_step++) {
+        uint32_t a_fragments[Config::m_tiles][4];
+        uint32_t b_fragments[Config::n_tiles][2];
+#pragma unroll
+        for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
+            const int row = warp_row + m_tile * 16 + (matrix % 2) * 8 + matrix_row;
+            load_matrix_x4(a_fragments[m_tile], stage_a + swizzled_offset(row, k_step * 2 + matrix / 2));
+        }
+#pragma unroll
+        for (int n_pair = 0; n_pair < Config::n_tiles / 2; n_pair++) {
+            // NOTE: Within each group of 32 weight rows, MMA column 2t + e of n-tile j reads row
+            // 8t + 2((j + t) % 4) + e. Lane t of every quad then holds eight adjacent output columns for a 16-byte
+            // store, and the eight rows of each ldmatrix phase still differ modulo 8.
+            const int n_tile = n_pair * 2 + matrix / 2;
+            const int row_quad_lane = matrix_row / 2;
+            const int row =
+                warp_column + n_tile / 4 * 32 + row_quad_lane * 8 + ((n_tile + row_quad_lane) & 3) * 2 + matrix_row % 2;
+            uint32_t registers[4];
+            load_matrix_x4(registers, stage_b + swizzled_offset(row, k_step * 2 + matrix % 2));
+            b_fragments[n_pair * 2][0] = registers[0];
+            b_fragments[n_pair * 2][1] = registers[1];
+            b_fragments[n_pair * 2 + 1][0] = registers[2];
+            b_fragments[n_pair * 2 + 1][1] = registers[3];
+        }
+#pragma unroll
+        for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
+#pragma unroll
+            for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
+                mma(accumulators[m_tile][n_tile], a_fragments[m_tile], b_fragments[n_tile][0], b_fragments[n_tile][1]);
+            }
+        }
+    }
+}
+
+// Ring position of a warp, shared by the INT8 and adapter blocks.
+struct Ring {
+    int stage = 0;
+    uint32_t phase = 0;
+    int sequence = 0;
+
+    __device__ void advance() {
+        sequence++;
+        if (++stage == STAGES) {
+            stage = 0;
+            phase ^= 1;
+        }
+    }
+};
 
 template <typename Config>
 __global__ void __launch_bounds__(WARPS * 32, 1)
-    int8_gemm_kernel(const __grid_constant__ CUtensorMap activation_map, const __grid_constant__ CUtensorMap weight_map,
-                     const float* __restrict__ activation_scales, const float* __restrict__ weight_scales,
-                     __nv_bfloat16* __restrict__ output, int m, int n, int k) {
+    int8_gemm_kernel(const __grid_constant__ TensorMaps maps, const float* __restrict__ activation_scales,
+                     const float* __restrict__ weight_scales, __nv_bfloat16* __restrict__ output, int m, int n, int k,
+                     int adapter_blocks, float adapter_scale) {
     extern __shared__ __align__(1024) uint8_t shared_memory[];
     const uint32_t shared_base = (shared_address(shared_memory) + 1023) & ~1023u;
     const uint32_t barriers = shared_base + STAGES * Config::stage_bytes;
@@ -140,6 +229,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     grid.tiles_n = n / Config::block_n;
     grid.tiles = grid.tiles_m * grid.tiles_n;
     grid.k_blocks = k / BLOCK_K;
+    grid.blocks_per_tile = grid.k_blocks + adapter_blocks;
 
     if (threadIdx.x == 0) {
         for (int stage = 0; stage < STAGES; stage++) {
@@ -148,8 +238,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         }
         asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
         for (int stage = 0; stage < STAGES; stage++) {
-            fill_stage<Config>(grid, stage, shared_base + stage * Config::stage_bytes, barriers + stage * 8,
-                               &activation_map, &weight_map);
+            fill_stage<Config>(grid, stage, shared_base + stage * Config::stage_bytes, barriers + stage * 8, maps);
         }
     }
     __syncthreads();
@@ -158,16 +247,29 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int warp = threadIdx.x / 32;
     const int warp_row = warp / Config::warps_n * Config::warp_m;
     const int warp_column = warp % Config::warps_n * Config::warp_n;
-    // Lane-dependent parts of the ldmatrix row addresses.
-    const int matrix = lane / 8;
-    const int matrix_row = lane % 8;
     // Position of the lane in the MMA accumulator layout.
     const int group_id = lane / 4;
     const int quad_lane = lane % 4;
 
-    int stage = 0;
-    uint32_t phase = 0;
-    int sequence = 0;
+    // Waits for the ring's current stage, multiplies it and releases it. The warp that releases it last refills it.
+    Ring ring;
+    auto consume = [&](auto& accumulators) {
+        const uint32_t barrier = barriers + ring.stage * 8;
+        barrier_wait(barrier, ring.phase);
+        const uint32_t stage_a = shared_base + ring.stage * Config::stage_bytes;
+        multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane);
+        __syncwarp();
+        if (lane == 0) {
+            __threadfence_block();
+            if (atomicAdd(release_counts + ring.stage, 1) == WARPS - 1) {
+                release_counts[ring.stage] = 0;
+                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                fill_stage<Config>(grid, ring.sequence + STAGES, stage_a, barrier, maps);
+            }
+        }
+        ring.advance();
+    };
+
     for (int tile = blockIdx.x; tile < grid.tiles; tile += gridDim.x) {
         int tile_m, tile_n;
         grid.coordinates(tile, tile_m, tile_n);
@@ -182,61 +284,13 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
                 }
             }
         }
-
-        for (int k_block = 0; k_block < grid.k_blocks; k_block++, sequence++) {
-            const uint32_t barrier = barriers + stage * 8;
-            barrier_wait(barrier, phase);
-            const uint32_t stage_a = shared_base + stage * Config::stage_bytes;
-            const uint32_t stage_b = stage_a + Config::a_bytes;
-#pragma unroll
-            for (int k_step = 0; k_step < BLOCK_K / 32; k_step++) {
-                uint32_t a_fragments[Config::m_tiles][4];
-                uint32_t b_fragments[Config::n_tiles][2];
-#pragma unroll
-                for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-                    const int row = warp_row + m_tile * 16 + (matrix % 2) * 8 + matrix_row;
-                    load_matrix_x4(a_fragments[m_tile], stage_a + swizzled_offset(row, k_step * 2 + matrix / 2));
-                }
-#pragma unroll
-                for (int n_pair = 0; n_pair < Config::n_tiles / 2; n_pair++) {
-                    // NOTE: Within each group of 32 weight rows, MMA column 2t + e of n-tile j reads row
-                    // 8t + 2((j + t) % 4) + e. Lane t of every quad then holds eight adjacent output columns for a
-                    // 16-byte store, and the eight rows of each ldmatrix phase still differ modulo 8.
-                    const int n_tile = n_pair * 2 + matrix / 2;
-                    const int row_quad_lane = matrix_row / 2;
-                    const int row = warp_column + n_tile / 4 * 32 + row_quad_lane * 8 +
-                                    ((n_tile + row_quad_lane) & 3) * 2 + matrix_row % 2;
-                    uint32_t registers[4];
-                    load_matrix_x4(registers, stage_b + swizzled_offset(row, k_step * 2 + matrix % 2));
-                    b_fragments[n_pair * 2][0] = registers[0];
-                    b_fragments[n_pair * 2][1] = registers[1];
-                    b_fragments[n_pair * 2 + 1][0] = registers[2];
-                    b_fragments[n_pair * 2 + 1][1] = registers[3];
-                }
-#pragma unroll
-                for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
-                    for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
-                        mma_s8(accumulators[m_tile][n_tile], a_fragments[m_tile], b_fragments[n_tile][0],
-                               b_fragments[n_tile][1]);
-                    }
-                }
-            }
-            __syncwarp();
-            if (lane == 0) {
-                __threadfence_block();
-                if (atomicAdd(release_counts + stage, 1) == WARPS - 1) {
-                    release_counts[stage] = 0;
-                    asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
-                    fill_stage<Config>(grid, sequence + STAGES, stage_a, barrier, &activation_map, &weight_map);
-                }
-            }
-            if (++stage == STAGES) {
-                stage = 0;
-                phase ^= 1;
-            }
+        for (int k_block = 0; k_block < grid.k_blocks; k_block++) {
+            consume(accumulators);
         }
 
+        // Scale the INT8 products. Slot j of each quad of n-tiles holds output columns 2((j + t) % 4) and the one after
+        // among the lane's eight.
+        float values[Config::m_tiles][Config::n_tiles][4];
         float row_scales[Config::m_tiles][2];
 #pragma unroll
         for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
@@ -249,13 +303,54 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
 #pragma unroll
         for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
             const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
-            // Slot j of the quad holds output columns column + 2((j + t) % 4) and the one after.
-            float2 column_scales[4];
 #pragma unroll
             for (int slot = 0; slot < 4; slot++) {
-                column_scales[slot] =
+                const float2 column_scale =
                     *reinterpret_cast<const float2*>(weight_scales + column + ((slot + quad_lane) & 3) * 2);
+#pragma unroll
+                for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
+#pragma unroll
+                    for (int half = 0; half < 2; half++) {
+                        const int32_t* products = accumulators[m_tile][quad * 4 + slot] + half * 2;
+                        float* scaled = values[m_tile][quad * 4 + slot] + half * 2;
+                        scaled[0] = static_cast<float>(products[0]) * row_scales[m_tile][half] * column_scale.x;
+                        scaled[1] = static_cast<float>(products[1]) * row_scales[m_tile][half] * column_scale.y;
+                    }
+                }
             }
+        }
+
+        // Add adapter_scale · down · upᵀ in FP32, accumulating the products at the scale of the adapter.
+        if (adapter_blocks > 0) {
+            const float inverse_scale = 1.0f / adapter_scale;
+#pragma unroll
+            for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
+#pragma unroll
+                for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
+#pragma unroll
+                    for (int index = 0; index < 4; index++) {
+                        values[m_tile][n_tile][index] *= inverse_scale;
+                    }
+                }
+            }
+            for (int block = 0; block < adapter_blocks; block++) {
+                consume(values);
+            }
+#pragma unroll
+            for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
+#pragma unroll
+                for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
+#pragma unroll
+                    for (int index = 0; index < 4; index++) {
+                        values[m_tile][n_tile][index] *= adapter_scale;
+                    }
+                }
+            }
+        }
+
+#pragma unroll
+        for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
+            const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
 #pragma unroll
             for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
 #pragma unroll
@@ -263,11 +358,8 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
                     uint32_t words[4];
 #pragma unroll
                     for (int slot = 0; slot < 4; slot++) {
-                        const int32_t* values = accumulators[m_tile][quad * 4 + slot] + half * 2;
-                        const float row_scale = row_scales[m_tile][half];
-                        __nv_bfloat162 value =
-                            __floats2bfloat162_rn(static_cast<float>(values[0]) * row_scale * column_scales[slot].x,
-                                                  static_cast<float>(values[1]) * row_scale * column_scales[slot].y);
+                        const float* scaled = values[m_tile][quad * 4 + slot] + half * 2;
+                        __nv_bfloat162 value = __floats2bfloat162_rn(scaled[0], scaled[1]);
                         words[slot] = *reinterpret_cast<uint32_t*>(&value);
                     }
                     // Rotate the slots right by t to put the columns in order.
@@ -314,19 +406,21 @@ PFN_cuTensorMapEncodeTiled_v12000 tensor_map_encoder() {
     return encoder;
 }
 
-// Describes `rows` rows of `k` bytes to TMA in boxes of `box_rows` rows by one K block, zero-filling rows past the end.
-bool encode_tensor_map(CUtensorMap* map, const int8_t* base, int rows, int k, int box_rows) {
+// Describes `rows` rows of `columns` elements to TMA in boxes of `box_rows` rows by 128 bytes, zero-filling rows past
+// the end.
+bool encode_tensor_map(CUtensorMap* map, const void* base, CUtensorMapDataType type, int element_bytes, int rows,
+                       int columns, int box_rows) {
     PFN_cuTensorMapEncodeTiled_v12000 encoder = tensor_map_encoder();
     if (encoder == nullptr) {
         return false;
     }
-    const cuuint64_t dimensions[2] = {static_cast<cuuint64_t>(k), static_cast<cuuint64_t>(rows)};
-    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(k)};
-    const cuuint32_t box[2] = {BLOCK_K, static_cast<cuuint32_t>(box_rows)};
+    const cuuint64_t dimensions[2] = {static_cast<cuuint64_t>(columns), static_cast<cuuint64_t>(rows)};
+    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(columns) * element_bytes};
+    const cuuint32_t box[2] = {static_cast<cuuint32_t>(BLOCK_K / element_bytes), static_cast<cuuint32_t>(box_rows)};
     const cuuint32_t element_strides[2] = {1, 1};
-    return encoder(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 2, const_cast<int8_t*>(base), dimensions, strides, box,
-                   element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B,
-                   CU_TENSOR_MAP_L2_PROMOTION_L2_256B, CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+    return encoder(map, type, 2, const_cast<void*>(base), dimensions, strides, box, element_strides,
+                   CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
 int multiprocessor_count() {
@@ -341,17 +435,39 @@ int multiprocessor_count() {
     return count;
 }
 
+// A low-rank adapter to add to the product, or none when `down` is null.
+struct Adapter {
+    const __nv_bfloat16* down;
+    const __nv_bfloat16* up;
+    int rank;
+    float scale;
+};
+
 template <typename Config>
 int launch(const int8_t* activations, const int8_t* weights, const float* activation_scales,
-           const float* weight_scales, __nv_bfloat16* output, int m, int n, int k, cudaStream_t stream) {
-    if (n % Config::block_n != 0 || k % BLOCK_K != 0 || m <= 0) {
+           const float* weight_scales, __nv_bfloat16* output, int m, int n, int k, Adapter adapter,
+           cudaStream_t stream) {
+    const bool has_adapter = adapter.down != nullptr && adapter.up != nullptr && adapter.scale != 0.0f;
+    const int adapter_blocks = has_adapter ? adapter.rank * 2 / BLOCK_K : 0;
+    if (n % Config::block_n != 0 || k % BLOCK_K != 0 || m <= 0 ||
+        (has_adapter && (adapter.rank <= 0 || adapter.rank * 2 % BLOCK_K != 0))) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
-    CUtensorMap activation_map;
-    CUtensorMap weight_map;
-    if (!encode_tensor_map(&activation_map, activations, m, k, Config::block_m) ||
-        !encode_tensor_map(&weight_map, weights, n, k, Config::block_n)) {
+    TensorMaps maps;
+    if (!encode_tensor_map(&maps.activations, activations, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, m, k, Config::block_m) ||
+        !encode_tensor_map(&maps.weights, weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, n, k, Config::block_n)) {
         return static_cast<int>(cudaErrorInvalidValue);
+    }
+    if (has_adapter) {
+        if (!encode_tensor_map(&maps.adapter_down, adapter.down, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, m, adapter.rank,
+                               Config::block_m) ||
+            !encode_tensor_map(&maps.adapter_up, adapter.up, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n, adapter.rank,
+                               Config::block_n)) {
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+    } else {
+        maps.adapter_down = maps.activations;
+        maps.adapter_up = maps.weights;
     }
     static bool configured = false;
     if (!configured) {
@@ -368,8 +484,23 @@ int launch(const int8_t* activations, const int8_t* weights, const float* activa
         return static_cast<int>(cudaErrorInvalidDevice);
     }
     int8_gemm_kernel<Config><<<tiles < processors ? tiles : processors, WARPS * 32, Config::shared_bytes, stream>>>(
-        activation_map, weight_map, activation_scales, weight_scales, output, m, n, k);
+        maps, activation_scales, weight_scales, output, m, n, k, adapter_blocks, adapter.scale);
     return static_cast<int>(cudaGetLastError());
+}
+
+int launch_config(int config, const int8_t* activations, const int8_t* weights, const float* activation_scales,
+                  const float* weight_scales, __nv_bfloat16* output, int m, int n, int k, Adapter adapter,
+                  cudaStream_t stream) {
+    switch (config) {
+        case 0:
+            return launch<TallTile>(activations, weights, activation_scales, weight_scales, output, m, n, k, adapter,
+                                    stream);
+        case 1:
+            return launch<WideTile>(activations, weights, activation_scales, weight_scales, output, m, n, k, adapter,
+                                    stream);
+        default:
+            return static_cast<int>(cudaErrorInvalidValue);
+    }
 }
 
 }  // namespace
@@ -383,12 +514,17 @@ extern "C" int mmh3_int8_gemm_config_count() {
 extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t* activations, const int8_t* weights,
                                    const float* activation_scales, const float* weight_scales, __nv_bfloat16* output,
                                    int m, int n, int k, cudaStream_t stream) {
-    switch (config) {
-        case 0:
-            return launch<TallTile>(activations, weights, activation_scales, weight_scales, output, m, n, k, stream);
-        case 1:
-            return launch<WideTile>(activations, weights, activation_scales, weight_scales, output, m, n, k, stream);
-        default:
-            return static_cast<int>(cudaErrorInvalidValue);
-    }
+    return launch_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k,
+                         Adapter{nullptr, nullptr, 0, 0.0f}, stream);
+}
+
+// The same product plus adapter_scale · adapter_down · adapter_upᵀ, with adapter_down [m, rank] and adapter_up
+// [n, rank] in BF16 and the rank a multiple of 64, rounded to BF16 once.
+extern "C" int mmh3_int8_gemm_bf16_adapter(int config, const int8_t* activations, const int8_t* weights,
+                                           const float* activation_scales, const float* weight_scales,
+                                           __nv_bfloat16* output, int m, int n, int k,
+                                           const __nv_bfloat16* adapter_down, const __nv_bfloat16* adapter_up,
+                                           int rank, float adapter_scale, cudaStream_t stream) {
+    return launch_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k,
+                         Adapter{adapter_down, adapter_up, rank, adapter_scale}, stream);
 }

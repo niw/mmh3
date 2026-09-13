@@ -226,12 +226,8 @@ impl CudaDit {
     }
 
     fn linear(&self, name: &str, input: *const c_void, output: *mut c_void, rows: usize, workspace: &Workspace) -> Result<(), Error> {
-        self.tensors.linear(name, input, output, rows, &workspace.quantized, &workspace.scales)?;
-        if let Some(adapter) = self.adapters.get(name) {
-            // SAFETY: the layer read `rows × inputs` BF16 values from input and wrote `rows × outputs` to output.
-            unsafe { adapter.apply(input, output, rows, &workspace.adapter)? };
-        }
-        Ok(())
+        let adapter = self.adapters.get(name).map(|adapter| (adapter, &workspace.adapter));
+        self.tensors.linear(name, input, output, rows, &workspace.quantized, &workspace.scales, adapter)
     }
 
     #[allow(clippy::too_many_arguments)]

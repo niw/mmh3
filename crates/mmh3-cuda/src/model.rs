@@ -1,6 +1,6 @@
 //! Pieces shared by the model runners: errors, checkpoint tensors on the device and cuBLASLt linear layers.
 
-use crate::gemm::{int8_bf16_pointers, rotate_quantize_pointers};
+use crate::gemm::{AdapterPointers, int8_bf16_pointers, rotate_quantize_pointers};
 use crate::loader::{LoadError, Uploader};
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::json;
@@ -106,9 +106,11 @@ impl DeviceTensors {
     pub(crate) fn pointer(&self, name: &str) -> Result<*const c_void, Error> {
         Ok(self.get(name)?.buffer.pointer())
     }
-    /// Applies `{name}.weight` (and `{name}.bias` when present) to `rows` rows. The input and output types follow
-    /// the weight: BF16 for BF16 and INT8 ConvRot weights, FP32 for FP32 weights. INT8 ConvRot layers quantize the
-    /// rotated input into `quantized` and `activation_scales`.
+    /// Applies `{name}.weight` (and `{name}.bias` when present) to `rows` rows, plus a low-rank adapter with a
+    /// scratch buffer of `rows × rank` BF16 values. The input and output types follow the weight: BF16 for BF16 and
+    /// INT8 ConvRot weights, FP32 for FP32 weights. INT8 ConvRot layers quantize the rotated input into `quantized` and
+    /// `activation_scales` and add an adapter whose rank is a multiple of 64 inside the INT8 GEMM.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear(
         &self,
         name: &str,
@@ -117,6 +119,7 @@ impl DeviceTensors {
         rows: usize,
         quantized: &DeviceBuffer,
         activation_scales: &DeviceBuffer,
+        adapter: Option<(&LowRank, &DeviceBuffer)>,
     ) -> Result<(), Error> {
         let weight = self.get(&format!("{name}.weight"))?;
         let (outputs, features) = (weight.shape[0], weight.shape[1]);
@@ -128,8 +131,13 @@ impl DeviceTensors {
                     return Err(Error::Model(format!("{name}: unsupported INT8 layer")));
                 }
                 assert!(quantized.bytes() >= rows * features && activation_scales.bytes() >= rows * 4, "{name}: quantization buffers are too small");
-                // SAFETY: `quantized` holds `rows × features` values and `activation_scales` `rows`, checked above.
+                // SAFETY: `quantized` holds `rows × features` values and `activation_scales` `rows`, checked above. The
+                // adapter reads the BF16 input and writes `rows × rank` values into its scratch buffer.
                 unsafe {
+                    let fused = match adapter {
+                        Some((low_rank, scratch)) if low_rank.rank % 64 == 0 => Some(low_rank.project_down(input, rows, scratch)?),
+                        _ => None,
+                    };
                     rotate_quantize_pointers(input, quantized.pointer(), activation_scales.pointer(), rows, features)?;
                     int8_bf16_pointers(
                         quantized.pointer(),
@@ -140,13 +148,23 @@ impl DeviceTensors {
                         rows,
                         outputs,
                         features,
+                        fused,
                     )?;
+                    if let (None, Some((low_rank, scratch))) = (fused, adapter) {
+                        low_rank.apply(input, output, rows, scratch)?;
+                    }
                 }
             }
             DType::BF16 | DType::F32 => {
                 let kind = if weight.dtype == DType::BF16 { LinearKind::Bf16 } else { LinearKind::F32 };
-                // SAFETY: the caller passes buffers of `rows × features` inputs and `rows × outputs` outputs.
-                unsafe { cublaslt_linear(kind, input, weight.buffer.pointer(), bias, output, rows, outputs, features)? };
+                // SAFETY: the caller passes buffers of `rows × features` inputs and `rows × outputs` outputs, and the
+                // adapter's scratch buffer holds `rows × rank` values.
+                unsafe {
+                    cublaslt_linear(kind, input, weight.buffer.pointer(), bias, output, rows, outputs, features)?;
+                    if let Some((low_rank, scratch)) = adapter {
+                        low_rank.apply(input, output, rows, scratch)?;
+                    }
+                }
             }
             other => return Err(Error::Model(format!("{name}: unsupported weight dtype {other}"))),
         }
@@ -218,6 +236,18 @@ pub(crate) struct LowRank {
 }
 
 impl LowRank {
+    /// Writes `down · input` for `rows` BF16 input rows into `scratch`, which holds at least `rows × rank` BF16 values,
+    /// and returns the operands for an INT8 GEMM that adds the rest.
+    ///
+    /// # Safety
+    /// `input` must hold `rows × inputs` BF16 values.
+    pub(crate) unsafe fn project_down(&self, input: *const c_void, rows: usize, scratch: &DeviceBuffer) -> Result<AdapterPointers, CudaError> {
+        assert!(scratch.bytes() >= rows * self.rank * 2, "the adapter scratch buffer is too small");
+        // SAFETY: the caller guarantees the input extent, and scratch holds `rows × rank`, checked above.
+        unsafe { cublaslt_linear(LinearKind::Bf16, input, self.down.pointer(), ptr::null(), scratch.pointer(), rows, self.rank, self.inputs)? };
+        Ok(AdapterPointers { down: scratch.pointer(), up: self.up.pointer(), rank: self.rank, scale: self.scale })
+    }
+
     /// Adds the adapter's contribution for `rows` BF16 input rows to the BF16 output, through `scratch`, which holds
     /// at least `rows × rank` BF16 values.
     ///

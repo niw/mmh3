@@ -205,7 +205,7 @@ impl CudaTextEncoder {
     }
 
     fn linear(&self, name: &str, input: &DeviceBuffer, output: &DeviceBuffer, tokens: usize, workspace: &Workspace) -> Result<(), Error> {
-        self.tensors.linear(name, input.pointer(), output.pointer(), tokens, &workspace.quantized, &workspace.scales)
+        self.tensors.linear(name, input.pointer(), output.pointer(), tokens, &workspace.quantized, &workspace.scales, None)
     }
 
     fn normalize(&self, weight: &str, workspace: &Workspace, tokens: usize) -> Result<(), Error> {
