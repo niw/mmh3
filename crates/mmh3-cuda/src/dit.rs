@@ -3,7 +3,10 @@
 //! The residual stream stays in FP32. Linear layers take BF16 inputs and run through the INT8 ConvRot GEMM for
 //! quantized weights and through cuBLASLt for BF16 and FP32 weights.
 
-use crate::attention::{AttentionLayout, AttentionPrecision, HEAD_DIM, QuantizedWorkspace, SparseWorkspace, dense_bf16_pointers, dense_quantized_pointers, sparse_pointers};
+use crate::attention::{
+    AttentionInputs, AttentionLayout, AttentionPrecision, HEAD_DIM, PreparedAttention, QuantizedWorkspace, SparseWorkspace, dense_bf16_pointers,
+    dense_quantized_pointers, prepare_inputs_pointers, sparse_pointers,
+};
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
 use crate::model::{DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer};
@@ -422,28 +425,43 @@ impl CudaDit {
             self.normalize(&format!("{prefix}.norm1.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(0, 1))?;
             self.linear(&qkv, workspace.normalized.pointer(), workspace.qkv.pointer(), tokens, workspace)?;
         }
+        let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
+        let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
+        let angles = angles.map_or(ptr::null(), |angles| angles.pointer().cast_const());
+        let pairs = 3 * config.rope_frequencies;
+        let quantized = workspace.attention_quantized.as_ref().filter(|_| modulation.is_some());
+        // Sparse and quantized attention take their per-block inputs from the pass that normalizes q and k.
+        let prepared = match (sparse, quantized) {
+            (Some(pass), _) => Some(PreparedAttention::Sparse(pass.workspace)),
+            (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
+            (None, None) => None,
+        };
+        let inputs = if prepared.is_some() { AttentionInputs::Prepared } else { AttentionInputs::Raw };
         // SAFETY: qkv holds `tokens × 3 × heads × 128` values and the angles cover every token.
         unsafe {
-            check(mmh3_qk_norm_rope(
-                workspace.qkv.pointer(),
-                self.pointer(&format!("{prefix}.attn.q_norm.weight"))?,
-                self.pointer(&format!("{prefix}.attn.k_norm.weight"))?,
-                angles.map_or(ptr::null(), |angles| angles.pointer().cast_const()),
-                (3 * config.rope_frequencies) as c_int,
-                tokens as c_int,
-                config.heads as c_int,
-                config.heads as c_int,
-                config.norm_eps,
-                ptr::null_mut(),
-            ))?;
+            match prepared {
+                Some(attention) => prepare_inputs_pointers(
+                    workspace.qkv.pointer(), query_norm, key_norm, angles, pairs, tokens, config.heads, config.norm_eps, attention,
+                )?,
+                None => check(mmh3_qk_norm_rope(
+                    workspace.qkv.pointer(),
+                    query_norm,
+                    key_norm,
+                    angles,
+                    pairs as c_int,
+                    tokens as c_int,
+                    config.heads as c_int,
+                    config.heads as c_int,
+                    config.norm_eps,
+                    ptr::null_mut(),
+                ))?,
+            }
             let scale = 1.0 / (config.head_dim as f32).sqrt();
             match sparse {
-                None => {
-                    match workspace.attention_quantized.as_ref().filter(|_| modulation.is_some()) {
-                        Some(quantized) => dense_quantized_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), scale, quantized)?,
-                        None => dense_bf16_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), tokens, config.heads, scale)?,
-                    }
-                }
+                None => match quantized {
+                    Some(quantized) => dense_quantized_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), scale, quantized, inputs)?,
+                    None => dense_bf16_pointers(workspace.qkv.pointer(), workspace.attention.pointer(), tokens, config.heads, scale)?,
+                },
                 Some(pass) => {
                     let inner = config.inner();
                     let layout = AttentionLayout {
@@ -464,6 +482,7 @@ impl CudaDit {
                         pass.tau,
                         pass.sinks,
                         pass.workspace,
+                        inputs,
                     )?
                 }
             }

@@ -416,11 +416,14 @@ __global__ void __launch_bounds__(THREADS, 2)
 
 }  // namespace
 
-// Sol-Attn over one sequence of BF16 heads of 128. The layout's batch strides are ignored.
+// Sol-Attn over one sequence of BF16 heads of 128. The layout's batch strides are ignored. With `inputs_ready`, the
+// workspaces already hold the block statistics and, for quantized attention, the INT8 inputs of
+// mmh3_attention_inputs.
 extern "C" int mmh3_sparse_attention(const void* query, const void* key, const void* value, void* output, int tokens,
                                      int heads, const Mmh3AttentionLayout* layout, float scale, float tau,
                                      int sink_key_start, int sink_key_end, int sink_query_start, int sink_query_end,
-                                     const Mmh3SparseWorkspace* workspace, const Mmh3QuantizedWorkspace* quantized, cudaStream_t stream) {
+                                     const Mmh3SparseWorkspace* workspace, const Mmh3QuantizedWorkspace* quantized,
+                                     int inputs_ready, cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -430,8 +433,11 @@ extern "C" int mmh3_sparse_attention(const void* query, const void* key, const v
     const auto* k = static_cast<const __nv_bfloat16*>(key);
     const auto* v = static_cast<const __nv_bfloat16*>(value);
 
-    block_stats_kernel<<<dim3(blocks, heads), THREADS, 0, stream>>>(q, k, v, tokens, *layout, blocks, workspace->centroids,
-                                                                   workspace->block_keys, workspace->value_sums);
+    if (!inputs_ready) {
+        block_stats_kernel<<<dim3(blocks, heads), THREADS, 0, stream>>>(q, k, v, tokens, *layout, blocks,
+                                                                       workspace->centroids, workspace->block_keys,
+                                                                       workspace->value_sums);
+    }
     center_keys_kernel<<<heads, HEAD, 0, stream>>>(workspace->block_keys, blocks, workspace->key_mean,
                                                    workspace->key_variance);
     const size_t route_shared = static_cast<size_t>(blocks) * (sizeof(float) + 1);
@@ -452,7 +458,8 @@ extern "C" int mmh3_sparse_attention(const void* query, const void* key, const v
                                                                                   workspace->key_mean, log2_scale,
                                                                                   workspace->row_offsets);
     if (quantized != nullptr) {
-        return mmh3_attention_quantized(query, key, value, output, tokens, heads, layout, scale, workspace, quantized, stream);
+        return mmh3_attention_quantized(query, key, value, output, tokens, heads, layout, scale, workspace, quantized,
+                                        inputs_ready, stream);
     }
     sparse_attention_kernel<<<dim3(blocks, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
         q, k, v, static_cast<__nv_bfloat16*>(output), tokens, *layout, blocks, *workspace, log2_scale);

@@ -1,7 +1,7 @@
 //! Check approximate attention against the BF16 kernel, including ragged tiles and scratch reuse.
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
-use mmh3_cuda::attention::{self, HEAD_DIM, QuantizedWorkspace};
+use mmh3_cuda::attention::{self, AttentionInputs, HEAD_DIM, QuantizedWorkspace};
 
 fn download(buffer: &DeviceBuffer) -> Vec<f32> {
     let mut bytes = vec![0; buffer.bytes()];
@@ -31,7 +31,7 @@ fn bounded_error_with_ragged_tiles_and_reused_scales() {
             }).collect();
             input.copy_from_host(&values).unwrap();
             attention::dense_bf16(&input, &mut reference, tokens, heads, scale).unwrap();
-            attention::dense_quantized(&input, &mut output, scale, &workspace).unwrap();
+            attention::dense_quantized(&input, &mut output, scale, &workspace, AttentionInputs::Raw).unwrap();
             let expected = download(&reference);
             let actual = download(&output);
             assert!(actual.iter().all(|v| v.is_finite()));
@@ -72,7 +72,7 @@ fn zero_queries_produce_uniform_means_including_the_last_key() {
         input.copy_from_host(&qkv.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<_>>()).unwrap();
         let mut output = DeviceBuffer::new(tokens * HEAD_DIM * 2).unwrap();
         let workspace = QuantizedWorkspace::new(tokens, 1).unwrap();
-        attention::dense_quantized(&input, &mut output, 1.0 / (HEAD_DIM as f32).sqrt(), &workspace).unwrap();
+        attention::dense_quantized(&input, &mut output, 1.0 / (HEAD_DIM as f32).sqrt(), &workspace, AttentionInputs::Raw).unwrap();
         for (index, actual) in download(&output).into_iter().enumerate() {
             let mean = if tokens % 2 == 0 { 0.0 } else { 448.0 / tokens as f32 };
             let expected = bf16_to_f32(f32_to_bf16(if index % 2 == 0 { mean } else { -mean }));

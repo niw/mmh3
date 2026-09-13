@@ -30,8 +30,9 @@ struct Mmh3QuantizedWorkspace {
     float* value_maxima;     // [heads, ceil(tokens / 64)]
 };
 
-// INT8 QK and FP8 PV, FP32 softmax/accumulation, BF16 output. A null sparse workspace means dense attention.
+// INT8 QK and FP8 PV, FP32 softmax/accumulation, BF16 output. A null sparse workspace means dense attention. With
+// `inputs_ready`, the workspace already holds INT8 q and k, their scales and the |v| block maxima.
 extern "C" int mmh3_attention_quantized(const void* query, const void* key, const void* value, void* output,
                                          int tokens, int heads, const Mmh3AttentionLayout* layout, float scale,
                                          const Mmh3SparseWorkspace* sparse, const Mmh3QuantizedWorkspace* workspace,
-                                         cudaStream_t stream);
+                                         int inputs_ready, cudaStream_t stream);

@@ -3,7 +3,7 @@
 use mmh3_core::dit::sparse::{SPARSE_BLOCK, SparseSinks, reference};
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
-use mmh3_cuda::attention::{self, AttentionLayout, AttentionOffsets, AttentionPrecision, HEAD_DIM, SparseWorkspace};
+use mmh3_cuda::attention::{self, AttentionInputs, AttentionLayout, AttentionOffsets, AttentionPrecision, HEAD_DIM, SparseWorkspace};
 
 struct Random(u64);
 
@@ -46,7 +46,7 @@ fn check(tokens: usize, heads: usize, tau: f32, sinks: SparseSinks, precision: A
     };
     let workspace = SparseWorkspace::with_precision(tokens, heads, precision).unwrap();
     let offsets = AttentionOffsets { query: 0, key: inner, value: 2 * inner, output: 0 };
-    attention::sparse(&input, &mut output, offsets, tokens, heads, &layout, scale, tau, sinks, &workspace).unwrap();
+    attention::sparse(&input, &mut output, offsets, tokens, heads, &layout, scale, tau, sinks, &workspace, AttentionInputs::Raw).unwrap();
     let fraction = workspace.routed_fraction().unwrap();
     let mut bytes = vec![0u8; tokens * inner * 2];
     output.copy_to_host(&mut bytes).unwrap();

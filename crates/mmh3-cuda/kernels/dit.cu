@@ -4,6 +4,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "attention_workspace.cuh"
 #include "convrot.cuh"
 
 // Elementwise and row-wise kernels of the DiT blocks. The residual stream is FP32 and the inputs of the linear
@@ -87,10 +88,45 @@ __global__ void gated_residual_add_kernel(float* __restrict__ residual, const __
     }
 }
 
-// Per-head RMSNorm of q and k inside the fused [tokens, 3, heads, 128] qkv buffer, then the split-half rotary
-// embedding on the first 2 × pairs dimensions when angles are given. One warp handles one head of q or k.
+// RMSNorm of one head of 128 values from `source` with its weight, then the split-half rotary embedding of the first
+// 2 × pairs dimensions when angles are given. One warp works on the head, which it leaves in FP32 in `values`.
+//
+// NOTE: the _rn intrinsics spell out the multiply-adds that the compiler forms from the plain expressions, so that
+// every kernel normalizing heads rounds the same way.
+__device__ __forceinline__ void normalize_rotate_head(const __nv_bfloat16* source, float* values,
+                                                      const __nv_bfloat16* __restrict__ weight,
+                                                      const float* __restrict__ token_angles, int pairs, float epsilon) {
+    const int lane = threadIdx.x % 32;
+    float squares = 0.0f;
+    for (int index = lane; index < HEAD_DIM; index += 32) {
+        const float value = __bfloat162float(source[index]);
+        values[index] = value;
+        squares = __fmaf_rn(value, value, squares);
+    }
+    for (int offset = 16; offset > 0; offset /= 2) {
+        squares += __shfl_xor_sync(0xffffffff, squares, offset);
+    }
+    const float inverse = rsqrtf(__fmaf_rn(squares, 1.0f / HEAD_DIM, epsilon));
+    for (int index = lane; index < HEAD_DIM; index += 32) {
+        values[index] = __fmul_rn(values[index], __fmul_rn(inverse, __bfloat162float(weight[index])));
+    }
+    __syncwarp();
+    if (token_angles != nullptr) {
+        for (int pair = lane; pair < pairs; pair += 32) {
+            float sine, cosine;
+            sincosf(token_angles[pair], &sine, &cosine);
+            const float first = values[pair];
+            const float second = values[pair + pairs];
+            values[pair] = __fmaf_rn(cosine, first, -__fmul_rn(sine, second));
+            values[pair + pairs] = __fmaf_rn(sine, first, __fmul_rn(cosine, second));
+        }
+        __syncwarp();
+    }
+}
+
 // Per-head RMSNorm of q and k in rows of [q (query_heads × 128) | k (key_heads × 128) | v (key_heads × 128)], then
-// the split-half rotary embedding on the first 2 × pairs dimensions when angles are given.
+// the split-half rotary embedding on the first 2 × pairs dimensions when angles are given. One warp handles one head
+// of q or k.
 __global__ void qk_norm_rope_kernel(__nv_bfloat16* qkv, const __nv_bfloat16* __restrict__ query_weight,
                                     const __nv_bfloat16* __restrict__ key_weight, const float* __restrict__ angles,
                                     int pairs, int tokens, int query_heads, int key_heads, float epsilon) {
@@ -106,37 +142,174 @@ __global__ void qk_norm_rope_kernel(__nv_bfloat16* qkv, const __nv_bfloat16* __r
     const int64_t token = item / heads_per_token;
     const bool is_key = head >= query_heads;
     __nv_bfloat16* vector = qkv + token * (query_heads + 2 * key_heads) * HEAD_DIM + head * HEAD_DIM;
-    const __nv_bfloat16* weight = is_key ? key_weight : query_weight;
     float* shared = values[warp_in_block];
-
-    float squares = 0.0f;
-    for (int index = lane; index < HEAD_DIM; index += 32) {
-        float value = __bfloat162float(vector[index]);
-        shared[index] = value;
-        squares += value * value;
-    }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        squares += __shfl_xor_sync(0xffffffff, squares, offset);
-    }
-    const float inverse = rsqrtf(squares / HEAD_DIM + epsilon);
-    for (int index = lane; index < HEAD_DIM; index += 32) {
-        shared[index] *= inverse * __bfloat162float(weight[index]);
-    }
-    __syncwarp();
-    if (angles != nullptr) {
-        const float* token_angles = angles + token * pairs;
-        for (int pair = lane; pair < pairs; pair += 32) {
-            float sine, cosine;
-            sincosf(token_angles[pair], &sine, &cosine);
-            const float first = shared[pair];
-            const float second = shared[pair + pairs];
-            shared[pair] = first * cosine - second * sine;
-            shared[pair + pairs] = first * sine + second * cosine;
-        }
-        __syncwarp();
-    }
+    normalize_rotate_head(vector, shared, is_key ? key_weight : query_weight,
+                          angles != nullptr ? angles + token * pairs : nullptr, pairs, epsilon);
     for (int index = lane; index < HEAD_DIM; index += 32) {
         vector[index] = __float2bfloat16_rn(shared[index]);
+    }
+}
+
+constexpr int INPUT_BLOCK = 64;
+constexpr int INPUT_THREADS = 2 * HEAD_DIM;
+constexpr int INPUT_WARPS = INPUT_THREADS / 32;
+
+__device__ __forceinline__ float warp_max(float value) {
+    for (int offset = 16; offset > 0; offset /= 2) {
+        value = fmaxf(value, __shfl_xor_sync(0xffffffff, value, offset));
+    }
+    return value;
+}
+
+// qk_norm_rope_kernel for one 64-token block and one head of the fused qkv rows of `heads` heads, together with what
+// the attention needs from that block:
+//
+// - STATS: Sol-Attn's block statistics, the mean query, the mean key and the summed value, as block_stats_kernel in
+//   sparse_attention.cu computes them.
+// - QUANTIZE: INT8 q and k with their block scales, and the block maximum of |v|, as quantize_qk and value_max in
+//   quantized_attention.cu compute them.
+//
+// Normalized q goes back to qkv in BF16 when the attention or the Sol-Attn row offsets read it, and normalized k when
+// the attention reads BF16 keys. q and k take turns in one tile, and the rows of k load while q is normalized. The
+// register limit fits four CTAs on an SM, so that the loads of some overlap the arithmetic of others.
+template <bool STATS, bool QUANTIZE>
+__global__ void __launch_bounds__(INPUT_THREADS, 4)
+    attention_inputs_kernel(__nv_bfloat16* __restrict__ qkv, const __nv_bfloat16* __restrict__ query_weight,
+                            const __nv_bfloat16* __restrict__ key_weight, const float* __restrict__ angles, int pairs,
+                            int tokens, int heads, float epsilon, Mmh3SparseWorkspace sparse,
+                            Mmh3QuantizedWorkspace quantized) {
+    // A row of 128 BF16 values is 16 chunks of 16 bytes.
+    constexpr int CHUNKS_PER_THREAD = INPUT_BLOCK * 16 / INPUT_THREADS;
+    __shared__ __align__(16) __nv_bfloat16 tile[INPUT_BLOCK][HEAD_DIM];
+    __shared__ float head_values[INPUT_WARPS][HEAD_DIM];
+    __shared__ float maxima[2][HEAD_DIM / 32];
+    const int block = blockIdx.x;
+    const int head = blockIdx.y;
+    const int blocks = gridDim.x;
+    const int rows = min(INPUT_BLOCK, tokens - block * INPUT_BLOCK);
+    const int inner = heads * HEAD_DIM;
+    const int64_t row_stride = 3 * static_cast<int64_t>(inner);
+    const int64_t first_token = static_cast<int64_t>(block) * INPUT_BLOCK;
+    __nv_bfloat16* block_rows = qkv + first_token * row_stride + head * HEAD_DIM;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const size_t statistic = (static_cast<size_t>(head) * blocks + block) * HEAD_DIM;
+
+    uint4 chunks[CHUNKS_PER_THREAD];
+    auto load = [&](int part) {
+#pragma unroll
+        for (int index = 0; index < CHUNKS_PER_THREAD; index++) {
+            const int chunk = threadIdx.x + index * INPUT_THREADS;
+            if (chunk / 16 < rows) {
+                chunks[index] = *reinterpret_cast<const uint4*>(block_rows + (chunk / 16) * row_stride + part * inner +
+                                                                (chunk % 16) * 8);
+            }
+        }
+    };
+    load(0);
+    for (int part = 0; part < 2; part++) {
+#pragma unroll
+        for (int index = 0; index < CHUNKS_PER_THREAD; index++) {
+            const int chunk = threadIdx.x + index * INPUT_THREADS;
+            if (chunk / 16 < rows) {
+                *reinterpret_cast<uint4*>(&tile[chunk / 16][(chunk % 16) * 8]) = chunks[index];
+            }
+        }
+        __syncthreads();
+        if (part == 0) {
+            load(1);
+        }
+        for (int row = warp; row < rows; row += INPUT_WARPS) {
+            normalize_rotate_head(tile[row], head_values[warp], part ? key_weight : query_weight,
+                                  angles != nullptr ? angles + (first_token + row) * pairs : nullptr, pairs, epsilon);
+            for (int index = lane; index < HEAD_DIM; index += 32) {
+                tile[row][index] = __float2bfloat16_rn(head_values[warp][index]);
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+
+        // Sums and maxima over the rows of the block, one thread per dimension, and for v during the turn of q.
+        if (threadIdx.x < HEAD_DIM) {
+            const int dimension = threadIdx.x;
+            float sum = 0.0f, maximum = 0.0f;
+            for (int row = 0; row < rows; row++) {
+                const float value = __bfloat162float(tile[row][dimension]);
+                sum += value;
+                maximum = fmaxf(maximum, fabsf(value));
+            }
+            if constexpr (STATS) {
+                (part ? sparse.block_keys : sparse.centroids)[statistic + dimension] = sum / rows;
+            }
+            maximum = warp_max(maximum);
+            if (lane == 0) {
+                maxima[0][warp] = maximum;
+            }
+        } else if (part == 0) {
+            const int dimension = threadIdx.x - HEAD_DIM;
+            const __nv_bfloat16* value = block_rows + 2 * inner + dimension;
+            float sum = 0.0f, maximum = 0.0f;
+#pragma unroll 8
+            for (int row = 0; row < rows; row++) {
+                const float element = __bfloat162float(value[row * row_stride]);
+                sum += element;
+                maximum = fmaxf(maximum, fabsf(element));
+            }
+            if constexpr (STATS) {
+                sparse.value_sums[statistic + dimension] = sum;
+            }
+            maximum = warp_max(maximum);
+            if (lane == 0) {
+                maxima[1][warp - HEAD_DIM / 32] = maximum;
+            }
+        }
+
+        if constexpr (QUANTIZE) {
+            __syncthreads();
+            float maximum = maxima[0][0];
+            for (int index = 1; index < HEAD_DIM / 32; index++) {
+                maximum = fmaxf(maximum, maxima[0][index]);
+            }
+            const float scale = fmaxf(maximum / 127.0f, 1e-30f);
+            if (threadIdx.x == 0) {
+                (part ? quantized.key_scales : quantized.query_scales)[head * blocks + block] = scale;
+                if (part == 0) {
+                    float value_max = maxima[1][0];
+                    for (int index = 1; index < HEAD_DIM / 32; index++) {
+                        value_max = fmaxf(value_max, maxima[1][index]);
+                    }
+                    quantized.value_maxima[head * blocks + block] = value_max;
+                }
+            }
+            // A row of 128 INT8 values is 8 chunks of 16 bytes, each from 16 BF16 values.
+            uint8_t* destination = (part ? quantized.key : quantized.query) + (first_token * heads + head) * HEAD_DIM;
+            for (int chunk = threadIdx.x; chunk < rows * 8; chunk += INPUT_THREADS) {
+                const uint4* source = reinterpret_cast<const uint4*>(&tile[chunk / 8][(chunk % 8) * 16]);
+                const uint4 halves[2] = {source[0], source[1]};
+                const __nv_bfloat16* values = reinterpret_cast<const __nv_bfloat16*>(halves);
+                uint32_t words[4];
+#pragma unroll
+                for (int word = 0; word < 4; word++) {
+                    uint32_t packed = 0;
+#pragma unroll
+                    for (int byte = 0; byte < 4; byte++) {
+                        const int8_t value = static_cast<int8_t>(__float2int_rn(__bfloat162float(values[word * 4 + byte]) / scale));
+                        packed |= static_cast<uint32_t>(static_cast<uint8_t>(value)) << (8 * byte);
+                    }
+                    words[word] = packed;
+                }
+                *reinterpret_cast<uint4*>(destination + static_cast<int64_t>(chunk / 8) * heads * HEAD_DIM + (chunk % 8) * 16) =
+                    make_uint4(words[0], words[1], words[2], words[3]);
+            }
+        }
+
+        if (part == 0 ? STATS || !QUANTIZE : !QUANTIZE) {
+            for (int chunk = threadIdx.x; chunk < rows * 16; chunk += INPUT_THREADS) {
+                *reinterpret_cast<uint4*>(block_rows + (chunk / 16) * row_stride + part * inner + (chunk % 16) * 8) =
+                    *reinterpret_cast<const uint4*>(&tile[chunk / 16][(chunk % 16) * 8]);
+            }
+        }
+        __syncthreads();
     }
 }
 
@@ -273,6 +446,33 @@ extern "C" int mmh3_qk_norm_rope(__nv_bfloat16* qkv, const __nv_bfloat16* query_
     const unsigned blocks = static_cast<unsigned>((items + warps_per_block - 1) / warps_per_block);
     qk_norm_rope_kernel<<<blocks, ROW_THREADS, 0, stream>>>(qkv, query_weight, key_weight, angles, pairs, tokens,
                                                             query_heads, key_heads, epsilon);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// mmh3_qk_norm_rope over rows of heads × (q, k, v) fused with the attention's per-block work: the Sol-Attn block
+// statistics when `sparse` is given and the INT8 q and k with the |v| block maxima when `quantized` is given. The
+// attention that follows skips those steps.
+extern "C" int mmh3_attention_inputs(__nv_bfloat16* qkv, const __nv_bfloat16* query_weight,
+                                     const __nv_bfloat16* key_weight, const float* angles, int pairs, int tokens,
+                                     int heads, float epsilon, const Mmh3SparseWorkspace* sparse,
+                                     const Mmh3QuantizedWorkspace* quantized, cudaStream_t stream) {
+    if (tokens <= 0 || heads <= 0 || (sparse == nullptr && quantized == nullptr)) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const dim3 grid((tokens + INPUT_BLOCK - 1) / INPUT_BLOCK, heads);
+    const Mmh3SparseWorkspace sparse_workspace = sparse != nullptr ? *sparse : Mmh3SparseWorkspace{};
+    const Mmh3QuantizedWorkspace quantized_workspace = quantized != nullptr ? *quantized : Mmh3QuantizedWorkspace{};
+    auto launch = [&](auto kernel) {
+        kernel<<<grid, INPUT_THREADS, 0, stream>>>(qkv, query_weight, key_weight, angles, pairs, tokens, heads, epsilon,
+                                                   sparse_workspace, quantized_workspace);
+    };
+    if (sparse != nullptr && quantized != nullptr) {
+        launch(attention_inputs_kernel<true, true>);
+    } else if (sparse != nullptr) {
+        launch(attention_inputs_kernel<true, false>);
+    } else {
+        launch(attention_inputs_kernel<false, true>);
+    }
     return static_cast<int>(cudaGetLastError());
 }
 

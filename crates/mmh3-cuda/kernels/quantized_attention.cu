@@ -430,7 +430,7 @@ int launch_attention(const Mmh3QuantizedWorkspace& workspace, __nv_bfloat16* out
 extern "C" int mmh3_attention_quantized(const void* query, const void* key, const void* value, void* output,
                                          int tokens, int heads, const Mmh3AttentionLayout* layout, float scale,
                                          const Mmh3SparseWorkspace* sparse, const Mmh3QuantizedWorkspace* workspace,
-                                         cudaStream_t stream) {
+                                         int inputs_ready, cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0 || layout->causal || layout->heads_per_key_value > 1) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -440,12 +440,16 @@ extern "C" int mmh3_attention_quantized(const void* query, const void* key, cons
     const auto* k = static_cast<const __nv_bfloat16*>(key);
     const auto* v = static_cast<const __nv_bfloat16*>(value);
     auto* result = static_cast<__nv_bfloat16*>(output);
-    value_max<<<dim3(blocks, heads), 256, 0, stream>>>(v, tokens, *layout, workspace->value_maxima);
+    if (!inputs_ready) {
+        value_max<<<dim3(blocks, heads), 256, 0, stream>>>(v, tokens, *layout, workspace->value_maxima);
+    }
     value_scales<<<heads, 32, 0, stream>>>(workspace->value_maxima, workspace->value_scales, blocks);
     quantize_value<<<dim3(padded / 32, 4, heads), dim3(32, 8), 0, stream>>>(
         v, workspace->value, workspace->value_scales, tokens, padded, *layout);
-    quantize_qk<<<dim3(blocks, heads, 2), 256, 0, stream>>>(
-        q, k, workspace->query, workspace->key, workspace->query_scales, workspace->key_scales, tokens, heads, *layout);
+    if (!inputs_ready) {
+        quantize_qk<<<dim3(blocks, heads, 2), 256, 0, stream>>>(
+            q, k, workspace->query, workspace->key, workspace->query_scales, workspace->key_scales, tokens, heads, *layout);
+    }
     if (sparse != nullptr) {
         return launch_attention<true>(*workspace, result, tokens, heads, *layout, scale, *sparse, stream);
     }
