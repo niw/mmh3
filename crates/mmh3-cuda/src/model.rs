@@ -1,6 +1,6 @@
 //! Pieces shared by the model runners: errors, checkpoint tensors on the device and cuBLASLt linear layers.
 
-use crate::gemm::int8_bf16_pointers;
+use crate::gemm::{int8_bf16_pointers, rotate_quantize_pointers};
 use crate::loader::{LoadError, Uploader};
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::json;
@@ -23,14 +23,6 @@ unsafe extern "C" {
         k: i64,
         alpha: f32,
         beta: f32,
-        stream: *mut c_void,
-    ) -> c_int;
-    fn mmh3_rotate_quantize(
-        input: *const c_void,
-        output: *mut c_void,
-        scales: *mut c_void,
-        tokens: c_int,
-        columns: c_int,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_cublaslt_linear(
@@ -138,14 +130,7 @@ impl DeviceTensors {
                 assert!(quantized.bytes() >= rows * features && activation_scales.bytes() >= rows * 4, "{name}: quantization buffers are too small");
                 // SAFETY: `quantized` holds `rows × features` values and `activation_scales` `rows`, checked above.
                 unsafe {
-                    check(mmh3_rotate_quantize(
-                        input,
-                        quantized.pointer(),
-                        activation_scales.pointer(),
-                        rows as c_int,
-                        features as c_int,
-                        ptr::null_mut(),
-                    ))?;
+                    rotate_quantize_pointers(input, quantized.pointer(), activation_scales.pointer(), rows, features)?;
                     int8_bf16_pointers(
                         quantized.pointer(),
                         weight.buffer.pointer(),

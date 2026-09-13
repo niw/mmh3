@@ -5,6 +5,14 @@ use std::ffi::{c_int, c_void};
 use std::ptr;
 
 unsafe extern "C" {
+    fn mmh3_rotate_quantize(
+        input: *const c_void,
+        output: *mut c_void,
+        scales: *mut c_void,
+        tokens: c_int,
+        columns: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
     fn mmh3_int8_gemm_config_count() -> c_int;
     fn mmh3_int8_gemm_bf16(
         config: c_int,
@@ -18,6 +26,38 @@ unsafe extern "C" {
         k: c_int,
         stream: *mut c_void,
     ) -> c_int;
+}
+
+/// Raw form of `rotate_quantize`.
+///
+/// # Safety
+/// `input` must hold `rows × columns` BF16 values, `output` `rows × columns` bytes and `scales` `rows` f32 values.
+pub(crate) unsafe fn rotate_quantize_pointers(
+    input: *const c_void,
+    output: *mut c_void,
+    scales: *mut c_void,
+    rows: usize,
+    columns: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: the caller guarantees the extents.
+    check(unsafe { mmh3_rotate_quantize(input, output, scales, rows as c_int, columns as c_int, ptr::null_mut()) })
+}
+
+/// Prepares the activations of an INT8 ConvRot layer: rotates every group of 256 columns of the BF16 rows by the
+/// normalized regular Hadamard matrix and quantizes each row to INT8 with scale max |x| / 127, rounding half to even.
+/// Columns must be a multiple of 256, up to 32,768.
+pub fn rotate_quantize(
+    input: &DeviceBuffer,
+    output: &mut DeviceBuffer,
+    scales: &mut DeviceBuffer,
+    rows: usize,
+    columns: usize,
+) -> Result<(), CudaError> {
+    assert!(input.bytes() >= rows * columns * 2, "input is smaller than rows × columns");
+    assert!(output.bytes() >= rows * columns, "output is smaller than rows × columns");
+    assert!(scales.bytes() >= rows * 4, "scales are smaller than rows");
+    // SAFETY: every buffer covers the extent the kernel touches, checked above.
+    unsafe { rotate_quantize_pointers(input.pointer(), output.pointer(), scales.pointer(), rows, columns) }
 }
 
 /// Number of tile configurations the INT8 GEMM kernel is compiled for.
