@@ -107,28 +107,43 @@ __global__ void __launch_bounds__(HEAD)
     key_variance[head * HEAD + dimension] = squares / blocks;
 }
 
+// Routes QUERIES consecutive query blocks of one head, which share every block key and value sum the CTA loads.
+//
+// NOTE: the _rn intrinsics spell out the multiply-adds that the compiler forms from the plain expressions. A warp
+// scores 32 (query, key block) pairs at once and reduces them together over the same xor butterfly as warp_sum, and
+// the loops read several key blocks at once so that their loads overlap. Every sum keeps its order, so the results do
+// not depend on QUERIES.
+template <int QUERIES>
 __global__ void __launch_bounds__(THREADS)
     route_kernel(Mmh3SparseWorkspace workspace, int tokens, int blocks, float tau, float log2_scale, int sink_key_start,
                  int sink_key_end, int sink_query_start, int sink_query_end) {
+    constexpr int ROUTE_BATCH = 32 / QUERIES;
+    constexpr int TAIL_BATCH = 32;
     extern __shared__ float weights[];
-    uint8_t* routed = reinterpret_cast<uint8_t*>(weights + blocks);
-    __shared__ float centroid[HEAD];
+    uint8_t* routed = reinterpret_cast<uint8_t*>(weights + QUERIES * blocks);
+    __shared__ float centroids[QUERIES][HEAD];
+    __shared__ float thresholds[QUERIES];
+    __shared__ float tail_maxima[QUERIES];
+    __shared__ float tail_sums[QUERIES];
     __shared__ float scratch[THREADS / 32];
-    const int query_block = blockIdx.x;
+    const int first_query = blockIdx.x * QUERIES;
+    const int queries = min(QUERIES, blocks - first_query);
     const int head = blockIdx.y;
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
-    const size_t row = static_cast<size_t>(head) * blocks + query_block;
+    const size_t first_row = static_cast<size_t>(head) * blocks + first_query;
 
-    centroid[threadIdx.x] = workspace.centroids[row * HEAD + threadIdx.x];
-    const float spread = block_reduce<false>(
-        centroid[threadIdx.x] * centroid[threadIdx.x] * workspace.key_variance[head * HEAD + threadIdx.x], scratch);
-    const float threshold = tau * sqrtf(spread * log2_scale * log2_scale + 1e-6f);
-    const bool dense_row = query_block >= sink_query_start && query_block < sink_query_end;
+    for (int query = 0; query < queries; query++) {
+        const float centroid = workspace.centroids[(first_row + query) * HEAD + threadIdx.x];
+        centroids[query][threadIdx.x] = centroid;
+        const float spread = block_reduce<false>(
+            __fmul_rn(__fmul_rn(centroid, centroid), workspace.key_variance[head * HEAD + threadIdx.x]), scratch);
+        if (threadIdx.x == 0) {
+            thresholds[query] = __fmul_rn(tau, sqrtf(__fmaf_rn(__fmul_rn(spread, log2_scale), log2_scale, 1e-6f)));
+        }
+    }
+    __syncthreads();
 
-    // NOTE: the loops below read ROUTE_BATCH key blocks at once so that their loads overlap, and keep the order of
-    // every sum.
-    constexpr int ROUTE_BATCH = 8;
     const float* keys = workspace.block_keys + static_cast<size_t>(head) * blocks * HEAD;
     for (int first = warp * ROUTE_BATCH; first < blocks; first += THREADS / 32 * ROUTE_BATCH) {
         float loaded[ROUTE_BATCH][HEAD / 32];
@@ -139,63 +154,100 @@ __global__ void __launch_bounds__(THREADS)
                 loaded[batch][part] = first + batch < blocks ? keys[static_cast<size_t>(first + batch) * HEAD + lane + part * 32] : 0.0f;
             }
         }
+        float partials[32];
 #pragma unroll
-        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
-            const int key_block = first + batch;
-            float partial = 0.0f;
+        for (int query = 0; query < QUERIES; query++) {
 #pragma unroll
-            for (int part = 0; part < HEAD / 32; part++) {
-                partial += centroid[lane + part * 32] * loaded[batch][part];
+            for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+                float partial = 0.0f;
+#pragma unroll
+                for (int part = 0; part < HEAD / 32; part++) {
+                    partial = __fmaf_rn(centroids[query][lane + part * 32], loaded[batch][part], partial);
+                }
+                partials[query * ROUTE_BATCH + batch] = partial;
             }
-            const float score = warp_sum(partial) * log2_scale;
-            if (lane == 0 && key_block < blocks) {
-                weights[key_block] = score;
-                routed[key_block] = score > threshold || abs(query_block - key_block) <= 1 ||
-                                    (key_block >= sink_key_start && key_block < sink_key_end) || dense_row;
+        }
+        // Each step adds the partner lane's half of the pairs, so lane l ends up with the sum of pair l.
+#pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            const bool upper = lane & offset;
+#pragma unroll
+            for (int index = 0; index < offset; index++) {
+                const float kept = upper ? partials[index + offset] : partials[index];
+                const float sent = upper ? partials[index] : partials[index + offset];
+                partials[index] = kept + __shfl_xor_sync(0xffffffff, sent, offset);
             }
+        }
+        const int query = lane / ROUTE_BATCH;
+        const int key_block = first + lane % ROUTE_BATCH;
+        if (query < queries && key_block < blocks) {
+            const int query_block = first_query + query;
+            const float score = partials[0] * log2_scale;
+            weights[query * blocks + key_block] = score;
+            routed[query * blocks + key_block] = score > thresholds[query] || abs(query_block - key_block) <= 1 ||
+                                                 (key_block >= sink_key_start && key_block < sink_key_end) ||
+                                                 (query_block >= sink_query_start && query_block < sink_query_end);
         }
     }
     __syncthreads();
 
-    float maximum = -FLT_MAX;
-    for (int key_block = threadIdx.x; key_block < blocks; key_block += THREADS) {
-        if (!routed[key_block]) {
-            maximum = fmaxf(maximum, weights[key_block]);
+    for (int query = 0; query < queries; query++) {
+        float* query_weights = weights + query * blocks;
+        const uint8_t* query_routed = routed + query * blocks;
+        float maximum = -FLT_MAX;
+        for (int key_block = threadIdx.x; key_block < blocks; key_block += THREADS) {
+            if (!query_routed[key_block]) {
+                maximum = fmaxf(maximum, query_weights[key_block]);
+            }
+        }
+        maximum = block_reduce<true>(maximum, scratch);
+        float sum = 0.0f;
+        for (int key_block = threadIdx.x; key_block < blocks; key_block += THREADS) {
+            const float weight = query_routed[key_block] ? 0.0f : exp2f(query_weights[key_block] - maximum);
+            query_weights[key_block] = weight;
+            sum = __fmaf_rn(weight, static_cast<float>(block_rows(key_block, tokens)), sum);
+        }
+        sum = block_reduce<false>(sum, scratch);
+        if (threadIdx.x == 0) {
+            tail_maxima[query] = maximum;
+            tail_sums[query] = sum;
         }
     }
-    maximum = block_reduce<true>(maximum, scratch);
-    float sum = 0.0f;
-    for (int key_block = threadIdx.x; key_block < blocks; key_block += THREADS) {
-        const float weight = routed[key_block] ? 0.0f : exp2f(weights[key_block] - maximum);
-        weights[key_block] = weight;
-        sum += weight * block_rows(key_block, tokens);
-    }
-    sum = block_reduce<false>(sum, scratch);
+    __syncthreads();
 
     const float* values = workspace.value_sums + static_cast<size_t>(head) * blocks * HEAD + threadIdx.x;
-    float tail = 0.0f;
-    for (int first = 0; first < blocks; first += ROUTE_BATCH) {
-        float loaded[ROUTE_BATCH];
+    float tails[QUERIES] = {};
+    for (int first = 0; first < blocks; first += TAIL_BATCH) {
+        float loaded[TAIL_BATCH];
 #pragma unroll
-        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+        for (int batch = 0; batch < TAIL_BATCH; batch++) {
             loaded[batch] = first + batch < blocks ? values[static_cast<size_t>(first + batch) * HEAD] : 0.0f;
         }
 #pragma unroll
-        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+        for (int batch = 0; batch < TAIL_BATCH; batch++) {
             const int key_block = first + batch;
-            if (key_block < blocks && !routed[key_block]) {
-                tail += weights[key_block] * loaded[batch];
+#pragma unroll
+            for (int query = 0; query < QUERIES; query++) {
+                if (query < queries && key_block < blocks && !routed[query * blocks + key_block]) {
+                    tails[query] = __fmaf_rn(weights[query * blocks + key_block], loaded[batch], tails[query]);
+                }
             }
         }
     }
-    workspace.tail_values[row * HEAD + threadIdx.x] = tail;
+#pragma unroll
+    for (int query = 0; query < QUERIES; query++) {
+        if (query < queries) {
+            workspace.tail_values[(first_row + query) * HEAD + threadIdx.x] = tails[query];
+        }
+    }
 
-    if (warp == 0) {
+    for (int query = warp; query < queries; query += THREADS / 32) {
+        const size_t row = first_row + query;
         uint16_t* route = workspace.routes + row * blocks;
         int count = 0;
         for (int start = 0; start < blocks; start += 32) {
             const int key_block = start + lane;
-            const bool flag = key_block < blocks && routed[key_block];
+            const bool flag = key_block < blocks && routed[query * blocks + key_block];
             const unsigned mask = __ballot_sync(0xffffffff, flag);
             if (flag) {
                 route[count + __popc(mask & ((1u << lane) - 1))] = static_cast<uint16_t>(key_block);
@@ -204,10 +256,36 @@ __global__ void __launch_bounds__(THREADS)
         }
         if (lane == 0) {
             workspace.route_counts[row] = count;
-            workspace.tail_max[row] = maximum;
-            workspace.tail_sum[row] = sum;
+            workspace.tail_max[row] = tail_maxima[query];
+            workspace.tail_sum[row] = tail_sums[query];
         }
     }
+}
+
+// Launches route_kernel with as many query blocks per CTA as their weights and flags fit in shared memory.
+template <int QUERIES>
+int launch_route(const Mmh3SparseWorkspace& workspace, int tokens, int blocks, int heads, float tau, float log2_scale,
+                 int sink_key_start, int sink_key_end, int sink_query_start, int sink_query_end, cudaStream_t stream) {
+    constexpr size_t MAX_SHARED = 90 * 1024;
+    const size_t shared = static_cast<size_t>(QUERIES) * blocks * (sizeof(float) + 1);
+    if constexpr (QUERIES > 1) {
+        if (shared > MAX_SHARED) {
+            return launch_route<QUERIES / 2>(workspace, tokens, blocks, heads, tau, log2_scale, sink_key_start,
+                                             sink_key_end, sink_query_start, sink_query_end, stream);
+        }
+    }
+    static size_t configured_shared = 0;
+    if (shared > 48 * 1024 && shared > configured_shared) {
+        cudaError_t status = cudaFuncSetAttribute(route_kernel<QUERIES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                  static_cast<int>(shared));
+        if (status != cudaSuccess) {
+            return static_cast<int>(status);
+        }
+        configured_shared = shared;
+    }
+    route_kernel<QUERIES><<<dim3((blocks + QUERIES - 1) / QUERIES, heads), THREADS, shared, stream>>>(
+        workspace, tokens, blocks, tau, log2_scale, sink_key_start, sink_key_end, sink_query_start, sink_query_end);
+    return static_cast<int>(cudaGetLastError());
 }
 
 __global__ void row_offsets_kernel(const __nv_bfloat16* __restrict__ query, int tokens, int heads,
@@ -440,19 +518,11 @@ extern "C" int mmh3_sparse_attention(const void* query, const void* key, const v
     }
     center_keys_kernel<<<heads, HEAD, 0, stream>>>(workspace->block_keys, blocks, workspace->key_mean,
                                                    workspace->key_variance);
-    const size_t route_shared = static_cast<size_t>(blocks) * (sizeof(float) + 1);
-    static size_t configured_route_shared = 0;
-    if (route_shared > 48 * 1024 && route_shared > configured_route_shared) {
-        cudaError_t status = cudaFuncSetAttribute(route_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                  static_cast<int>(route_shared));
-        if (status != cudaSuccess) {
-            return static_cast<int>(status);
-        }
-        configured_route_shared = route_shared;
+    const int routed = launch_route<4>(*workspace, tokens, blocks, heads, tau, log2_scale, sink_key_start, sink_key_end,
+                                       sink_query_start, sink_query_end, stream);
+    if (routed != 0) {
+        return routed;
     }
-    route_kernel<<<dim3(blocks, heads), THREADS, route_shared, stream>>>(*workspace, tokens, blocks, tau, log2_scale,
-                                                                        sink_key_start, sink_key_end, sink_query_start,
-                                                                        sink_query_end);
     const int64_t items = static_cast<int64_t>(tokens) * heads;
     row_offsets_kernel<<<static_cast<unsigned>((items + 7) / 8), 256, 0, stream>>>(q, tokens, heads, *layout,
                                                                                   workspace->key_mean, log2_scale,
