@@ -51,6 +51,18 @@ unsafe extern "C" {
     ) -> c_int;
     fn mmh3_vae_swiglu(input: *const c_void, output: *mut c_void, tokens: c_int, width: c_int, stream: *mut c_void) -> c_int;
     fn mmh3_yuv420(pixels: *const c_void, output: *mut c_void, frames: c_int, height: c_int, width: c_int, stream: *mut c_void) -> c_int;
+    fn mmh3_vae_add_norm_quantize(
+        residual: *mut c_void,
+        delta: *const c_void,
+        scale: *const c_void,
+        weight: *const c_void,
+        quantized: *mut c_void,
+        scales: *mut c_void,
+        tokens: c_int,
+        width: c_int,
+        epsilon: f32,
+        stream: *mut c_void,
+    ) -> c_int;
     fn mmh3_vae_embed_suffix(
         embedded: *const c_void,
         registers: *const c_void,
@@ -346,8 +358,10 @@ impl CudaVideoDecoder {
     }
 
     /// Applies layer `name` to FP16 rows. `swiglu` writes `silu(gate) · up` of an INT8 layer whose rows went through
-    /// `interleave_swiglu`, `rows × outputs / 2` values.
-    fn linear(&self, name: &str, input: &DeviceBuffer, output: &DeviceBuffer, rows: usize, workspace: &Workspace, swiglu: bool) -> Result<(), Error> {
+    /// `interleave_swiglu`, `rows × outputs / 2` values, and `input_quantized` says that the workspace already holds the
+    /// rotated INT8 rows of an INT8 layer's input.
+    #[allow(clippy::too_many_arguments)]
+    fn linear(&self, name: &str, input: &DeviceBuffer, output: &DeviceBuffer, rows: usize, workspace: &Workspace, swiglu: bool, input_quantized: bool) -> Result<(), Error> {
         let weight = self.tensors.get(&format!("{name}.weight"))?;
         let bias = self.tensors.pointer(&format!("{name}.bias"))?;
         let (outputs, features) = (weight.shape[0], weight.shape[1]);
@@ -366,7 +380,9 @@ impl CudaVideoDecoder {
         let weight_scales = self.tensors.pointer(&format!("{name}.weight_scale"))?;
         // SAFETY: the quantization buffers hold the rows, checked above, and the bias holds `outputs` f32 values.
         unsafe {
-            rotate_quantize_pointers(input.pointer(), true, workspace.quantized.pointer(), workspace.scales.pointer(), rows, features)?;
+            if !input_quantized {
+                rotate_quantize_pointers(input.pointer(), true, workspace.quantized.pointer(), workspace.scales.pointer(), rows, features)?;
+            }
             let output = Int8Output { pointer: output.pointer(), f16: true, bias, swiglu };
             int8_pointers(workspace.quantized.pointer(), weight.buffer.pointer(), workspace.scales.pointer(), weight_scales, output, rows, outputs, features, None)?;
         }
@@ -388,6 +404,34 @@ impl CudaVideoDecoder {
                 workspace.normalized.pointer(),
                 tokens as c_int,
                 self.config.dim as c_int,
+                NORM_EPSILON,
+                ptr::null_mut(),
+            )
+        })?;
+        Ok(())
+    }
+
+    /// Adds `scale ⊙ delta` to the residual when `scale` is given, then normalizes the residual with `weight` and
+    /// quantizes it into the workspace for an INT8 layer.
+    fn add_norm_quantize(&self, scale: Option<&str>, weight: &str, workspace: &Workspace, tokens: usize) -> Result<(), Error> {
+        let dim = self.config.dim;
+        assert!(workspace.quantized.bytes() >= tokens * dim && workspace.scales.bytes() >= tokens * 4, "the quantization buffers are too small");
+        let (delta, scale) = match scale {
+            Some(name) => (workspace.delta.pointer().cast_const(), self.tensors.pointer(name)?),
+            None => (ptr::null(), ptr::null()),
+        };
+        // SAFETY: the residual and delta hold `tokens × dim` values, the quantization buffers were checked above, and the
+        // scale and weight hold `dim` values.
+        check(unsafe {
+            mmh3_vae_add_norm_quantize(
+                workspace.residual.pointer(),
+                delta,
+                scale,
+                self.tensors.pointer(weight)?,
+                workspace.quantized.pointer(),
+                workspace.scales.pointer(),
+                tokens as c_int,
+                dim as c_int,
                 NORM_EPSILON,
                 ptr::null_mut(),
             )
@@ -452,10 +496,21 @@ impl CudaVideoDecoder {
             ],
             ..AttentionLayout::default()
         };
+        // The second residual add of a block waits for the next block's first normalization when that one quantizes.
+        let mut pending_scale: Option<String> = None;
         for layer in 0..config.layers {
             let prefix = format!("transformer_blocks.{layer}");
-            self.normalize(&format!("{prefix}.norm1.weight"), None, workspace, tokens)?;
-            self.linear(&format!("{prefix}.attn.to_qkv"), &workspace.normalized, &workspace.qkv, tokens, workspace, false)?;
+            let to_qkv = format!("{prefix}.attn.to_qkv");
+            if self.tensors.is_int8(&to_qkv) {
+                self.add_norm_quantize(pending_scale.take().as_deref(), &format!("{prefix}.norm1.weight"), workspace, tokens)?;
+                self.linear(&to_qkv, &workspace.normalized, &workspace.qkv, tokens, workspace, false, true)?;
+            } else {
+                if let Some(scale) = pending_scale.take() {
+                    self.add_scaled(&scale, workspace, tokens)?;
+                }
+                self.normalize(&format!("{prefix}.norm1.weight"), None, workspace, tokens)?;
+                self.linear(&to_qkv, &workspace.normalized, &workspace.qkv, tokens, workspace, false, false)?;
+            }
             let qkv = workspace.qkv.pointer().cast::<u16>();
             // SAFETY: qkv holds `tokens × heads × 3 × 64` values, the angles cover a tile and the layout stays within
             // the `tiles × tile_tokens` rows of qkv and attention.
@@ -484,25 +539,29 @@ impl CudaVideoDecoder {
                     1.0 / (HEAD_DIM as f32).sqrt(),
                 )?;
             }
-            self.linear(&format!("{prefix}.attn.to_out"), &workspace.attention, &workspace.delta, tokens, workspace, false)?;
-            self.add_scaled(&format!("{prefix}.scale1"), workspace, tokens)?;
+            self.linear(&format!("{prefix}.attn.to_out"), &workspace.attention, &workspace.delta, tokens, workspace, false, false)?;
 
-            self.normalize(&format!("{prefix}.norm2.weight"), None, workspace, tokens)?;
             let w1 = format!("{prefix}.ff.w1");
             if self.tensors.is_int8(&w1) {
-                self.linear(&w1, &workspace.normalized, &workspace.activated, tokens, workspace, true)?;
+                self.add_norm_quantize(Some(&format!("{prefix}.scale1")), &format!("{prefix}.norm2.weight"), workspace, tokens)?;
+                self.linear(&w1, &workspace.normalized, &workspace.activated, tokens, workspace, true, true)?;
             } else {
-                self.linear(&w1, &workspace.normalized, &workspace.expanded, tokens, workspace, false)?;
+                self.add_scaled(&format!("{prefix}.scale1"), workspace, tokens)?;
+                self.normalize(&format!("{prefix}.norm2.weight"), None, workspace, tokens)?;
+                self.linear(&w1, &workspace.normalized, &workspace.expanded, tokens, workspace, false, false)?;
                 // SAFETY: expanded holds `tokens × 2 × ffn` values and activated `tokens × ffn`.
                 check(unsafe {
                     mmh3_vae_swiglu(workspace.expanded.pointer(), workspace.activated.pointer(), tokens as c_int, config.ffn as c_int, ptr::null_mut())
                 })?;
             }
-            self.linear(&format!("{prefix}.ff.w2"), &workspace.activated, &workspace.delta, tokens, workspace, false)?;
-            self.add_scaled(&format!("{prefix}.scale2"), workspace, tokens)?;
+            self.linear(&format!("{prefix}.ff.w2"), &workspace.activated, &workspace.delta, tokens, workspace, false, false)?;
+            pending_scale = Some(format!("{prefix}.scale2"));
+        }
+        if let Some(scale) = pending_scale {
+            self.add_scaled(&scale, workspace, tokens)?;
         }
         self.normalize("norm_out.weight", Some("norm_out.bias"), workspace, tokens)?;
-        self.linear("proj_out", &workspace.normalized, &workspace.projected, tokens, workspace, false)
+        self.linear("proj_out", &workspace.normalized, &workspace.projected, tokens, workspace, false, false)
     }
 
     /// The latent rows of every tile of one chunk, `[tiles, tile tokens, channels]` in FP16. `latent` is the

@@ -74,6 +74,24 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_bf16_to_f32(input: *const c_void, output: *mut c_void, count: usize, stream: *mut c_void) -> c_int;
+    fn mmh3_add_norm_quantize(
+        residual: *mut c_void,
+        delta: *const c_void,
+        modulation: *const c_void,
+        rows: *const c_void,
+        chunks: c_int,
+        gate_chunk: c_int,
+        shift_chunk: c_int,
+        scale_chunk: c_int,
+        weight: *const c_void,
+        normalized: *mut c_void,
+        quantized: *mut c_void,
+        scales: *mut c_void,
+        tokens: c_int,
+        hidden: c_int,
+        epsilon: f32,
+        stream: *mut c_void,
+    ) -> c_int;
 }
 
 /// Block modulation vectors per row: shift, scale and gate for attention, then for the MLP.
@@ -279,6 +297,49 @@ impl CudaDit {
         Ok(())
     }
 
+    /// Adds the gated delta to the residual when `gate` names its modulation chunk, then normalizes the residual with
+    /// `weight` and the modulation's shift and scale chunks and quantizes it into the workspace for the INT8 layer
+    /// `layer`. The BF16 rows stay in `normalized` only when the layer's adapter needs them.
+    #[allow(clippy::too_many_arguments)]
+    fn add_norm_quantize(
+        &self,
+        weight: &str,
+        layer: &str,
+        workspace: &Workspace,
+        tokens: usize,
+        (table, rows): (&DeviceBuffer, &DeviceBuffer),
+        gate: Option<usize>,
+        shift: usize,
+        scale: usize,
+    ) -> Result<(), Error> {
+        let hidden = self.config.hidden;
+        assert!(workspace.quantized.bytes() >= tokens * hidden && workspace.scales.bytes() >= tokens * 4, "the quantization buffers are too small");
+        let normalized = if self.adapters.contains_key(layer) { workspace.normalized.pointer() } else { ptr::null_mut() };
+        // SAFETY: the residual, delta and normalized buffers hold `tokens × hidden` values, the quantization buffers were
+        // checked above, and the modulation rows index the table.
+        check(unsafe {
+            mmh3_add_norm_quantize(
+                workspace.residual.pointer(),
+                gate.map_or(ptr::null(), |_| workspace.delta.pointer().cast_const()),
+                table.pointer(),
+                rows.pointer(),
+                BLOCK_CHUNKS as c_int,
+                gate.unwrap_or(0) as c_int,
+                shift as c_int,
+                scale as c_int,
+                self.pointer(weight)?,
+                normalized,
+                workspace.quantized.pointer(),
+                workspace.scales.pointer(),
+                tokens as c_int,
+                hidden as c_int,
+                self.config.norm_eps,
+                ptr::null_mut(),
+            )
+        })?;
+        Ok(())
+    }
+
     fn add_residual(
         &self,
         workspace: &Workspace,
@@ -342,8 +403,16 @@ impl CudaDit {
         let modulate = |shift, scale| modulation.map(|(table, rows)| (table, rows, BLOCK_CHUNKS, shift, scale));
         let gate = |chunk| modulation.map(|(table, rows)| (table, rows, chunk));
 
-        self.normalize(&format!("{prefix}.norm1.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(0, 1))?;
-        self.linear(&format!("{prefix}.attn.qkv_proj"), workspace.normalized.pointer(), workspace.qkv.pointer(), tokens, workspace)?;
+        let qkv = format!("{prefix}.attn.qkv_proj");
+        let adapter = |layer: &str| self.adapters.get(layer).map(|adapter| (adapter, &workspace.adapter));
+        // Modulated blocks normalize and quantize the inputs of their INT8 layers in one pass.
+        if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&qkv)) {
+            self.add_norm_quantize(&format!("{prefix}.norm1.weight"), &qkv, workspace, tokens, modulation, None, 0, 1)?;
+            self.tensors.linear_quantized(&qkv, workspace.normalized.pointer(), workspace.qkv.pointer(), tokens, &workspace.quantized, &workspace.scales, adapter(&qkv), false)?;
+        } else {
+            self.normalize(&format!("{prefix}.norm1.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(0, 1))?;
+            self.linear(&qkv, workspace.normalized.pointer(), workspace.qkv.pointer(), tokens, workspace)?;
+        }
         // SAFETY: qkv holds `tokens × 3 × heads × 128` values and the angles cover every token.
         unsafe {
             check(mmh3_qk_norm_rope(
@@ -386,14 +455,16 @@ impl CudaDit {
             }
         }
         self.linear(&format!("{prefix}.attn.out_proj"), workspace.attention.pointer(), workspace.delta.pointer(), tokens, workspace)?;
-        self.add_residual(workspace, tokens, gate(2))?;
 
-        self.normalize(&format!("{prefix}.norm2.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(3, 4))?;
         let fc1 = format!("{prefix}.mlp.fc1");
-        if self.tensors.is_int8(&fc1) {
-            let adapter = self.adapters.get(&fc1).map(|adapter| (adapter, &workspace.adapter));
-            self.tensors.linear_swiglu(&fc1, workspace.normalized.pointer(), workspace.activated.pointer(), tokens, &workspace.quantized, &workspace.scales, adapter)?;
+        if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&fc1)) {
+            self.add_norm_quantize(&format!("{prefix}.norm2.weight"), &fc1, workspace, tokens, modulation, Some(2), 3, 4)?;
+            self.tensors.linear_quantized(&fc1, workspace.normalized.pointer(), workspace.activated.pointer(), tokens, &workspace.quantized, &workspace.scales, adapter(&fc1), true)?;
+        } else if self.tensors.is_int8(&fc1) {
+            return Err(Error::Model(format!("{fc1}: an INT8 MLP needs the block modulation")));
         } else {
+            self.add_residual(workspace, tokens, gate(2))?;
+            self.normalize(&format!("{prefix}.norm2.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(3, 4))?;
             self.linear(&fc1, workspace.normalized.pointer(), workspace.expanded.pointer(), tokens, workspace)?;
             // SAFETY: expanded holds `tokens × 2 × ffn` values and activated `tokens × ffn`.
             check(unsafe {

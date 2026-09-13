@@ -3,6 +3,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "convrot.cuh"
+
 // Kernels of the video VAE's ViT decoder. The residual stream is FP32, linear layers run in FP16 like the
 // reference, and the decoded pixels are blended and finalized in FP32.
 
@@ -103,6 +105,40 @@ __global__ void qk_norm_rope_kernel(__half* qkv, const float* __restrict__ angle
     for (int index = lane; index < VAE_HEAD_DIM; index += 32) {
         vector[index] = __float2half_rn(shared[index]);
     }
+}
+
+// For each token: residual += scale ⊙ delta when a delta is given, then the unbiased norm_kernel of the residual in
+// FP16, rotated and quantized to INT8 with the row's scale.
+//
+// NOTE: The result matches residual_add_scaled_kernel, norm_kernel without a bias and rotate_quantize_kernel run one
+// after the other in every bit. The compiler fuses the residual update and the sum of squares of those kernels into
+// multiply-adds, which the _rn intrinsics spell out here, and the normalized row reaches the rotation through shared
+// memory in FP16.
+template <int GROUPS_PER_WARP>
+__global__ void __launch_bounds__(ROW_THREADS)
+    add_norm_quantize_kernel(float* __restrict__ residual, const __half* __restrict__ delta,
+                             const __half* __restrict__ scale, const __half* __restrict__ weight,
+                             int8_t* __restrict__ quantized, float* __restrict__ scales, int width, float epsilon) {
+    extern __shared__ __align__(16) __half normalized_row[];
+    __shared__ float scratch[ROW_THREADS / 32];
+    const int64_t token = blockIdx.x;
+    float* row = residual + token * width;
+    float squares = 0.0f;
+    for (int index = threadIdx.x; index < width; index += blockDim.x) {
+        float value = row[index];
+        if (delta != nullptr) {
+            value = __fmaf_rn(__half2float(delta[token * width + index]), __half2float(scale[index]), value);
+            row[index] = value;
+        }
+        squares = __fmaf_rn(value, value, squares);
+    }
+    const float inverse = rsqrtf(block_sum(squares, scratch) / width + epsilon);
+    for (int index = threadIdx.x; index < width; index += blockDim.x) {
+        normalized_row[index] = __float2half_rn(__fmul_rn(__fmul_rn(row[index], inverse), __half2float(weight[index])));
+    }
+    __syncthreads();
+    rotate_quantize_row<GROUPS_PER_WARP>(reinterpret_cast<const __half2*>(normalized_row), quantized + token * width,
+                                         scales + token, width);
 }
 
 __global__ void residual_add_scaled_kernel(float* __restrict__ residual, const __half* __restrict__ delta,
@@ -384,5 +420,35 @@ extern "C" int mmh3_yuv420(const float* pixels, uint8_t* output, int frames, int
     }
     const size_t blocks = static_cast<size_t>(frames) * (height / 2) * (width / 2);
     yuv420_kernel<<<grid_for(blocks), ROW_THREADS, 0, stream>>>(pixels, output, frames, height, width);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int mmh3_vae_add_norm_quantize(float* residual, const __half* delta, const __half* scale, const __half* weight,
+                                          int8_t* quantized, float* scales, int tokens, int width, float epsilon,
+                                          cudaStream_t stream) {
+    const int groups = width / CONVROT_GROUP;
+    const int groups_per_warp = (groups + ROW_THREADS / 32 - 1) / (ROW_THREADS / 32);
+    if (width % CONVROT_GROUP != 0 || groups == 0 || groups_per_warp > MAX_GROUPS_PER_WARP) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const size_t shared_bytes = static_cast<size_t>(width) * sizeof(__half);
+    auto launch = [&](auto kernel) {
+        kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(residual, delta, scale, weight, quantized, scales, width,
+                                                              epsilon);
+    };
+    switch (groups_per_warp) {
+        case 1:
+            launch(add_norm_quantize_kernel<1>);
+            break;
+        case 2:
+            launch(add_norm_quantize_kernel<2>);
+            break;
+        case 3:
+            launch(add_norm_quantize_kernel<3>);
+            break;
+        default:
+            launch(add_norm_quantize_kernel<4>);
+            break;
+    }
     return static_cast<int>(cudaGetLastError());
 }

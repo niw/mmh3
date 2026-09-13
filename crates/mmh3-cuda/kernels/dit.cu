@@ -4,13 +4,14 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "convrot.cuh"
+
 // Elementwise and row-wise kernels of the DiT blocks. The residual stream is FP32 and the inputs of the linear
 // layers are BF16. Modulation tables are FP32 `[rows, chunks, hidden]`, and every token picks its row.
 
 namespace {
 
 constexpr int ROW_THREADS = 256;
-constexpr int CONVROT_GROUP = 256;
 constexpr int HEAD_DIM = 128;
 
 __device__ __forceinline__ float block_sum(float value, float* scratch) {
@@ -151,133 +152,62 @@ __global__ void swiglu_kernel(const __nv_bfloat16* __restrict__ input, __nv_bflo
     }
 }
 
-// Groups of 256 columns a warp rotates at most, so rows up to 32 warps × 4 × 256 = 32,768 columns fit in registers.
-constexpr int MAX_GROUPS_PER_WARP = 4;
-
-// Rotates a 256 group by the normalized regular Hadamard matrix: four radix-4 stages with strides 1, 4, 16 and 64 of
-// the symmetric 4 × 4 kernel y0 = x0 + x1 + x2 - x3, y1 = x0 + x1 - x2 + x3, y2 = x0 - x1 + x2 + x3,
-// y3 = -x0 + x1 + x2 + x3, then a factor of 1/16. Lane l holds elements 8l to 8l + 7. Of the index bits, bits 0-1
-// (stride 1) are in the register index, bits 2-3 (stride 4) are register bit 2 and lane bit 0, bits 4-5 (stride 16)
-// lane bits 1-2 and bits 6-7 (stride 64) lane bits 3-4.
-//
-// NOTE: Every output keeps the order of additions written above, so the result is the same in every bit whichever
-// lane computes it. The rewritten forms below only use a + b == b + a and a + (-b) == a - b, which hold exactly.
-__device__ __forceinline__ void rotate_group(float (&values)[8], int lane) {
-#pragma unroll
-    for (int base = 0; base < 8; base += 4) {
-        const float x0 = values[base], x1 = values[base + 1], x2 = values[base + 2], x3 = values[base + 3];
-        values[base] = x0 + x1 + x2 - x3;
-        values[base + 1] = x0 + x1 - x2 + x3;
-        values[base + 2] = x0 - x1 + x2 + x3;
-        values[base + 3] = -x0 + x1 + x2 + x3;
-    }
-    // Stride 4: even lanes hold x0 and x1 and compute y0 and y1, odd lanes hold x2 and x3 and compute y2 and y3.
-    const bool odd_lane = lane & 1;
-#pragma unroll
-    for (int low = 0; low < 4; low++) {
-        const float own_0 = values[low], own_1 = values[low + 4];
-        const float other_0 = __shfl_xor_sync(0xffffffff, own_0, 1);
-        const float other_1 = __shfl_xor_sync(0xffffffff, own_1, 1);
-        const float first_0 = odd_lane ? other_0 - other_1 : own_0 + own_1;
-        const float first_1 = odd_lane ? other_1 - other_0 : own_0 + own_1;
-        values[low] = first_0 + (odd_lane ? own_0 : other_0) + (odd_lane ? own_1 : -other_1);
-        values[low + 4] = first_1 + (odd_lane ? own_0 : -other_0) + (odd_lane ? own_1 : other_1);
-    }
-    // Strides 16 and 64: the lane with digit j finds x_(j ^ k) at xor distance k << shift. With v_k read from there,
-    // y0 = (v0 + v1 + v2) - v3, y1 = (v0 + v1 - v3) + v2, y2 = (v2 - v3 + v0) + v1 and y3 = (v2 - v3 + v1) + v0.
-#pragma unroll
-    for (int shift = 1; shift <= 3; shift += 2) {
-        const int digit = (lane >> shift) & 3;
-        const bool high = digit & 2;
-        const bool odd = digit & 1;
-#pragma unroll
-        for (int index = 0; index < 8; index++) {
-            const float v0 = values[index];
-            const float v1 = __shfl_xor_sync(0xffffffff, v0, 1 << shift);
-            const float v2 = __shfl_xor_sync(0xffffffff, v0, 2 << shift);
-            const float v3 = __shfl_xor_sync(0xffffffff, v0, 3 << shift);
-            const float first = high ? v2 - v3 : v0 + v1;
-            const float second = high ? (odd ? v1 : v0) : (odd ? -v3 : v2);
-            const float third = high ? (odd ? v0 : v1) : (odd ? v2 : -v3);
-            values[index] = first + second + third;
-        }
-    }
-#pragma unroll
-    for (int index = 0; index < 8; index++) {
-        values[index] *= 1.0f / 16.0f;
-    }
-}
-
-__device__ __forceinline__ float2 to_float2(__nv_bfloat162 pair) {
-    return __bfloat1622float2(pair);
-}
-
-__device__ __forceinline__ float2 to_float2(__half2 pair) {
-    return __half22float2(pair);
-}
-
-// Rotates each 256 group of a row of BF16 or FP16 values, then quantizes the row to INT8 with scale = max |x| / 127,
-// rounding half to even. One block handles one row, and warp w rotates groups w, w + warps and so on.
+// One block per row.
 template <int GROUPS_PER_WARP, typename Pair>
 __global__ void rotate_quantize_kernel(const Pair* __restrict__ input, int8_t* __restrict__ output,
                                        float* __restrict__ scales, int columns) {
-    __shared__ float warp_maxima[32];
-    const int lane = threadIdx.x % 32;
-    const int warp = threadIdx.x / 32;
-    const int warps = blockDim.x / 32;
-    const int groups = columns / CONVROT_GROUP;
     const size_t row_offset = static_cast<size_t>(blockIdx.x) * columns;
+    rotate_quantize_row<GROUPS_PER_WARP>(input + row_offset / 2, output + row_offset, scales + blockIdx.x, columns);
+}
 
-    float values[GROUPS_PER_WARP][8];
-    float maximum = 0.0f;
-#pragma unroll
-    for (int slot = 0; slot < GROUPS_PER_WARP; slot++) {
-        const int group = warp + slot * warps;
-        if (group < groups) {
-            const uint4 packed = *reinterpret_cast<const uint4*>(input + (row_offset + group * CONVROT_GROUP + lane * 8) / 2);
-            const Pair* pairs = reinterpret_cast<const Pair*>(&packed);
-#pragma unroll
-            for (int pair = 0; pair < 4; pair++) {
-                const float2 value = to_float2(pairs[pair]);
-                values[slot][pair * 2] = value.x;
-                values[slot][pair * 2 + 1] = value.y;
-            }
-            rotate_group(values[slot], lane);
-#pragma unroll
-            for (int index = 0; index < 8; index++) {
-                maximum = fmaxf(maximum, fabsf(values[slot][index]));
-            }
+// For each token: residual += gate ⊙ delta when a delta is given, then rms_norm(residual) ⊙ weight ⊙ (1 + scale) +
+// shift in BF16, kept in `normalized` when it is not null, and its ConvRot rotation quantized to INT8 with the row's
+// scale.
+//
+// NOTE: The result matches gated_residual_add_kernel, rms_norm_modulate_kernel and rotate_quantize_kernel run one
+// after the other in every bit. The compiler fuses the residual update, the sum of squares and the modulation of those
+// kernels into multiply-adds, which the _rn intrinsics spell out here, and the normalized row reaches the rotation
+// through shared memory in BF16.
+template <int GROUPS_PER_WARP>
+__global__ void __launch_bounds__(ROW_THREADS)
+    add_norm_quantize_kernel(float* __restrict__ residual, const __nv_bfloat16* __restrict__ delta,
+                             const float* __restrict__ modulation, const int32_t* __restrict__ rows, int chunks,
+                             int gate_chunk, int shift_chunk, int scale_chunk, const __nv_bfloat16* __restrict__ weight,
+                             __nv_bfloat16* __restrict__ normalized, int8_t* __restrict__ quantized,
+                             float* __restrict__ scales, int hidden, float epsilon) {
+    extern __shared__ __align__(16) __nv_bfloat16 normalized_row[];
+    __shared__ float scratch[ROW_THREADS / 32];
+    const int64_t token = blockIdx.x;
+    float* row = residual + token * hidden;
+    const float* vectors = modulation != nullptr ? modulation + static_cast<size_t>(rows[token]) * chunks * hidden : nullptr;
+
+    float squares = 0.0f;
+    for (int index = threadIdx.x; index < hidden; index += blockDim.x) {
+        float value = row[index];
+        if (delta != nullptr) {
+            const float change = __bfloat162float(delta[token * hidden + index]);
+            value = vectors != nullptr ? __fmaf_rn(change, vectors[static_cast<size_t>(gate_chunk) * hidden + index], value)
+                                       : __fadd_rn(value, change);
+            row[index] = value;
         }
+        squares = __fmaf_rn(value, value, squares);
     }
-    for (int offset = 16; offset > 0; offset /= 2) {
-        maximum = fmaxf(maximum, __shfl_xor_sync(0xffffffff, maximum, offset));
-    }
-    if (lane == 0) {
-        warp_maxima[warp] = maximum;
+    const float inverse = rsqrtf(block_sum(squares, scratch) / hidden + epsilon);
+    for (int index = threadIdx.x; index < hidden; index += blockDim.x) {
+        float value = __fmul_rn(__fmul_rn(row[index], inverse), __bfloat162float(weight[index]));
+        if (vectors != nullptr) {
+            value = __fmaf_rn(value, __fadd_rn(1.0f, vectors[static_cast<size_t>(scale_chunk) * hidden + index]),
+                              vectors[static_cast<size_t>(shift_chunk) * hidden + index]);
+        }
+        const __nv_bfloat16 rounded = __float2bfloat16_rn(value);
+        normalized_row[index] = rounded;
+        if (normalized != nullptr) {
+            normalized[token * hidden + index] = rounded;
+        }
     }
     __syncthreads();
-    maximum = 0.0f;
-    for (int index = 0; index < warps; index++) {
-        maximum = fmaxf(maximum, warp_maxima[index]);
-    }
-    const float scale = fmaxf(maximum / 127.0f, 1e-30f);
-    if (threadIdx.x == 0) {
-        scales[blockIdx.x] = scale;
-    }
-#pragma unroll
-    for (int slot = 0; slot < GROUPS_PER_WARP; slot++) {
-        const int group = warp + slot * warps;
-        if (group < groups) {
-            uint32_t words[2] = {0, 0};
-#pragma unroll
-            for (int index = 0; index < 8; index++) {
-                const int quantized = static_cast<int>(fminf(fmaxf(rintf(values[slot][index] / scale), -128.0f), 127.0f));
-                words[index / 4] |= (static_cast<uint32_t>(quantized) & 0xFF) << (index % 4 * 8);
-            }
-            *reinterpret_cast<uint2*>(output + row_offset + group * CONVROT_GROUP + lane * 8) =
-                make_uint2(words[0], words[1]);
-        }
-    }
+    rotate_quantize_row<GROUPS_PER_WARP>(reinterpret_cast<const __nv_bfloat162*>(normalized_row),
+                                         quantized + token * hidden, scales + token, hidden);
 }
 
 // output[step, o] = Σ_r time_embedding[step, r] · weight[o, r] + bias[o], with FP16 weights.
@@ -399,5 +329,38 @@ extern "C" int mmh3_modulation(const float* time_embedding, const __half* weight
 
 extern "C" int mmh3_bf16_to_f32(const __nv_bfloat16* input, float* output, size_t count, cudaStream_t stream) {
     bf16_to_f32_kernel<<<grid_for(count), ROW_THREADS, 0, stream>>>(input, output, count);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int mmh3_add_norm_quantize(float* residual, const __nv_bfloat16* delta, const float* modulation,
+                                      const int32_t* rows, int chunks, int gate_chunk, int shift_chunk,
+                                      int scale_chunk, const __nv_bfloat16* weight, __nv_bfloat16* normalized,
+                                      int8_t* quantized, float* scales, int tokens, int hidden, float epsilon,
+                                      cudaStream_t stream) {
+    const int groups = hidden / CONVROT_GROUP;
+    const int groups_per_warp = (groups + ROW_THREADS / 32 - 1) / (ROW_THREADS / 32);
+    if (hidden % CONVROT_GROUP != 0 || groups == 0 || groups_per_warp > MAX_GROUPS_PER_WARP) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const size_t shared_bytes = static_cast<size_t>(hidden) * sizeof(__nv_bfloat16);
+    auto launch = [&](auto kernel) {
+        kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(residual, delta, modulation, rows, chunks, gate_chunk,
+                                                              shift_chunk, scale_chunk, weight, normalized, quantized,
+                                                              scales, hidden, epsilon);
+    };
+    switch (groups_per_warp) {
+        case 1:
+            launch(add_norm_quantize_kernel<1>);
+            break;
+        case 2:
+            launch(add_norm_quantize_kernel<2>);
+            break;
+        case 3:
+            launch(add_norm_quantize_kernel<3>);
+            break;
+        default:
+            launch(add_norm_quantize_kernel<4>);
+            break;
+    }
     return static_cast<int>(cudaGetLastError());
 }
