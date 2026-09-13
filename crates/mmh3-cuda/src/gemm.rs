@@ -26,7 +26,8 @@ pub fn int8_config_count() -> usize {
     unsafe { mmh3_int8_gemm_config_count() as usize }
 }
 
-/// Raw form of `int8_bf16` that picks the widest tile the output width allows.
+/// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows, such as prompts,
+/// and 256 × 128 otherwise.
 ///
 /// # Safety
 /// The pointers must cover the extents described for `int8_bf16`.
@@ -41,7 +42,7 @@ pub(crate) unsafe fn int8_bf16_pointers(
     n: usize,
     k: usize,
 ) -> Result<(), CudaError> {
-    let config = if n % 256 == 0 { 0 } else { 1 };
+    let config = if m < 256 && n % 256 == 0 { 1 } else { 0 };
     // SAFETY: the caller guarantees the extents.
     check(unsafe {
         mmh3_int8_gemm_bf16(
@@ -61,7 +62,8 @@ pub(crate) unsafe fn int8_bf16_pointers(
 
 /// output[m, n] = bf16(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] · weight_scales[n]).
 ///
-/// Activations and weights are row-major INT8 with K contiguous, scales are f32.
+/// Activations and weights are row-major INT8 with K contiguous, scales are f32. K must be a multiple of 128 and N
+/// a multiple of the config's tile width, 128 for config 0 and 256 for config 1.
 #[allow(clippy::too_many_arguments)]
 pub fn int8_bf16(
     config: usize,
