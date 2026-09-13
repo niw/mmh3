@@ -6,7 +6,7 @@ export PROMPT = A woman in a yellow raincoat opens a clear umbrella on a neon-li
 .PHONY: build
 build:
 	$(if $(shell command -v cargo),,$(error cargo is not installed. Install Rust))
-	cargo build --release --features cuda
+	cargo build --release --features cuda --bin mmh3
 
 # The fastest measured settings, with the video and audio encoded as an MP4 next to them.
 # NOTE: the prompt goes through the environment so that quotes in it reach mmh3 as they are.

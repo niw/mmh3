@@ -110,9 +110,25 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 make
 ```
 
-`make` runs `cargo build --release --features cuda`. `CUDA_HOME` points at the CUDA toolkit (default
-`/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU architecture (default `sm_120f`). Without
-`--features cuda`, only the CPU-side crates build and the command offers just `inspect`.
+`make` builds `mmh3` with `cargo build --release --features cuda --bin mmh3`.
+`CUDA_HOME` points at the CUDA toolkit (default `/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU
+architecture (default `sm_120f`). Without `--features cuda`, both commands can build with the CPU-side
+crates; only `mmh3-tools inspect` is available.
+
+Build the inspection and development tools separately with:
+
+```sh
+cargo build --release --features cuda --bin mmh3-tools
+```
+
+To run a specific command through Cargo:
+
+```sh
+cargo run --release --features cuda --bin mmh3 -- generate --prompt "A rainy street." --out out.y4m
+cargo run --release --features cuda --bin mmh3-tools -- device
+```
+
+`cargo run` defaults to `mmh3` when `--bin` is omitted.
 
 ## Models
 
@@ -193,17 +209,20 @@ overall_soundscape: The deep roar of waves breaking on the rocks, gusting wind, 
 non_diegetic_music: A slow, swelling orchestral string theme.
 ```
 
-Other commands:
+Inspection and development commands are available in `mmh3-tools`:
 
-- `mmh3 inspect FILE` summarizes the tensors of a safetensors file.
-- `mmh3 device` prints the GPU.
-- `mmh3 bench gemm|memory|mma|attention` measures kernels and the GPU.
-- `mmh3 check dit|sample|video-vae|audio-vae|text-encoder` compares a stage with golden data written
+- `mmh3-tools inspect FILE` summarizes the tensors of a safetensors file.
+- `mmh3-tools device` prints the GPU.
+- `mmh3-tools bench gemm|memory|mma|attention` measures kernels and the GPU.
+- `mmh3-tools check dit|sample|video-vae|audio-vae|text-encoder` compares a stage with golden data written
   by `tools/golden`.
 
 ## Repository layout
 
-- `src/main.rs`: the `mmh3` command.
+- `src/bin/mmh3/`: the `mmh3` entry point and video generation.
+- `src/bin/mmh3-tools/`: the `mmh3-tools` entry point, checkpoint inspection, benchmarks and reference checks.
+- `src/lib.rs`: support shared by both commands, with argument parsing in `src/cli.rs` and checkpoint loading
+  options in `src/models.rs`.
 - `crates/mmh3-core`: everything that does not depend on a GPU backend, such as the safetensors
   reader, the tokenizer, the packed token layout, schedules, VAE tiling plans, Sol-Attn's reference
   and the media writers.

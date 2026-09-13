@@ -1,5 +1,6 @@
 [package]
 name = "mmh3"
+default-run = "mmh3"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
