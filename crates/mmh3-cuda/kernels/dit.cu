@@ -333,9 +333,10 @@ __global__ void rotate_quantize_kernel(const Pair* __restrict__ input, int8_t* _
     rotate_quantize_row<GROUPS_PER_WARP>(input + row_offset / 2, output + row_offset, scales + blockIdx.x, columns);
 }
 
-// For each token: residual += gate ⊙ delta when a delta is given, then rms_norm(residual) ⊙ weight ⊙ (1 + scale) +
-// shift in BF16, kept in `normalized` when it is not null, and its ConvRot rotation quantized to INT8 with the row's
-// scale.
+// For each token: residual += gate ⊙ delta when a delta is given, with the gate from `gate_modulation`, then
+// rms_norm(residual) ⊙ weight ⊙ (1 + scale) + shift in BF16 with shift and scale from `modulation`, kept in
+// `normalized` when it is not null, and its ConvRot rotation quantized to INT8 with the row's scale. Both modulation
+// tables share the token's row.
 //
 // NOTE: The result matches gated_residual_add_kernel, rms_norm_modulate_kernel and rotate_quantize_kernel run one
 // after the other in every bit. The compiler fuses the residual update, the sum of squares and the modulation of those
@@ -344,7 +345,8 @@ __global__ void rotate_quantize_kernel(const Pair* __restrict__ input, int8_t* _
 template <int GROUPS_PER_WARP>
 __global__ void __launch_bounds__(ROW_THREADS)
     add_norm_quantize_kernel(float* __restrict__ residual, const __nv_bfloat16* __restrict__ delta,
-                             const float* __restrict__ modulation, const int32_t* __restrict__ rows, int chunks,
+                             const float* __restrict__ gate_modulation, const float* __restrict__ modulation,
+                             const int32_t* __restrict__ rows, int chunks,
                              int gate_chunk, int shift_chunk, int scale_chunk, const __nv_bfloat16* __restrict__ weight,
                              __nv_bfloat16* __restrict__ normalized, int8_t* __restrict__ quantized,
                              float* __restrict__ scales, int hidden, float epsilon) {
@@ -353,14 +355,17 @@ __global__ void __launch_bounds__(ROW_THREADS)
     const int64_t token = blockIdx.x;
     float* row = residual + token * hidden;
     const float* vectors = modulation != nullptr ? modulation + static_cast<size_t>(rows[token]) * chunks * hidden : nullptr;
+    const float* gate_vectors =
+        gate_modulation != nullptr ? gate_modulation + static_cast<size_t>(rows[token]) * chunks * hidden : nullptr;
 
     float squares = 0.0f;
     for (int index = threadIdx.x; index < hidden; index += blockDim.x) {
         float value = row[index];
         if (delta != nullptr) {
             const float change = __bfloat162float(delta[token * hidden + index]);
-            value = vectors != nullptr ? __fmaf_rn(change, vectors[static_cast<size_t>(gate_chunk) * hidden + index], value)
-                                       : __fadd_rn(value, change);
+            value = gate_vectors != nullptr
+                        ? __fmaf_rn(change, gate_vectors[static_cast<size_t>(gate_chunk) * hidden + index], value)
+                        : __fadd_rn(value, change);
             row[index] = value;
         }
         squares = __fmaf_rn(value, value, squares);
@@ -532,11 +537,11 @@ extern "C" int mmh3_bf16_to_f32(const __nv_bfloat16* input, float* output, size_
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int mmh3_add_norm_quantize(float* residual, const __nv_bfloat16* delta, const float* modulation,
-                                      const int32_t* rows, int chunks, int gate_chunk, int shift_chunk,
-                                      int scale_chunk, const __nv_bfloat16* weight, __nv_bfloat16* normalized,
-                                      int8_t* quantized, float* scales, int tokens, int hidden, float epsilon,
-                                      cudaStream_t stream) {
+extern "C" int mmh3_add_norm_quantize(float* residual, const __nv_bfloat16* delta, const float* gate_modulation,
+                                      const float* modulation, const int32_t* rows, int chunks, int gate_chunk,
+                                      int shift_chunk, int scale_chunk, const __nv_bfloat16* weight,
+                                      __nv_bfloat16* normalized, int8_t* quantized, float* scales, int tokens,
+                                      int hidden, float epsilon, cudaStream_t stream) {
     const int groups = hidden / CONVROT_GROUP;
     const int groups_per_warp = (groups + ROW_THREADS / 32 - 1) / (ROW_THREADS / 32);
     if (hidden % CONVROT_GROUP != 0 || groups == 0 || groups_per_warp > MAX_GROUPS_PER_WARP) {
@@ -544,9 +549,9 @@ extern "C" int mmh3_add_norm_quantize(float* residual, const __nv_bfloat16* delt
     }
     const size_t shared_bytes = static_cast<size_t>(hidden) * sizeof(__nv_bfloat16);
     auto launch = [&](auto kernel) {
-        kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(residual, delta, modulation, rows, chunks, gate_chunk,
-                                                              shift_chunk, scale_chunk, weight, normalized, quantized,
-                                                              scales, hidden, epsilon);
+        kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(residual, delta, gate_modulation, modulation, rows, chunks,
+                                                              gate_chunk, shift_chunk, scale_chunk, weight, normalized,
+                                                              quantized, scales, hidden, epsilon);
     };
     switch (groups_per_warp) {
         case 1:

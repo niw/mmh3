@@ -80,6 +80,7 @@ unsafe extern "C" {
     fn mmh3_add_norm_quantize(
         residual: *mut c_void,
         delta: *const c_void,
+        gate_modulation: *const c_void,
         modulation: *const c_void,
         rows: *const c_void,
         chunks: c_int,
@@ -99,6 +100,8 @@ unsafe extern "C" {
 
 /// Block modulation vectors per row: shift, scale and gate for attention, then for the MLP.
 const BLOCK_CHUNKS: usize = 6;
+/// The chunk of the block modulation that gates the MLP output.
+const MLP_GATE_CHUNK: usize = 5;
 /// Final layer modulation vectors per row: shift and scale.
 const FINAL_CHUNKS: usize = 2;
 
@@ -309,9 +312,9 @@ impl CudaDit {
         Ok(())
     }
 
-    /// Adds the gated delta to the residual when `gate` names its modulation chunk, then normalizes the residual with
-    /// `weight` and the modulation's shift and scale chunks and quantizes it into the workspace for the INT8 layer
-    /// `layer`. The BF16 rows stay in `normalized` only when the layer's adapter needs them.
+    /// Adds the delta to the residual, gated by a chunk of a modulation table when `gate` names one, then normalizes
+    /// the residual with `weight` and the modulation's shift and scale chunks and quantizes it into the workspace for
+    /// the INT8 layer `layer`. The BF16 rows stay in `normalized` only when the layer's adapter needs them.
     #[allow(clippy::too_many_arguments)]
     fn add_norm_quantize(
         &self,
@@ -320,7 +323,7 @@ impl CudaDit {
         workspace: &Workspace,
         tokens: usize,
         (table, rows): (&DeviceBuffer, &DeviceBuffer),
-        gate: Option<usize>,
+        gate: Option<(&DeviceBuffer, usize)>,
         shift: usize,
         scale: usize,
     ) -> Result<(), Error> {
@@ -333,10 +336,11 @@ impl CudaDit {
             mmh3_add_norm_quantize(
                 workspace.residual.pointer(),
                 gate.map_or(ptr::null(), |_| workspace.delta.pointer().cast_const()),
+                gate.map_or(ptr::null(), |(gate_table, _)| gate_table.pointer().cast_const()),
                 table.pointer(),
                 rows.pointer(),
                 BLOCK_CHUNKS as c_int,
-                gate.unwrap_or(0) as c_int,
+                gate.map_or(0, |(_, chunk)| chunk) as c_int,
                 shift as c_int,
                 scale as c_int,
                 self.pointer(weight)?,
@@ -402,6 +406,11 @@ impl CudaDit {
 
     /// Attention and MLP halves of a block or refiner block. `modulation` carries the block modulation and `sparse`
     /// replaces dense attention with Sol-Attn.
+    ///
+    /// A modulated block leaves its MLP output in `delta` instead of adding it to the residual, so that the next block
+    /// adds it in its first normalization. `pending` is the modulation table of the block that left it, and
+    /// `add_pending` adds it on its own.
+    #[allow(clippy::too_many_arguments)]
     fn transformer_block(
         &self,
         prefix: &str,
@@ -409,6 +418,7 @@ impl CudaDit {
         tokens: usize,
         angles: Option<&DeviceBuffer>,
         modulation: Option<(&DeviceBuffer, &DeviceBuffer)>,
+        pending: Option<&DeviceBuffer>,
         sparse: Option<&SparsePass>,
     ) -> Result<(), Error> {
         let config = &self.config;
@@ -419,9 +429,13 @@ impl CudaDit {
         let adapter = |layer: &str| self.adapters.get(layer).map(|adapter| (adapter, &workspace.adapter));
         // Modulated blocks normalize and quantize the inputs of their INT8 layers in one pass.
         if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&qkv)) {
-            self.add_norm_quantize(&format!("{prefix}.norm1.weight"), &qkv, workspace, tokens, modulation, None, 0, 1)?;
+            let pending_gate = pending.map(|table| (table, MLP_GATE_CHUNK));
+            self.add_norm_quantize(&format!("{prefix}.norm1.weight"), &qkv, workspace, tokens, modulation, pending_gate, 0, 1)?;
             self.tensors.linear_quantized(&qkv, workspace.normalized.pointer(), workspace.qkv.pointer(), tokens, &workspace.quantized, &workspace.scales, adapter(&qkv), false)?;
         } else {
+            if let Some((table, rows)) = pending.zip(modulation.map(|(_, rows)| rows)) {
+                self.add_pending(workspace, tokens, table, rows)?;
+            }
             self.normalize(&format!("{prefix}.norm1.weight"), workspace.residual.pointer(), workspace.normalized.pointer(), false, tokens, modulate(0, 1))?;
             self.linear(&qkv, workspace.normalized.pointer(), workspace.qkv.pointer(), tokens, workspace)?;
         }
@@ -491,7 +505,7 @@ impl CudaDit {
 
         let fc1 = format!("{prefix}.mlp.fc1");
         if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&fc1)) {
-            self.add_norm_quantize(&format!("{prefix}.norm2.weight"), &fc1, workspace, tokens, modulation, Some(2), 3, 4)?;
+            self.add_norm_quantize(&format!("{prefix}.norm2.weight"), &fc1, workspace, tokens, modulation, Some((modulation.0, 2)), 3, 4)?;
             self.tensors.linear_quantized(&fc1, workspace.normalized.pointer(), workspace.activated.pointer(), tokens, &workspace.quantized, &workspace.scales, adapter(&fc1), true)?;
         } else if self.tensors.is_int8(&fc1) {
             return Err(Error::Model(format!("{fc1}: an INT8 MLP needs the block modulation")));
@@ -505,7 +519,15 @@ impl CudaDit {
             })?;
         }
         self.linear(&format!("{prefix}.mlp.fc2"), workspace.activated.pointer(), workspace.delta.pointer(), tokens, workspace)?;
-        self.add_residual(workspace, tokens, gate(5))
+        match modulation {
+            Some(_) => Ok(()),
+            None => self.add_residual(workspace, tokens, None),
+        }
+    }
+
+    /// Adds the MLP output a modulated block left in `delta`, gated by the block's modulation table.
+    fn add_pending(&self, workspace: &Workspace, tokens: usize, table: &DeviceBuffer, rows: &DeviceBuffer) -> Result<(), Error> {
+        self.add_residual(workspace, tokens, Some((table, rows, MLP_GATE_CHUNK)))
     }
 
     /// Writes the refined text states into the first rows of the residual stream.
@@ -519,7 +541,7 @@ impl CudaDit {
             mmh3_bf16_to_f32(workspace.normalized.pointer(), workspace.residual.pointer(), tokens * self.config.hidden, ptr::null_mut())
         })?;
         for layer in 0..self.config.refiner_layers {
-            self.transformer_block(&format!("token_refiner.blocks.{layer}"), workspace, tokens, None, None, None)?;
+            self.transformer_block(&format!("token_refiner.blocks.{layer}"), workspace, tokens, None, None, None, None)?;
         }
         self.normalize("token_refiner.final_norm.weight", workspace.residual.pointer(), workspace.residual.pointer(), true, tokens, None)
     }
@@ -565,18 +587,30 @@ impl CudaDit {
         };
         let sparse_pass = sparse_workspace.as_ref().map(|(workspace, tau)| SparsePass { workspace, tau: *tau, sinks: SparseSinks::for_layout(&layout) });
         let mut routed = 0.0;
-        let modulation = DeviceBuffer::new(steps * MODALITY_COUNT * BLOCK_CHUNKS * hidden * 4)?;
+        // Each block leaves its gated MLP output to the next, so the tables of two blocks are alive at a time.
+        let modulations = [
+            DeviceBuffer::new(steps * MODALITY_COUNT * BLOCK_CHUNKS * hidden * 4)?,
+            DeviceBuffer::new(steps * MODALITY_COUNT * BLOCK_CHUNKS * hidden * 4)?,
+        ];
+        let mut pending = None;
         let mut blocks = Vec::new();
         for layer in 0..config.layers {
             let prefix = format!("blocks.{layer}");
-            self.modulation(&format!("{prefix}.adaln_proj.linear"), &time_embedding, steps, &modulation)?;
-            self.transformer_block(&prefix, &workspace, tokens, Some(&angles), Some((&modulation, &block_rows)), sparse_pass.as_ref())?;
+            let modulation = &modulations[layer % 2];
+            self.modulation(&format!("{prefix}.adaln_proj.linear"), &time_embedding, steps, modulation)?;
+            self.transformer_block(&prefix, &workspace, tokens, Some(&angles), Some((modulation, &block_rows)), pending, sparse_pass.as_ref())?;
+            pending = Some(modulation);
             if let Some(pass) = &sparse_pass {
                 routed += pass.workspace.routed_fraction()?;
             }
             if capture.contains(&layer) {
+                self.add_pending(&workspace, tokens, modulation, &block_rows)?;
+                pending = None;
                 blocks.push((layer, workspace.residual.to_f32()?));
             }
+        }
+        if let Some(modulation) = pending {
+            self.add_pending(&workspace, tokens, modulation, &block_rows)?;
         }
 
         let final_modulation = DeviceBuffer::new(steps * FINAL_CHUNKS * hidden * 4)?;
