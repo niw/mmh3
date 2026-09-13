@@ -426,7 +426,7 @@ impl CudaDit {
         let time_embedding = DeviceBuffer::from_f32(&timesteps.time_embedding(&self.adaln_table))?;
 
         self.refine_text(&inputs.context, &workspace)?;
-        let text_states = workspace.residual.to_f32()?[..text_tokens * hidden].to_vec();
+        let text_states = workspace.residual.to_f32_range(0, text_tokens * hidden)?;
 
         let audio = layout.segment(SegmentKind::Audio);
         let video = layout.segment(SegmentKind::Video);

@@ -14,6 +14,9 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::ptr;
 
+// Device buffers hold f32 and other values in the GPU's little-endian byte order, which host slices share.
+const _: () = assert!(cfg!(target_endian = "little"), "mmh3 assumes a little-endian host");
+
 #[repr(C)]
 struct RawDeviceInfo {
     name: [c_char; 256],
@@ -150,13 +153,21 @@ impl DeviceBuffer {
     }
 
     pub fn from_f32(values: &[f32]) -> Result<Self, CudaError> {
-        Self::from_bytes(&values.iter().flat_map(|value| value.to_le_bytes()).collect::<Vec<_>>())
+        // SAFETY: the byte view covers exactly the storage of the slice.
+        Self::from_bytes(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) })
     }
 
     pub fn to_f32(&self) -> Result<Vec<f32>, CudaError> {
-        let mut bytes = vec![0; self.bytes];
-        self.copy_to_host(&mut bytes)?;
-        Ok(bytes.chunks_exact(4).map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap())).collect())
+        self.to_f32_range(0, self.bytes / 4)
+    }
+
+    /// Copies `count` f32 values starting at value `first`.
+    pub fn to_f32_range(&self, first: usize, count: usize) -> Result<Vec<f32>, CudaError> {
+        let mut values = vec![0.0f32; count];
+        // SAFETY: the byte view covers exactly the storage of the vector, and every bit pattern is a valid f32.
+        let bytes = unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), count * 4) };
+        self.copy_range_to_host(first * 4, bytes)?;
+        Ok(values)
     }
 
     pub fn bytes(&self) -> usize {
