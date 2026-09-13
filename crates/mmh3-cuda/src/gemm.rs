@@ -1,0 +1,97 @@
+//! GEMM kernels for the DiT linear layers.
+
+use crate::{CudaError, DeviceBuffer, check};
+use std::ffi::{c_int, c_void};
+use std::ptr;
+
+unsafe extern "C" {
+    fn mmh3_int8_gemm_config_count() -> c_int;
+    fn mmh3_int8_gemm_bf16(
+        config: c_int,
+        activations: *const c_void,
+        weights: *const c_void,
+        activation_scales: *const c_void,
+        weight_scales: *const c_void,
+        output: *mut c_void,
+        m: c_int,
+        n: c_int,
+        k: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+}
+
+/// Number of tile configurations the INT8 GEMM kernel is compiled for.
+pub fn int8_config_count() -> usize {
+    // SAFETY: no arguments.
+    unsafe { mmh3_int8_gemm_config_count() as usize }
+}
+
+/// Raw form of `int8_bf16` that picks the widest tile the output width allows.
+///
+/// # Safety
+/// The pointers must cover the extents described for `int8_bf16`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn int8_bf16_pointers(
+    activations: *const c_void,
+    weights: *const c_void,
+    activation_scales: *const c_void,
+    weight_scales: *const c_void,
+    output: *mut c_void,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    let config = if n % 256 == 0 { 0 } else { 1 };
+    // SAFETY: the caller guarantees the extents.
+    check(unsafe {
+        mmh3_int8_gemm_bf16(
+            config,
+            activations,
+            weights,
+            activation_scales,
+            weight_scales,
+            output,
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            ptr::null_mut(),
+        )
+    })
+}
+
+/// output[m, n] = bf16(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] · weight_scales[n]).
+///
+/// Activations and weights are row-major INT8 with K contiguous, scales are f32.
+#[allow(clippy::too_many_arguments)]
+pub fn int8_bf16(
+    config: usize,
+    activations: &DeviceBuffer,
+    weights: &DeviceBuffer,
+    activation_scales: &DeviceBuffer,
+    weight_scales: &DeviceBuffer,
+    output: &mut DeviceBuffer,
+    m: usize,
+    n: usize,
+    k: usize,
+) -> Result<(), CudaError> {
+    assert!(activations.bytes() >= m * k, "activations are smaller than m × k");
+    assert!(weights.bytes() >= n * k, "weights are smaller than n × k");
+    assert!(activation_scales.bytes() >= m * 4, "activation scales are smaller than m");
+    assert!(weight_scales.bytes() >= n * 4, "weight scales are smaller than n");
+    assert!(output.bytes() >= m * n * 2, "output is smaller than m × n");
+    // SAFETY: every buffer covers the extent the kernel touches, checked above.
+    check(unsafe {
+        mmh3_int8_gemm_bf16(
+            config as c_int,
+            activations.pointer(),
+            weights.pointer(),
+            activation_scales.pointer(),
+            weight_scales.pointer(),
+            output.pointer(),
+            m as c_int,
+            n as c_int,
+            k as c_int,
+            ptr::null_mut(),
+        )
+    })
+}
