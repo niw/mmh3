@@ -39,7 +39,9 @@ constexpr int WARPS = BLOCK / 16;
 constexpr int THREADS = WARPS * 32;
 using T = Tiles<HEAD>;
 using N = Numeric<__nv_bfloat16>;
-static_assert(BLOCK * T::row_bytes <= T::stage_bytes, "the query tile must fit in one stage");
+static_assert(BLOCK * T::row_bytes <= T::tile_bytes, "the query tile must fit in the value buffer");
+// A key and a value buffer, small enough for two CTAs per SM.
+constexpr int ATTENTION_SHARED_BYTES = 2 * T::tile_bytes;
 static_assert(THREADS == HEAD, "the routing kernel gives each thread one dimension");
 
 __device__ __forceinline__ int block_rows(int block, int tokens) {
@@ -137,17 +139,33 @@ __global__ void __launch_bounds__(THREADS)
     const float threshold = tau * sqrtf(spread * log2_scale * log2_scale + 1e-6f);
     const bool dense_row = query_block >= sink_query_start && query_block < sink_query_end;
 
+    // NOTE: the loops below read ROUTE_BATCH key blocks at once so that their loads overlap, and keep the order of
+    // every sum.
+    constexpr int ROUTE_BATCH = 8;
     const float* keys = workspace.block_keys + static_cast<size_t>(head) * blocks * HEAD;
-    for (int key_block = warp; key_block < blocks; key_block += THREADS / 32) {
-        float partial = 0.0f;
-        for (int dimension = lane; dimension < HEAD; dimension += 32) {
-            partial += centroid[dimension] * keys[static_cast<size_t>(key_block) * HEAD + dimension];
+    for (int first = warp * ROUTE_BATCH; first < blocks; first += THREADS / 32 * ROUTE_BATCH) {
+        float loaded[ROUTE_BATCH][HEAD / 32];
+#pragma unroll
+        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+#pragma unroll
+            for (int part = 0; part < HEAD / 32; part++) {
+                loaded[batch][part] = first + batch < blocks ? keys[static_cast<size_t>(first + batch) * HEAD + lane + part * 32] : 0.0f;
+            }
         }
-        const float score = warp_sum(partial) * log2_scale;
-        if (lane == 0) {
-            weights[key_block] = score;
-            routed[key_block] = score > threshold || abs(query_block - key_block) <= 1 ||
-                                (key_block >= sink_key_start && key_block < sink_key_end) || dense_row;
+#pragma unroll
+        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+            const int key_block = first + batch;
+            float partial = 0.0f;
+#pragma unroll
+            for (int part = 0; part < HEAD / 32; part++) {
+                partial += centroid[lane + part * 32] * loaded[batch][part];
+            }
+            const float score = warp_sum(partial) * log2_scale;
+            if (lane == 0 && key_block < blocks) {
+                weights[key_block] = score;
+                routed[key_block] = score > threshold || abs(query_block - key_block) <= 1 ||
+                                    (key_block >= sink_key_start && key_block < sink_key_end) || dense_row;
+            }
         }
     }
     __syncthreads();
@@ -169,9 +187,18 @@ __global__ void __launch_bounds__(THREADS)
 
     const float* values = workspace.value_sums + static_cast<size_t>(head) * blocks * HEAD + threadIdx.x;
     float tail = 0.0f;
-    for (int key_block = 0; key_block < blocks; key_block++) {
-        if (!routed[key_block]) {
-            tail += weights[key_block] * values[static_cast<size_t>(key_block) * HEAD];
+    for (int first = 0; first < blocks; first += ROUTE_BATCH) {
+        float loaded[ROUTE_BATCH];
+#pragma unroll
+        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+            loaded[batch] = first + batch < blocks ? values[static_cast<size_t>(first + batch) * HEAD] : 0.0f;
+        }
+#pragma unroll
+        for (int batch = 0; batch < ROUTE_BATCH; batch++) {
+            const int key_block = first + batch;
+            if (key_block < blocks && !routed[key_block]) {
+                tail += weights[key_block] * loaded[batch];
+            }
         }
     }
     workspace.tail_values[row * HEAD + threadIdx.x] = tail;
@@ -237,28 +264,37 @@ __global__ void __launch_bounds__(THREADS, 2)
     const __nv_bfloat16* query_head = query + head * layout.head_stride[QUERY];
     const __nv_bfloat16* key_head = key + head * layout.head_stride[KEY];
     const __nv_bfloat16* value_head = value + head * layout.head_stride[VALUE];
-    auto stage_address = [&](int stage) { return shared_base + stage * T::stage_bytes; };
-    auto load_key_value_block = [&](int entry, int stage) {
-        const int key_block = route[entry];
-        load_rows<HEAD, THREADS>(stage_address(stage), key_head, layout.token_stride[KEY], key_block * BLOCK, BLOCK, tokens);
-        load_rows<HEAD, THREADS>(stage_address(stage) + T::tile_bytes, value_head, layout.token_stride[VALUE],
-                                 key_block * BLOCK, BLOCK, tokens);
+    // NOTE: keys and values have one buffer each. The next key tile loads while the warps apply softmax and multiply
+    // the values, and the next value tile while they score the next keys.
+    const uint32_t key_tile = shared_base;
+    const uint32_t value_tile = shared_base + T::tile_bytes;
+    auto load_keys = [&](int entry) {
+        load_rows<HEAD, THREADS>(key_tile, key_head, layout.token_stride[KEY], route[entry] * BLOCK, BLOCK, tokens);
+    };
+    auto load_values = [&](int entry) {
+        load_rows<HEAD, THREADS>(value_tile, value_head, layout.token_stride[VALUE], route[entry] * BLOCK, BLOCK, tokens);
     };
 
-    load_rows<HEAD, THREADS>(stage_address(1), query_head, layout.token_stride[QUERY], first_query, BLOCK, tokens);
+    // The query tile borrows the value buffer until it has been copied into registers.
+    load_rows<HEAD, THREADS>(value_tile, query_head, layout.token_stride[QUERY], first_query, BLOCK, tokens);
+    if (count > 0) {
+        load_keys(0);
+    }
     copy_async_commit();
-    load_key_value_block(0, 0);
-    copy_async_commit();
-    copy_async_wait<1>();
+    copy_async_wait<0>();
     __syncthreads();
 
     uint32_t query_fragments[HEAD / 16][4];
 #pragma unroll
     for (int k_step = 0; k_step < HEAD / 16; k_step++) {
         const int tile_row = warp * 16 + (matrix % 2) * 8 + matrix_row;
-        load_matrix_x4(query_fragments[k_step], stage_address(1) + T::offset(tile_row, k_step * 2 + matrix / 2));
+        load_matrix_x4(query_fragments[k_step], value_tile + T::offset(tile_row, k_step * 2 + matrix / 2));
     }
     __syncthreads();
+    if (count > 0) {
+        load_values(0);
+    }
+    copy_async_commit();
 
     const int group_id = lane / 4;
     float offsets[2];
@@ -272,15 +308,6 @@ __global__ void __launch_bounds__(THREADS, 2)
     float row_sum[2] = {0.0f, 0.0f};
 
     for (int entry = 0; entry < count; entry++) {
-        if (entry + 1 < count) {
-            load_key_value_block(entry + 1, (entry + 1) % 2);
-        }
-        copy_async_commit();
-        copy_async_wait<1>();
-        __syncthreads();
-
-        const uint32_t key_tile = stage_address(entry % 2);
-        const uint32_t value_tile = key_tile + T::tile_bytes;
         float scores[BLOCK / 8][4] = {};
 #pragma unroll
         for (int k_step = 0; k_step < HEAD / 16; k_step++) {
@@ -293,6 +320,14 @@ __global__ void __launch_bounds__(THREADS, 2)
                 N::mma(scores[key_pair * 2 + 1], query_fragments[k_step], registers[2], registers[3]);
             }
         }
+
+        // The value tile of this entry has arrived, and no warp reads the key buffer any more.
+        copy_async_wait<0>();
+        __syncthreads();
+        if (entry + 1 < count) {
+            load_keys(entry + 1);
+        }
+        copy_async_commit();
 
         const int first_key = route[entry] * BLOCK;
         const bool partial_block = first_key + BLOCK > tokens;
@@ -352,7 +387,13 @@ __global__ void __launch_bounds__(THREADS, 2)
                 N::mma(output_accumulators[dimension_pair * 2 + 1], probability_fragment, registers[2], registers[3]);
             }
         }
+        // The key tile of the next entry has arrived, and no warp reads the value buffer any more.
+        copy_async_wait<0>();
         __syncthreads();
+        if (entry + 1 < count) {
+            load_values(entry + 1);
+        }
+        copy_async_commit();
     }
     copy_async_wait<0>();
 
@@ -423,16 +464,7 @@ extern "C" int mmh3_sparse_attention(const void* query, const void* key, const v
     row_offsets_kernel<<<static_cast<unsigned>((items + 7) / 8), 256, 0, stream>>>(q, tokens, heads, *layout,
                                                                                   workspace->key_mean, log2_scale,
                                                                                   workspace->row_offsets);
-    static bool configured = false;
-    if (!configured) {
-        cudaError_t status = cudaFuncSetAttribute(sparse_attention_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                  T::shared_bytes);
-        if (status != cudaSuccess) {
-            return static_cast<int>(status);
-        }
-        configured = true;
-    }
-    sparse_attention_kernel<<<dim3(blocks, heads), THREADS, T::shared_bytes, stream>>>(
+    sparse_attention_kernel<<<dim3(blocks, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
         q, k, v, static_cast<__nv_bfloat16*>(output), tokens, *layout, blocks, *workspace, log2_scale);
     return static_cast<int>(cudaGetLastError());
 }
