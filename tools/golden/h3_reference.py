@@ -14,7 +14,11 @@ default BF16, as a tighter reference. --lora applies a LoRA from models/loras to
 DiT, for example the 768p Turbo LoRA with --steps 4 --shift-video 6. ComfyUI merges a
 LoRA into quantized weights and requantizes them with stochastic rounding, and
 --lora-rounding nearest rounds to nearest instead. --sparse-attention sol patches in
-ComfyUI's Sol-Attn from the step at --sparse-start of the run.
+ComfyUI's Sol-Attn from the step at --sparse-start of the run. --dit picks another DiT
+from the models directory, and --sparse-attention vsa replaces the attention of its blocks
+with an FP32 implementation of FastVideo's VSA-H3 on every step, for FastH3 checkpoints
+such as diffusion_models/minimax_h3_fastvideo_vsa_datafree_1300step_4step_int8_convrot
+.safetensors.
 
 It writes up to three files into the output directory:
 
@@ -38,6 +42,7 @@ It writes up to three files into the output directory:
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -67,6 +72,172 @@ def temporal_shape(frames):
 
 def time_shift(base, shift):
     return shift * base / (1.0 + (shift - 1.0) * base)
+
+
+VSA_TILE = 64
+VSA_CUBE = (4, 4, 4)
+
+
+def vsa_plan(layout, device):
+    """Tiles of FastVideo's VSA-H3 for a ComfyUI packed layout.
+
+    Returns the padded tile table [tiles, 64] of sequence rows (-1 marks padding), the
+    tile lengths and the number of text and audio tiles, which come first. Every
+    non-video segment is cut into tiles of up to 64 consecutive rows, and the video
+    patches form 4 x 4 x 4 cubes of (latent frame, patch row, patch column).
+    """
+    _, latent_t, latent_h, latent_w, _ = layout.signature
+    tiles = []
+    for start, end, kind in layout.segments:
+        if kind != "video":
+            tiles += [
+                list(range(row, min(row + VSA_TILE, end)))
+                for row in range(start, end, VSA_TILE)
+            ]
+    prefix = len(tiles)
+    start, end = next((a, b) for a, b, kind in layout.segments if kind == "video")
+    grid = (int(latent_t), int(latent_h) // 2, int(latent_w) // 2)
+    rows = torch.arange(start, end).view(*grid)
+    for t in range(0, grid[0], VSA_CUBE[0]):
+        for h in range(0, grid[1], VSA_CUBE[1]):
+            for w in range(0, grid[2], VSA_CUBE[2]):
+                cube = rows[
+                    t : t + VSA_CUBE[0], h : h + VSA_CUBE[1], w : w + VSA_CUBE[2]
+                ]
+                tiles.append(cube.flatten().tolist())
+    table = torch.full((len(tiles), VSA_TILE), -1, dtype=torch.int64)
+    for index, tile in enumerate(tiles):
+        table[index, : len(tile)] = torch.tensor(tile)
+    lengths = torch.tensor([len(tile) for tile in tiles])
+    return table.to(device), lengths.to(device), prefix
+
+
+def vsa(query, key, value, gate, plan, sparsity, chunk_tiles=8):
+    """VSA-H3 in FP32 over [tokens, heads, dim] tensors in sequence order.
+
+    Each query tile attends to the key tiles it selects, gathered per head. The matrix
+    products run in TF32, which holds the BF16 query, key and value exactly.
+    """
+    table, lengths, prefix = plan
+    tiles = table.shape[0]
+    tokens, heads, dim = query.shape
+    live = (table >= 0).flatten()
+    rows = table.flatten()[live]
+
+    def tiled(x):
+        padded = x.new_zeros((tiles * VSA_TILE, heads, dim), dtype=torch.float32)
+        padded[live] = x[rows].float()
+        return padded
+
+    q, k, v = tiled(query), tiled(key), tiled(value)
+    count = lengths.float().view(tiles, 1, 1)
+    pooled = [x.view(tiles, VSA_TILE, heads, dim).sum(1) / count for x in (q, k, v)]
+    scale = 1.0 / math.sqrt(dim)
+    scores = torch.einsum("qhd,khd->hqk", pooled[0], pooled[1]) * scale
+    video = tiles - prefix
+    kept = max(1, min(math.ceil((1.0 - sparsity) * video), video))
+
+    # [heads, tiles, 64, dim] views and the live key slots of every tile.
+    q4, k4, v4 = (
+        x.view(tiles, VSA_TILE, heads, dim).permute(2, 0, 1, 3) for x in (q, k, v)
+    )
+    live4 = table >= 0
+    output4 = torch.empty_like(q4)
+    tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+    try:
+        # Text and audio query tiles, and every tile without sparsity, attend to all keys.
+        dense = prefix if kept < video else tiles
+        dense_chunk = max(1, chunk_tiles // 4)
+        for first in range(0, dense, dense_chunk):
+            last = min(first + dense_chunk, dense)
+            logits = torch.einsum(
+                "hqd,hkd->hqk", q4[:, first:last].flatten(1, 2), k4.flatten(1, 2)
+            )
+            logits = logits * scale
+            logits.masked_fill_(~live4.view(1, 1, -1), float("-inf"))
+            output4[:, first:last] = torch.einsum(
+                "hqk,hkd->hqd", torch.softmax(logits, -1), v4.flatten(1, 2)
+            ).view(heads, last - first, VSA_TILE, dim)
+        if kept < video:
+            top = scores[:, prefix:, prefix:].topk(kept, dim=-1).indices + prefix
+            selected = torch.cat(
+                [
+                    torch.arange(prefix, device=top.device).expand(
+                        heads, video, prefix
+                    ),
+                    top,
+                ],
+                -1,
+            )
+            head_index = torch.arange(heads, device=top.device).view(heads, 1, 1)
+            for first in range(0, video, chunk_tiles):
+                last = min(first + chunk_tiles, video)
+                chosen = selected[:, first:last]
+                keys = k4[head_index, chosen].flatten(2, 3)
+                values = v4[head_index, chosen].flatten(2, 3)
+                logits = torch.einsum(
+                    "hcqd,hckd->hcqk", q4[:, prefix + first : prefix + last], keys
+                )
+                logits = logits * scale
+                logits.masked_fill_(
+                    ~live4[chosen].flatten(2, 3).unsqueeze(2), float("-inf")
+                )
+                output4[:, prefix + first : prefix + last] = torch.einsum(
+                    "hcqk,hckd->hcqd", torch.softmax(logits, -1), values
+                )
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = tf32
+    output = output4.permute(1, 2, 0, 3).reshape(-1, heads, dim)
+    if gate is not None:
+        coarse = torch.einsum("hqk,khd->qhd", torch.softmax(scores, -1), pooled[2])
+        output = output.view(tiles, VSA_TILE, heads, dim) + tiled(gate).view(
+            tiles, VSA_TILE, heads, dim
+        ) * coarse.unsqueeze(1)
+        output = output.view(-1, heads, dim)
+    result = torch.empty((tokens, heads, dim), dtype=torch.float32, device=query.device)
+    result[rows] = output[live]
+    return result
+
+
+def vsa_block_patch(block, sparsity, plans):
+    import comfy.model_management
+    import comfy.quant_ops
+
+    attn = block.attn
+
+    def attention(x, rope_freqs=None, transformer_options=None):
+        layout = transformer_options["minimax_h3_layout"]
+        key = (layout.signature, tuple(layout.segments))
+        if key not in plans:
+            plans[key] = vsa_plan(layout, x.device)
+        tokens, heads, dim = x.shape[0], attn.heads, attn.head_dim
+        q, k, v = attn.qkv_proj(x).split(heads * dim, dim=-1)
+        q = q.view(1, tokens, heads, dim)
+        k = k.view(1, tokens, heads, dim)
+        query_weight = comfy.model_management.cast_to(
+            attn.q_norm.weight, device=x.device
+        )
+        key_weight = comfy.model_management.cast_to(attn.k_norm.weight, device=x.device)
+        comfy.quant_ops.ck.rms_rope_split_half_(
+            q,
+            k,
+            rope_freqs,
+            query_weight,
+            key_weight,
+            epsilon=attn.q_norm.eps,
+            rot_dim=rope_freqs.shape[-3] * 2,
+        )
+        gate = None
+        if attn.to_gate_compress is not None:
+            gate = attn.to_gate_compress(x).view(tokens, heads, dim)
+        out = vsa(q[0], k[0], v.reshape(tokens, heads, dim), gate, plans[key], sparsity)
+        return attn.out_proj(out.to(x.dtype).view(tokens, heads * dim))
+
+    def patch(args, extra):
+        return extra["original_block"]({**args, "attention": attention})
+
+    return patch
 
 
 def main():
@@ -107,7 +278,11 @@ def main():
         default="stochastic",
         help="how ComfyUI requantizes quantized weights after merging the LoRA",
     )
-    parser.add_argument("--sparse-attention", choices=["off", "sol"], default="off")
+    parser.add_argument("--dit", default=DIT, help="DiT file in the models directory")
+    parser.add_argument(
+        "--sparse-attention", choices=["off", "sol", "vsa"], default="off"
+    )
+    parser.add_argument("--vsa-sparsity", type=float, default=0.9)
     parser.add_argument("--sparse-tau", type=float, default=1.3)
     parser.add_argument("--sparse-extra-tokens", type=int, default=256)
     parser.add_argument(
@@ -187,7 +362,7 @@ def main():
         model_management.soft_empty_cache()
 
     started = time.time()
-    patcher = comfy.sd.load_diffusion_model(os.path.join(models, DIT))
+    patcher = comfy.sd.load_diffusion_model(os.path.join(models, arguments.dit))
     if arguments.lora:
         if arguments.lora_rounding == "nearest":
             # ComfyUI seeds stochastic rounding from each weight's key, and seed 0 means
@@ -217,6 +392,16 @@ def main():
             extra_tokens=arguments.sparse_extra_tokens,
             verbose=False,
         )
+    if arguments.sparse_attention == "vsa":
+        patcher = patcher.clone()
+        plans = {}
+        for index, block in enumerate(patcher.model.diffusion_model.blocks):
+            patcher.set_model_patch_replace(
+                vsa_block_patch(block, arguments.vsa_sparsity, plans),
+                "dit",
+                "double_block",
+                index,
+            )
     model_management.load_models_gpu([patcher], force_full_load=True)
     model = patcher.model.diffusion_model
     # ComfyUI's DiT computes in the dtype of the context it receives.
@@ -270,6 +455,8 @@ def main():
                 tensors[f"step{step}.input.video"] = video.float().cpu()
                 tensors[f"step{step}.input.audio"] = audio.float().cpu()
             step_options = dict(options)
+            if arguments.sparse_attention == "vsa":
+                step_options.update(patcher.model_options["transformer_options"])
             if arguments.sparse_attention == "sol":
                 step_options.update(patcher.model_options["transformer_options"])
                 sparse = step >= arguments.sparse_start * arguments.steps
