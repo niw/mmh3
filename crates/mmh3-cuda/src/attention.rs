@@ -72,6 +72,11 @@ pub struct QuantizedWorkspace {
 
 impl QuantizedWorkspace {
     pub fn new(tokens: usize, heads: usize) -> Result<Self, CudaError> {
+        Self::with_blocks(tokens, heads, tokens.div_ceil(SPARSE_BLOCK))
+    }
+
+    /// Scratch for key blocks of 64 columns each, such as VSA tiles.
+    fn with_blocks(tokens: usize, heads: usize, blocks: usize) -> Result<Self, CudaError> {
         assert!(
             tokens > 0
                 && tokens <= (i32::MAX - 63) as usize
@@ -79,7 +84,6 @@ impl QuantizedWorkspace {
                 && heads <= u16::MAX as usize,
             "invalid attention shape"
         );
-        let blocks = tokens.div_ceil(SPARSE_BLOCK);
         let rows = tokens
             .checked_mul(heads)
             .and_then(|n| n.checked_mul(HEAD_DIM))
@@ -169,6 +173,9 @@ unsafe extern "C" {
         epsilon: f32,
         sparse: *const RawSparseWorkspace,
         quantized: *const RawQuantizedWorkspace,
+        tile_starts: *const c_void,
+        tile_lengths: *const c_void,
+        tiles: c_int,
         stream: *mut c_void,
     ) -> c_int;
     #[allow(clippy::too_many_arguments)]
@@ -199,6 +206,7 @@ unsafe extern "C" {
         gate: *const c_void,
         gate_stride: i64,
         output: *mut c_void,
+        tokens: c_int,
         heads: c_int,
         layout: *const AttentionLayout,
         scale: f32,
@@ -206,6 +214,8 @@ unsafe extern "C" {
         prefix_tiles: c_int,
         kept: c_int,
         workspace: *const RawVsaWorkspace,
+        quantized: *const RawQuantizedWorkspace,
+        inputs_ready: c_int,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_attention(
@@ -483,11 +493,12 @@ pub fn qk_norm_rope(
 pub enum PreparedAttention<'a> {
     DenseQuantized(&'a QuantizedWorkspace),
     Sparse(&'a SparseWorkspace),
+    Vsa(&'a VsaWorkspace),
 }
 
 /// `qk_norm_rope` fused with the per-block work of the attention that follows, which then runs with
-/// `AttentionInputs::Prepared`: Sol-Attn's block statistics, and INT8 q and k with the block maxima
-/// of |v| for quantized attention. Normalized k stays unwritten in qkv when the attention reads
+/// `AttentionInputs::Prepared`: Sol-Attn's block statistics, VSA's pooled tiles, and INT8 q and k
+/// with the block maxima of |v| for quantized attention. Normalized k stays unwritten in qkv when the attention reads
 /// only the INT8 keys, and so does normalized q for dense quantized attention.
 pub fn prepare_inputs(
     qkv: &mut DeviceBuffer,
@@ -530,6 +541,7 @@ pub(crate) unsafe fn prepare_inputs_pointers(
     epsilon: f32,
     attention: PreparedAttention,
 ) -> Result<(), CudaError> {
+    let mut tiles = (ptr::null(), ptr::null(), 0);
     let (sparse, quantized) = match attention {
         PreparedAttention::DenseQuantized(workspace) => {
             assert!(
@@ -548,6 +560,35 @@ pub(crate) unsafe fn prepare_inputs_pointers(
                 workspace.quantized.as_ref().map(QuantizedWorkspace::raw),
             )
         }
+        PreparedAttention::Vsa(workspace) => {
+            assert!(
+                workspace.tokens == tokens && workspace.heads == heads,
+                "the VSA workspace has another shape"
+            );
+            tiles = (
+                workspace.tile_starts.pointer().cast_const(),
+                workspace.tile_lengths.pointer().cast_const(),
+                workspace.tiles as c_int,
+            );
+            // The pooled tiles take the places of the block statistics.
+            let pooled = RawSparseWorkspace {
+                centroids: workspace.pooled_query.pointer(),
+                block_keys: workspace.pooled_key.pointer(),
+                value_sums: workspace.pooled_value.pointer(),
+                key_mean: ptr::null_mut(),
+                key_variance: ptr::null_mut(),
+                row_offsets: ptr::null_mut(),
+                routes: ptr::null_mut(),
+                route_counts: ptr::null_mut(),
+                tail_max: ptr::null_mut(),
+                tail_sum: ptr::null_mut(),
+                tail_values: ptr::null_mut(),
+            };
+            (
+                Some(pooled),
+                workspace.quantized.as_ref().map(QuantizedWorkspace::raw),
+            )
+        }
     };
     // SAFETY: the caller guarantees the extents, and the workspaces match the shape, checked above.
     check(unsafe {
@@ -562,6 +603,9 @@ pub(crate) unsafe fn prepare_inputs_pointers(
             epsilon,
             sparse.as_ref().map_or(ptr::null(), |raw| raw),
             quantized.as_ref().map_or(ptr::null(), |raw| raw),
+            tiles.0,
+            tiles.1,
+            tiles.2,
             ptr::null_mut(),
         )
     })
@@ -782,6 +826,7 @@ struct RawVsaWorkspace {
 
 /// The tiles of one VSA plan and scratch buffers for its sequence and head count.
 pub struct VsaWorkspace {
+    quantized: Option<QuantizedWorkspace>,
     tokens: usize,
     heads: usize,
     tiles: usize,
@@ -798,6 +843,16 @@ pub struct VsaWorkspace {
 
 impl VsaWorkspace {
     pub fn new(plan: &VsaPlan, tokens: usize, heads: usize) -> Result<Self, CudaError> {
+        Self::with_precision(plan, tokens, heads, AttentionPrecision::Bf16)
+    }
+
+    /// Quantizes the token attention when requested, which then needs prepared inputs.
+    pub fn with_precision(
+        plan: &VsaPlan,
+        tokens: usize,
+        heads: usize,
+        precision: AttentionPrecision,
+    ) -> Result<Self, CudaError> {
         let tiles = plan.tiles();
         assert!(
             tiles > 0 && tiles <= u16::MAX as usize + 1,
@@ -824,6 +879,12 @@ impl VsaWorkspace {
         };
         let per_tile = heads * tiles * HEAD_DIM * 4;
         Ok(VsaWorkspace {
+            quantized: match precision {
+                AttentionPrecision::Bf16 => None,
+                AttentionPrecision::Int8Fp8 => {
+                    Some(QuantizedWorkspace::with_blocks(tokens, heads, tiles)?)
+                }
+            },
             tokens,
             heads,
             tiles,
@@ -888,8 +949,14 @@ pub(crate) unsafe fn vsa_pointers(
     scale: f32,
     kept: usize,
     workspace: &VsaWorkspace,
+    inputs: AttentionInputs,
 ) -> Result<(), CudaError> {
+    assert!(
+        workspace.quantized.is_none() || inputs == AttentionInputs::Prepared,
+        "quantized VSA needs prepared inputs"
+    );
     let raw = workspace.raw();
+    let quantized = workspace.quantized.as_ref().map(QuantizedWorkspace::raw);
     // SAFETY: the caller guarantees the extents, and the workspace's tiles lie inside its sequence.
     check(unsafe {
         mmh3_vsa_attention(
@@ -899,6 +966,7 @@ pub(crate) unsafe fn vsa_pointers(
             gate,
             gate_stride as i64,
             output,
+            workspace.tokens as c_int,
             workspace.heads as c_int,
             layout,
             scale,
@@ -906,6 +974,8 @@ pub(crate) unsafe fn vsa_pointers(
             workspace.prefix_tiles as c_int,
             kept as c_int,
             &raw,
+            quantized.as_ref().map_or(ptr::null(), |raw| raw),
+            inputs.ready(),
             ptr::null_mut(),
         )
     })
@@ -925,6 +995,7 @@ pub fn vsa(
     scale: f32,
     kept: usize,
     workspace: &VsaWorkspace,
+    inputs: AttentionInputs,
 ) -> Result<(), CudaError> {
     let (tokens, heads) = (workspace.tokens, workspace.heads);
     let last = |offset: usize, operand: usize| {
@@ -965,6 +1036,7 @@ pub fn vsa(
             scale,
             kept,
             workspace,
+            inputs,
         )
     }
 }

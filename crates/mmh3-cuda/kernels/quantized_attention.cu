@@ -9,10 +9,10 @@
 #include "attention_workspace.cuh"
 #include "tensor_core.cuh"
 
-// Quantized DiT attention: Q/K use symmetric INT8 scales per head and 64-token block.
-// V uses FP8 E4M3 with one scale per head, and is transposed for the PV MMA. Probabilities
+// Quantized DiT attention: Q/K use symmetric INT8 scales per head and 64-token block, or per VSA
+// tile. V uses FP8 E4M3 with one scale per head, and is transposed for the PV MMA. Probabilities
 // are scaled by 448 before FP8 conversion. Softmax, the pooled sparse tail, and accumulation
-// stay in FP32. Both paths read BF16 inputs and write BF16 output.
+// stay in FP32. Every path reads BF16 inputs and writes BF16 output.
 
 namespace {
 
@@ -204,13 +204,55 @@ __global__ void quantize_qk(const __nv_bfloat16 *query, const __nv_bfloat16 *key
     }
 }
 
-template <bool SPARSE>
+// Quantize and transpose V like quantize_value, into 64 columns per VSA tile: half a tile of rows
+// per 32-column group, zero past the tile's length.
+__global__ void quantize_value_tiles(const __nv_bfloat16 *value, uint8_t *output,
+                                     const float *scales, int padded, Mmh3AttentionLayout layout,
+                                     Mmh3VsaWorkspace vsa) {
+    __shared__ uint8_t tile[32][33];
+    const int x = threadIdx.x;
+    const int y = threadIdx.y;
+    const int head = blockIdx.z;
+    const float scale = scales[head];
+    const int vsa_tile = blockIdx.x / 2;
+    const int first_row = (blockIdx.x % 2) * 32;
+    const int start = vsa.tile_starts[vsa_tile];
+    const int length = vsa.tile_lengths[vsa_tile];
+    for (int part = 0; part < 32; part += 8) {
+        const int row = first_row + y + part;
+        const int dimension = blockIdx.y * 32 + x;
+        const float v =
+            row < length
+                ? __bfloat162float(
+                      value[static_cast<int64_t>(start + row) * layout.token_stride[VALUE] +
+                            head * layout.head_stride[VALUE] + dimension]) /
+                      scale
+                : 0.0f;
+        tile[y + part][x] = __nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+    }
+    __syncthreads();
+    for (int part = 0; part < 32; part += 8) {
+        const int column = blockIdx.x * 32 + x;
+        const int dimension = blockIdx.y * 32 + y + part;
+        output[(static_cast<int64_t>(head) * HEAD_DIM + dimension) * padded + column] =
+            tile[x][y + part];
+    }
+}
+
+enum class Pattern { DENSE, SOL, VSA };
+
+// One CTA per head and query block of 64 tokens, or per head and VSA tile. Sol-Attn and VSA attend
+// to the routed blocks only, and Sol-Attn merges its pooled tail. VSA adds gate · coarse.
+template <Pattern PATTERN>
 __global__ void __launch_bounds__(THREADS, 3)
     attention_kernel(const uint8_t *__restrict__ query, const uint8_t *__restrict__ key,
                      const uint8_t *__restrict__ value, Element *__restrict__ output, int tokens,
                      Mmh3AttentionLayout layout, float scale_log2, const float *q_scales,
-                     const float *k_scales, const float *value_scale,
-                     Mmh3SparseWorkspace workspace) {
+                     const float *k_scales, const float *value_scale, Mmh3SparseWorkspace workspace,
+                     Mmh3VsaWorkspace vsa, const __nv_bfloat16 *__restrict__ gate,
+                     int64_t gate_stride) {
+    constexpr bool SPARSE = PATTERN == Pattern::SOL;
+    constexpr bool VSA = PATTERN == Pattern::VSA;
     using T = QuantizedTiles;
     using Q = Tiles<64>;
     using N = Numeric<Element>;
@@ -218,13 +260,16 @@ __global__ void __launch_bounds__(THREADS, 3)
     const uint32_t shared_base = shared_address(shared_memory);
     const int head = blockIdx.y;
     const int batch = blockIdx.z;
-    const int first_query = blockIdx.x * BLOCK_M;
+    const int first_query = VSA ? vsa.tile_starts[blockIdx.x] : blockIdx.x * BLOCK_M;
+    // Rows of the query block that hold tokens.
+    const int query_rows = VSA ? vsa.tile_lengths[blockIdx.x] : min(BLOCK_M, tokens - first_query);
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
     const int matrix = lane / 8;
     const int matrix_row = lane % 8;
-    const int route_blocks = (tokens + 63) / 64;
+    const int route_blocks = gridDim.x;
     const size_t route_row = static_cast<size_t>(head) * route_blocks + blockIdx.x;
+    const uint16_t *routes = VSA ? vsa.routes : workspace.routes;
 
     const int key_value_head = head / layout.heads_per_key_value;
     auto head_base = [&](const auto *base, Operand operand) {
@@ -234,7 +279,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     };
     const auto *query_head = head_base(query, QUERY);
     const auto *key_head = head_base(key, KEY);
-    const int padded_tokens = ((tokens + 63) / 64) * 64;
+    const int padded_tokens = route_blocks * 64;
     const uint8_t *value_head = value + static_cast<int64_t>(head) * HEAD_DIM * padded_tokens;
 
     auto stage_address = [&](int stage) { return shared_base + stage * T::stage_bytes; };
@@ -255,14 +300,16 @@ __global__ void __launch_bounds__(THREADS, 3)
         value_offsets[chunk] = (index / 4) * padded_tokens + (index % 4) * 16;
     }
     auto load_key_value_block = [&](int entry, int stage) {
-        const int block = SPARSE ? workspace.routes[route_row * route_blocks + entry] : entry;
+        const int block = SPARSE || VSA ? routes[route_row * route_blocks + entry] : entry;
+        const int first_key = VSA ? vsa.tile_starts[block] : block * BLOCK_N;
+        const int key_count = VSA ? vsa.tile_lengths[block] : tokens - first_key;
         const uint8_t *key_block =
-            key_head + static_cast<int64_t>(block) * BLOCK_N * layout.token_stride[KEY];
+            key_head + static_cast<int64_t>(first_key) * layout.token_stride[KEY];
         const uint8_t *value_block = value_head + block * BLOCK_N;
         const uint32_t base = stage_address(stage);
         #pragma unroll
         for (int chunk = 0; chunk < CHUNKS; chunk++) {
-            const bool valid = block * BLOCK_N + key_rows[chunk] < tokens;
+            const bool valid = key_rows[chunk] < key_count;
             copy_async_16(base + key_shared[chunk],
                           valid ? key_block + key_offsets[chunk] : key_head, valid);
         }
@@ -274,7 +321,7 @@ __global__ void __launch_bounds__(THREADS, 3)
 
     // The query tile borrows stage 1 until it has been copied into registers.
     load_qk8(stage_address(1), query_head, layout.token_stride[QUERY], first_query, BLOCK_M,
-             tokens);
+             first_query + query_rows);
     copy_async_commit();
     load_key_value_block(0, 0);
     copy_async_commit();
@@ -293,8 +340,10 @@ __global__ void __launch_bounds__(THREADS, 3)
     float output_accumulators[HEAD_DIM / 8][4] = {};
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
     float row_sum[2] = {0.0f, 0.0f};
-    const int blocks = SPARSE ? workspace.route_counts[route_row] : route_blocks;
-    const uint16_t *route = SPARSE ? workspace.routes + route_row * route_blocks : nullptr;
+    const int blocks = SPARSE ? workspace.route_counts[route_row]
+                       : VSA  ? vsa.route_counts[route_row]
+                              : route_blocks;
+    const uint16_t *route = SPARSE || VSA ? routes + route_row * route_blocks : nullptr;
     float offsets[2];
     #pragma unroll
     for (int half = 0; half < 2; half++) {
@@ -332,22 +381,22 @@ __global__ void __launch_bounds__(THREADS, 3)
             }
         }
 
-        const int key_block = SPARSE ? route[block] : block;
-        const bool masked_block = (key_block + 1) * BLOCK_N > tokens;
+        const int key_block = SPARSE || VSA ? route[block] : block;
+        // Keys past the block's tokens are masked.
+        const int key_count = VSA ? vsa.tile_lengths[key_block] : tokens - key_block * BLOCK_N;
+        const bool masked_block = key_count < BLOCK_N;
         float block_max[2] = {-FLT_MAX, -FLT_MAX};
         #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
             #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float score = static_cast<float>(raw_scores[key_tile_index][element]) *
-                                  (scale_log2 *
-                                   q_scales[head * route_blocks + (first_query + warp * 16) / 64] *
+                                  (scale_log2 * q_scales[head * route_blocks + blockIdx.x] *
                                    k_scales[head * route_blocks + key_block]) -
                               offsets[element / 2];
                 if (masked_block) {
-                    const int key_index =
-                        key_block * BLOCK_N + key_tile_index * 8 + (lane % 4) * 2 + (element % 2);
-                    if (key_index >= tokens) {
+                    const int key_row = key_tile_index * 8 + (lane % 4) * 2 + (element % 2);
+                    if (key_row >= key_count) {
                         score = -FLT_MAX;
                     }
                 }
@@ -438,10 +487,11 @@ __global__ void __launch_bounds__(THREADS, 3)
         output + batch * layout.batch_stride[OUTPUT] + head * layout.head_stride[OUTPUT];
     #pragma unroll
     for (int half = 0; half < 2; half++) {
-        const int token = first_query + warp * 16 + half * 8 + group_id;
-        if (token >= tokens) {
+        const int query_row = warp * 16 + half * 8 + group_id;
+        if (query_row >= query_rows) {
             continue;
         }
+        const int token = first_query + query_row;
         Element *output_row =
             output_head + static_cast<int64_t>(token) * layout.token_stride[OUTPUT];
         const float value_factor = value_scale[head] / 448.0f;
@@ -467,6 +517,23 @@ __global__ void __launch_bounds__(THREADS, 3)
                                      inverse_sum;
                 *reinterpret_cast<uint32_t *>(output_row + dimension) = N::pack(first, second);
             }
+        } else if (VSA && gate != nullptr) {
+            const float inverse_sum = value_factor / row_sum[half];
+            const float *coarse = vsa.coarse + route_row * HEAD_DIM;
+            const __nv_bfloat16 *gate_row = gate + token * gate_stride + head * HEAD_DIM;
+            #pragma unroll
+            for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
+                const int dimension = dimension_tile * 8 + (lane % 4) * 2;
+                const __nv_bfloat162 gates =
+                    *reinterpret_cast<const __nv_bfloat162 *>(gate_row + dimension);
+                const float first =
+                    fmaf(__low2float(gates), coarse[dimension],
+                         output_accumulators[dimension_tile][half * 2] * inverse_sum);
+                const float second =
+                    fmaf(__high2float(gates), coarse[dimension + 1],
+                         output_accumulators[dimension_tile][half * 2 + 1] * inverse_sum);
+                *reinterpret_cast<uint32_t *>(output_row + dimension) = N::pack(first, second);
+            }
         } else {
             const float inverse_sum = value_factor / row_sum[half];
             #pragma unroll
@@ -481,22 +548,23 @@ __global__ void __launch_bounds__(THREADS, 3)
 }
 
 // The launch path makes no allocations or host downloads. All scratch belongs to the caller.
-template <bool SPARSE>
+template <Pattern PATTERN>
 int launch_attention(const Mmh3QuantizedWorkspace &workspace, __nv_bfloat16 *output, int tokens,
                      int heads, Mmh3AttentionLayout layout, float scale, Mmh3SparseWorkspace sparse,
-                     cudaStream_t stream) {
+                     int blocks, Mmh3VsaWorkspace vsa, const __nv_bfloat16 *gate,
+                     int64_t gate_stride, cudaStream_t stream) {
     static const cudaError_t configured = cudaFuncSetAttribute(
-        attention_kernel<SPARSE>, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES);
+        attention_kernel<PATTERN>, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES);
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }
     layout.token_stride[0] = layout.token_stride[1] = static_cast<int64_t>(heads) * HEAD_DIM;
     layout.head_stride[0] = layout.head_stride[1] = HEAD_DIM;
     layout.heads_per_key_value = 1;
-    attention_kernel<SPARSE><<<dim3((tokens + 63) / 64, heads), THREADS, SHARED_BYTES, stream>>>(
+    attention_kernel<PATTERN><<<dim3(blocks, heads), THREADS, SHARED_BYTES, stream>>>(
         workspace.query, workspace.key, workspace.value, output, tokens, layout,
         scale * 1.4426950408889634f, workspace.query_scales, workspace.key_scales,
-        workspace.value_scales, sparse);
+        workspace.value_scales, sparse, vsa, gate, gate_stride);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -531,8 +599,29 @@ extern "C" int mmh3_attention_quantized(const void *query, const void *key, cons
             tokens, heads, *layout);
     }
     if (sparse != nullptr) {
-        return launch_attention<true>(*workspace, result, tokens, heads, *layout, scale, *sparse,
-                                      stream);
+        return launch_attention<Pattern::SOL>(*workspace, result, tokens, heads, *layout, scale,
+                                              *sparse, blocks, {}, nullptr, 0, stream);
     }
-    return launch_attention<false>(*workspace, result, tokens, heads, *layout, scale, {}, stream);
+    return launch_attention<Pattern::DENSE>(*workspace, result, tokens, heads, *layout, scale, {},
+                                            blocks, {}, nullptr, 0, stream);
+}
+
+extern "C" int mmh3_vsa_attention_quantized(const void *value, const void *gate,
+                                            int64_t gate_stride, void *output, int tokens,
+                                            int heads, const Mmh3AttentionLayout *layout,
+                                            float scale, int tiles, const Mmh3VsaWorkspace *vsa,
+                                            const Mmh3QuantizedWorkspace *workspace,
+                                            cudaStream_t stream) {
+    if (tokens <= 0 || heads <= 0 || tiles <= 0 || layout->causal ||
+        layout->heads_per_key_value > 1) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const int padded = tiles * 64;
+    value_scales<<<heads, 32, 0, stream>>>(workspace->value_maxima, workspace->value_scales, tiles);
+    quantize_value_tiles<<<dim3(tiles * 2, 4, heads), dim3(32, 8), 0, stream>>>(
+        static_cast<const __nv_bfloat16 *>(value), workspace->value, workspace->value_scales,
+        padded, *layout, *vsa);
+    return launch_attention<Pattern::VSA>(
+        *workspace, static_cast<__nv_bfloat16 *>(output), tokens, heads, *layout, scale, {}, tiles,
+        *vsa, static_cast<const __nv_bfloat16 *>(gate), gate_stride, stream);
 }

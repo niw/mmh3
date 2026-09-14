@@ -2,12 +2,14 @@
 //! attention path has to match qk_norm_rope followed by the attention's own preparation in every
 //! bit.
 
+use mmh3_core::dit::layout::PackedLayout;
 use mmh3_core::dit::sparse::SparseSinks;
-use mmh3_core::numeric::f32_to_bf16;
+use mmh3_core::dit::vsa::{VsaPlan, reference};
+use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
 use mmh3_cuda::attention::{
     self, AttentionInputs, AttentionLayout, AttentionOffsets, AttentionPrecision, HEAD_DIM,
-    HeadNorm, PreparedAttention, QuantizedWorkspace, SparseWorkspace,
+    HeadNorm, PreparedAttention, QuantizedWorkspace, SparseWorkspace, VsaWorkspace,
 };
 
 const PAIRS: usize = 48;
@@ -250,6 +252,215 @@ fn dense_quantized_attention_with_prepared_inputs_matches_separate_passes() {
         assert!(
             download(&separate_output) == download(&fused_output),
             "{tokens} tokens: outputs differ"
+        );
+    }
+}
+
+#[test]
+fn vsa_with_prepared_inputs_matches_separate_passes() {
+    let heads = 3;
+    let inner = heads * HEAD_DIM;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let attention_layout = AttentionLayout {
+        token_stride: [
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            inner as i64,
+        ],
+        head_stride: [HEAD_DIM as i64; 4],
+        ..AttentionLayout::default()
+    };
+    let offsets = AttentionOffsets {
+        query: 0,
+        key: inner,
+        value: 2 * inner,
+        output: 0,
+    };
+    for layout in [
+        PackedLayout::text_to_video(3, 1, 4, 4, 2),
+        PackedLayout::text_to_video(70, 9, 16, 24, 40),
+    ] {
+        let plan = VsaPlan::for_layout(&layout);
+        let tokens = layout.len();
+        let kept = plan.kept_video_tiles(0.7);
+        let inputs = Inputs::new(tokens, heads);
+        let gate = bf16_buffer(
+            &(0..tokens * inner)
+                .map(|index| ((index * 37 % 101) as f32 - 50.0) / 25.0)
+                .collect::<Vec<_>>(),
+        );
+        let run = |fused: bool| {
+            let mut qkv = bf16_buffer(&inputs.qkv);
+            let mut output = DeviceBuffer::new(tokens * inner * 2).unwrap();
+            let workspace = VsaWorkspace::new(&plan, tokens, heads).unwrap();
+            if fused {
+                attention::prepare_inputs(
+                    &mut qkv,
+                    &inputs.norm(),
+                    tokens,
+                    heads,
+                    PreparedAttention::Vsa(&workspace),
+                )
+                .unwrap();
+            } else {
+                attention::qk_norm_rope(&mut qkv, &inputs.norm(), tokens, heads).unwrap();
+            }
+            let prepared = if fused {
+                AttentionInputs::Prepared
+            } else {
+                AttentionInputs::Raw
+            };
+            attention::vsa(
+                &qkv,
+                Some(&gate),
+                &mut output,
+                offsets,
+                &attention_layout,
+                scale,
+                kept,
+                &workspace,
+                prepared,
+            )
+            .unwrap();
+            (
+                download(&output),
+                columns(&qkv, tokens, heads, 2 * inner),
+                workspace.selected_fraction().unwrap(),
+            )
+        };
+        let (separate, fused) = (run(false), run(true));
+        assert_eq!(separate.2, fused.2, "{tokens} tokens: selection differs");
+        assert!(
+            separate.1 == fused.1,
+            "{tokens} tokens: normalized q or k differs"
+        );
+        assert!(separate.0 == fused.0, "{tokens} tokens: outputs differ");
+        eprintln!(
+            "{tokens} tokens, {heads} heads, VSA: identical, selected {:.3}",
+            fused.2
+        );
+    }
+}
+
+/// INT8/FP8 VSA runs on prepared inputs only, so it is compared with the f64 reference on the
+/// normalized q and k of the separate BF16 pass.
+#[test]
+fn quantized_vsa_matches_the_reference() {
+    let heads = 2;
+    let inner = heads * HEAD_DIM;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let attention_layout = AttentionLayout {
+        token_stride: [
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            inner as i64,
+        ],
+        head_stride: [HEAD_DIM as i64; 4],
+        ..AttentionLayout::default()
+    };
+    let offsets = AttentionOffsets {
+        query: 0,
+        key: inner,
+        value: 2 * inner,
+        output: 0,
+    };
+    let layout = PackedLayout::text_to_video(70, 9, 16, 24, 40);
+    let plan = VsaPlan::for_layout(&layout);
+    let tokens = layout.len();
+    let inputs = Inputs::new(tokens, heads);
+    let gate_values: Vec<f32> = (0..tokens * inner)
+        .map(|index| ((index * 37 % 101) as f32 - 50.0) / 25.0)
+        .collect();
+    let gate = bf16_buffer(&gate_values);
+    let gate_values: Vec<f32> = download(&gate)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| bf16_to_f32(u16::from_le_bytes(pair)))
+        .collect();
+    for sparsity in [0.7, 0.0] {
+        let kept = plan.kept_video_tiles(sparsity);
+        let mut normalized = bf16_buffer(&inputs.qkv);
+        attention::qk_norm_rope(&mut normalized, &inputs.norm(), tokens, heads).unwrap();
+        let values: Vec<f32> = download(&normalized)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| bf16_to_f32(u16::from_le_bytes(pair)))
+            .collect();
+        let part = |offset: usize| -> Vec<f32> {
+            (0..tokens * inner)
+                .map(|index| values[(index / inner) * 3 * inner + offset + index % inner])
+                .collect()
+        };
+        let expected = reference(
+            &part(0),
+            &part(inner),
+            &part(2 * inner),
+            Some(&gate_values),
+            &plan,
+            heads,
+            HEAD_DIM,
+            scale,
+            kept,
+        );
+
+        let mut qkv = bf16_buffer(&inputs.qkv);
+        let mut output = DeviceBuffer::new(tokens * inner * 2).unwrap();
+        let workspace =
+            VsaWorkspace::with_precision(&plan, tokens, heads, AttentionPrecision::Int8Fp8)
+                .unwrap();
+        attention::prepare_inputs(
+            &mut qkv,
+            &inputs.norm(),
+            tokens,
+            heads,
+            PreparedAttention::Vsa(&workspace),
+        )
+        .unwrap();
+        attention::vsa(
+            &qkv,
+            Some(&gate),
+            &mut output,
+            offsets,
+            &attention_layout,
+            scale,
+            kept,
+            &workspace,
+            AttentionInputs::Prepared,
+        )
+        .unwrap();
+        let actual: Vec<f32> = download(&output)
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| bf16_to_f32(u16::from_le_bytes(pair)))
+            .collect();
+        let difference: f64 = actual
+            .iter()
+            .zip(&expected)
+            .map(|(&a, &b)| (a as f64 - b as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let norm: f64 = expected
+            .iter()
+            .map(|&value| (value as f64).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let worst = actual
+            .iter()
+            .zip(&expected)
+            .fold(0.0f32, |maximum, (&a, &b)| maximum.max((a - b).abs()));
+        eprintln!(
+            "{tokens} tokens, sparsity {sparsity}, INT8/FP8 VSA: relative error {:.3e}, max error {worst:.3e}",
+            difference / norm
+        );
+        assert!(
+            difference / norm < 0.02 && worst < 0.1,
+            "relative error {}, max error {worst}",
+            difference / norm
         );
     }
 }

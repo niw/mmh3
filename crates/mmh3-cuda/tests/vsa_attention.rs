@@ -5,7 +5,9 @@ use mmh3_core::dit::layout::PackedLayout;
 use mmh3_core::dit::vsa::{VsaPlan, reference};
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
-use mmh3_cuda::attention::{self, AttentionLayout, AttentionOffsets, HEAD_DIM, VsaWorkspace};
+use mmh3_cuda::attention::{
+    self, AttentionInputs, AttentionLayout, AttentionOffsets, HEAD_DIM, VsaWorkspace,
+};
 
 struct Random(u64);
 
@@ -104,6 +106,7 @@ fn check(layout: &PackedLayout, heads: usize, sparsity: f64, gated: bool) {
         scale,
         kept,
         &workspace,
+        AttentionInputs::Raw,
     )
     .unwrap();
     let fraction = workspace.selected_fraction().unwrap();

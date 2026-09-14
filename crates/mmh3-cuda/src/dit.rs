@@ -189,7 +189,7 @@ impl Workspace {
 struct ForwardBuffers {
     workspace: Option<Workspace>,
     sparse: Option<(AttentionPrecision, SparseWorkspace)>,
-    vsa: Option<(VsaPlan, VsaWorkspace)>,
+    vsa: Option<(AttentionPrecision, VsaPlan, VsaWorkspace)>,
     text: Option<TextStates>,
 }
 
@@ -653,7 +653,7 @@ impl CudaDit {
             (Some(SparsePass::Sol { workspace, .. }), _) => {
                 Some(PreparedAttention::Sparse(workspace))
             }
-            (Some(SparsePass::Vsa { .. }), _) => None,
+            (Some(SparsePass::Vsa { workspace, .. }), _) => Some(PreparedAttention::Vsa(workspace)),
             (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
             (None, None) => None,
         };
@@ -753,6 +753,7 @@ impl CudaDit {
                             scale,
                             kept,
                             vsa_workspace,
+                            inputs,
                         )?,
                     }
                 }
@@ -976,9 +977,6 @@ impl CudaDit {
             Some(SparseMethod::Vsa { sparsity }) => Some(sparsity),
             _ => None,
         };
-        if vsa_sparsity.is_some() && self.attention_precision != AttentionPrecision::Bf16 {
-            return Err(Error::Model("VSA runs with BF16 attention only".to_owned()));
-        }
         let plan = vsa_sparsity.map(|_| VsaPlan::for_layout(&layout));
         let quantized_dense =
             self.attention_precision == AttentionPrecision::Int8Fp8 && method.is_none();
@@ -1032,12 +1030,21 @@ impl CudaDit {
         }
         match &plan {
             Some(plan)
-                if cached_vsa
-                    .as_ref()
-                    .is_some_and(|(cached, _)| cached == plan) => {}
+                if cached_vsa.as_ref().is_some_and(|(precision, cached, _)| {
+                    *precision == self.attention_precision && cached == plan
+                }) => {}
             Some(plan) => {
                 *cached_vsa = None;
-                *cached_vsa = Some((plan.clone(), VsaWorkspace::new(plan, tokens, config.heads)?));
+                *cached_vsa = Some((
+                    self.attention_precision,
+                    plan.clone(),
+                    VsaWorkspace::with_precision(
+                        plan,
+                        tokens,
+                        config.heads,
+                        self.attention_precision,
+                    )?,
+                ));
             }
             None => *cached_vsa = None,
         }
@@ -1116,7 +1123,7 @@ impl CudaDit {
             (None, Some(sparsity)) => {
                 cached_vsa
                     .as_ref()
-                    .map(|(plan, workspace)| SparsePass::Vsa {
+                    .map(|(_, plan, workspace)| SparsePass::Vsa {
                         workspace,
                         kept: plan.kept_video_tiles(sparsity),
                     })

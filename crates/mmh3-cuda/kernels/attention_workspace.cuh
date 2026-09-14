@@ -31,6 +31,18 @@ struct Mmh3QuantizedWorkspace {
     float *value_maxima; // [heads, ceil(tokens / 64)]
 };
 
+// The tiles of one VSA plan and its scratch. Owned by the Rust workspace.
+struct Mmh3VsaWorkspace {
+    const int32_t *tile_starts;  // [tiles]
+    const int32_t *tile_lengths; // [tiles]
+    float *pooled_query;         // [heads, tiles, 128]
+    float *pooled_key;           // [heads, tiles, 128]
+    float *pooled_value;         // [heads, tiles, 128], summed rather than averaged
+    uint16_t *routes;            // [heads, tiles, tiles], the first route_counts entries are used
+    int32_t *route_counts;       // [heads, tiles]
+    float *coarse;               // [heads, tiles, 128]
+};
+
 // INT8 QK and FP8 PV, FP32 softmax/accumulation, BF16 output. A null sparse workspace means dense
 // attention. With `inputs_ready`, the workspace already holds INT8 q and k, their scales and the
 // |v| block maxima.
@@ -40,3 +52,14 @@ extern "C" int mmh3_attention_quantized(const void *query, const void *key, cons
                                         const Mmh3SparseWorkspace *sparse,
                                         const Mmh3QuantizedWorkspace *workspace, int inputs_ready,
                                         cudaStream_t stream);
+
+// VSA's token attention with INT8 QK and FP8 PV over the tiles the VSA workspace selected, plus
+// gate · coarse when `gate` is not null. The quantized workspace is laid out by tile: INT8 q and k
+// with per-tile scales and the |v| tile maxima from mmh3_attention_inputs, and V transposed into
+// 64 columns per tile.
+extern "C" int mmh3_vsa_attention_quantized(const void *value, const void *gate,
+                                            int64_t gate_stride, void *output, int tokens,
+                                            int heads, const Mmh3AttentionLayout *layout,
+                                            float scale, int tiles, const Mmh3VsaWorkspace *vsa,
+                                            const Mmh3QuantizedWorkspace *workspace,
+                                            cudaStream_t stream);

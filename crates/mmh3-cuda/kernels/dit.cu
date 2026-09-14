@@ -173,7 +173,8 @@ __device__ __forceinline__ float warp_max(float value) {
 }
 
 // qk_norm_rope_kernel for one 64-token block and one head of the fused qkv rows of `heads` heads,
-// together with what the attention needs from that block:
+// together with what the attention needs from that block. With tile tables, the blocks are VSA
+// tiles of up to 64 tokens instead:
 //
 // - STATS: Sol-Attn's block statistics, the mean query, the mean key and the summed value, as
 // block_stats_kernel in
@@ -193,7 +194,9 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
                             const __nv_bfloat16 *__restrict__ key_weight,
                             const float *__restrict__ angles, int pairs, int tokens, int heads,
                             float epsilon, Mmh3SparseWorkspace sparse,
-                            Mmh3QuantizedWorkspace quantized) {
+                            Mmh3QuantizedWorkspace quantized,
+                            const int32_t *__restrict__ tile_starts,
+                            const int32_t *__restrict__ tile_lengths) {
     // A row of 128 BF16 values is 16 chunks of 16 bytes.
     constexpr int CHUNKS_PER_THREAD = INPUT_BLOCK * 16 / INPUT_THREADS;
     __shared__ __align__(16) __nv_bfloat16 tile[INPUT_BLOCK][HEAD_DIM];
@@ -202,10 +205,12 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
     const int block = blockIdx.x;
     const int head = blockIdx.y;
     const int blocks = gridDim.x;
-    const int rows = min(INPUT_BLOCK, tokens - block * INPUT_BLOCK);
+    const int rows = tile_lengths != nullptr ? tile_lengths[block]
+                                             : min(INPUT_BLOCK, tokens - block * INPUT_BLOCK);
     const int inner = heads * HEAD_DIM;
     const int64_t row_stride = 3 * static_cast<int64_t>(inner);
-    const int64_t first_token = static_cast<int64_t>(block) * INPUT_BLOCK;
+    const int64_t first_token =
+        tile_starts != nullptr ? tile_starts[block] : static_cast<int64_t>(block) * INPUT_BLOCK;
     __nv_bfloat16 *block_rows = qkv + first_token * row_stride + head * HEAD_DIM;
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
@@ -326,7 +331,8 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
             }
         }
 
-        if (part == 0 ? STATS || !QUANTIZE : !QUANTIZE) {
+        // Sol-Attn's row offsets read BF16 q, and INT8/FP8 VSA neither q nor k.
+        if (part == 0 ? (STATS && tile_starts == nullptr) || !QUANTIZE : !QUANTIZE) {
             for (int chunk = threadIdx.x; chunk < rows * 16; chunk += INPUT_THREADS) {
                 *reinterpret_cast<uint4 *>(block_rows + (chunk / 16) * row_stride + part * inner +
                                            (chunk % 16) * 8) =
@@ -499,16 +505,21 @@ extern "C" int mmh3_qk_norm_rope(__nv_bfloat16 *qkv, const __nv_bfloat16 *query_
 
 // mmh3_qk_norm_rope over rows of heads × (q, k, v) fused with the attention's per-block work: the
 // Sol-Attn block statistics when `sparse` is given and the INT8 q and k with the |v| block maxima
-// when `quantized` is given. The attention that follows skips those steps.
+// when `quantized` is given. The attention that follows skips those steps. Non-null tile tables
+// (`tiles` runs of at most 64 tokens covering the sequence) replace the 64-token blocks, for VSA.
 extern "C" int mmh3_attention_inputs(__nv_bfloat16 *qkv, const __nv_bfloat16 *query_weight,
                                      const __nv_bfloat16 *key_weight, const float *angles,
                                      int pairs, int tokens, int heads, float epsilon,
                                      const Mmh3SparseWorkspace *sparse,
-                                     const Mmh3QuantizedWorkspace *quantized, cudaStream_t stream) {
-    if (tokens <= 0 || heads <= 0 || (sparse == nullptr && quantized == nullptr)) {
+                                     const Mmh3QuantizedWorkspace *quantized,
+                                     const int32_t *tile_starts, const int32_t *tile_lengths,
+                                     int tiles, cudaStream_t stream) {
+    if (tokens <= 0 || heads <= 0 || (sparse == nullptr && quantized == nullptr) ||
+        (tile_starts != nullptr && (tile_lengths == nullptr || tiles <= 0))) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
-    const dim3 grid((tokens + INPUT_BLOCK - 1) / INPUT_BLOCK, heads);
+    const dim3 grid(tile_starts != nullptr ? tiles : (tokens + INPUT_BLOCK - 1) / INPUT_BLOCK,
+                    heads);
     const Mmh3SparseWorkspace sparse_workspace =
         sparse != nullptr ? *sparse : Mmh3SparseWorkspace{};
     const Mmh3QuantizedWorkspace quantized_workspace =
@@ -516,7 +527,7 @@ extern "C" int mmh3_attention_inputs(__nv_bfloat16 *qkv, const __nv_bfloat16 *qu
     auto launch = [&](auto kernel) {
         kernel<<<grid, INPUT_THREADS, 0, stream>>>(qkv, query_weight, key_weight, angles, pairs,
                                                    tokens, heads, epsilon, sparse_workspace,
-                                                   quantized_workspace);
+                                                   quantized_workspace, tile_starts, tile_lengths);
     };
     if (sparse != nullptr && quantized != nullptr) {
         launch(attention_inputs_kernel<true, true>);
