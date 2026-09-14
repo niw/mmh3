@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
-                [--width N] [--height N] [--frames N] [--steps N] [--seed N] [--shift-video X] [--shift-audio X]
+                [--width N] [--height N] [--frames N] [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
                 [--ffmpeg [FFMPEG_ARGUMENTS...]]

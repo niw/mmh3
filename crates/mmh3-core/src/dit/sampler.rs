@@ -13,8 +13,25 @@ impl Schedule {
     /// `steps` model calls on the unshifted grid linspace(1, 0, steps + 1), shifted separately per
     /// stream. This is the official scheduler's grid and the q grid of the Turbo LoRAs.
     pub fn uniform(steps: usize, shift_video: f32, shift_audio: f32) -> Self {
-        let base: Vec<f32> = (0..=steps)
-            .map(|step| 1.0 - step as f32 / steps as f32)
+        let indices: Vec<usize> = (0..=steps).collect();
+        Self::retained(steps + 1, &indices, shift_video, shift_audio)
+    }
+
+    /// The states at `indices` of the shifted `points`-point grid linspace(1, 0, points). The first
+    /// index must be 0 and the last `points − 1`, so that sampling starts from noise and ends at
+    /// zero.
+    pub fn retained(points: usize, indices: &[usize], shift_video: f32, shift_audio: f32) -> Self {
+        assert!(
+            indices.len() >= 2
+                && indices[0] == 0
+                && indices[indices.len() - 1] == points - 1
+                && indices.windows(2).all(|pair| pair[0] < pair[1]),
+            "the retained states must rise from 0 to {}",
+            points - 1
+        );
+        let base: Vec<f32> = indices
+            .iter()
+            .map(|&index| 1.0 - index as f32 / (points - 1) as f32)
             .collect();
         Schedule {
             video: base
@@ -26,6 +43,12 @@ impl Schedule {
                 .map(|&value| time_shift_sigma(value, 1.0, shift_audio))
                 .collect(),
         }
+    }
+
+    /// The three steps TaoMate-H3's LoRA was distilled for: states 0, 16, 33 and 49 of the
+    /// 50-point grid.
+    pub fn taomate(shift_video: f32, shift_audio: f32) -> Self {
+        Self::retained(50, &[0, 16, 33, 49], shift_video, shift_audio)
     }
 
     pub fn steps(&self) -> usize {
@@ -56,6 +79,19 @@ mod tests {
         }
         for (actual, expected) in schedule.audio.iter().zip(expected_audio) {
             assert!((actual - expected).abs() < 1e-4, "{:?}", schedule.audio);
+        }
+    }
+
+    #[test]
+    fn matches_the_taomate_states() {
+        let schedule = Schedule::taomate(12.0, 3.0);
+        let expected_video = [1.0, 0.961165, 0.853333, 0.0];
+        let expected_audio = [1.0, 0.860870, 0.592593, 0.0];
+        for (actual, expected) in schedule.video.iter().zip(expected_video) {
+            assert!((actual - expected).abs() < 1e-5, "{:?}", schedule.video);
+        }
+        for (actual, expected) in schedule.audio.iter().zip(expected_audio) {
+            assert!((actual - expected).abs() < 1e-5, "{:?}", schedule.audio);
         }
     }
 

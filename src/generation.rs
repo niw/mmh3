@@ -3,6 +3,7 @@
 
 use crate::cli::{option_float, option_number};
 use crate::models::{TEXT_ENCODER_FILE, load_dit, option_path, sparse_attention};
+use mmh3_core::dit::sampler::Schedule;
 use mmh3_core::generation::GenerationShape;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
@@ -20,6 +21,7 @@ pub const OPTIONS: &[&str] = &[
     "height",
     "frames",
     "steps",
+    "schedule",
     "seed",
     "shift-video",
     "shift-audio",
@@ -37,6 +39,7 @@ pub const OPTIONS: &[&str] = &[
 
 pub struct Settings {
     pub shape: GenerationShape,
+    pub schedule: Schedule,
     pub steps: usize,
     pub seed: u64,
     pub shift_video: f32,
@@ -44,23 +47,40 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The canvas, step count, seed and schedule shifts of the options, with their defaults.
+    /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
     pub fn parse(options: &HashMap<&str, &str>) -> Result<Self, Box<dyn Error>> {
-        let settings = Settings {
+        let shift_video = option_float(options, "shift-video", 12.0)?;
+        let shift_audio = option_float(options, "shift-audio", 3.0)?;
+        let schedule = match options.get("schedule").copied().unwrap_or("uniform") {
+            "uniform" => {
+                let steps = option_number(options, "steps", 20)?;
+                if steps == 0 {
+                    return Err("--steps must be at least 1".into());
+                }
+                Schedule::uniform(steps, shift_video, shift_audio)
+            }
+            "taomate" => {
+                if options.contains_key("steps") {
+                    return Err("--schedule taomate always runs 3 steps, leave out --steps".into());
+                }
+                Schedule::taomate(shift_video, shift_audio)
+            }
+            other => {
+                return Err(format!("--schedule must be uniform or taomate, not {other}").into());
+            }
+        };
+        Ok(Settings {
             shape: GenerationShape::new(
                 option_number(options, "width", 1344)?,
                 option_number(options, "height", 768)?,
                 option_number(options, "frames", 124)?,
             )?,
-            steps: option_number(options, "steps", 20)?,
+            steps: schedule.steps(),
+            schedule,
             seed: option_number(options, "seed", 0)? as u64,
-            shift_video: option_float(options, "shift-video", 12.0)?,
-            shift_audio: option_float(options, "shift-audio", 3.0)?,
-        };
-        if settings.steps == 0 {
-            return Err("--steps must be at least 1".into());
-        }
-        Ok(settings)
+            shift_video,
+            shift_audio,
+        })
     }
 }
 
@@ -71,7 +91,7 @@ pub fn sample(
     settings: &Settings,
 ) -> Result<(Tensor, Tensor), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
-    use mmh3_core::dit::sampler::{Schedule, euler_step};
+    use mmh3_core::dit::sampler::euler_step;
     use mmh3_core::generation::FPS;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tokenizer::Tokenizer;
@@ -136,7 +156,7 @@ pub fn sample(
 
     let dit = load_dit(options, "dit")?;
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
-    let schedule = Schedule::uniform(steps, settings.shift_video, settings.shift_audio);
+    let schedule = &settings.schedule;
     for step in 0..steps {
         let started = Instant::now();
         let inputs = DitInputs {

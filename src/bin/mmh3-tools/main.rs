@@ -30,10 +30,10 @@ const USAGE: &str = "usage:
   mmh3-tools check audio-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3-tools check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
   mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
-                    [--models DIR] [--width N] [--height N] [--frames N] [--steps N] [--seed N] [--shift-video X]
-                    [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--patch FILE] [--lora FILE] [--lora-strength X]
-                    [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X]
-                    [--vsa-sparsity X]
+                    [--models DIR] [--width N] [--height N] [--frames N] [--steps N | --schedule taomate] [--seed N]
+                    [--shift-video X] [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--patch FILE] [--lora FILE]
+                    [--lora-strength X] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X]
+                    [--sparse-start X] [--vsa-sparsity X]
 
 Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.
 latent samples like the generate command of mmh3, with the same defaults, and writes the final video and audio
