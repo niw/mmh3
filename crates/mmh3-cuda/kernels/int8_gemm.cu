@@ -537,9 +537,9 @@ int launch(const int8_t* activations, const int8_t* weights, const float* activa
     if (processors == 0) {
         return static_cast<int>(cudaErrorInvalidDevice);
     }
-    int8_gemm_kernel<Config, Output, SWIGLU>
-        <<<tiles < processors ? tiles : processors, WARPS * 32, Config::shared_bytes, stream>>>(
-            maps, activation_scales, weight_scales, bias, output, m, n, k, adapter_blocks, adapter.scale);
+    const int blocks = tiles < processors ? tiles : processors;
+    int8_gemm_kernel<Config, Output, SWIGLU><<<blocks, WARPS * 32, Config::shared_bytes, stream>>>(
+        maps, activation_scales, weight_scales, bias, output, m, n, k, adapter_blocks, adapter.scale);
     return static_cast<int>(cudaGetLastError());
 }
 
