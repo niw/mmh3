@@ -30,3 +30,13 @@ generate: build
 .PHONY: download-models
 download-models:
 	tools/download-models.sh --models "$(MODELS)"
+
+# Formats the Rust code with rustfmt, the Python tools with ruff and the C++ and CUDA code with
+# clang-format. uvx runs pinned formatter versions, so the output does not change between releases.
+.PHONY: format
+format:
+	$(if $(shell command -v cargo),,$(error cargo is not installed. Install Rust))
+	$(if $(shell command -v uvx),,$(error uvx is not installed. Install uv))
+	cargo fmt --all
+	uvx ruff@0.16.7 format tools
+	uvx clang-format@23.1.1 -i $$(git ls-files '*.cu' '*.cuh' '*.cpp' '*.h')

@@ -381,6 +381,16 @@ The tests run the CUDA kernels and models on small fixtures and compare them wit
 and CPU references. They run one at a time, because loading a model during another test's DiT
 forward pass can corrupt that forward pass.
 
+## Formatting
+
+```sh
+make format
+```
+
+`make format` formats the Rust code with rustfmt, the Python tools with ruff and the C++ and CUDA
+code with clang-format. ruff and clang-format run through `uvx` of [uv](https://docs.astral.sh/uv/)
+at pinned versions, so they need no separate installation.
+
 ## License
 
 mmh3 is released under the MIT License. See [LICENSE](LICENSE), and [NOTICE](NOTICE) for third-party
