@@ -4,17 +4,22 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
-#include "tensor_core.cuh"
 #include "attention_workspace.cuh"
+#include "tensor_core.cuh"
 
-// Sol-Attn block-sparse attention for BF16 heads of 128 (see mmh3-core's dit/sparse.rs for the algorithm).
+// Sol-Attn block-sparse attention for BF16 heads of 128 (see mmh3-core's dit/sparse.rs for the
+// algorithm).
 //
-// 1. block_stats: per head and 64-token block, the mean query (centroid), mean key and summed value.
+// 1. block_stats: per head and 64-token block, the mean query (centroid), mean key and summed
+// value.
 // 2. center_keys: per head, the mean and variance of the block keys, which are then centered.
-// 3. route: per head and query block, the pooled scores against every key block, the routed key blocks and the
+// 3. route: per head and query block, the pooled scores against every key block, the routed key
+// blocks and the
 //    pooled tail of the rest as an online-softmax state (max, weighted sum, weighted values).
-// 4. row_offsets: per token and head, q · key mean, which centers the keys of the token-level scores.
-// 5. sparse_attention: FlashAttention over the routed key blocks of each query block, merged with its tail.
+// 4. row_offsets: per token and head, q · key mean, which centers the keys of the token-level
+// scores.
+// 5. sparse_attention: FlashAttention over the routed key blocks of each query block, merged with
+// its tail.
 
 namespace {
 
@@ -50,8 +55,7 @@ __device__ __forceinline__ float warp_max(float value) {
 }
 
 // Sum or max over the block of THREADS threads.
-template <bool MAXIMUM>
-__device__ float block_reduce(float value, float* scratch) {
+template <bool MAXIMUM> __device__ float block_reduce(float value, float *scratch) {
     value = MAXIMUM ? warp_max(value) : warp_sum(value);
     if (threadIdx.x % 32 == 0) {
         scratch[threadIdx.x / 32] = value;
@@ -66,9 +70,11 @@ __device__ float block_reduce(float value, float* scratch) {
 }
 
 __global__ void __launch_bounds__(THREADS)
-    block_stats_kernel(const __nv_bfloat16* __restrict__ query, const __nv_bfloat16* __restrict__ key,
-                       const __nv_bfloat16* __restrict__ value, int tokens, Mmh3AttentionLayout layout, int blocks,
-                       float* __restrict__ centroids, float* __restrict__ block_keys, float* __restrict__ value_sums) {
+    block_stats_kernel(const __nv_bfloat16 *__restrict__ query,
+                       const __nv_bfloat16 *__restrict__ key,
+                       const __nv_bfloat16 *__restrict__ value, int tokens,
+                       Mmh3AttentionLayout layout, int blocks, float *__restrict__ centroids,
+                       float *__restrict__ block_keys, float *__restrict__ value_sums) {
     const int block = blockIdx.x;
     const int head = blockIdx.y;
     const int dimension = threadIdx.x;
@@ -76,9 +82,12 @@ __global__ void __launch_bounds__(THREADS)
     float query_sum = 0.0f, key_sum = 0.0f, value_sum = 0.0f;
     for (int row = 0; row < rows; row++) {
         const int64_t token = static_cast<int64_t>(block) * BLOCK + row;
-        query_sum += __bfloat162float(query[token * layout.token_stride[QUERY] + head * layout.head_stride[QUERY] + dimension]);
-        key_sum += __bfloat162float(key[token * layout.token_stride[KEY] + head * layout.head_stride[KEY] + dimension]);
-        value_sum += __bfloat162float(value[token * layout.token_stride[VALUE] + head * layout.head_stride[VALUE] + dimension]);
+        query_sum += __bfloat162float(query[token * layout.token_stride[QUERY] +
+                                            head * layout.head_stride[QUERY] + dimension]);
+        key_sum += __bfloat162float(
+            key[token * layout.token_stride[KEY] + head * layout.head_stride[KEY] + dimension]);
+        value_sum += __bfloat162float(value[token * layout.token_stride[VALUE] +
+                                            head * layout.head_stride[VALUE] + dimension]);
     }
     const size_t index = (static_cast<size_t>(head) * blocks + block) * HEAD + dimension;
     centroids[index] = query_sum / rows;
@@ -87,11 +96,11 @@ __global__ void __launch_bounds__(THREADS)
 }
 
 __global__ void __launch_bounds__(HEAD)
-    center_keys_kernel(float* __restrict__ block_keys, int blocks, float* __restrict__ key_mean,
-                       float* __restrict__ key_variance) {
+    center_keys_kernel(float *__restrict__ block_keys, int blocks, float *__restrict__ key_mean,
+                       float *__restrict__ key_variance) {
     const int head = blockIdx.x;
     const int dimension = threadIdx.x;
-    float* keys = block_keys + static_cast<size_t>(head) * blocks * HEAD + dimension;
+    float *keys = block_keys + static_cast<size_t>(head) * blocks * HEAD + dimension;
     float sum = 0.0f;
     for (int block = 0; block < blocks; block++) {
         sum += keys[static_cast<size_t>(block) * HEAD];
@@ -107,20 +116,21 @@ __global__ void __launch_bounds__(HEAD)
     key_variance[head * HEAD + dimension] = squares / blocks;
 }
 
-// Routes QUERIES consecutive query blocks of one head, which share every block key and value sum the CTA loads.
+// Routes QUERIES consecutive query blocks of one head, which share every block key and value sum
+// the CTA loads.
 //
-// NOTE: the _rn intrinsics spell out the multiply-adds that the compiler forms from the plain expressions. A warp
-// scores 32 (query, key block) pairs at once and reduces them together over the same xor butterfly as warp_sum, and
-// the loops read several key blocks at once so that their loads overlap. Every sum keeps its order, so the results do
-// not depend on QUERIES.
+// NOTE: the _rn intrinsics spell out the multiply-adds that the compiler forms from the plain
+// expressions. A warp scores 32 (query, key block) pairs at once and reduces them together over the
+// same xor butterfly as warp_sum, and the loops read several key blocks at once so that their loads
+// overlap. Every sum keeps its order, so the results do not depend on QUERIES.
 template <int QUERIES>
 __global__ void __launch_bounds__(THREADS)
-    route_kernel(Mmh3SparseWorkspace workspace, int tokens, int blocks, float tau, float log2_scale, int sink_key_start,
-                 int sink_key_end, int sink_query_start, int sink_query_end) {
+    route_kernel(Mmh3SparseWorkspace workspace, int tokens, int blocks, float tau, float log2_scale,
+                 int sink_key_start, int sink_key_end, int sink_query_start, int sink_query_end) {
     constexpr int ROUTE_BATCH = 32 / QUERIES;
     constexpr int TAIL_BATCH = 32;
     extern __shared__ float weights[];
-    uint8_t* routed = reinterpret_cast<uint8_t*>(weights + QUERIES * blocks);
+    uint8_t *routed = reinterpret_cast<uint8_t *>(weights + QUERIES * blocks);
     __shared__ float centroids[QUERIES][HEAD];
     __shared__ float thresholds[QUERIES];
     __shared__ float tail_maxima[QUERIES];
@@ -136,22 +146,28 @@ __global__ void __launch_bounds__(THREADS)
     for (int query = 0; query < queries; query++) {
         const float centroid = workspace.centroids[(first_row + query) * HEAD + threadIdx.x];
         centroids[query][threadIdx.x] = centroid;
-        const float spread = block_reduce<false>(
-            __fmul_rn(__fmul_rn(centroid, centroid), workspace.key_variance[head * HEAD + threadIdx.x]), scratch);
+        const float spread =
+            block_reduce<false>(__fmul_rn(__fmul_rn(centroid, centroid),
+                                          workspace.key_variance[head * HEAD + threadIdx.x]),
+                                scratch);
         if (threadIdx.x == 0) {
-            thresholds[query] = __fmul_rn(tau, sqrtf(__fmaf_rn(__fmul_rn(spread, log2_scale), log2_scale, 1e-6f)));
+            thresholds[query] =
+                __fmul_rn(tau, sqrtf(__fmaf_rn(__fmul_rn(spread, log2_scale), log2_scale, 1e-6f)));
         }
     }
     __syncthreads();
 
-    const float* keys = workspace.block_keys + static_cast<size_t>(head) * blocks * HEAD;
+    const float *keys = workspace.block_keys + static_cast<size_t>(head) * blocks * HEAD;
     for (int first = warp * ROUTE_BATCH; first < blocks; first += THREADS / 32 * ROUTE_BATCH) {
         float loaded[ROUTE_BATCH][HEAD / 32];
 #pragma unroll
         for (int batch = 0; batch < ROUTE_BATCH; batch++) {
 #pragma unroll
             for (int part = 0; part < HEAD / 32; part++) {
-                loaded[batch][part] = first + batch < blocks ? keys[static_cast<size_t>(first + batch) * HEAD + lane + part * 32] : 0.0f;
+                loaded[batch][part] =
+                    first + batch < blocks
+                        ? keys[static_cast<size_t>(first + batch) * HEAD + lane + part * 32]
+                        : 0.0f;
             }
         }
         float partials[32];
@@ -162,12 +178,14 @@ __global__ void __launch_bounds__(THREADS)
                 float partial = 0.0f;
 #pragma unroll
                 for (int part = 0; part < HEAD / 32; part++) {
-                    partial = __fmaf_rn(centroids[query][lane + part * 32], loaded[batch][part], partial);
+                    partial =
+                        __fmaf_rn(centroids[query][lane + part * 32], loaded[batch][part], partial);
                 }
                 partials[query * ROUTE_BATCH + batch] = partial;
             }
         }
-        // Each step adds the partner lane's half of the pairs, so lane l ends up with the sum of pair l.
+        // Each step adds the partner lane's half of the pairs, so lane l ends up with the sum of
+        // pair l.
 #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             const bool upper = lane & offset;
@@ -184,16 +202,17 @@ __global__ void __launch_bounds__(THREADS)
             const int query_block = first_query + query;
             const float score = partials[0] * log2_scale;
             weights[query * blocks + key_block] = score;
-            routed[query * blocks + key_block] = score > thresholds[query] || abs(query_block - key_block) <= 1 ||
-                                                 (key_block >= sink_key_start && key_block < sink_key_end) ||
-                                                 (query_block >= sink_query_start && query_block < sink_query_end);
+            routed[query * blocks + key_block] =
+                score > thresholds[query] || abs(query_block - key_block) <= 1 ||
+                (key_block >= sink_key_start && key_block < sink_key_end) ||
+                (query_block >= sink_query_start && query_block < sink_query_end);
         }
     }
     __syncthreads();
 
     for (int query = 0; query < queries; query++) {
-        float* query_weights = weights + query * blocks;
-        const uint8_t* query_routed = routed + query * blocks;
+        float *query_weights = weights + query * blocks;
+        const uint8_t *query_routed = routed + query * blocks;
         float maximum = -FLT_MAX;
         for (int key_block = threadIdx.x; key_block < blocks; key_block += THREADS) {
             if (!query_routed[key_block]) {
@@ -203,7 +222,8 @@ __global__ void __launch_bounds__(THREADS)
         maximum = block_reduce<true>(maximum, scratch);
         float sum = 0.0f;
         for (int key_block = threadIdx.x; key_block < blocks; key_block += THREADS) {
-            const float weight = query_routed[key_block] ? 0.0f : exp2f(query_weights[key_block] - maximum);
+            const float weight =
+                query_routed[key_block] ? 0.0f : exp2f(query_weights[key_block] - maximum);
             query_weights[key_block] = weight;
             sum = __fmaf_rn(weight, static_cast<float>(block_rows(key_block, tokens)), sum);
         }
@@ -215,13 +235,15 @@ __global__ void __launch_bounds__(THREADS)
     }
     __syncthreads();
 
-    const float* values = workspace.value_sums + static_cast<size_t>(head) * blocks * HEAD + threadIdx.x;
+    const float *values =
+        workspace.value_sums + static_cast<size_t>(head) * blocks * HEAD + threadIdx.x;
     float tails[QUERIES] = {};
     for (int first = 0; first < blocks; first += TAIL_BATCH) {
         float loaded[TAIL_BATCH];
 #pragma unroll
         for (int batch = 0; batch < TAIL_BATCH; batch++) {
-            loaded[batch] = first + batch < blocks ? values[static_cast<size_t>(first + batch) * HEAD] : 0.0f;
+            loaded[batch] =
+                first + batch < blocks ? values[static_cast<size_t>(first + batch) * HEAD] : 0.0f;
         }
 #pragma unroll
         for (int batch = 0; batch < TAIL_BATCH; batch++) {
@@ -229,7 +251,8 @@ __global__ void __launch_bounds__(THREADS)
 #pragma unroll
             for (int query = 0; query < QUERIES; query++) {
                 if (query < queries && key_block < blocks && !routed[query * blocks + key_block]) {
-                    tails[query] = __fmaf_rn(weights[query * blocks + key_block], loaded[batch], tails[query]);
+                    tails[query] =
+                        __fmaf_rn(weights[query * blocks + key_block], loaded[batch], tails[query]);
                 }
             }
         }
@@ -243,7 +266,7 @@ __global__ void __launch_bounds__(THREADS)
 
     for (int query = warp; query < queries; query += THREADS / 32) {
         const size_t row = first_row + query;
-        uint16_t* route = workspace.routes + row * blocks;
+        uint16_t *route = workspace.routes + row * blocks;
         int count = 0;
         for (int start = 0; start < blocks; start += 32) {
             const int key_block = start + lane;
@@ -262,35 +285,41 @@ __global__ void __launch_bounds__(THREADS)
     }
 }
 
-// Launches route_kernel with as many query blocks per CTA as their weights and flags fit in shared memory.
+// Launches route_kernel with as many query blocks per CTA as their weights and flags fit in shared
+// memory.
 template <int QUERIES>
-int launch_route(const Mmh3SparseWorkspace& workspace, int tokens, int blocks, int heads, float tau, float log2_scale,
-                 int sink_key_start, int sink_key_end, int sink_query_start, int sink_query_end, cudaStream_t stream) {
+int launch_route(const Mmh3SparseWorkspace &workspace, int tokens, int blocks, int heads, float tau,
+                 float log2_scale, int sink_key_start, int sink_key_end, int sink_query_start,
+                 int sink_query_end, cudaStream_t stream) {
     constexpr size_t MAX_SHARED = 90 * 1024;
     const size_t shared = static_cast<size_t>(QUERIES) * blocks * (sizeof(float) + 1);
     if constexpr (QUERIES > 1) {
         if (shared > MAX_SHARED) {
-            return launch_route<QUERIES / 2>(workspace, tokens, blocks, heads, tau, log2_scale, sink_key_start,
-                                             sink_key_end, sink_query_start, sink_query_end, stream);
+            return launch_route<QUERIES / 2>(workspace, tokens, blocks, heads, tau, log2_scale,
+                                             sink_key_start, sink_key_end, sink_query_start,
+                                             sink_query_end, stream);
         }
     }
     static size_t configured_shared = 0;
     if (shared > 48 * 1024 && shared > configured_shared) {
-        cudaError_t status = cudaFuncSetAttribute(route_kernel<QUERIES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                  static_cast<int>(shared));
+        cudaError_t status =
+            cudaFuncSetAttribute(route_kernel<QUERIES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                 static_cast<int>(shared));
         if (status != cudaSuccess) {
             return static_cast<int>(status);
         }
         configured_shared = shared;
     }
-    route_kernel<QUERIES><<<dim3((blocks + QUERIES - 1) / QUERIES, heads), THREADS, shared, stream>>>(
-        workspace, tokens, blocks, tau, log2_scale, sink_key_start, sink_key_end, sink_query_start, sink_query_end);
+    route_kernel<QUERIES>
+        <<<dim3((blocks + QUERIES - 1) / QUERIES, heads), THREADS, shared, stream>>>(
+            workspace, tokens, blocks, tau, log2_scale, sink_key_start, sink_key_end,
+            sink_query_start, sink_query_end);
     return static_cast<int>(cudaGetLastError());
 }
 
-__global__ void row_offsets_kernel(const __nv_bfloat16* __restrict__ query, int tokens, int heads,
-                                   Mmh3AttentionLayout layout, const float* __restrict__ key_mean, float log2_scale,
-                                   float* __restrict__ row_offsets) {
+__global__ void row_offsets_kernel(const __nv_bfloat16 *__restrict__ query, int tokens, int heads,
+                                   Mmh3AttentionLayout layout, const float *__restrict__ key_mean,
+                                   float log2_scale, float *__restrict__ row_offsets) {
     const int lane = threadIdx.x % 32;
     const int64_t item = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + threadIdx.x / 32;
     if (item >= static_cast<int64_t>(tokens) * heads) {
@@ -298,7 +327,8 @@ __global__ void row_offsets_kernel(const __nv_bfloat16* __restrict__ query, int 
     }
     const int head = static_cast<int>(item % heads);
     const int64_t token = item / heads;
-    const __nv_bfloat16* row = query + token * layout.token_stride[QUERY] + head * layout.head_stride[QUERY];
+    const __nv_bfloat16 *row =
+        query + token * layout.token_stride[QUERY] + head * layout.head_stride[QUERY];
     float partial = 0.0f;
     for (int dimension = lane; dimension < HEAD; dimension += 32) {
         partial += __bfloat162float(row[dimension]) * key_mean[head * HEAD + dimension];
@@ -309,10 +339,10 @@ __global__ void row_offsets_kernel(const __nv_bfloat16* __restrict__ query, int 
     }
 }
 
-__global__ void __launch_bounds__(THREADS, 2)
-    sparse_attention_kernel(const __nv_bfloat16* __restrict__ query, const __nv_bfloat16* __restrict__ key,
-                            const __nv_bfloat16* __restrict__ value, __nv_bfloat16* __restrict__ output, int tokens,
-                            Mmh3AttentionLayout layout, int blocks, Mmh3SparseWorkspace workspace, float scale_log2) {
+__global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
+    const __nv_bfloat16 *__restrict__ query, const __nv_bfloat16 *__restrict__ key,
+    const __nv_bfloat16 *__restrict__ value, __nv_bfloat16 *__restrict__ output, int tokens,
+    Mmh3AttentionLayout layout, int blocks, Mmh3SparseWorkspace workspace, float scale_log2) {
     extern __shared__ __align__(128) uint8_t shared_memory[];
     const uint32_t shared_base = shared_address(shared_memory);
     const int query_block = blockIdx.x;
@@ -323,25 +353,28 @@ __global__ void __launch_bounds__(THREADS, 2)
     const int matrix = lane / 8;
     const int matrix_row = lane % 8;
     const size_t row = static_cast<size_t>(head) * blocks + query_block;
-    const uint16_t* route = workspace.routes + row * blocks;
+    const uint16_t *route = workspace.routes + row * blocks;
     const int count = workspace.route_counts[row];
 
-    const __nv_bfloat16* query_head = query + head * layout.head_stride[QUERY];
-    const __nv_bfloat16* key_head = key + head * layout.head_stride[KEY];
-    const __nv_bfloat16* value_head = value + head * layout.head_stride[VALUE];
-    // NOTE: keys and values have one buffer each. The next key tile loads while the warps apply softmax and multiply
-    // the values, and the next value tile while they score the next keys.
+    const __nv_bfloat16 *query_head = query + head * layout.head_stride[QUERY];
+    const __nv_bfloat16 *key_head = key + head * layout.head_stride[KEY];
+    const __nv_bfloat16 *value_head = value + head * layout.head_stride[VALUE];
+    // NOTE: keys and values have one buffer each. The next key tile loads while the warps apply
+    // softmax and multiply the values, and the next value tile while they score the next keys.
     const uint32_t key_tile = shared_base;
     const uint32_t value_tile = shared_base + T::tile_bytes;
     auto load_keys = [&](int entry) {
-        load_rows<HEAD, THREADS>(key_tile, key_head, layout.token_stride[KEY], route[entry] * BLOCK, BLOCK, tokens);
+        load_rows<HEAD, THREADS>(key_tile, key_head, layout.token_stride[KEY], route[entry] * BLOCK,
+                                 BLOCK, tokens);
     };
     auto load_values = [&](int entry) {
-        load_rows<HEAD, THREADS>(value_tile, value_head, layout.token_stride[VALUE], route[entry] * BLOCK, BLOCK, tokens);
+        load_rows<HEAD, THREADS>(value_tile, value_head, layout.token_stride[VALUE],
+                                 route[entry] * BLOCK, BLOCK, tokens);
     };
 
     // The query tile borrows the value buffer until it has been copied into registers.
-    load_rows<HEAD, THREADS>(value_tile, query_head, layout.token_stride[QUERY], first_query, BLOCK, tokens);
+    load_rows<HEAD, THREADS>(value_tile, query_head, layout.token_stride[QUERY], first_query, BLOCK,
+                             tokens);
     if (count > 0) {
         load_keys(0);
     }
@@ -353,7 +386,8 @@ __global__ void __launch_bounds__(THREADS, 2)
 #pragma unroll
     for (int k_step = 0; k_step < HEAD / 16; k_step++) {
         const int tile_row = warp * 16 + (matrix % 2) * 8 + matrix_row;
-        load_matrix_x4(query_fragments[k_step], value_tile + T::offset(tile_row, k_step * 2 + matrix / 2));
+        load_matrix_x4(query_fragments[k_step],
+                       value_tile + T::offset(tile_row, k_step * 2 + matrix / 2));
     }
     __syncthreads();
     if (count > 0) {
@@ -366,7 +400,9 @@ __global__ void __launch_bounds__(THREADS, 2)
 #pragma unroll
     for (int half = 0; half < 2; half++) {
         const int token = first_query + warp * 16 + half * 8 + group_id;
-        offsets[half] = token < tokens ? workspace.row_offsets[static_cast<size_t>(head) * tokens + token] : 0.0f;
+        offsets[half] = token < tokens
+                            ? workspace.row_offsets[static_cast<size_t>(head) * tokens + token]
+                            : 0.0f;
     }
     float output_accumulators[HEAD / 8][4] = {};
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
@@ -382,7 +418,8 @@ __global__ void __launch_bounds__(THREADS, 2)
                 uint32_t registers[4];
                 load_matrix_x4(registers, key_tile + T::offset(tile_row, k_step * 2 + matrix % 2));
                 N::mma(scores[key_pair * 2], query_fragments[k_step], registers[0], registers[1]);
-                N::mma(scores[key_pair * 2 + 1], query_fragments[k_step], registers[2], registers[3]);
+                N::mma(scores[key_pair * 2 + 1], query_fragments[k_step], registers[2],
+                       registers[3]);
             }
         }
 
@@ -402,7 +439,8 @@ __global__ void __launch_bounds__(THREADS, 2)
 #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float score = scores[key_tile_index][element] * scale_log2 - offsets[element / 2];
-                if (partial_block && first_key + key_tile_index * 8 + (lane % 4) * 2 + (element % 2) >= tokens) {
+                if (partial_block &&
+                    first_key + key_tile_index * 8 + (lane % 4) * 2 + (element % 2) >= tokens) {
                     score = -FLT_MAX;
                 }
                 scores[key_tile_index][element] = score;
@@ -412,8 +450,10 @@ __global__ void __launch_bounds__(THREADS, 2)
         float correction[2];
 #pragma unroll
         for (int half = 0; half < 2; half++) {
-            block_max[half] = fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
-            block_max[half] = fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 2));
+            block_max[half] =
+                fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
+            block_max[half] =
+                fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 2));
             const float new_max = fmaxf(row_max[half], block_max[half]);
             correction[half] = exp2f(row_max[half] - new_max);
             row_max[half] = new_max;
@@ -423,7 +463,8 @@ __global__ void __launch_bounds__(THREADS, 2)
         for (int key_tile_index = 0; key_tile_index < BLOCK / 8; key_tile_index++) {
 #pragma unroll
             for (int element = 0; element < 4; element++) {
-                const float probability = exp2f(scores[key_tile_index][element] - row_max[element / 2]);
+                const float probability =
+                    exp2f(scores[key_tile_index][element] - row_max[element / 2]);
                 scores[key_tile_index][element] = probability;
                 row_sum[element / 2] += probability;
             }
@@ -447,9 +488,12 @@ __global__ void __launch_bounds__(THREADS, 2)
             for (int dimension_pair = 0; dimension_pair < HEAD / 16; dimension_pair++) {
                 const int tile_row = key_step * 16 + (matrix % 2) * 8 + matrix_row;
                 uint32_t registers[4];
-                load_matrix_x4_transposed(registers, value_tile + T::offset(tile_row, dimension_pair * 2 + matrix / 2));
-                N::mma(output_accumulators[dimension_pair * 2], probability_fragment, registers[0], registers[1]);
-                N::mma(output_accumulators[dimension_pair * 2 + 1], probability_fragment, registers[2], registers[3]);
+                load_matrix_x4_transposed(
+                    registers, value_tile + T::offset(tile_row, dimension_pair * 2 + matrix / 2));
+                N::mma(output_accumulators[dimension_pair * 2], probability_fragment, registers[0],
+                       registers[1]);
+                N::mma(output_accumulators[dimension_pair * 2 + 1], probability_fragment,
+                       registers[2], registers[3]);
             }
         }
         // The key tile of the next entry has arrived, and no warp reads the value buffer any more.
@@ -465,8 +509,8 @@ __global__ void __launch_bounds__(THREADS, 2)
     // Merge the routed blocks with the pooled tail of the query block.
     const float tail_max = workspace.tail_max[row];
     const float tail_sum = workspace.tail_sum[row];
-    const float* tail_values = workspace.tail_values + row * HEAD;
-    __nv_bfloat16* output_head = output + head * layout.head_stride[OUTPUT];
+    const float *tail_values = workspace.tail_values + row * HEAD;
+    __nv_bfloat16 *output_head = output + head * layout.head_stride[OUTPUT];
 #pragma unroll
     for (int half = 0; half < 2; half++) {
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 1);
@@ -479,59 +523,66 @@ __global__ void __launch_bounds__(THREADS, 2)
         const float routed_weight = exp2f(row_max[half] - merged_max);
         const float tail_weight = exp2f(tail_max - merged_max);
         const float inverse_sum = 1.0f / (row_sum[half] * routed_weight + tail_sum * tail_weight);
-        __nv_bfloat16* output_row = output_head + static_cast<int64_t>(token) * layout.token_stride[OUTPUT];
+        __nv_bfloat16 *output_row =
+            output_head + static_cast<int64_t>(token) * layout.token_stride[OUTPUT];
 #pragma unroll
         for (int dimension_tile = 0; dimension_tile < HEAD / 8; dimension_tile++) {
             const int dimension = dimension_tile * 8 + (lane % 4) * 2;
             const float first = (output_accumulators[dimension_tile][half * 2] * routed_weight +
-                                 tail_values[dimension] * tail_weight) * inverse_sum;
-            const float second = (output_accumulators[dimension_tile][half * 2 + 1] * routed_weight +
-                                  tail_values[dimension + 1] * tail_weight) * inverse_sum;
-            *reinterpret_cast<uint32_t*>(output_row + dimension) = N::pack(first, second);
+                                 tail_values[dimension] * tail_weight) *
+                                inverse_sum;
+            const float second =
+                (output_accumulators[dimension_tile][half * 2 + 1] * routed_weight +
+                 tail_values[dimension + 1] * tail_weight) *
+                inverse_sum;
+            *reinterpret_cast<uint32_t *>(output_row + dimension) = N::pack(first, second);
         }
     }
 }
 
-}  // namespace
+} // namespace
 
-// Sol-Attn over one sequence of BF16 heads of 128. The layout's batch strides are ignored. With `inputs_ready`, the
-// workspaces already hold the block statistics and, for quantized attention, the INT8 inputs of
-// mmh3_attention_inputs.
-extern "C" int mmh3_sparse_attention(const void* query, const void* key, const void* value, void* output, int tokens,
-                                     int heads, const Mmh3AttentionLayout* layout, float scale, float tau,
-                                     int sink_key_start, int sink_key_end, int sink_query_start, int sink_query_end,
-                                     const Mmh3SparseWorkspace* workspace, const Mmh3QuantizedWorkspace* quantized,
-                                     int inputs_ready, cudaStream_t stream) {
+// Sol-Attn over one sequence of BF16 heads of 128. The layout's batch strides are ignored. With
+// `inputs_ready`, the workspaces already hold the block statistics and, for quantized attention,
+// the INT8 inputs of mmh3_attention_inputs.
+extern "C" int mmh3_sparse_attention(const void *query, const void *key, const void *value,
+                                     void *output, int tokens, int heads,
+                                     const Mmh3AttentionLayout *layout, float scale, float tau,
+                                     int sink_key_start, int sink_key_end, int sink_query_start,
+                                     int sink_query_end, const Mmh3SparseWorkspace *workspace,
+                                     const Mmh3QuantizedWorkspace *quantized, int inputs_ready,
+                                     cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const int blocks = (tokens + BLOCK - 1) / BLOCK;
     const float log2_scale = scale * 1.4426950408889634f;
-    const auto* q = static_cast<const __nv_bfloat16*>(query);
-    const auto* k = static_cast<const __nv_bfloat16*>(key);
-    const auto* v = static_cast<const __nv_bfloat16*>(value);
+    const auto *q = static_cast<const __nv_bfloat16 *>(query);
+    const auto *k = static_cast<const __nv_bfloat16 *>(key);
+    const auto *v = static_cast<const __nv_bfloat16 *>(value);
 
     if (!inputs_ready) {
-        block_stats_kernel<<<dim3(blocks, heads), THREADS, 0, stream>>>(q, k, v, tokens, *layout, blocks,
-                                                                       workspace->centroids, workspace->block_keys,
-                                                                       workspace->value_sums);
+        block_stats_kernel<<<dim3(blocks, heads), THREADS, 0, stream>>>(
+            q, k, v, tokens, *layout, blocks, workspace->centroids, workspace->block_keys,
+            workspace->value_sums);
     }
-    center_keys_kernel<<<heads, HEAD, 0, stream>>>(workspace->block_keys, blocks, workspace->key_mean,
-                                                   workspace->key_variance);
-    const int routed = launch_route<4>(*workspace, tokens, blocks, heads, tau, log2_scale, sink_key_start, sink_key_end,
-                                       sink_query_start, sink_query_end, stream);
+    center_keys_kernel<<<heads, HEAD, 0, stream>>>(workspace->block_keys, blocks,
+                                                   workspace->key_mean, workspace->key_variance);
+    const int routed =
+        launch_route<4>(*workspace, tokens, blocks, heads, tau, log2_scale, sink_key_start,
+                        sink_key_end, sink_query_start, sink_query_end, stream);
     if (routed != 0) {
         return routed;
     }
     const int64_t items = static_cast<int64_t>(tokens) * heads;
-    row_offsets_kernel<<<static_cast<unsigned>((items + 7) / 8), 256, 0, stream>>>(q, tokens, heads, *layout,
-                                                                                  workspace->key_mean, log2_scale,
-                                                                                  workspace->row_offsets);
+    row_offsets_kernel<<<static_cast<unsigned>((items + 7) / 8), 256, 0, stream>>>(
+        q, tokens, heads, *layout, workspace->key_mean, log2_scale, workspace->row_offsets);
     if (quantized != nullptr) {
-        return mmh3_attention_quantized(query, key, value, output, tokens, heads, layout, scale, workspace, quantized,
-                                        inputs_ready, stream);
+        return mmh3_attention_quantized(query, key, value, output, tokens, heads, layout, scale,
+                                        workspace, quantized, inputs_ready, stream);
     }
     sparse_attention_kernel<<<dim3(blocks, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
-        q, k, v, static_cast<__nv_bfloat16*>(output), tokens, *layout, blocks, *workspace, log2_scale);
+        q, k, v, static_cast<__nv_bfloat16 *>(output), tokens, *layout, blocks, *workspace,
+        log2_scale);
     return static_cast<int>(cudaGetLastError());
 }

@@ -15,11 +15,11 @@ struct Mmh3DeviceInfo {
     uint64_t total_global_bytes;
 };
 
-extern "C" int mmh3_cuda_device_count(int* count) {
+extern "C" int mmh3_cuda_device_count(int *count) {
     return static_cast<int>(cudaGetDeviceCount(count));
 }
 
-extern "C" int mmh3_cuda_device_info(int device, Mmh3DeviceInfo* info) {
+extern "C" int mmh3_cuda_device_info(int device, Mmh3DeviceInfo *info) {
     cudaDeviceProp properties;
     cudaError_t status = cudaGetDeviceProperties(&properties, device);
     if (status != cudaSuccess) {
@@ -31,46 +31,45 @@ extern "C" int mmh3_cuda_device_info(int device, Mmh3DeviceInfo* info) {
     info->compute_minor = properties.minor;
     info->multiprocessor_count = properties.multiProcessorCount;
     info->shared_memory_per_block_optin = static_cast<int32_t>(properties.sharedMemPerBlockOptin);
-    info->shared_memory_per_multiprocessor = static_cast<int32_t>(properties.sharedMemPerMultiprocessor);
+    info->shared_memory_per_multiprocessor =
+        static_cast<int32_t>(properties.sharedMemPerMultiprocessor);
     info->l2_cache_bytes = properties.l2CacheSize;
     info->integrated = properties.integrated;
     info->total_global_bytes = properties.totalGlobalMem;
     return 0;
 }
 
-extern "C" int mmh3_cuda_memory_info(size_t* free_bytes, size_t* total_bytes) {
+extern "C" int mmh3_cuda_memory_info(size_t *free_bytes, size_t *total_bytes) {
     return static_cast<int>(cudaMemGetInfo(free_bytes, total_bytes));
 }
 
-extern "C" const char* mmh3_cuda_error_string(int code) {
+extern "C" const char *mmh3_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }
 
-extern "C" int mmh3_cuda_malloc(void** pointer, size_t bytes) {
+extern "C" int mmh3_cuda_malloc(void **pointer, size_t bytes) {
     return static_cast<int>(cudaMalloc(pointer, bytes));
 }
 
-extern "C" int mmh3_cuda_free(void* pointer) {
-    return static_cast<int>(cudaFree(pointer));
-}
+extern "C" int mmh3_cuda_free(void *pointer) { return static_cast<int>(cudaFree(pointer)); }
 
-extern "C" int mmh3_cuda_copy_to_device(void* destination, const void* source, size_t bytes) {
+extern "C" int mmh3_cuda_copy_to_device(void *destination, const void *source, size_t bytes) {
     return static_cast<int>(cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
 }
 
-extern "C" int mmh3_cuda_copy_to_host(void* destination, const void* source, size_t bytes) {
+extern "C" int mmh3_cuda_copy_to_host(void *destination, const void *source, size_t bytes) {
     return static_cast<int>(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost));
 }
 
-extern "C" int mmh3_cuda_host_alloc(void** pointer, size_t bytes) {
+extern "C" int mmh3_cuda_host_alloc(void **pointer, size_t bytes) {
     return static_cast<int>(cudaHostAlloc(pointer, bytes, cudaHostAllocDefault));
 }
 
-extern "C" int mmh3_cuda_host_free(void* pointer) {
+extern "C" int mmh3_cuda_host_free(void *pointer) {
     return static_cast<int>(cudaFreeHost(pointer));
 }
 
-extern "C" int mmh3_cuda_stream_create(cudaStream_t* stream) {
+extern "C" int mmh3_cuda_stream_create(cudaStream_t *stream) {
     return static_cast<int>(cudaStreamCreateWithFlags(stream, cudaStreamNonBlocking));
 }
 
@@ -82,7 +81,7 @@ extern "C" int mmh3_cuda_stream_synchronize(cudaStream_t stream) {
     return static_cast<int>(cudaStreamSynchronize(stream));
 }
 
-extern "C" int mmh3_cuda_event_create(cudaEvent_t* event) {
+extern "C" int mmh3_cuda_event_create(cudaEvent_t *event) {
     return static_cast<int>(cudaEventCreateWithFlags(event, cudaEventDisableTiming));
 }
 
@@ -98,26 +97,27 @@ extern "C" int mmh3_cuda_event_synchronize(cudaEvent_t event) {
     return static_cast<int>(cudaEventSynchronize(event));
 }
 
-extern "C" int mmh3_cuda_copy_to_device_async(void* destination, const void* source, size_t bytes, cudaStream_t stream) {
-    return static_cast<int>(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
+extern "C" int mmh3_cuda_copy_to_device_async(void *destination, const void *source, size_t bytes,
+                                              cudaStream_t stream) {
+    return static_cast<int>(
+        cudaMemcpyAsync(destination, source, bytes, cudaMemcpyHostToDevice, stream));
 }
 
-extern "C" int mmh3_cuda_memset(void* pointer, int value, size_t bytes) {
+extern "C" int mmh3_cuda_memset(void *pointer, int value, size_t bytes) {
     return static_cast<int>(cudaMemset(pointer, value, bytes));
 }
 
-extern "C" int mmh3_cuda_synchronize() {
-    return static_cast<int>(cudaDeviceSynchronize());
-}
+extern "C" int mmh3_cuda_synchronize() { return static_cast<int>(cudaDeviceSynchronize()); }
 
-__global__ void fill_f32_kernel(float* data, float value, size_t count) {
+__global__ void fill_f32_kernel(float *data, float value, size_t count) {
     size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
-    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count; index += stride) {
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
+         index += stride) {
         data[index] = value;
     }
 }
 
-extern "C" int mmh3_cuda_fill_f32(float* data, float value, size_t count) {
+extern "C" int mmh3_cuda_fill_f32(float *data, float value, size_t count) {
     if (count == 0) {
         return 0;
     }
