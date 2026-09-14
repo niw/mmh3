@@ -5,18 +5,22 @@ set -euo pipefail
 
 usage() {
   cat <<EOF
-usage: $0 [--precision int8|fp16] [--lora | --no-lora] [--models DIR]
+usage: $0 [--video-vae int8|fp16] [--fasth3 | --no-fasth3] [--lightx2v-turbo | --no-lightx2v-turbo]
+       [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf). By default
-it downloads the ones for the fastest generation: the INT8 ConvRot DiT, text encoder and video VAE,
-the FP32 audio VAE and the lightx2v 4-step Turbo LoRA.
+it downloads the ones make generate uses: the INT8 ConvRot DiT, text encoder and video VAE, the FP32
+audio VAE and the FastH3 VSA-DataFree patch.
 
-  --precision int8  The INT8 ConvRot video VAE from Kijai/MiniMax-H3-experimental (default).
-  --precision fp16  The FP16 video VAE from Comfy-Org/MiniMax-H3 instead. The DiT and the text
-                    encoder are INT8 ConvRot either way.
-  --lora            The 768p 4-step Turbo LoRA from lightx2v/Minimax-h3-Turbo (default).
-  --no-lora         No Turbo LoRA.
-  --models DIR      The models directory (default: models in the repository).
+  --video-vae int8     The INT8 ConvRot video VAE from Kijai/MiniMax-H3-experimental (default).
+  --video-vae fp16     The FP16 video VAE from Comfy-Org/MiniMax-H3 instead. The DiT and the text
+                       encoder are INT8 ConvRot either way.
+  --fasth3             The FastH3 VSA-DataFree patch from yniw/MiniMax-H3-mmh3, into patches
+                       (default).
+  --no-fasth3          No FastH3 patch.
+  --lightx2v-turbo     The 768p 4-step Turbo LoRA from lightx2v/Minimax-h3-Turbo, into loras.
+  --no-lightx2v-turbo  No Turbo LoRA (default).
+  --models DIR         The models directory (default: models in the repository).
 EOF
 }
 
@@ -25,19 +29,22 @@ fail() {
   exit 2
 }
 
-precision=int8
-lora=1
+video_vae=int8
+fasth3=1
+turbo=0
 models=$(cd "$(dirname "$0")/.." && pwd)/models
 
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --precision)
-      [[ $# -ge 2 ]] || fail "--precision needs int8 or fp16"
-      precision=$2
+    --video-vae)
+      [[ $# -ge 2 ]] || fail "--video-vae needs int8 or fp16"
+      video_vae=$2
       shift
       ;;
-    --lora) lora=1 ;;
-    --no-lora) lora=0 ;;
+    --fasth3) fasth3=1 ;;
+    --no-fasth3) fasth3=0 ;;
+    --lightx2v-turbo) turbo=1 ;;
+    --no-lightx2v-turbo) turbo=0 ;;
     --models)
       [[ $# -ge 2 ]] || fail "--models needs a directory"
       models=$2
@@ -52,9 +59,9 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-case $precision in
+case $video_vae in
   int8 | fp16) ;;
-  *) fail "--precision must be int8 or fp16, not $precision" ;;
+  *) fail "--video-vae must be int8 or fp16, not $video_vae" ;;
 esac
 
 if ! command -v hf >/dev/null; then
@@ -74,15 +81,19 @@ files=(
   text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
   vae/minimax_h3_audio_vae_fp32.safetensors
 )
-if [[ $precision == fp16 ]]; then
+if [[ $video_vae == fp16 ]]; then
   files+=(vae/minimax_h3_video_vae_fp16.safetensors)
 fi
 hf download Comfy-Org/MiniMax-H3 "${files[@]}" --local-dir "$models"
-if [[ $precision == int8 ]]; then
+if [[ $video_vae == int8 ]]; then
   hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
     --local-dir "$models/vae"
 fi
-if [[ $lora == 1 ]]; then
+if [[ $turbo == 1 ]]; then
   hf download lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
     --local-dir "$models/loras"
+fi
+if [[ $fasth3 == 1 ]]; then
+  hf download yniw/MiniMax-H3-mmh3 patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors \
+    --local-dir "$models"
 fi

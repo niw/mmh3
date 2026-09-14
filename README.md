@@ -22,7 +22,7 @@ make generate
 `make` builds mmh3, `make download-models` downloads the models into `models`, and `make generate`
 generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.mp4`
 (NVENC H.264 video and AAC audio). A complete MP4 generation on a DGX Spark took about
-**86 seconds**, including model loading and encoding ([details](#performance)). The targets stop
+**87 seconds**, including model loading and encoding. The targets stop
 with a message when cargo or `hf` is missing.
 
 `PROMPT`, `SEED`, `OUT` and `MODELS` change the prompt, the seed, the output file and the models
@@ -36,9 +36,9 @@ make generate PROMPT="A red panda sips tea on a sunny wooden porch while birds c
 To save VP9 + Opus WebM, use `make generate FEATURES=cuda,webm OUT=out.webm`. The extension
 selects the native encoder. Neither command launches ffmpeg or writes intermediate Y4M/WAV files.
 
-`make generate` uses the fastest settings measured so far: the INT8 video VAE, the 4-step Turbo
-LoRA, INT8/FP8 attention and Sol-Attn from the first step. Compared with mmh3's defaults, they can
-change image details and the composition. See [Usage](#usage) for the other settings.
+`make generate` uses FastVideo's 4-step [FastH3](#fasth3) as a patch on the base DiT, with its
+video sparse attention, INT8/FP8 attention and the INT8 video VAE. Compared with mmh3's defaults,
+they can change image details and the composition. See [Usage](#usage) for the other settings.
 
 ## Status
 
@@ -68,9 +68,9 @@ tokens (38,710 tokens in all):
 | Text encoder load and encode | 3.4 s | |
 | DiT load | 2.9 s | |
 
-A complete run with the settings of `make generate`, the garden red panda prompt (75 text tokens),
-and seed 42 took **86.29 s for MP4** and **90.88 s for WebM**, including model loading and native
-encoding. Both runs produced 1344×768, 124-frame clips with stereo audio, and both files were
+A complete run with the Turbo LoRA settings in [Usage](#usage), the garden red panda prompt (75 text
+tokens) and seed 42 took **86.29 s for MP4** and **90.88 s for WebM**, including model loading and
+native encoding. Both runs produced 1344×768, 124-frame clips with stereo audio, and both files were
 verified by decoding the entire video and audio streams. These are individual runs, not averages.
 
 With the Tokyo rain prompt and seed 1, the same settings took 86.76 s without the final video and
@@ -124,7 +124,7 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - Native MP4 requires the `mp4` feature, H.264 NVENC and a driver supporting NVENC API 12.2.
   The driver is loaded at runtime. No separately installed Video Codec SDK is required. GPUs
   without NVENC can use WebM or ffmpeg output with a build without `mp4`.
-- About 54 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
+- About 55 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
   21 GB of weights plus activations.
 
 ffmpeg is optional: install it only to use the explicit `--ffmpeg` output path. Developers
@@ -174,11 +174,13 @@ directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `
 | `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Comfy-Org/MiniMax-H3 |
 | `vae/minimax_h3_audio_vae_fp32.safetensors` | Comfy-Org/MiniMax-H3 |
 | `vae/minimax_h3_video_vae_int8_convrot.safetensors` | Kijai/MiniMax-H3-experimental |
-| `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` | lightx2v/Minimax-h3-Turbo |
+| `patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors` | yniw/MiniMax-H3-mmh3 |
 
-With `--precision fp16`, the script downloads the FP16 video VAE,
+With `--video-vae fp16`, the script downloads the FP16 video VAE,
 `vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
-`--no-lora` skips the LoRA, and `--models DIR` downloads into another directory.
+`--no-fasth3` skips the FastH3 patch, `--lightx2v-turbo` also downloads the Turbo LoRA,
+`loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` from
+lightx2v/Minimax-h3-Turbo, and `--models DIR` downloads into another directory.
 
 Patches, such as the FastH3 patch below, go into `patches` of the models directory. `--patch` and
 `--lora` take a path, or a file name that mmh3 looks up in `patches` and then `loras` of the models
@@ -312,8 +314,8 @@ cargo test -p mmh3-output --features mp4,webm -- --include-ignored
 cargo test -p mmh3-output-nvenc --test output -- --ignored
 ```
 
-The fast settings of `make generate` use the Turbo LoRA with the shifts it was trained with,
-INT8/FP8 attention, and Sol-Attn from the first step:
+The Turbo LoRA, which `tools/download-models.sh --lightx2v-turbo` downloads, runs in four steps with
+the shifts it was trained with, INT8/FP8 attention, and Sol-Attn from the first step:
 
 ```sh
 target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
@@ -334,7 +336,9 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
   --patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
 ```
 
-[tools/models](tools/models/README.md) describes the patch and how to build it.
+`make generate` runs these settings, `make download-models` downloads the patch from
+[yniw/MiniMax-H3-mmh3](https://huggingface.co/yniw/MiniMax-H3-mmh3), and
+[tools/models](tools/models/README.md) describes it and how to build it.
 
 INT8/FP8 attention changes image details and needs about 0.76 GiB more memory. `--sparse-start 0`
 can also change the composition. `--sparse-start 0.2` keeps the first step dense and took 98.98 s.

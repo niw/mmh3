@@ -10,7 +10,8 @@ build:
 	$(if $(shell command -v cargo),,$(error cargo is not installed. Install Rust))
 	cargo build --release --features "$(FEATURES)" --bin mmh3
 
-# The fastest measured generation settings. Native output works without ffmpeg.
+# FastVideo's FastH3 in four steps, as a patch on the base DiT, with VSA and INT8/FP8 attention.
+# Native output works without ffmpeg.
 # NOTE: the prompt goes through the environment so that quotes in it reach mmh3 as they are.
 .PHONY: generate
 generate: build
@@ -20,12 +21,8 @@ generate: build
 		--prompt "$$PROMPT" \
 		--seed $(SEED) \
 		--steps 4 \
-		--shift-video 6 \
-		--shift-audio 3 \
-		--attention sol \
 		--attention-precision int8-fp8 \
-		--sparse-start 0 \
-		--lora "$(MODELS)/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors"
+		--patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
 
 .PHONY: download-models
 download-models:

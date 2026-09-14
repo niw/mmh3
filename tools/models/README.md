@@ -8,7 +8,10 @@ so no other setup is needed.
 
 Builds a patch that turns the pruned INT8 ConvRot FL2VA DiT, which mmh3 loads by default, into
 FastVideo's [FastH3 VSA-DataFree](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree)
-4-step model. mmh3 applies it with `--patch`. It is 2.7 GB, because it reuses the base DiT.
+4-step model. mmh3 applies it with `--patch`. It is 2.7 GB, because it reuses the base DiT. The
+patch built with the defaults is published at
+[yniw/MiniMax-H3-mmh3](https://huggingface.co/yniw/MiniMax-H3-mmh3), and
+`tools/download-models.sh` downloads it.
 
 It reads two checkpoints of about 66 GB each: the full BF16 FL2VA DiT of Comfy-Org/MiniMax-H3, and
 the `transformer` directory of the FastH3 repository. The Hugging Face CLI prints where it puts
