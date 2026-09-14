@@ -20,16 +20,16 @@ make generate
 ```
 
 `make` builds mmh3, `make download-models` downloads the models into `models`, and `make generate`
-generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.mp4`
-(NVENC H.264 video and AAC audio). A complete MP4 generation on a DGX Spark took about
-**87 seconds**, including model loading and encoding. The targets stop
-with a message when cargo or `hf` is missing.
+generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.mp4` (NVENC
+H.264 video and AAC audio). A complete MP4 generation on a DGX Spark took about **87 seconds**,
+including model loading and encoding. The targets stop with a message when cargo or `hf` is missing.
 
 `PROMPT`, `SEED`, `OUT` and `MODELS` change the prompt, the seed, the output file and the models
 directory. This writes `panda.mp4`:
 
 ```sh
-make generate PROMPT="A red panda sips tea on a sunny wooden porch while birds chirp in the garden." \
+make generate \
+  PROMPT="A red panda sips tea on a sunny wooden porch while birds chirp in the garden." \
   SEED=2 OUT=panda.mp4
 ```
 
@@ -137,12 +137,12 @@ make
 ```
 
 `make` builds `mmh3` with CUDA, native MP4 output and the ffmpeg CLI output:
-`cargo build --release --features cuda,mp4 --bin mmh3`. `make FEATURES=cuda,webm` builds
-native WebM output instead of MP4, for GPUs without NVENC. It needs the VP9/Opus dependencies
-and the libvpx download. `make FEATURES=cuda,mp4,webm` builds both.
-`CUDA_HOME` points at the CUDA toolkit (default `/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU
-architecture (default `sm_120f`). Without `--features cuda`, both commands can build with the CPU-side
-crates. In that case, only `mmh3-tools inspect` is available.
+`cargo build --release --features cuda,mp4 --bin mmh3`. `make FEATURES=cuda,webm` builds native WebM
+output instead of MP4, for GPUs without NVENC. It needs the VP9/Opus dependencies and the libvpx
+download. `make FEATURES=cuda,mp4,webm` builds both. `CUDA_HOME` points at the CUDA toolkit (default
+`/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU architecture (default `sm_120f`). Without
+`--features cuda`, both commands can build with the CPU-side crates. In that case, only
+`mmh3-tools inspect` is available.
 
 Build the inspection and development tools separately with:
 
@@ -153,7 +153,8 @@ cargo build --release --features cuda --bin mmh3-tools
 To run a specific command through Cargo:
 
 ```sh
-cargo run --release --features cuda,mp4 --bin mmh3 -- generate --prompt "A rainy street." --out out.mp4
+cargo run --release --features cuda,mp4 --bin mmh3 -- \
+  generate --prompt "A rainy street." --out out.mp4
 cargo run --release --features cuda --bin mmh3-tools -- device
 ```
 
@@ -220,12 +221,12 @@ The encoder and output file are validated before model loading. Unsupported hard
 missing drivers, unsupported dimensions or unavailable build features produce an early
 error. There is no automatic switch from a requested MP4 to WebM or ffmpeg.
 
-For the software path, build with the `webm` feature and use `--out out.webm`. Video is
-encoded by libvpx (VP9 profile 0, CPU-used 4, fixed quantizer 30 on the 0–63 scale, 8-bit
-YUV420 with BT.709 limited-range colors). These encoder settings are currently library defaults, not CLI options.
-Audio is encoded by libopus at 192 kb/s after resampling from 32 to 48 kHz. Audio is trimmed
-or padded with silence to the video duration. Resampler and Opus delays are compensated. The
-file includes duration and keyframe seeking information.
+For the software path, build with the `webm` feature and use `--out out.webm`. Video is encoded by
+libvpx (VP9 profile 0, CPU-used 4, fixed quantizer 30 on the 0–63 scale, 8-bit YUV420 with BT.709
+limited-range colors). These encoder settings are currently library defaults, not CLI options. Audio
+is encoded by libopus at 192 kb/s after resampling from 32 to 48 kHz. Audio is trimmed or padded
+with silence to the video duration. Resampler and Opus delays are compensated. The file includes
+duration and keyframe seeking information.
 
 To use the ffmpeg CLI instead, append `--ffmpeg`. With no further arguments it uses the
 H.264 (libx264, CRF 18) + AAC (192 kb/s) recipe:
@@ -344,23 +345,30 @@ INT8/FP8 attention changes image details and needs about 0.76 GiB more memory. `
 can also change the composition. `--sparse-start 0.2` keeps the first step dense and took 98.98 s.
 So far these settings have been compared visually on one prompt and seed only.
 
-| Option | Default | Meaning |
-| --- | --- | --- |
-| `--out FILE` | required (`make generate` uses `out.mp4`) | `.mp4` uses native NVENC H.264 + AAC in an `mp4` build. `.webm` uses native VP9 + Opus in a `webm` build. |
-| `--ffmpeg [ARGS...]` | off | Use an installed ffmpeg instead. All following arguments belong to ffmpeg. |
-| `--prompt TEXT`, `--prompt-file FILE` | | The prompt, raw text without a chat template. |
-| `--width N`, `--height N` | 1344, 768 | Canvas size, multiples of 32. H3 is trained with a 768-pixel short edge. |
-| `--frames N` | 124 | Frame count at 24 fps, rounded up to the next 17n + 5. |
-| `--steps N` | 20 | Model evaluations. The released checkpoint is guidance-distilled, so there is no CFG. |
-| `--seed N` | 0 | Seed of the initial noise. |
-| `--shift-video X`, `--shift-audio X` | 12, 3 | Sigma shifts of the two schedules. The 768p Turbo LoRA wants 6 and 3. |
-| `--attention dense\|sol\|vsa` | `vsa` with VSA gates, `dense` otherwise | Sol-Attn switches to block-sparse attention. VSA is the sparse attention FastH3 was trained with. |
-| `--attention-precision bf16\|int8-fp8` | `bf16` | INT8 QK / FP8 PV in the DiT, with FP32 softmax and accumulation. Changes generated details. |
-| `--sparse-tau X` | 1.3 | Sol-Attn's routing threshold. Higher is sparser. |
-| `--sparse-start X` | 0.2 for Sol-Attn, 0 for VSA | Fraction of the steps that stay dense before the sparse attention starts. |
-| `--vsa-sparsity X` | 0.9 | Fraction of the video tiles VSA leaves out for each query tile. |
-| `--patch FILE` | none | A patch for the DiT, such as the FastH3 patch, applied before a LoRA. |
-| `--lora FILE`, `--lora-strength X` | none, 1.0 | A ComfyUI LoRA for the DiT. |
+- `--out FILE` (required, `make generate` uses `out.mp4`): `.mp4` uses native NVENC H.264 + AAC in
+  an `mp4` build. `.webm` uses native VP9 + Opus in a `webm` build.
+- `--ffmpeg [ARGS...]` (default off): Use an installed ffmpeg instead. All following arguments
+  belong to ffmpeg.
+- `--prompt TEXT`, `--prompt-file FILE`: The prompt, raw text without a chat template.
+- `--width N`, `--height N` (default 1344, 768): Canvas size, multiples of 32. H3 is trained with a
+  768-pixel short edge.
+- `--frames N` (default 124): Frame count at 24 fps, rounded up to the next 17n + 5.
+- `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
+  there is no CFG.
+- `--seed N` (default 0): Seed of the initial noise.
+- `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
+  Turbo LoRA wants 6 and 3.
+- `--attention dense|sol|vsa` (default `vsa` with VSA gates, `dense` otherwise): Sol-Attn switches
+  to block-sparse attention. VSA is the sparse attention FastH3 was trained with.
+- `--attention-precision bf16|int8-fp8` (default `bf16`): INT8 QK / FP8 PV in the DiT, with FP32
+  softmax and accumulation. Changes generated details.
+- `--sparse-tau X` (default 1.3): Sol-Attn's routing threshold. Higher is sparser.
+- `--sparse-start X` (default 0.2 for Sol-Attn, 0 for VSA): Fraction of the steps that stay dense
+  before the sparse attention starts.
+- `--vsa-sparsity X` (default 0.9): Fraction of the video tiles VSA leaves out for each query tile.
+- `--patch FILE` (default none): A patch for the DiT, such as the FastH3 patch, applied before a
+  LoRA.
+- `--lora FILE`, `--lora-strength X` (default none, 1.0): A ComfyUI LoRA for the DiT.
 
 H3 follows long, structured prompts well, with the picture, the sound and the music described
 separately, one section per line:
@@ -376,22 +384,24 @@ Inspection and development commands are available in `mmh3-tools`:
 - `mmh3-tools inspect FILE` summarizes the tensors of a safetensors file.
 - `mmh3-tools device` prints the GPU.
 - `mmh3-tools bench gemm|memory|mma|attention` measures kernels and the GPU.
-- `mmh3-tools check dit|sample|video-vae|audio-vae|text-encoder` compares a stage with golden data written
-  by `tools/golden`.
+- `mmh3-tools check dit|sample|video-vae|audio-vae|text-encoder` compares a stage with golden data
+  written by `tools/golden`.
 
 ## Repository layout
 
 - `src/bin/mmh3/`: the `mmh3` entry point and video generation.
-- `src/bin/mmh3-tools/`: the `mmh3-tools` entry point, checkpoint inspection, benchmarks and reference checks.
-- `src/lib.rs`: support shared by both commands, with argument parsing in `src/cli.rs` and checkpoint loading
-  options in `src/models.rs`.
+- `src/bin/mmh3-tools/`: the `mmh3-tools` entry point, checkpoint inspection, benchmarks and
+  reference checks.
+- `src/lib.rs`: support shared by both commands, with argument parsing in `src/cli.rs` and
+  checkpoint loading options in `src/models.rs`.
 - `crates/mmh3-core`: everything that does not depend on a GPU backend, such as the safetensors
   reader, the tokenizer, the packed token layout, schedules, VAE tiling plans, Sol-Attn's reference
   and the media writers.
 - `crates/mmh3-cuda`: the CUDA kernels (`kernels/*.cu`) and the Rust code that runs the models with
   them.
 - `crates/mmh3-cpu`: an FP32 CPU reference of the DiT for tests.
-- `crates/mmh3-output`: portable encoder interfaces, AAC encoding, MP4/WebM muxing and ffmpeg CLI output.
+- `crates/mmh3-output`: portable encoder interfaces, AAC encoding, MP4/WebM muxing and ffmpeg CLI
+  output.
 - `crates/mmh3-output-nvenc`: the NVENC adapter that accepts CUDA frames for native H.264 encoding.
 - `tests/fixtures`: small random models with outputs computed by ComfyUI's implementation.
 - `tools/download-models.sh`: the model downloader that `make download-models` runs.
