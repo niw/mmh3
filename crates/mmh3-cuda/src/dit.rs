@@ -11,7 +11,7 @@ use crate::attention::{
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
 use crate::model::{DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer};
-use crate::{CudaError, DeviceBuffer, check};
+use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::dit::latent::{pack_audio, patchify_video, unpack_audio, unpatchify_video};
@@ -178,12 +178,18 @@ impl Workspace {
 struct ForwardBuffers {
     workspace: Option<Workspace>,
     sparse: Option<(AttentionPrecision, SparseWorkspace)>,
+    text: Option<TextStates>,
+}
+
+/// Refined text states `[text tokens, hidden]` in FP32 and the context they came from. The refiner
+/// sees only the context, so the steps of a generation share them.
+struct TextStates {
+    context: Tensor,
+    states: DeviceBuffer,
 }
 
 /// Outputs of one call and the states captured along the way.
 pub struct DitOutputs {
-    /// Refined text states `[text tokens, hidden]`.
-    pub text_states: Vec<f32>,
     /// Residual stream `[tokens, hidden]` after each requested block.
     pub blocks: Vec<(usize, Vec<f32>)>,
     /// Velocity in the layout of the video input.
@@ -269,6 +275,17 @@ impl CudaDit {
         &self.config
     }
 
+    /// Refined text states `[text tokens, hidden]` of the last call's context, or `None` before the
+    /// first call or after `add_lora`.
+    pub fn text_states(&self) -> Result<Option<Vec<f32>>, Error> {
+        let buffers = self.buffers.borrow();
+        Ok(buffers
+            .text
+            .as_ref()
+            .map(|text| text.states.to_f32())
+            .transpose()?)
+    }
+
     fn pointer(&self, name: &str) -> Result<*const c_void, Error> {
         self.tensors.pointer(name)
     }
@@ -331,6 +348,8 @@ impl CudaDit {
         }
         let added = adapters.len();
         self.adapters.extend(adapters);
+        // The adapters may change the refiner.
+        self.buffers.get_mut().text = None;
         Ok(added)
     }
 
@@ -855,6 +874,7 @@ impl CudaDit {
         let ForwardBuffers {
             workspace: cached_workspace,
             sparse: cached_sparse,
+            text: cached_text,
         } = &mut *buffers;
         let shape = WorkspaceShape {
             tokens,
@@ -908,8 +928,29 @@ impl CudaDit {
         let angles = DeviceBuffer::from_f32(&layout.rope_angles(&self.inverse_frequencies))?;
         let time_embedding = DeviceBuffer::from_f32(&timesteps.time_embedding(&self.adaln_table))?;
 
-        self.refine_text(&inputs.context, workspace)?;
-        let text_states = workspace.residual.to_f32_range(0, text_tokens * hidden)?;
+        let text_bytes = text_tokens * hidden * 4;
+        match cached_text {
+            Some(text) if text.context == inputs.context => {
+                // SAFETY: both buffers hold the text rows.
+                unsafe {
+                    copy_device(
+                        workspace.residual.pointer(),
+                        text.states.pointer(),
+                        text_bytes,
+                    )?
+                };
+            }
+            _ => {
+                self.refine_text(&inputs.context, workspace)?;
+                let states = DeviceBuffer::new(text_bytes)?;
+                // SAFETY: both buffers hold the text rows.
+                unsafe { copy_device(states.pointer(), workspace.residual.pointer(), text_bytes)? };
+                *cached_text = Some(TextStates {
+                    context: inputs.context.clone(),
+                    states,
+                });
+            }
+        }
 
         let audio = layout.segment(SegmentKind::Audio);
         let video = layout.segment(SegmentKind::Video);
@@ -1014,7 +1055,6 @@ impl CudaDit {
         )?;
         let audio_velocity = project(audio, "final_layer.audio_out", config.audio_channels)?;
         Ok(DitOutputs {
-            text_states,
             blocks,
             video: unpatchify_video(&video_velocity, video_shape)
                 .into_iter()

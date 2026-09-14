@@ -81,7 +81,9 @@ fn check_forward(precision: AttentionPrecision) {
     let outputs = dit.forward(&inputs, &[0, 1], None).unwrap();
     assert_close(
         "text states",
-        &outputs.text_states,
+        &dit.text_states()
+            .unwrap()
+            .expect("no text states after a call"),
         &tensor(&file, "intermediate.text_states").data,
     );
     for (index, block) in &outputs.blocks {
@@ -93,6 +95,10 @@ fn check_forward(precision: AttentionPrecision) {
     }
     assert_close("video", &outputs.video, &tensor(&file, "output.video").data);
     assert_close("audio", &outputs.audio, &tensor(&file, "output.audio").data);
+
+    // The second call takes the refined text states from the first.
+    let repeated = dit.forward(&inputs, &[], None).unwrap();
+    assert!(repeated.video == outputs.video && repeated.audio == outputs.audio);
 }
 
 #[test]

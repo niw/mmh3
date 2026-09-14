@@ -51,6 +51,11 @@ unsafe extern "C" {
         source: *const c_void,
         bytes: usize,
     ) -> c_int;
+    fn mmh3_cuda_copy_device(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> c_int;
     fn mmh3_cuda_memset(pointer: *mut c_void, value: c_int, bytes: usize) -> c_int;
     fn mmh3_cuda_synchronize() -> c_int;
     fn mmh3_cublaslt_status_string(code: c_int) -> *const c_char;
@@ -141,6 +146,19 @@ pub fn memory_info() -> Result<(usize, usize), CudaError> {
 pub fn synchronize() -> Result<(), CudaError> {
     // SAFETY: no arguments.
     check(unsafe { mmh3_cuda_synchronize() })
+}
+
+/// Copies `bytes` bytes between device addresses, in order with the kernels on the default stream.
+///
+/// # Safety
+/// Both ranges must lie inside live device allocations.
+pub(crate) unsafe fn copy_device(
+    destination: *mut c_void,
+    source: *const c_void,
+    bytes: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: the caller keeps both ranges inside their allocations.
+    check(unsafe { mmh3_cuda_copy_device(destination, source, bytes) })
 }
 
 /// An owned device allocation.

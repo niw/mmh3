@@ -61,6 +61,10 @@ extern "C" int mmh3_cuda_copy_to_host(void *destination, const void *source, siz
     return static_cast<int>(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToHost));
 }
 
+extern "C" int mmh3_cuda_copy_device(void *destination, const void *source, size_t bytes) {
+    return static_cast<int>(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToDevice));
+}
+
 extern "C" int mmh3_cuda_host_alloc(void **pointer, size_t bytes) {
     return static_cast<int>(cudaHostAlloc(pointer, bytes, cudaHostAllocDefault));
 }
