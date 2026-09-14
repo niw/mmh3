@@ -10,8 +10,43 @@ namespace {
 
 constexpr size_t WORKSPACE_BYTES = 32ull << 20;
 
-cublasLtHandle_t shared_handle = nullptr;
-void *shared_workspace = nullptr;
+int status_code(cublasStatus_t status) {
+    return status == CUBLAS_STATUS_SUCCESS ? 0 : 1000 + static_cast<int>(status);
+}
+
+// A handle and workspace for the calls of one host thread, or the status that made creating them
+// fail.
+// NOTE: an algorithm may run several kernels that pass partial results through the workspace. Calls
+// from two threads interleave their kernels even on the legacy default stream, so a shared
+// workspace lets one call read the partial results of another. The calls of one thread share its
+// workspace, so they must use one stream.
+struct ThreadState {
+    cublasLtHandle_t handle = nullptr;
+    void *workspace = nullptr;
+    int status = 0;
+
+    ThreadState() {
+        status = status_code(cublasLtCreate(&handle));
+        if (status != 0) {
+            handle = nullptr;
+            return;
+        }
+        status = static_cast<int>(cudaMalloc(&workspace, WORKSPACE_BYTES));
+    }
+
+    // cudaFree waits for the kernels that still use the workspace.
+    ~ThreadState() {
+        if (workspace != nullptr) {
+            cudaFree(workspace);
+        }
+        if (handle != nullptr) {
+            cublasLtDestroy(handle);
+        }
+    }
+
+    ThreadState(const ThreadState &) = delete;
+    ThreadState &operator=(const ThreadState &) = delete;
+};
 
 struct Descriptors {
     cublasLtMatmulDesc_t operation = nullptr;
@@ -38,10 +73,6 @@ struct Descriptors {
     }
 };
 
-int status_code(cublasStatus_t status) {
-    return status == CUBLAS_STATUS_SUCCESS ? 0 : 1000 + static_cast<int>(status);
-}
-
 } // namespace
 
 extern "C" const char *mmh3_cublaslt_status_string(int code) {
@@ -53,15 +84,9 @@ extern "C" const char *mmh3_cublaslt_status_string(int code) {
 extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *weight,
                                     const void *bias, void *output, int64_t m, int64_t n, int64_t k,
                                     float alpha, float beta, cudaStream_t stream) {
-    if (shared_handle == nullptr) {
-        cublasStatus_t status = cublasLtCreate(&shared_handle);
-        if (status != CUBLAS_STATUS_SUCCESS) {
-            return status_code(status);
-        }
-        cudaError_t allocation = cudaMalloc(&shared_workspace, WORKSPACE_BYTES);
-        if (allocation != cudaSuccess) {
-            return static_cast<int>(allocation);
-        }
+    thread_local const ThreadState state;
+    if (state.status != 0) {
+        return state.status;
     }
     const cudaDataType_t data_type =
         kind == 0 ? CUDA_R_16BF : (kind == 1 ? CUDA_R_32F : CUDA_R_16F);
@@ -102,15 +127,15 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     cublasLtMatmulHeuristicResult_t result;
     int returned = 0;
     status = cublasLtMatmulAlgoGetHeuristic(
-        shared_handle, descriptors.operation, descriptors.weight, descriptors.input,
+        state.handle, descriptors.operation, descriptors.weight, descriptors.input,
         descriptors.output, descriptors.output, descriptors.preference, 1, &result, &returned);
     if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
         return status_code(status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED : status);
     }
     status =
-        cublasLtMatmul(shared_handle, descriptors.operation, &alpha, weight, descriptors.weight,
+        cublasLtMatmul(state.handle, descriptors.operation, &alpha, weight, descriptors.weight,
                        input, descriptors.input, &beta, output, descriptors.output, output,
-                       descriptors.output, &result.algo, shared_workspace, WORKSPACE_BYTES, stream);
+                       descriptors.output, &result.algo, state.workspace, WORKSPACE_BYTES, stream);
     return status_code(status);
 }
 

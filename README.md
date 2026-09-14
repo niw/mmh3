@@ -374,12 +374,11 @@ Inspection and development commands are available in `mmh3-tools`:
 ## Tests
 
 ```sh
-cargo test --release --workspace --features cuda,mp4 -- --test-threads=1
+cargo test --release --workspace --features cuda,mp4
 ```
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results
-and CPU references. They run one at a time, because loading a model during another test's DiT
-forward pass can corrupt that forward pass.
+and CPU references.
 
 ## Formatting
 
