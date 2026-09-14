@@ -11,7 +11,8 @@ use crate::attention::{
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
 use crate::model::{
-    ADAPTER_RANK_MULTIPLE, DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer,
+    ADAPTER_RANK_MULTIPLE, DeviceTensors, Down, LowRank, check_quantization, host_tensor,
+    i32_buffer,
 };
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
@@ -205,11 +206,12 @@ struct TextStates {
 /// How a LoRA reaches the INT8 ConvRot layers.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum LoraMode {
-    /// A BF16 adapter next to the INT8 weights, exact but with its own work in every call.
+    /// An adapter next to the INT8 weights with its own work in every call. Its down projection
+    /// runs on the quantized input of the layer, and the rest in BF16.
     #[default]
     Adapter,
-    /// Added into the weights, which are quantized again. No work per call, one more rounding of
-    /// the weights, like ComfyUI's merge into INT8 checkpoints.
+    /// Added into the weights, which are quantized again, like ComfyUI's merge into INT8
+    /// checkpoints. No work per call, but updates smaller than half an INT8 step round away.
     Merge,
 }
 
@@ -395,11 +397,18 @@ impl CudaDit {
                 return Err(Error::Model(format!("{layer} already has a LoRA")));
             }
             let padded_rank = rank.next_multiple_of(ADAPTER_RANK_MULTIPLE);
-            let (down, up) = if padded_rank == rank {
-                (uploader.allocate(file, info)?, uploader.allocate(file, up)?)
+            let down = if weight_dtype == DType::I8 {
+                LowRank::quantize_down(file.data(info), rank, inputs)?
+            } else if padded_rank == rank {
+                Down::Bf16(uploader.allocate(file, info)?)
             } else {
                 let mut down = file.data(info).to_vec();
                 down.resize(padded_rank * inputs * 2, 0);
+                Down::Bf16(DeviceBuffer::from_bytes(&down)?)
+            };
+            let up = if padded_rank == rank {
+                uploader.allocate(file, up)?
+            } else {
                 let mut padded_up = vec![0; outputs * padded_rank * 2];
                 for (source, destination) in file
                     .data(up)
@@ -408,10 +417,7 @@ impl CudaDit {
                 {
                     destination[..rank * 2].copy_from_slice(source);
                 }
-                (
-                    DeviceBuffer::from_bytes(&down)?,
-                    DeviceBuffer::from_bytes(&padded_up)?,
-                )
+                DeviceBuffer::from_bytes(&padded_up)?
             };
             let adapter = LowRank {
                 down,
@@ -541,7 +547,7 @@ impl CudaDit {
     /// Adds the delta to the residual, gated by a chunk of a modulation table when `gate` names
     /// one, then normalizes the residual with `weight` and the modulation's shift and scale chunks
     /// and quantizes it into the workspace for the INT8 layer `layer`. The BF16 rows stay in
-    /// `normalized` only when the layer's adapter needs them.
+    /// `normalized` only when an adapter of the layer needs them.
     #[allow(clippy::too_many_arguments)]
     fn add_norm_quantize(
         &self,
@@ -560,7 +566,11 @@ impl CudaDit {
                 && workspace.scales.bytes() >= tokens * 4,
             "the quantization buffers are too small"
         );
-        let normalized = if self.adapters.contains_key(layer) {
+        let normalized = if self
+            .adapters
+            .get(layer)
+            .is_some_and(|adapter| matches!(adapter.down, Down::Bf16(_)))
+        {
             workspace.normalized.pointer()
         } else {
             ptr::null_mut()
@@ -697,7 +707,6 @@ impl CudaDit {
             )?;
             self.tensors.linear_quantized(
                 &qkv,
-                workspace.normalized.pointer(),
                 workspace.qkv.pointer(),
                 tokens,
                 &workspace.quantized,
@@ -874,7 +883,6 @@ impl CudaDit {
             )?;
             self.tensors.linear_quantized(
                 &fc1,
-                workspace.normalized.pointer(),
                 workspace.activated.pointer(),
                 tokens,
                 &workspace.quantized,
@@ -948,7 +956,6 @@ impl CudaDit {
         if fused && self.tensors.is_int8(&name) {
             self.tensors.linear_quantized(
                 &name,
-                workspace.normalized.pointer(),
                 gate.pointer(),
                 tokens,
                 &workspace.quantized,
@@ -1053,7 +1060,7 @@ impl CudaDit {
         let adapter_rank = self
             .adapters
             .values()
-            .map(|adapter| adapter.rank)
+            .map(LowRank::scratch_columns)
             .max()
             .unwrap_or(0);
         // The refiner's MLPs still write the gate and up projections for the text tokens.

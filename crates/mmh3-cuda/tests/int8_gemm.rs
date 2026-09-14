@@ -47,16 +47,33 @@ fn u16_bytes(values: &[u16]) -> Vec<u8> {
 }
 
 /// Runs every config on random operands, with a random adapter of `rank` when it is not zero, and
-/// compares the output with an f64 reference within BF16 rounding. `f16_with_bias` switches to FP16
-/// output with a random bias.
-fn check_every_config(m: usize, n: usize, k: usize, rank: usize, f16_with_bias: bool, seed: u64) {
+/// compares the output with an f64 reference within BF16 rounding. The adapter's down rows lie
+/// `down_stride` values apart, with values the kernel must skip in between. `f16_with_bias`
+/// switches to FP16 output with a random bias.
+fn check_every_config(
+    m: usize,
+    n: usize,
+    k: usize,
+    rank: usize,
+    down_stride: usize,
+    f16_with_bias: bool,
+    seed: u64,
+) {
     let mut random = Random(seed);
     let activations: Vec<i8> = (0..m * k).map(|_| random.int8()).collect();
     let weights: Vec<i8> = (0..n * k).map(|_| random.int8()).collect();
     let activation_scales: Vec<f32> = (0..m).map(|_| random.uniform(0.5, 1.5)).collect();
     // Small weight scales keep the INT8 product about as large as the adapter's contribution.
     let weight_scales: Vec<f32> = (0..n).map(|_| random.uniform(0.0001, 0.001)).collect();
-    let down: Vec<u16> = (0..m * rank).map(|_| random.bf16(-2.0, 2.0)).collect();
+    let down: Vec<u16> = (0..m * down_stride)
+        .map(|index| {
+            if index % down_stride < rank {
+                random.bf16(-2.0, 2.0)
+            } else {
+                f32_to_bf16(1000.0)
+            }
+        })
+        .collect();
     let up: Vec<u16> = (0..n * rank).map(|_| random.bf16(-2.0, 2.0)).collect();
     let adapter_scale = 1.5f32;
     let bias: Vec<f32> = (0..n)
@@ -83,6 +100,7 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, f16_with_bias: 
         down: &down_buffer,
         up: &up_buffer,
         rank,
+        down_stride,
         scale: adapter_scale,
     };
     let bias_buffer = upload(&f32_bytes(&bias));
@@ -97,7 +115,7 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, f16_with_bias: 
                 .sum();
             let low_rank: f64 = (0..rank)
                 .map(|index| {
-                    bf16_to_f32(down[row * rank + index]) as f64
+                    bf16_to_f32(down[row * down_stride + index]) as f64
                         * bf16_to_f32(up[column * rank + index]) as f64
                 })
                 .sum();
@@ -150,26 +168,32 @@ fn check_every_config(m: usize, n: usize, k: usize, rank: usize, f16_with_bias: 
 
 #[test]
 fn matches_cpu_reference_for_every_config() {
-    check_every_config(300, 512, 384, 0, false, 7);
+    check_every_config(300, 512, 384, 0, 0, false, 7);
 }
 
 #[test]
 fn matches_cpu_reference_over_several_tiles_per_block() {
     // 192 tiles, more than a Blackwell GPU has SMs, with a ragged last row of tiles and an odd
     // number of K blocks.
-    check_every_config(2000, 3072, 384, 0, false, 8);
+    check_every_config(2000, 3072, 384, 0, 0, false, 8);
 }
 
 #[test]
 fn adds_a_low_rank_adapter() {
-    check_every_config(300, 512, 256, 128, false, 9);
+    check_every_config(300, 512, 256, 128, 128, false, 9);
     // The rank of the fused qkv adapters, and more tiles than SMs.
-    check_every_config(600, 3072, 256, 384, false, 10);
+    check_every_config(600, 3072, 256, 384, 384, false, 10);
+}
+
+#[test]
+fn reads_adapter_rows_at_their_stride() {
+    // The down projections of INT8 layers come out 128 columns wide for ranks of 64.
+    check_every_config(300, 512, 256, 64, 128, false, 12);
 }
 
 #[test]
 fn writes_fp16_with_a_bias() {
-    check_every_config(600, 3072, 256, 0, true, 11);
+    check_every_config(600, 3072, 256, 0, 0, true, 11);
 }
 
 /// Rounds an f64 to BF16 or FP16 and back.
@@ -218,6 +242,7 @@ fn writes_swiglu_of_interleaved_rows() {
             down: &down_buffer,
             up: &up_buffer,
             rank,
+            down_stride: rank,
             scale: adapter_scale,
         };
 

@@ -192,15 +192,13 @@ impl DeviceTensors {
     }
 
     /// Applies the INT8 ConvRot layer `name` to rows whose rotated INT8 values and scales already
-    /// sit in `quantized` and `activation_scales`. `input` holds the same rows in BF16 for the
-    /// adapter's down projection and is not read without an adapter. With `swiglu`, the weights,
-    /// weight scales and adapter up weights went through `interleave_swiglu` and the output is
-    /// `silu(gate) · up`, `rows × outputs / 2` BF16 values.
+    /// sit in `quantized` and `activation_scales`. With `swiglu`, the weights, weight scales and
+    /// adapter up weights went through `interleave_swiglu` and the output is `silu(gate) · up`,
+    /// `rows × outputs / 2` BF16 values.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_quantized(
         &self,
         name: &str,
-        input: *const c_void,
         output: *mut c_void,
         rows: usize,
         quantized: &DeviceBuffer,
@@ -212,7 +210,7 @@ impl DeviceTensors {
         output.swiglu = swiglu;
         self.int8_linear(
             name,
-            input,
+            ptr::null(),
             true,
             output,
             rows,
@@ -223,7 +221,8 @@ impl DeviceTensors {
     }
 
     /// The INT8 ConvRot path of `linear`: quantizes the BF16 input unless `input_quantized`, and
-    /// runs the INT8 GEMM with the adapter inside it when its rank is a multiple of 64.
+    /// runs the INT8 GEMM with the adapter inside it. The adapter's down projection runs on the
+    /// quantized input.
     #[allow(clippy::too_many_arguments)]
     fn int8_linear(
         &self,
@@ -250,20 +249,9 @@ impl DeviceTensors {
             "{name}: quantization buffers are too small"
         );
         // SAFETY: `quantized` holds `rows × features` values and `activation_scales` `rows`,
-        // checked above. The adapter reads the BF16 input and writes `rows × rank` values into its
-        // scratch buffer.
+        // checked above. The adapter writes `rows × scratch_columns()` values into its scratch
+        // buffer.
         unsafe {
-            let fused = match adapter {
-                Some((low_rank, scratch)) if low_rank.rank % ADAPTER_RANK_MULTIPLE == 0 => {
-                    Some(low_rank.project_down(input, rows, scratch)?)
-                }
-                Some(_) if output.swiglu => {
-                    return Err(Error::Model(format!(
-                        "{name}: the adapter rank must be a multiple of 64"
-                    )));
-                }
-                _ => None,
-            };
             if !input_quantized {
                 rotate_quantize_pointers(
                     input,
@@ -274,6 +262,22 @@ impl DeviceTensors {
                     features,
                 )?;
             }
+            let adapter = match adapter {
+                Some((low_rank, scratch)) if low_rank.rank % ADAPTER_RANK_MULTIPLE == 0 => {
+                    Some(low_rank.project_down_quantized(
+                        quantized.pointer(),
+                        activation_scales.pointer(),
+                        rows,
+                        scratch,
+                    )?)
+                }
+                Some(_) => {
+                    return Err(Error::Model(format!(
+                        "{name}: the adapter rank must be a multiple of {ADAPTER_RANK_MULTIPLE}"
+                    )));
+                }
+                None => None,
+            };
             int8_pointers(
                 quantized.pointer(),
                 weight.buffer.pointer(),
@@ -283,11 +287,8 @@ impl DeviceTensors {
                 rows,
                 outputs,
                 features,
-                fused,
+                adapter,
             )?;
-            if let (None, Some((low_rank, scratch))) = (fused, adapter) {
-                low_rank.apply(input, output.pointer, rows, scratch)?;
-            }
         }
         Ok(())
     }
@@ -432,11 +433,24 @@ pub(crate) unsafe fn cublaslt_linear(
     })
 }
 
-/// A low-rank adapter of one linear layer: output += scale · up · (down · input), in BF16.
+/// The down projection of a low-rank adapter.
+pub(crate) enum Down {
+    /// BF16 `[rank, inputs]`, applied to BF16 inputs.
+    Bf16(DeviceBuffer),
+    /// For INT8 ConvRot layers: the rows rotated like the activations and quantized to INT8
+    /// `[columns, inputs]` with one scale per row, applied to the layer's quantized input. `columns`
+    /// is the rank padded with zero rows to a multiple of 128, the INT8 GEMM's tile width.
+    Int8 {
+        weights: DeviceBuffer,
+        scales: DeviceBuffer,
+        columns: usize,
+    },
+}
+
+/// A low-rank adapter of one linear layer: output += scale · up · (down · input).
 pub(crate) struct LowRank {
-    /// `[rank, inputs]`.
-    pub(crate) down: DeviceBuffer,
-    /// `[outputs, rank]`.
+    pub(crate) down: Down,
+    /// BF16 `[outputs, rank]`.
     pub(crate) up: DeviceBuffer,
     pub(crate) rank: usize,
     pub(crate) inputs: usize,
@@ -445,39 +459,93 @@ pub(crate) struct LowRank {
 }
 
 impl LowRank {
-    /// Writes `down · input` for `rows` BF16 input rows into `scratch`, which holds at least
-    /// `rows × rank` BF16 values, and returns the operands for an INT8 GEMM that adds the rest.
+    /// Quantizes a BF16 down projection `[rank, inputs]`, given as its little-endian bytes, for an
+    /// INT8 ConvRot layer, see `Down::Int8`.
+    pub(crate) fn quantize_down(
+        down: &[u8],
+        rank: usize,
+        inputs: usize,
+    ) -> Result<Down, CudaError> {
+        let columns = rank.next_multiple_of(128);
+        let mut padded = down.to_vec();
+        padded.resize(columns * inputs * 2, 0);
+        let padded = DeviceBuffer::from_bytes(&padded)?;
+        let weights = DeviceBuffer::new(columns * inputs)?;
+        let scales = DeviceBuffer::new(columns * 4)?;
+        // SAFETY: `padded` holds `columns × inputs` BF16 values, `weights` as many bytes and
+        // `scales` `columns` f32 values.
+        unsafe {
+            rotate_quantize_pointers(
+                padded.pointer(),
+                false,
+                weights.pointer(),
+                scales.pointer(),
+                columns,
+                inputs,
+            )?
+        };
+        Ok(Down::Int8 {
+            weights,
+            scales,
+            columns,
+        })
+    }
+
+    /// Values per input row the adapter's scratch buffer needs.
+    pub(crate) fn scratch_columns(&self) -> usize {
+        match self.down {
+            Down::Bf16(_) => self.rank,
+            Down::Int8 { columns, .. } => columns,
+        }
+    }
+
+    /// Writes the INT8 down projection of `rows` quantized input rows into `scratch`, which holds
+    /// at least `rows × scratch_columns()` BF16 values, and returns the operands for an INT8 GEMM
+    /// that adds the rest.
     ///
     /// # Safety
-    /// `input` must hold `rows × inputs` BF16 values.
-    pub(crate) unsafe fn project_down(
+    /// `quantized` and `activation_scales` must hold `rows × inputs` INT8 values and `rows` scales.
+    pub(crate) unsafe fn project_down_quantized(
         &self,
-        input: *const c_void,
+        quantized: *const c_void,
+        activation_scales: *const c_void,
         rows: usize,
         scratch: &DeviceBuffer,
-    ) -> Result<AdapterPointers, CudaError> {
+    ) -> Result<AdapterPointers, Error> {
+        let Down::Int8 {
+            weights,
+            scales,
+            columns,
+        } = &self.down
+        else {
+            return Err(Error::Model(
+                "the adapter of an INT8 layer needs a quantized down projection".to_owned(),
+            ));
+        };
         assert!(
-            scratch.bytes() >= rows * self.rank * 2,
+            scratch.bytes() >= rows * columns * 2,
             "the adapter scratch buffer is too small"
         );
-        // SAFETY: the caller guarantees the input extent, and scratch holds `rows × rank`, checked
-        // above.
+        // SAFETY: the caller guarantees the input extents, the down projection holds `columns ×
+        // inputs` values and scratch `rows × columns`, checked above.
         unsafe {
-            cublaslt_linear(
-                LinearKind::Bf16,
-                input,
-                self.down.pointer(),
-                ptr::null(),
-                scratch.pointer(),
+            int8_pointers(
+                quantized,
+                weights.pointer(),
+                activation_scales,
+                scales.pointer(),
+                Int8Output::bf16(scratch.pointer()),
                 rows,
-                self.rank,
+                *columns,
                 self.inputs,
+                None,
             )?
         };
         Ok(AdapterPointers {
             down: scratch.pointer(),
             up: self.up.pointer(),
             rank: self.rank,
+            down_stride: *columns,
             scale: self.scale,
         })
     }
@@ -493,7 +561,12 @@ impl LowRank {
         output: *mut c_void,
         rows: usize,
         scratch: &DeviceBuffer,
-    ) -> Result<(), CudaError> {
+    ) -> Result<(), Error> {
+        let Down::Bf16(down) = &self.down else {
+            return Err(Error::Model(
+                "a quantized down projection needs an INT8 layer".to_owned(),
+            ));
+        };
         assert!(
             scratch.bytes() >= rows * self.rank * 2,
             "the adapter scratch buffer is too small"
@@ -504,7 +577,7 @@ impl LowRank {
             cublaslt_linear(
                 LinearKind::Bf16,
                 input,
-                self.down.pointer(),
+                down.pointer(),
                 ptr::null(),
                 scratch.pointer(),
                 rows,
@@ -523,7 +596,8 @@ impl LowRank {
                 self.scale,
                 1.0,
                 ptr::null_mut(),
-            ))
+            ))?;
         }
+        Ok(())
     }
 }

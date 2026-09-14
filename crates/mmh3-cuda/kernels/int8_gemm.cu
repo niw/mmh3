@@ -495,15 +495,16 @@ PFN_cuTensorMapEncodeTiled_v12000 tensor_map_encoder() {
 
 // Describes `rows` rows of `columns` elements to TMA in boxes of `box_rows` rows by 128 bytes,
 // zero-filling rows past the end.
+// A [rows, columns] matrix whose rows lie row_stride elements apart.
 bool encode_tensor_map(CUtensorMap *map, const void *base, CUtensorMapDataType type,
-                       int element_bytes, int rows, int columns, int box_rows) {
+                       int element_bytes, int rows, int columns, int box_rows, int row_stride) {
     PFN_cuTensorMapEncodeTiled_v12000 encoder = tensor_map_encoder();
     if (encoder == nullptr) {
         return false;
     }
     const cuuint64_t dimensions[2] = {static_cast<cuuint64_t>(columns),
                                       static_cast<cuuint64_t>(rows)};
-    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(columns) * element_bytes};
+    const cuuint64_t strides[1] = {static_cast<cuuint64_t>(row_stride) * element_bytes};
     const cuuint32_t box[2] = {static_cast<cuuint32_t>(BLOCK_K / element_bytes),
                                static_cast<cuuint32_t>(box_rows)};
     const cuuint32_t element_strides[2] = {1, 1};
@@ -527,11 +528,13 @@ int multiprocessor_count() {
     return count;
 }
 
-// A low-rank adapter to add to the product, or none when `down` is null.
+// A low-rank adapter to add to the product, or none when `down` is null. The rows of `down` lie
+// `down_stride` elements apart.
 struct Adapter {
     const __nv_bfloat16 *down;
     const __nv_bfloat16 *up;
     int rank;
+    int down_stride;
     float scale;
 };
 
@@ -543,21 +546,22 @@ int launch(const int8_t *activations, const int8_t *weights, const float *activa
         adapter.down != nullptr && adapter.up != nullptr && adapter.scale != 0.0f;
     const int adapter_blocks = has_adapter ? adapter.rank * 2 / BLOCK_K : 0;
     if (n % Config::block_n != 0 || k % BLOCK_K != 0 || m <= 0 ||
-        (has_adapter && (adapter.rank <= 0 || adapter.rank * 2 % BLOCK_K != 0))) {
+        (has_adapter && (adapter.rank <= 0 || adapter.rank * 2 % BLOCK_K != 0 ||
+                         adapter.down_stride < adapter.rank || adapter.down_stride % 8 != 0))) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     TensorMaps maps;
     if (!encode_tensor_map(&maps.activations, activations, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, m, k,
-                           Config::block_m) ||
+                           Config::block_m, k) ||
         !encode_tensor_map(&maps.weights, weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, n, k,
-                           Config::block_n)) {
+                           Config::block_n, k)) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     if (has_adapter) {
         if (!encode_tensor_map(&maps.adapter_down, adapter.down, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                               2, m, adapter.rank, Config::block_m) ||
+                               2, m, adapter.rank, Config::block_m, adapter.down_stride) ||
             !encode_tensor_map(&maps.adapter_up, adapter.up, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n,
-                               adapter.rank, Config::block_n)) {
+                               adapter.rank, Config::block_n, adapter.rank)) {
             return static_cast<int>(cudaErrorInvalidValue);
         }
     } else {
@@ -641,21 +645,22 @@ extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t *activations, const 
                                    cudaStream_t stream) {
     return launch_config<__nv_bfloat16, false>(config, activations, weights, activation_scales,
                                                weight_scales, nullptr, output, m, n, k,
-                                               Adapter{nullptr, nullptr, 0, 0.0f}, stream);
+                                               Adapter{nullptr, nullptr, 0, 0, 0.0f}, stream);
 }
 
 // The same product with an optional FP32 bias [n], BF16 or FP16 output, and an optional adapter
-// adapter_scale · adapter_down · adapter_upᵀ with adapter_down [m, rank] and adapter_up [n, rank]
-// in BF16 and the rank a multiple of 64. The result is rounded once. With `swiglu`, the output is
-// silu(gate) · up, [m, n / 2], for weights, weight scales, bias and adapter_up whose rows went
-// through mmh3_interleave_swiglu_rows.
+// adapter_scale · adapter_down · adapter_upᵀ with adapter_down [m, rank], its rows
+// adapter_down_stride elements apart (a multiple of 8), and adapter_up [n, rank] in BF16 and the
+// rank a multiple of 64. The result is rounded once. With `swiglu`, the output is silu(gate) · up,
+// [m, n / 2], for weights, weight scales, bias and adapter_up whose rows went through
+// mmh3_interleave_swiglu_rows.
 extern "C" int mmh3_int8_gemm(int config, const int8_t *activations, const int8_t *weights,
                               const float *activation_scales, const float *weight_scales,
                               const float *bias, void *output, int output_is_f16, int swiglu, int m,
                               int n, int k, const __nv_bfloat16 *adapter_down,
-                              const __nv_bfloat16 *adapter_up, int rank, float adapter_scale,
-                              cudaStream_t stream) {
-    const Adapter adapter{adapter_down, adapter_up, rank, adapter_scale};
+                              const __nv_bfloat16 *adapter_up, int rank, int adapter_down_stride,
+                              float adapter_scale, cudaStream_t stream) {
+    const Adapter adapter{adapter_down, adapter_up, rank, adapter_down_stride, adapter_scale};
     if (output_is_f16) {
         return launch_output(config, activations, weights, activation_scales, weight_scales, bias,
                              static_cast<__half *>(output), swiglu != 0, m, n, k, adapter, stream);

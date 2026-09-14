@@ -31,6 +31,7 @@ unsafe extern "C" {
         adapter_down: *const c_void,
         adapter_up: *const c_void,
         rank: c_int,
+        adapter_down_stride: c_int,
         adapter_scale: f32,
         stream: *mut c_void,
     ) -> c_int;
@@ -118,12 +119,14 @@ pub fn int8_config_count() -> usize {
     unsafe { mmh3_int8_gemm_config_count() as usize }
 }
 
-/// A low-rank adapter added to an INT8 GEMM: `scale · down · upᵀ` with `down` `[m, rank]` and `up`
-/// `[n, rank]`, both BF16, and the rank a multiple of 64.
+/// A low-rank adapter added to an INT8 GEMM: `scale · down · upᵀ` with `down` `[m, rank]`, its rows
+/// `down_stride` elements apart (a multiple of 8), and `up` `[n, rank]`, both BF16, and the rank a
+/// multiple of 64.
 pub struct Adapter<'a> {
     pub down: &'a DeviceBuffer,
     pub up: &'a DeviceBuffer,
     pub rank: usize,
+    pub down_stride: usize,
     pub scale: f32,
 }
 
@@ -133,6 +136,7 @@ pub(crate) struct AdapterPointers {
     pub(crate) down: *const c_void,
     pub(crate) up: *const c_void,
     pub(crate) rank: usize,
+    pub(crate) down_stride: usize,
     pub(crate) scale: f32,
 }
 
@@ -281,6 +285,7 @@ unsafe fn int8_config(
         down: ptr::null(),
         up: ptr::null(),
         rank: 0,
+        down_stride: 0,
         scale: 0.0,
     });
     // SAFETY: the caller guarantees the extents.
@@ -301,6 +306,7 @@ unsafe fn int8_config(
             adapter.down,
             adapter.up,
             adapter.rank as c_int,
+            adapter.down_stride as c_int,
             adapter.scale,
             ptr::null_mut(),
         )
@@ -358,8 +364,9 @@ pub fn int8(
     }
     if let Some(adapter) = adapter {
         assert!(
-            adapter.down.bytes() >= m * adapter.rank * 2,
-            "adapter down activations are smaller than m × rank"
+            adapter.down_stride >= adapter.rank
+                && adapter.down.bytes() >= m * adapter.down_stride * 2,
+            "adapter down activations are smaller than m × down_stride"
         );
         assert!(
             adapter.up.bytes() >= n * adapter.rank * 2,
@@ -370,6 +377,7 @@ pub fn int8(
         down: adapter.down.pointer(),
         up: adapter.up.pointer(),
         rank: adapter.rank,
+        down_stride: adapter.down_stride,
         scale: adapter.scale,
     });
     let output = Int8Output {
