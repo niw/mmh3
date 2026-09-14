@@ -23,16 +23,22 @@ impl Tensor {
         let bytes = file.data(info);
         let data = match info.dtype {
             DType::F32 => bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&chunk| f32::from_le_bytes(chunk))
                 .collect(),
             DType::BF16 => bytes
-                .chunks_exact(2)
-                .map(|chunk| bf16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&chunk| bf16_to_f32(u16::from_le_bytes(chunk)))
                 .collect(),
             DType::F16 => bytes
-                .chunks_exact(2)
-                .map(|chunk| f16_to_f32(u16::from_le_bytes([chunk[0], chunk[1]])))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|&chunk| f16_to_f32(u16::from_le_bytes(chunk)))
                 .collect(),
             other => {
                 return Err(format!(

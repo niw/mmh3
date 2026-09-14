@@ -64,7 +64,7 @@ impl PackedLayout {
         audio_frames: usize,
     ) -> Self {
         assert!(
-            latent_height % 2 == 0 && latent_width % 2 == 0,
+            latent_height.is_multiple_of(2) && latent_width.is_multiple_of(2),
             "latent height and width must be even"
         );
         let square_root_area = ((latent_height * latent_width) as f64).sqrt();

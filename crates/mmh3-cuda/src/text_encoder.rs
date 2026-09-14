@@ -159,8 +159,8 @@ impl CudaTextEncoder {
             ffn: tensor_info(file, "layers.0.mlp.gate_proj.weight")?.shape[0],
         };
         if embedding.dtype != DType::BF16
-            || config.query_heads % config.key_value_heads != 0
-            || config.hidden % CONVROT_GROUP != 0
+            || !config.query_heads.is_multiple_of(config.key_value_heads)
+            || !config.hidden.is_multiple_of(CONVROT_GROUP)
         {
             return Err(Error::Model(format!(
                 "unsupported text encoder {config:?} with {} embeddings",

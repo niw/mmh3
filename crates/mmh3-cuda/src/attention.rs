@@ -689,8 +689,10 @@ impl SparseWorkspace {
         let mut bytes = vec![0u8; self.route_counts.bytes()];
         self.route_counts.copy_to_host(&mut bytes)?;
         let routed: u64 = bytes
-            .chunks_exact(4)
-            .map(|count| i32::from_le_bytes(count.try_into().unwrap()) as u64)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&count| i32::from_le_bytes(count) as u64)
             .sum();
         Ok(routed as f64 / (self.heads * self.blocks * self.blocks) as f64)
     }

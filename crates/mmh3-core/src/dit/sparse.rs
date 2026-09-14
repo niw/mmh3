@@ -129,8 +129,7 @@ pub fn reference(
         let dot =
             |left: &[f64], right: &[f64]| left.iter().zip(right).map(|(a, b)| a * b).sum::<f64>();
 
-        for query_block in 0..blocks {
-            let centroid = &centroids[query_block];
+        for (query_block, centroid) in centroids.iter().enumerate() {
             let spread: f64 = centroid
                 .iter()
                 .zip(&key_variance)

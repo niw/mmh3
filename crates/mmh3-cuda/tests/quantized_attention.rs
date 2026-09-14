@@ -7,8 +7,10 @@ fn download(buffer: &DeviceBuffer) -> Vec<f32> {
     let mut bytes = vec![0; buffer.bytes()];
     buffer.copy_to_host(&mut bytes).unwrap();
     bytes
-        .chunks_exact(2)
-        .map(|b| bf16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| bf16_to_f32(u16::from_le_bytes(pair)))
         .collect()
 }
 

@@ -30,8 +30,8 @@ impl GenerationShape {
     pub fn new(width: usize, height: usize, frames: usize) -> Result<Self, String> {
         if width == 0
             || height == 0
-            || width % CANVAS_MULTIPLE != 0
-            || height % CANVAS_MULTIPLE != 0
+            || !width.is_multiple_of(CANVAS_MULTIPLE)
+            || !height.is_multiple_of(CANVAS_MULTIPLE)
         {
             return Err(format!(
                 "width and height must be positive multiples of {CANVAS_MULTIPLE}, got {width}×{height}"

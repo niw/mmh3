@@ -47,13 +47,14 @@ fn contraction(characters: &[char], start: usize) -> Option<usize> {
 
 fn letters(characters: &[char], start: usize) -> Option<usize> {
     let first = characters[start];
-    if !is_line_break(first) && !is_letter(first) && !is_number(first) {
-        if characters
+    if !is_line_break(first)
+        && !is_letter(first)
+        && !is_number(first)
+        && characters
             .get(start + 1)
             .is_some_and(|&next| is_letter(next))
-        {
-            return Some(run_end(characters, start + 1, is_letter));
-        }
+    {
+        return Some(run_end(characters, start + 1, is_letter));
     }
     is_letter(first).then(|| run_end(characters, start, is_letter))
 }

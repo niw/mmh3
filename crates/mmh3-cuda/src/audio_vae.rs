@@ -296,6 +296,7 @@ impl CudaAudioDecoder {
 
     /// `output[sequences × length, outputs]` from `input[sequences × length, inputs]`, through
     /// im2col for kernels wider than one sample. Zero padding keeps the length.
+    #[allow(clippy::too_many_arguments)]
     fn convolve(
         &self,
         convolution: &Convolution,

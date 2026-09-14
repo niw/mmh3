@@ -9,8 +9,10 @@ fn fill_kernel_writes_every_element() {
     buffer.copy_to_host(&mut bytes).unwrap();
     assert!(
         bytes
-            .chunks_exact(4)
-            .all(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()) == 3.5)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .all(|&chunk| f32::from_le_bytes(chunk) == 3.5)
     );
 }
 

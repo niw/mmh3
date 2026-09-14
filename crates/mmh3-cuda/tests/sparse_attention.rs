@@ -103,8 +103,10 @@ fn check(tokens: usize, heads: usize, tau: f32, sinks: SparseSinks, precision: A
     let mut bytes = vec![0u8; tokens * inner * 2];
     output.copy_to_host(&mut bytes).unwrap();
     let actual: Vec<f32> = bytes
-        .chunks_exact(2)
-        .map(|pair| bf16_to_f32(u16::from_le_bytes([pair[0], pair[1]])))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| bf16_to_f32(u16::from_le_bytes(pair)))
         .collect();
 
     let difference: f64 = actual

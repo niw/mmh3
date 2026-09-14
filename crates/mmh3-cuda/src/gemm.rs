@@ -194,7 +194,7 @@ pub(crate) unsafe fn int8_pointers(
     // NOTE: in the DiT at 768p, the MLP down projection (K = 14,336) takes 35 ms per layer with
     // 128 × 256 tiles and 47 ms with 256 × 128 tiles, although both take about 31 ms when timed
     // alone.
-    let config = if (m < 256 || k > 8192) && n % 256 == 0 {
+    let config = if (m < 256 || k > 8192) && n.is_multiple_of(256) {
         1
     } else {
         0

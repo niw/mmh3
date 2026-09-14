@@ -105,9 +105,9 @@ pub fn write_y4m(writer: &mut impl Write, video: &Yuv420, fps: usize) -> io::Res
             "the video data does not match its frames",
         ));
     }
-    write!(
+    writeln!(
         writer,
-        "YUV4MPEG2 W{width} H{height} F{fps}:1 Ip A1:1 C420jpeg XCOLORRANGE=LIMITED\n"
+        "YUV4MPEG2 W{width} H{height} F{fps}:1 Ip A1:1 C420jpeg XCOLORRANGE=LIMITED"
     )?;
     for frame in video.data.chunks_exact(frame_bytes) {
         writer.write_all(b"FRAME\n")?;
@@ -191,8 +191,10 @@ mod tests {
             32_000
         );
         let samples: Vec<i16> = bytes[44..]
-            .chunks_exact(2)
-            .map(|pair| i16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair))
             .collect();
         assert_eq!(samples, vec![16384, 32767, -32767, 32767]);
     }

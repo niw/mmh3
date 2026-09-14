@@ -104,7 +104,7 @@ impl TemporalPlan {
         let padded_frames: usize = (0..pad_tokens)
             .map(|index| {
                 let intra_tail = CLIP_LENGTH % TEMPORAL_RATIO;
-                if intra_tail != 0 && (latent_frames + index) % CHUNK_TOKENS == 0 {
+                if intra_tail != 0 && (latent_frames + index).is_multiple_of(CHUNK_TOKENS) {
                     intra_tail
                 } else {
                     TEMPORAL_RATIO

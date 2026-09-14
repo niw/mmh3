@@ -56,7 +56,7 @@ fn decompose(code_point: u32, output: &mut Vec<u32>) {
     if syllable < HANGUL_SYLLABLE_COUNT {
         output.push(HANGUL_LEADING_BASE + syllable / HANGUL_BLOCK);
         output.push(HANGUL_VOWEL_BASE + syllable % HANGUL_BLOCK / HANGUL_TRAILING_COUNT);
-        if syllable % HANGUL_TRAILING_COUNT != 0 {
+        if !syllable.is_multiple_of(HANGUL_TRAILING_COUNT) {
             output.push(HANGUL_TRAILING_BASE + syllable % HANGUL_TRAILING_COUNT);
         }
         return;
@@ -82,7 +82,7 @@ fn compose(first: u32, second: u32) -> Option<u32> {
     let syllable = first.wrapping_sub(HANGUL_SYLLABLE_BASE);
     let trailing = second.wrapping_sub(HANGUL_TRAILING_BASE);
     if syllable < HANGUL_SYLLABLE_COUNT
-        && syllable % HANGUL_TRAILING_COUNT == 0
+        && syllable.is_multiple_of(HANGUL_TRAILING_COUNT)
         && (1..HANGUL_TRAILING_COUNT).contains(&trailing)
     {
         return Some(first + trailing);

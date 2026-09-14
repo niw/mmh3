@@ -443,12 +443,16 @@ impl CudaVideoDecoder {
             ffn: shape("decoder.transformer_blocks.0.ff.w2.weight")?[1],
             registers: shape("decoder.register_tokens")?[1],
         };
-        if config.dim % HEAD_DIM != 0 || shape("decoder.proj_out.weight")?[0] != PATCH_FEATURES {
+        if !config.dim.is_multiple_of(HEAD_DIM)
+            || shape("decoder.proj_out.weight")?[0] != PATCH_FEATURES
+        {
             return Err(Error::Model(format!(
                 "unsupported video decoder {config:?}"
             )));
         }
-        if tile_size % SPATIAL_RATIO != 0 || tile_overlap_min % SPATIAL_RATIO != 0 {
+        if !tile_size.is_multiple_of(SPATIAL_RATIO)
+            || !tile_overlap_min.is_multiple_of(SPATIAL_RATIO)
+        {
             return Err(Error::Model(format!(
                 "tile size {tile_size} and overlap {tile_overlap_min} must be multiples of {SPATIAL_RATIO}"
             )));
@@ -986,7 +990,7 @@ impl CudaVideoDecoder {
             grid.columns.length,
         );
         let mut data = vec![0.0f32; OUTPUT_CHANNELS * pixel_frames * pixel_height * pixel_width];
-        for (index, pair) in bytes.chunks_exact(2).enumerate() {
+        for (index, &pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
             let (token, feature) = (index / PATCH_FEATURES, index % PATCH_FEATURES);
             let (frame, y, x) = (
                 token / (tile_height * tile_width),
@@ -1006,7 +1010,7 @@ impl CudaVideoDecoder {
                 * pixel_width
                 + x * SPATIAL_RATIO
                 + sub_x;
-            data[target] = f16_to_f32(u16::from_le_bytes([pair[0], pair[1]]));
+            data[target] = f16_to_f32(u16::from_le_bytes(pair));
         }
         Ok(Tensor::new(
             vec![OUTPUT_CHANNELS, pixel_frames, pixel_height, pixel_width],
