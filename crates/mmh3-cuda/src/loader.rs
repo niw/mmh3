@@ -1,6 +1,6 @@
-//! Streams checkpoint tensors into device buffers: direct reads of the file into two pinned staging buffers,
-//! overlapped with asynchronous copies to the GPU, so loading neither copies from pageable memory nor fills the page
-//! cache.
+//! Streams checkpoint tensors into device buffers: direct reads of the file into two pinned staging
+//! buffers, overlapped with asynchronous copies to the GPU, so loading neither copies from pageable
+//! memory nor fills the page cache.
 
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::direct_file::{DIRECT_ALIGNMENT, DirectFile};
@@ -20,7 +20,12 @@ unsafe extern "C" {
     fn mmh3_cuda_event_destroy(event: *mut c_void) -> c_int;
     fn mmh3_cuda_event_record(event: *mut c_void, stream: *mut c_void) -> c_int;
     fn mmh3_cuda_event_synchronize(event: *mut c_void) -> c_int;
-    fn mmh3_cuda_copy_to_device_async(destination: *mut c_void, source: *const c_void, bytes: usize, stream: *mut c_void) -> c_int;
+    fn mmh3_cuda_copy_to_device_async(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> c_int;
 }
 
 /// Bytes each staging buffer holds, a multiple of the direct-read alignment.
@@ -100,7 +105,10 @@ struct CopyQueue {
 
 impl CopyQueue {
     fn new() -> Result<Self, CudaError> {
-        let mut queue = CopyQueue { stream: ptr::null_mut(), events: [ptr::null_mut(); 2] };
+        let mut queue = CopyQueue {
+            stream: ptr::null_mut(),
+            events: [ptr::null_mut(); 2],
+        };
         // SAFETY: the fields are valid out pointers, and drop releases whatever was created.
         unsafe {
             check(mmh3_cuda_stream_create(&mut queue.stream))?;
@@ -139,20 +147,43 @@ pub(crate) struct Uploader {
 
 impl Uploader {
     pub(crate) fn new(file: &SafeTensors) -> Self {
-        Uploader { path: file.path().to_owned(), uploads: Vec::new() }
+        Uploader {
+            path: file.path().to_owned(),
+            uploads: Vec::new(),
+        }
     }
 
     /// Queues the bytes of `info` for `offset` bytes into `buffer`. The buffer must outlive `run`.
-    pub(crate) fn queue(&mut self, file: &SafeTensors, info: &TensorInfo, buffer: &DeviceBuffer, offset: usize) {
-        assert!(file.path() == self.path, "the tensor comes from another file");
-        assert!(offset + info.byte_count() <= buffer.bytes(), "the tensor does not fit in its buffer");
+    pub(crate) fn queue(
+        &mut self,
+        file: &SafeTensors,
+        info: &TensorInfo,
+        buffer: &DeviceBuffer,
+        offset: usize,
+    ) {
+        assert!(
+            file.path() == self.path,
+            "the tensor comes from another file"
+        );
+        assert!(
+            offset + info.byte_count() <= buffer.bytes(),
+            "the tensor does not fit in its buffer"
+        );
         if info.byte_count() > 0 {
-            self.uploads.push(Upload { file_offset: file.file_offset(info), length: info.byte_count(), destination: buffer.pointer_at(offset) });
+            self.uploads.push(Upload {
+                file_offset: file.file_offset(info),
+                length: info.byte_count(),
+                destination: buffer.pointer_at(offset),
+            });
         }
     }
 
     /// Allocates a device buffer for `info` and queues its bytes.
-    pub(crate) fn allocate(&mut self, file: &SafeTensors, info: &TensorInfo) -> Result<DeviceBuffer, CudaError> {
+    pub(crate) fn allocate(
+        &mut self,
+        file: &SafeTensors,
+        info: &TensorInfo,
+    ) -> Result<DeviceBuffer, CudaError> {
         let buffer = DeviceBuffer::new(info.byte_count())?;
         self.queue(file, info, &buffer, 0);
         Ok(buffer)
@@ -162,10 +193,14 @@ impl Uploader {
     pub(crate) fn run(mut self) -> Result<usize, LoadError> {
         self.uploads.sort_by_key(|upload| upload.file_offset);
         let file = DirectFile::open(&self.path)?;
-        let mut staging = [PinnedBuffer::new(STAGING_BYTES)?, PinnedBuffer::new(STAGING_BYTES)?];
+        let mut staging = [
+            PinnedBuffer::new(STAGING_BYTES)?,
+            PinnedBuffer::new(STAGING_BYTES)?,
+        ];
         let queue = CopyQueue::new()?;
 
-        // Aligned ranges covering the uploads, merged across small gaps, with the end of the data each one needs.
+        // Aligned ranges covering the uploads, merged across small gaps, with the end of the data
+        // each one needs.
         let alignment = DIRECT_ALIGNMENT as u64;
         let mut ranges: Vec<(u64, u64, u64)> = Vec::new();
         for upload in &self.uploads {
@@ -188,7 +223,8 @@ impl Uploader {
             while position < range_end {
                 let slot = chunk % 2;
                 if chunk >= 2 {
-                    // SAFETY: the event was recorded after the copies that last read this staging buffer.
+                    // SAFETY: the event was recorded after the copies that last read this staging
+                    // buffer.
                     check(unsafe { mmh3_cuda_event_synchronize(queue.events[slot]) })?;
                 }
                 let length = ((range_end - position) as usize).min(STAGING_BYTES);
@@ -196,9 +232,16 @@ impl Uploader {
                 let chunk_end = position + read as u64;
                 // Only the aligned tail past the end of the file may come back short.
                 if chunk_end < data_end.min(position + length as u64) {
-                    return Err(LoadError::Io(io::Error::new(io::ErrorKind::UnexpectedEof, "the checkpoint is shorter than its header says")));
+                    return Err(LoadError::Io(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the checkpoint is shorter than its header says",
+                    )));
                 }
-                while next_upload < self.uploads.len() && self.uploads[next_upload].file_offset + (self.uploads[next_upload].length as u64) <= position {
+                while next_upload < self.uploads.len()
+                    && self.uploads[next_upload].file_offset
+                        + (self.uploads[next_upload].length as u64)
+                        <= position
+                {
                     next_upload += 1;
                 }
                 for upload in &self.uploads[next_upload..] {
@@ -210,12 +253,21 @@ impl Uploader {
                     if start >= end {
                         continue;
                     }
-                    // SAFETY: the destination range lies inside the buffer queued for this upload, and the source
-                    // inside the bytes just read into the staging buffer, which stays untouched until its event.
+                    // SAFETY: the destination range lies inside the buffer queued for this upload,
+                    // and the source inside the bytes just read into the staging buffer, which
+                    // stays untouched until its event.
                     check(unsafe {
                         mmh3_cuda_copy_to_device_async(
-                            upload.destination.cast::<u8>().add((start - upload.file_offset) as usize).cast(),
-                            staging[slot].pointer.cast::<u8>().add((start - position) as usize).cast(),
+                            upload
+                                .destination
+                                .cast::<u8>()
+                                .add((start - upload.file_offset) as usize)
+                                .cast(),
+                            staging[slot]
+                                .pointer
+                                .cast::<u8>()
+                                .add((start - position) as usize)
+                                .cast(),
                             (end - start) as usize,
                             queue.stream,
                         )

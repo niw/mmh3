@@ -2,7 +2,9 @@ use crate::webm_mux::{self, Packet};
 use crate::{DecodedMedia, MediaSpec, OutputBackend, Result, output_parent, validate_destination};
 use opus::{Application, Bitrate, Channels};
 use rubato::{FftFixedInOut, Resampler};
-use shiguredo_libvpx::{CodecConfig, EncodeOptions, Encoder, EncoderConfig, ImageData, ImageFormat, Vp9Config};
+use shiguredo_libvpx::{
+    CodecConfig, EncodeOptions, Encoder, EncoderConfig, ImageData, ImageFormat, Vp9Config,
+};
 use std::io::{BufWriter, Write};
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -78,8 +80,13 @@ impl WebmOutput {
 impl OutputBackend for WebmOutput {
     fn validate(&self, spec: &MediaSpec, destination: &Path) -> Result<()> {
         spec.validate()?;
-        if !destination.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("webm")) {
-            return Err("built-in output requires --out FILE.webm. Use --ffmpeg for other formats".into());
+        if !destination
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("webm"))
+        {
+            return Err(
+                "built-in output requires --out FILE.webm. Use --ffmpeg for other formats".into(),
+            );
         }
         validate_destination(destination)?;
         self.encoder(spec)?;
@@ -206,7 +213,8 @@ pub(crate) fn timestamp(samples: u64, rate: u64) -> u64 {
 fn resample(media: &DecodedMedia<'_>) -> Result<Vec<Vec<f32>>> {
     let channels = media.spec.channels;
     let source_frames = media.audio.shape[1];
-    let target_frames = usize::try_from(media.spec.frames as u128 * OPUS_RATE as u128 / media.spec.fps as u128)?;
+    let target_frames =
+        usize::try_from(media.spec.frames as u128 * OPUS_RATE as u128 / media.spec.fps as u128)?;
     if target_frames == 0 {
         return Err("video duration is shorter than one audio sample".into());
     }
@@ -222,9 +230,12 @@ fn resample(media: &DecodedMedia<'_>) -> Result<Vec<Vec<f32>>> {
             })
             .collect());
     }
-    let mut resampler = FftFixedInOut::<f32>::new(media.spec.sample_rate, OPUS_RATE, 1024, channels)?;
+    let mut resampler =
+        FftFixedInOut::<f32>::new(media.spec.sample_rate, OPUS_RATE, 1024, channels)?;
     let delay = resampler.output_delay();
-    let resampled_frames = usize::try_from(source_frames as u128 * OPUS_RATE as u128 / media.spec.sample_rate as u128)?;
+    let resampled_frames = usize::try_from(
+        source_frames as u128 * OPUS_RATE as u128 / media.spec.sample_rate as u128,
+    )?;
     let retained = resampled_frames.min(target_frames);
     let mut output = vec![Vec::new(); channels];
     let mut offset = 0;

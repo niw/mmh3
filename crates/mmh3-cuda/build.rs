@@ -17,18 +17,32 @@ fn main() {
     let mut sources: Vec<PathBuf> = fs::read_dir(&kernel_directory)
         .expect("kernels directory is missing")
         .map(|entry| entry.unwrap().path())
-        .filter(|path| matches!(path.extension().and_then(|extension| extension.to_str()), Some("cu" | "cuh")))
+        .filter(|path| {
+            matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("cu" | "cuh")
+            )
+        })
         .collect();
     sources.sort();
     for source in &sources {
         println!("cargo:rerun-if-changed={}", source.display());
     }
-    let compiled_sources: Vec<&PathBuf> =
-        sources.iter().filter(|path| path.extension().is_some_and(|extension| extension == "cu")).collect();
+    let compiled_sources: Vec<&PathBuf> = sources
+        .iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "cu"))
+        .collect();
 
     let library = output_directory.join("libmmh3_cuda_kernels.a");
     let status = Command::new(PathBuf::from(&cuda_home).join("bin/nvcc"))
-        .args(["--lib", "-O3", "-std=c++17", "-lineinfo", "-Xcompiler", "-fPIC"])
+        .args([
+            "--lib",
+            "-O3",
+            "-std=c++17",
+            "-lineinfo",
+            "-Xcompiler",
+            "-fPIC",
+        ])
         .arg(format!("-arch={architecture}"))
         .arg("-o")
         .arg(&library)
@@ -37,7 +51,10 @@ fn main() {
         .expect("failed to run nvcc");
     assert!(status.success(), "nvcc failed");
 
-    println!("cargo:rustc-link-search=native={}", output_directory.display());
+    println!(
+        "cargo:rustc-link-search=native={}",
+        output_directory.display()
+    );
     println!("cargo:rustc-link-lib=static=mmh3_cuda_kernels");
     println!("cargo:rustc-link-search=native={cuda_home}/lib64");
     println!("cargo:rustc-link-lib=static=cudart_static");

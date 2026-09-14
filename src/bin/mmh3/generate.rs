@@ -3,7 +3,8 @@
 use crate::USAGE;
 use mmh3::cli::{option_float, option_number, parse_options, split_ffmpeg_arguments};
 use mmh3::models::{
-    AUDIO_VAE_FILE, TEXT_ENCODER_FILE, VIDEO_VAE_FILE, VIDEO_VAE_INT8_FILE, load_dit, option_path, sparse_attention,
+    AUDIO_VAE_FILE, TEXT_ENCODER_FILE, VIDEO_VAE_FILE, VIDEO_VAE_INT8_FILE, load_dit, option_path,
+    sparse_attention,
 };
 use mmh3_core::safetensors::SafeTensors;
 use std::error::Error;
@@ -69,8 +70,10 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut output = mmh3::output::prepare(ffmpeg_arguments, spec, &video_path)?;
     let steps = option_number(&options, "steps", 20)?;
     let seed = option_number(&options, "seed", 0)? as u64;
-    let (shift_video, shift_audio) =
-        (option_float(&options, "shift-video", 12.0)?, option_float(&options, "shift-audio", 3.0)?);
+    let (shift_video, shift_audio) = (
+        option_float(&options, "shift-video", 12.0)?,
+        option_float(&options, "shift-audio", 3.0)?,
+    );
     if steps == 0 {
         return Err("--steps must be at least 1".into());
     }
@@ -88,13 +91,20 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
             let encoder = CudaTextEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
             let context = encoder.encode(&ids, &[])?.context;
-            println!("encoded {} prompt tokens in {:.1} s", ids.len(), started.elapsed().as_secs_f64());
+            println!(
+                "encoded {} prompt tokens in {:.1} s",
+                ids.len(),
+                started.elapsed().as_secs_f64()
+            );
             context
         }
         (None, Some(path)) => {
             let file = SafeTensors::open(Path::new(path))?;
-            let mut context =
-                Tensor::load(&file, file.get("context").ok_or("the context file has no context tensor")?)?;
+            let mut context = Tensor::load(
+                &file,
+                file.get("context")
+                    .ok_or("the context file has no context tensor")?,
+            )?;
             if context.shape.len() == 3 && context.shape[0] == 1 {
                 context.shape.remove(0);
             }
@@ -105,8 +115,14 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     // NOTE: the video noise is drawn before the audio noise, the order of the official pipeline.
     let mut noise = NormalSampler::new(seed);
     let (video_shape, audio_shape) = (shape.video_latent_shape(), shape.audio_latent_shape());
-    let mut video = Tensor::new(video_shape.clone(), noise.samples(video_shape.iter().product()));
-    let mut audio = Tensor::new(audio_shape.clone(), noise.samples(audio_shape.iter().product()));
+    let mut video = Tensor::new(
+        video_shape.clone(),
+        noise.samples(video_shape.iter().product()),
+    );
+    let mut audio = Tensor::new(
+        audio_shape.clone(),
+        noise.samples(audio_shape.iter().product()),
+    );
     println!(
         "{}×{}, {} frames ({:.2} s), {} text tokens, {steps} steps, seed {seed}",
         shape.width,
@@ -132,11 +148,21 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             };
             let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
             let outputs = dit.forward(&inputs, &[], step_sparse.as_ref())?;
-            euler_step(&mut video.data, &outputs.video, schedule.video[step], schedule.video[step + 1]);
-            euler_step(&mut audio.data, &outputs.audio, schedule.audio[step], schedule.audio[step + 1]);
-            let routing = outputs
-                .routed_fraction
-                .map_or(String::new(), |fraction| format!(", Sol-Attn routed {:.1}%", 100.0 * fraction));
+            euler_step(
+                &mut video.data,
+                &outputs.video,
+                schedule.video[step],
+                schedule.video[step + 1],
+            );
+            euler_step(
+                &mut audio.data,
+                &outputs.audio,
+                schedule.audio[step],
+                schedule.audio[step + 1],
+            );
+            let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
+                format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
+            });
             println!(
                 "step {}/{steps} at sigma {:.4} in {:.1} s{routing}",
                 step + 1,
@@ -147,27 +173,47 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let started = Instant::now();
-    // Without --video-vae, the INT8 ConvRot VAE decodes when the models directory has it, and the FP16 one otherwise.
+    // Without --video-vae, the INT8 ConvRot VAE decodes when the models directory has it, and the
+    // FP16 one otherwise.
     let path = match options.get("video-vae") {
         Some(path) => (*path).to_owned(),
         None => {
             let int8_path = option_path(&options, "video-vae", VIDEO_VAE_INT8_FILE)?;
-            if Path::new(&int8_path).exists() { int8_path } else { option_path(&options, "video-vae", VIDEO_VAE_FILE)? }
+            if Path::new(&int8_path).exists() {
+                int8_path
+            } else {
+                option_path(&options, "video-vae", VIDEO_VAE_FILE)?
+            }
         }
     };
-    let decoded =
-        CudaVideoDecoder::load(&SafeTensors::open(Path::new(&path))?, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
-            .decode_device(&video)?;
+    let decoded = CudaVideoDecoder::load(
+        &SafeTensors::open(Path::new(&path))?,
+        "",
+        DEFAULT_TILE_SIZE,
+        DEFAULT_TILE_OVERLAP_MIN,
+    )?
+    .decode_device(&video)?;
     output.write_cuda_video(&decoded)?;
     drop(decoded);
-    println!("decoded and submitted the video with {path} in {:.1} s", started.elapsed().as_secs_f64());
+    println!(
+        "decoded and submitted the video with {path} in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
     let started = Instant::now();
     let path = option_path(&options, "audio-vae", AUDIO_VAE_FILE)?;
-    let waveform = CudaAudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
-    println!("decoded the audio in {:.1} s", started.elapsed().as_secs_f64());
+    let waveform =
+        CudaAudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
+    println!(
+        "decoded the audio in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
     let started = Instant::now();
     output.write_audio(waveform)?;
     output.finish()?;
-    println!("wrote {} in {:.1} s", video_path.display(), started.elapsed().as_secs_f64());
+    println!(
+        "wrote {} in {:.1} s",
+        video_path.display(),
+        started.elapsed().as_secs_f64()
+    );
     Ok(())
 }

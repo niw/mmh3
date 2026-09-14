@@ -1,6 +1,8 @@
 //! Unicode letter classification and NFC normalization over the generated tables.
 
-use super::unicode_tables::{COMBINING_CLASSES, COMPOSITIONS, DECOMPOSITIONS, LETTERS, NFC_STABLE_BELOW};
+use super::unicode_tables::{
+    COMBINING_CLASSES, COMPOSITIONS, DECOMPOSITIONS, LETTERS, NFC_STABLE_BELOW,
+};
 
 const HANGUL_SYLLABLE_BASE: u32 = 0xAC00;
 const HANGUL_LEADING_BASE: u32 = 0x1100;
@@ -79,7 +81,10 @@ fn compose(first: u32, second: u32) -> Option<u32> {
     }
     let syllable = first.wrapping_sub(HANGUL_SYLLABLE_BASE);
     let trailing = second.wrapping_sub(HANGUL_TRAILING_BASE);
-    if syllable < HANGUL_SYLLABLE_COUNT && syllable % HANGUL_TRAILING_COUNT == 0 && (1..HANGUL_TRAILING_COUNT).contains(&trailing) {
+    if syllable < HANGUL_SYLLABLE_COUNT
+        && syllable % HANGUL_TRAILING_COUNT == 0
+        && (1..HANGUL_TRAILING_COUNT).contains(&trailing)
+    {
         return Some(first + trailing);
     }
     COMPOSITIONS
@@ -90,7 +95,10 @@ fn compose(first: u32, second: u32) -> Option<u32> {
 
 /// Canonical composition after canonical decomposition (Unicode normalization form C).
 pub fn nfc(text: &str) -> String {
-    if text.chars().all(|character| (character as u32) < NFC_STABLE_BELOW) {
+    if text
+        .chars()
+        .all(|character| (character as u32) < NFC_STABLE_BELOW)
+    {
         return text.to_owned();
     }
     let mut decomposed = Vec::with_capacity(text.len());
@@ -144,7 +152,9 @@ mod tests {
             assert!(is_letter(letter), "{letter:?}");
         }
         // Devanagari vowel signs and circled letters are alphabetic but not general category L.
-        for other in ['1', ' ', '_', '!', '\u{94D}', '\u{93E}', 'Ⓐ', '²', '🐼', '\u{301}'] {
+        for other in [
+            '1', ' ', '_', '!', '\u{94D}', '\u{93E}', 'Ⓐ', '²', '🐼', '\u{301}',
+        ] {
             assert!(!is_letter(other), "{other:?}");
         }
     }

@@ -10,13 +10,21 @@ pub struct Schedule {
 }
 
 impl Schedule {
-    /// `steps` model calls on the unshifted grid linspace(1, 0, steps + 1), shifted separately per stream.
-    /// This is the official scheduler's grid and the q grid of the Turbo LoRAs.
+    /// `steps` model calls on the unshifted grid linspace(1, 0, steps + 1), shifted separately per
+    /// stream. This is the official scheduler's grid and the q grid of the Turbo LoRAs.
     pub fn uniform(steps: usize, shift_video: f32, shift_audio: f32) -> Self {
-        let base: Vec<f32> = (0..=steps).map(|step| 1.0 - step as f32 / steps as f32).collect();
+        let base: Vec<f32> = (0..=steps)
+            .map(|step| 1.0 - step as f32 / steps as f32)
+            .collect();
         Schedule {
-            video: base.iter().map(|&value| time_shift_sigma(value, 1.0, shift_video)).collect(),
-            audio: base.iter().map(|&value| time_shift_sigma(value, 1.0, shift_audio)).collect(),
+            video: base
+                .iter()
+                .map(|&value| time_shift_sigma(value, 1.0, shift_video))
+                .collect(),
+            audio: base
+                .iter()
+                .map(|&value| time_shift_sigma(value, 1.0, shift_audio))
+                .collect(),
         }
     }
 
@@ -25,7 +33,8 @@ impl Schedule {
     }
 }
 
-/// One Euler step: x ← x + (sigma_next − sigma) · v, where v is the flow velocity (x0 = x − sigma · v).
+/// One Euler step: x ← x + (sigma_next − sigma) · v, where v is the flow velocity
+/// (x0 = x − sigma · v).
 pub fn euler_step(latent: &mut [f32], velocity: &[f32], sigma: f32, sigma_next: f32) {
     let delta = sigma_next - sigma;
     for (value, &slope) in latent.iter_mut().zip(velocity) {

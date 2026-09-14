@@ -9,7 +9,14 @@ const PROT_READ: i32 = 1;
 const MAP_PRIVATE: i32 = 2;
 
 unsafe extern "C" {
-    fn mmap(address: *mut c_void, length: usize, protection: i32, flags: i32, descriptor: i32, offset: i64) -> *mut c_void;
+    fn mmap(
+        address: *mut c_void,
+        length: usize,
+        protection: i32,
+        flags: i32,
+        descriptor: i32,
+        offset: i64,
+    ) -> *mut c_void;
     fn munmap(address: *mut c_void, length: usize) -> i32;
 }
 
@@ -26,12 +33,25 @@ unsafe impl Sync for MappedFile {}
 impl MappedFile {
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
-        let length = usize::try_from(file.metadata()?.len()).map_err(|_| io::Error::other("file is too large to map"))?;
+        let length = usize::try_from(file.metadata()?.len())
+            .map_err(|_| io::Error::other("file is too large to map"))?;
         if length == 0 {
-            return Ok(Self { address: ptr::null_mut(), length: 0 });
+            return Ok(Self {
+                address: ptr::null_mut(),
+                length: 0,
+            });
         }
         // SAFETY: the arguments describe a private read-only mapping of an open descriptor.
-        let address = unsafe { mmap(ptr::null_mut(), length, PROT_READ, MAP_PRIVATE, file.as_raw_fd(), 0) };
+        let address = unsafe {
+            mmap(
+                ptr::null_mut(),
+                length,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
         if address as usize == usize::MAX {
             return Err(io::Error::last_os_error());
         }

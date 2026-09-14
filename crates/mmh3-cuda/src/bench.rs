@@ -62,8 +62,13 @@ pub enum GemmKind {
 }
 
 impl GemmKind {
-    pub const ALL: [GemmKind; 5] =
-        [GemmKind::Bf16, GemmKind::Fp8E4m3, GemmKind::Int8, GemmKind::Nvfp4, GemmKind::Int8Mmh3];
+    pub const ALL: [GemmKind; 5] = [
+        GemmKind::Bf16,
+        GemmKind::Fp8E4m3,
+        GemmKind::Int8,
+        GemmKind::Nvfp4,
+        GemmKind::Int8Mmh3,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -139,12 +144,23 @@ pub struct MemoryBandwidth {
 
 fn failure(code: c_int, message: &[c_char]) -> CudaError {
     // SAFETY: the launcher writes a NUL-terminated message into the zeroed buffer.
-    let text = unsafe { CStr::from_ptr(message.as_ptr()) }.to_string_lossy().into_owned();
-    CudaError { code, message: text }
+    let text = unsafe { CStr::from_ptr(message.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
+    CudaError {
+        code,
+        message: text,
+    }
 }
 
 /// Times y[m, n] = x[m, k] · w[n, k]ᵀ and reports the fastest candidate for the kind.
-pub fn gemm(kind: GemmKind, m: usize, n: usize, k: usize, iterations: usize) -> Result<GemmTiming, CudaError> {
+pub fn gemm(
+    kind: GemmKind,
+    m: usize,
+    n: usize,
+    k: usize,
+    iterations: usize,
+) -> Result<GemmTiming, CudaError> {
     let mut milliseconds = 0.0;
     let mut candidates_timed = 0;
     let mut message = [0 as c_char; 256];
@@ -181,7 +197,10 @@ pub fn gemm(kind: GemmKind, m: usize, n: usize, k: usize, iterations: usize) -> 
     if code != 0 {
         return Err(failure(code, &message));
     }
-    Ok(GemmTiming { milliseconds, candidates_timed })
+    Ok(GemmTiming {
+        milliseconds,
+        candidates_timed,
+    })
 }
 
 /// Tensor core throughput of one instruction form in tera-operations per second.
@@ -190,7 +209,13 @@ pub fn mma_peak(kind: MmaKind, iterations: usize) -> Result<f32, CudaError> {
     let mut message = [0 as c_char; 256];
     // SAFETY: the out pointer is valid and the message buffer length is passed along.
     let code = unsafe {
-        mmh3_bench_mma_peak(kind.code(), iterations as c_int, &mut throughput, message.as_mut_ptr(), message.len())
+        mmh3_bench_mma_peak(
+            kind.code(),
+            iterations as c_int,
+            &mut throughput,
+            message.as_mut_ptr(),
+            message.len(),
+        )
     };
     if code != 0 {
         return Err(failure(code, &message));
@@ -237,5 +262,8 @@ pub fn memory_copy(bytes: usize, iterations: usize) -> Result<MemoryBandwidth, C
     if code != 0 {
         return Err(failure(code, &message));
     }
-    Ok(MemoryBandwidth { copy_kernel_gigabytes_per_second: copy_kernel, memcpy_gigabytes_per_second: memcpy })
+    Ok(MemoryBandwidth {
+        copy_kernel_gigabytes_per_second: copy_kernel,
+        memcpy_gigabytes_per_second: memcpy,
+    })
 }

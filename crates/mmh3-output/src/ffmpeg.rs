@@ -23,9 +23,11 @@ impl FfmpegOutput {
     }
 
     fn template(&self) -> bool {
-        self.arguments
-            .iter()
-            .any(|arg| ["{video}", "{audio}", "{out}"].iter().any(|placeholder| arg == placeholder))
+        self.arguments.iter().any(|arg| {
+            ["{video}", "{audio}", "{out}"]
+                .iter()
+                .any(|placeholder| arg == placeholder)
+        })
     }
 
     fn command_arguments(&self, video: &Path, audio: &Path, out: &Path) -> Result<Vec<OsString>> {
@@ -43,7 +45,12 @@ impl FfmpegOutput {
                 });
             }
         } else {
-            args.extend([OsString::from("-i"), video.into(), OsString::from("-i"), audio.into()]);
+            args.extend([
+                OsString::from("-i"),
+                video.into(),
+                OsString::from("-i"),
+                audio.into(),
+            ]);
             if self.arguments.is_empty() {
                 args.extend(
                     [
@@ -75,8 +82,14 @@ impl FfmpegOutput {
         Ok(args)
     }
 
-    /// Writes the media as temporary Y4M and WAV inputs, then runs ffmpeg with `output` as the output path.
-    fn encode(&self, media: &DecodedMedia<'_>, output: &Path, global_options: &[&str]) -> Result<()> {
+    /// Writes the media as temporary Y4M and WAV inputs, then runs ffmpeg with `output` as the
+    /// output path.
+    fn encode(
+        &self,
+        media: &DecodedMedia<'_>,
+        output: &Path,
+        global_options: &[&str],
+    ) -> Result<()> {
         let inputs = tempfile::tempdir()?;
         let video = inputs.path().join("video.y4m");
         let audio = inputs.path().join("audio.wav");
@@ -120,7 +133,10 @@ impl OutputBackend for FfmpegOutput {
             data: video_data,
         };
         let samples = spec.sample_rate.div_ceil(spec.fps);
-        let audio = Tensor::new(vec![spec.channels, samples], vec![0.0; spec.channels * samples]);
+        let audio = Tensor::new(
+            vec![spec.channels, samples],
+            vec![0.0; spec.channels * samples],
+        );
         let trial = tempfile::tempdir()?;
         let mut name = OsString::from("trial");
         if let Some(extension) = destination.extension() {
@@ -132,8 +148,18 @@ impl OutputBackend for FfmpegOutput {
             video: &video,
             audio: &audio,
         };
-        self.encode(&media, &trial.path().join(name), &["-hide_banner", "-loglevel", "error"])
-            .map_err(|error| format!("ffmpeg cannot write {} with these arguments: {error}", destination.display()).into())
+        self.encode(
+            &media,
+            &trial.path().join(name),
+            &["-hide_banner", "-loglevel", "error"],
+        )
+        .map_err(|error| {
+            format!(
+                "ffmpeg cannot write {} with these arguments: {error}",
+                destination.display()
+            )
+            .into()
+        })
     }
 
     fn write(&self, media: &DecodedMedia<'_>, destination: &Path) -> Result<()> {
@@ -163,7 +189,11 @@ mod tests {
     fn arguments_preserve_boundaries_and_override_defaults() {
         let backend = FfmpegOutput::new(vec!["-vf".into(), "drawtext=text='a b;$HOME'".into()]);
         let args = backend
-            .command_arguments(Path::new("a b.y4m"), Path::new("a b.wav"), Path::new("out.mp4"))
+            .command_arguments(
+                Path::new("a b.y4m"),
+                Path::new("a b.wav"),
+                Path::new("out.mp4"),
+            )
             .unwrap();
         assert_eq!(
             args,
@@ -184,13 +214,24 @@ mod tests {
 
     #[test]
     fn templates_support_input_options_and_omitting_audio() {
-        let backend = FfmpegOutput::new(["-ss", "1", "-i", "{video}", "-an", "{out}"].map(OsString::from).into());
+        let backend = FfmpegOutput::new(
+            ["-ss", "1", "-i", "{video}", "-an", "{out}"]
+                .map(OsString::from)
+                .into(),
+        );
         let args = backend
-            .command_arguments(Path::new("a b.y4m"), Path::new("audio.wav"), Path::new("x.webm"))
+            .command_arguments(
+                Path::new("a b.y4m"),
+                Path::new("audio.wav"),
+                Path::new("x.webm"),
+            )
             .unwrap();
         assert_eq!(
             args,
-            ["-nostdin", "-y", "-ss", "1", "-i", "a b.y4m", "-an", "x.webm"].map(OsString::from)
+            [
+                "-nostdin", "-y", "-ss", "1", "-i", "a b.y4m", "-an", "x.webm"
+            ]
+            .map(OsString::from)
         );
         assert!(
             FfmpegOutput::new(vec!["{video}".into()])

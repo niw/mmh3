@@ -1,7 +1,8 @@
 //! File reads that bypass the page cache, for streaming large checkpoints once.
 //!
-//! A checkpoint read through the page cache stays in memory next to its copy on the GPU, which on unified-memory
-//! systems such as GB10 holds the weights twice in the same RAM. Direct reads leave nothing behind.
+//! A checkpoint read through the page cache stays in memory next to its copy on the GPU, which on
+//! unified-memory systems such as GB10 holds the weights twice in the same RAM. Direct reads leave
+//! nothing behind.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -28,29 +29,39 @@ pub struct DirectFile {
 }
 
 impl DirectFile {
-    /// Opens `path` for direct reads, or, where the file system refuses them, for buffered reads that drop what they
-    /// read from the page cache.
+    /// Opens `path` for direct reads, or, where the file system refuses them, for buffered reads
+    /// that drop what they read from the page cache.
     pub fn open(path: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            if let Ok(file) = OpenOptions::new().read(true).custom_flags(O_DIRECT).open(path) {
+            if let Ok(file) = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_DIRECT)
+                .open(path)
+            {
                 return Ok(DirectFile { file, direct: true });
             }
         }
-        Ok(DirectFile { file: OpenOptions::new().read(true).open(path)?, direct: false })
+        Ok(DirectFile {
+            file: OpenOptions::new().read(true).open(path)?,
+            direct: false,
+        })
     }
 
     pub fn is_direct(&self) -> bool {
         self.direct
     }
 
-    /// Fills `buffer` from `offset` and returns the bytes read, fewer only at the end of the file. For direct reads
-    /// `offset`, the buffer address and its length must be multiples of [`DIRECT_ALIGNMENT`].
+    /// Fills `buffer` from `offset` and returns the bytes read, fewer only at the end of the file.
+    /// For direct reads `offset`, the buffer address and its length must be multiples of
+    /// [`DIRECT_ALIGNMENT`].
     pub fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         let mut filled = 0;
         while filled < buffer.len() {
-            let read = self.file.read_at(&mut buffer[filled..], offset + filled as u64)?;
+            let read = self
+                .file
+                .read_at(&mut buffer[filled..], offset + filled as u64)?;
             if read == 0 {
                 break;
             }
@@ -59,7 +70,12 @@ impl DirectFile {
         if !self.direct {
             // SAFETY: plain advice on an open descriptor.
             unsafe {
-                posix_fadvise(self.file.as_raw_fd(), offset as i64, filled as i64, POSIX_FADV_DONTNEED);
+                posix_fadvise(
+                    self.file.as_raw_fd(),
+                    offset as i64,
+                    filled as i64,
+                    POSIX_FADV_DONTNEED,
+                );
             }
         }
         Ok(filled)
@@ -73,7 +89,9 @@ mod tests {
     #[test]
     fn reads_aligned_blocks_to_the_end_of_the_file() {
         let path = std::env::temp_dir().join(format!("mmh3-direct-{}", std::process::id()));
-        let contents: Vec<u8> = (0..3 * DIRECT_ALIGNMENT + 100).map(|index| (index % 251) as u8).collect();
+        let contents: Vec<u8> = (0..3 * DIRECT_ALIGNMENT + 100)
+            .map(|index| (index % 251) as u8)
+            .collect();
         std::fs::write(&path, &contents).unwrap();
         let file = DirectFile::open(&path).unwrap();
         // An aligned buffer: over-allocate and start at the first aligned address.

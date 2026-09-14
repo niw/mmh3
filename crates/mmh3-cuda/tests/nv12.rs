@@ -7,8 +7,15 @@ fn device_nv12_matches_reference_with_pitched_rows_and_guard_bytes() {
     let pixels: Vec<f32> = (0..3 * frames * height * width)
         .map(|i| ((i * 37 + i / 11) % 1009) as f32 / 1008.0)
         .collect();
-    let reference = Yuv420::from_pixels(&Tensor::new(vec![3, frames, height, width], pixels.clone())).unwrap();
-    let video = CudaVideoFrames::from_rgb(DeviceBuffer::from_f32(&pixels).unwrap(), frames, height, width).unwrap();
+    let reference =
+        Yuv420::from_pixels(&Tensor::new(vec![3, frames, height, width], pixels.clone())).unwrap();
+    let video = CudaVideoFrames::from_rgb(
+        DeviceBuffer::from_f32(&pixels).unwrap(),
+        frames,
+        height,
+        width,
+    )
+    .unwrap();
     let size = pitch * height * 3 / 2;
     let mut output = DeviceBuffer::from_bytes(&vec![0xa5; size + 64]).unwrap();
     for frame in 0..frames {
@@ -21,7 +28,11 @@ fn device_nv12_matches_reference_with_pitched_rows_and_guard_bytes() {
                 &bytes[row * pitch..row * pitch + width],
                 &expected[row * width..(row + 1) * width]
             );
-            assert!(bytes[row * pitch + width..(row + 1) * pitch].iter().all(|&byte| byte == 0xa5));
+            assert!(
+                bytes[row * pitch + width..(row + 1) * pitch]
+                    .iter()
+                    .all(|&byte| byte == 0xa5)
+            );
         }
         for row in 0..height / 2 {
             for col in 0..width / 2 {

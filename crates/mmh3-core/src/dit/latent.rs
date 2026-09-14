@@ -2,9 +2,15 @@
 
 use crate::tensor::Tensor;
 
-/// Video latent `[channels, frames, height, width]` to rows of 2 × 2 patches, features ordered (channel, y, x).
+/// Video latent `[channels, frames, height, width]` to rows of 2 × 2 patches, features ordered
+/// (channel, y, x).
 pub fn patchify_video(latent: &Tensor) -> Vec<f32> {
-    let (channels, frames, height, width) = (latent.shape[0], latent.shape[1], latent.shape[2], latent.shape[3]);
+    let (channels, frames, height, width) = (
+        latent.shape[0],
+        latent.shape[1],
+        latent.shape[2],
+        latent.shape[3],
+    );
     let mut rows = Vec::with_capacity(latent.data.len());
     for frame in 0..frames {
         for patch_y in 0..height / 2 {
@@ -13,7 +19,9 @@ pub fn patchify_video(latent: &Tensor) -> Vec<f32> {
                     for offset_y in 0..2 {
                         for offset_x in 0..2 {
                             let (y, x) = (patch_y * 2 + offset_y, patch_x * 2 + offset_x);
-                            rows.push(latent.data[((channel * frames + frame) * height + y) * width + x]);
+                            rows.push(
+                                latent.data[((channel * frames + frame) * height + y) * width + x],
+                            );
                         }
                     }
                 }
@@ -35,7 +43,8 @@ pub fn unpatchify_video(rows: &[f32], shape: &[usize]) -> Vec<f32> {
                     for offset_y in 0..2 {
                         for offset_x in 0..2 {
                             let (y, x) = (patch_y * 2 + offset_y, patch_x * 2 + offset_x);
-                            latent[((channel * frames + frame) * height + y) * width + x] = rows[index];
+                            latent[((channel * frames + frame) * height + y) * width + x] =
+                                rows[index];
                             index += 1;
                         }
                     }
@@ -52,7 +61,10 @@ pub fn pack_audio(latent: &Tensor) -> Vec<f32> {
     let mut rows = Vec::with_capacity(latent.data.len());
     for side in 0..stereo {
         for frame in 0..frames {
-            rows.extend((0..channels).map(|channel| latent.data[(channel * stereo + side) * frames + frame]));
+            rows.extend(
+                (0..channels)
+                    .map(|channel| latent.data[(channel * stereo + side) * frames + frame]),
+            );
         }
     }
     rows
@@ -65,7 +77,8 @@ pub fn unpack_audio(rows: &[f32], shape: &[usize]) -> Vec<f32> {
     for side in 0..stereo {
         for frame in 0..frames {
             for channel in 0..channels {
-                latent[(channel * stereo + side) * frames + frame] = rows[(side * frames + frame) * channels + channel];
+                latent[(channel * stereo + side) * frames + frame] =
+                    rows[(side * frames + frame) * channels + channel];
             }
         }
     }
@@ -78,7 +91,10 @@ mod tests {
 
     #[test]
     fn round_trips_latents() {
-        let video = Tensor::new(vec![3, 2, 4, 6], (0..144).map(|value| value as f32).collect());
+        let video = Tensor::new(
+            vec![3, 2, 4, 6],
+            (0..144).map(|value| value as f32).collect(),
+        );
         let rows = patchify_video(&video);
         assert_eq!(&rows[..4], &[0.0, 1.0, 6.0, 7.0]);
         assert_eq!(unpatchify_video(&rows, &video.shape), video.data);

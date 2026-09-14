@@ -15,8 +15,12 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 /// Output and input features of the four linear layers in every DiT block.
-const DIT_LINEAR_SHAPES: [(&str, usize, usize); 4] =
-    [("qkv", 21504, 5376), ("out", 5376, 7168), ("fc1", 28672, 5376), ("fc2", 5376, 14336)];
+const DIT_LINEAR_SHAPES: [(&str, usize, usize); 4] = [
+    ("qkv", 21504, 5376),
+    ("out", 5376, 7168),
+    ("fc1", 28672, 5376),
+    ("fc2", 5376, 14336),
+];
 
 const DIT_BLOCK_COUNT: usize = 50;
 
@@ -29,20 +33,32 @@ fn bench_gemm(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let kinds = match options.get("kinds") {
         Some(list) => list
             .split(',')
-            .map(|name| GemmKind::from_name(name).ok_or_else(|| format!("unknown GEMM kind {name}")))
+            .map(|name| {
+                GemmKind::from_name(name).ok_or_else(|| format!("unknown GEMM kind {name}"))
+            })
             .collect::<Result<Vec<_>, _>>()?,
         None => GemmKind::ALL.to_vec(),
     };
 
-    println!("y[{tokens}, N] = x[{tokens}, K] · w[N, K]ᵀ, best candidate of each kind, {iterations} runs each");
-    println!("{:<6} {:>6} {:>6}  {:<9} {:>10} {:>9} {:>10}", "layer", "N", "K", "kind", "ms", "TFLOPS", "candidates");
-    let mut step_seconds: Vec<(GemmKind, Option<f64>)> = kinds.iter().map(|&kind| (kind, Some(0.0))).collect();
+    println!(
+        "y[{tokens}, N] = x[{tokens}, K] · w[N, K]ᵀ, best candidate of each kind, {iterations} runs each"
+    );
+    println!(
+        "{:<6} {:>6} {:>6}  {:<9} {:>10} {:>9} {:>10}",
+        "layer", "N", "K", "kind", "ms", "TFLOPS", "candidates"
+    );
+    let mut step_seconds: Vec<(GemmKind, Option<f64>)> =
+        kinds.iter().map(|&kind| (kind, Some(0.0))).collect();
     for (layer, output_features, input_features) in DIT_LINEAR_SHAPES {
         for (kind, total) in step_seconds.iter_mut() {
-            let label = format!("{layer:<6} {output_features:>6} {input_features:>6}  {:<9}", kind.name());
+            let label = format!(
+                "{layer:<6} {output_features:>6} {input_features:>6}  {:<9}",
+                kind.name()
+            );
             match gemm(*kind, tokens, output_features, input_features, iterations) {
                 Ok(timing) => {
-                    let operations = 2.0 * tokens as f64 * output_features as f64 * input_features as f64;
+                    let operations =
+                        2.0 * tokens as f64 * output_features as f64 * input_features as f64;
                     let teraflops = operations / (timing.milliseconds as f64 * 1e-3) / 1e12;
                     println!(
                         "{label} {:>10.3} {:>9.1} {:>10}",
@@ -76,8 +92,14 @@ fn bench_memory(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let iterations = option_number(&options, "iterations", 20)?;
     let bandwidth = mmh3_cuda::bench::memory_copy(megabytes << 20, iterations)?;
     println!("device copy of {megabytes} MiB, {iterations} runs (read + write)");
-    println!("  copy kernel  {:.1} GB/s", bandwidth.copy_kernel_gigabytes_per_second);
-    println!("  cudaMemcpy   {:.1} GB/s", bandwidth.memcpy_gigabytes_per_second);
+    println!(
+        "  copy kernel  {:.1} GB/s",
+        bandwidth.copy_kernel_gigabytes_per_second
+    );
+    println!(
+        "  cudaMemcpy   {:.1} GB/s",
+        bandwidth.memcpy_gigabytes_per_second
+    );
     Ok(())
 }
 
@@ -86,7 +108,9 @@ fn bench_mma(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let options = parse_options(arguments, &["iterations"], USAGE)?;
     let iterations = option_number(&options, "iterations", 4096)?;
-    println!("register-only mma.sync throughput, {iterations} iterations of 8 independent chains per warp");
+    println!(
+        "register-only mma.sync throughput, {iterations} iterations of 8 independent chains per warp"
+    );
     for kind in MmaKind::ALL {
         let throughput = mma_peak(kind, iterations)?;
         println!("  {:<22} {throughput:>7.1} T/s", kind.instruction());

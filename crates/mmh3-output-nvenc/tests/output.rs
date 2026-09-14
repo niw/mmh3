@@ -14,13 +14,23 @@ fn decode(path: &Path, kind: &str, seek: bool) -> Vec<u8> {
     }
     command.arg("-i").arg(path);
     if kind == "video" {
-        command.args(["-map", "0:v:0", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-"]);
+        command.args([
+            "-map", "0:v:0", "-pix_fmt", "yuv420p", "-f", "rawvideo", "-",
+        ]);
     } else {
         command.args(["-map", "0:a:0", "-f", "f32le", "-"]);
     }
     let output = command.output().unwrap();
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
-    assert!(output.stderr.is_empty(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     output.stdout
 }
 
@@ -42,7 +52,8 @@ fn nvenc_mp4_preserves_frames_color_audio_timing_and_seeking() {
             channels,
         };
         let path = dir.path().join(format!("{frames}.mp4"));
-        // Deliberately non-grey frames and changing luminance expose plane swaps, padding and reordering.
+        // Deliberately non-grey frames and changing luminance expose plane swaps, padding and
+        // reordering.
         let data: Vec<f32> = (0..3)
             .flat_map(|channel| {
                 (0..frames).flat_map(move |frame| {
@@ -51,17 +62,28 @@ fn nvenc_mp4_preserves_frames_color_audio_timing_and_seeking() {
                 })
             })
             .collect();
-        let reference = Yuv420::from_pixels(&Tensor::new(vec![3, frames, height, width], data.clone())).unwrap();
-        let video = CudaVideoFrames::from_rgb(DeviceBuffer::from_f32(&data).unwrap(), frames, height, width).unwrap();
+        let reference =
+            Yuv420::from_pixels(&Tensor::new(vec![3, frames, height, width], data.clone()))
+                .unwrap();
+        let video = CudaVideoFrames::from_rgb(
+            DeviceBuffer::from_f32(&data).unwrap(),
+            frames,
+            height,
+            width,
+        )
+        .unwrap();
         let waveform = (0..channels)
             .flat_map(|channel| {
                 (0..source_samples).map(move |i| {
-                    0.3 * (std::f32::consts::TAU * (440 * (channel + 1)) as f32 * i as f32 / rate as f32).sin()
+                    0.3 * (std::f32::consts::TAU * (440 * (channel + 1)) as f32 * i as f32
+                        / rate as f32)
+                        .sin()
                 })
             })
             .collect();
         let audio = Tensor::new(vec![channels, source_samples], waveform);
-        let mut session = Mp4Session::prepare(spec, &path, AacOutput, || NvencEncoder::new(spec)).unwrap();
+        let mut session =
+            Mp4Session::prepare(spec, &path, AacOutput, || NvencEncoder::new(spec)).unwrap();
         session.write_video(&video).unwrap();
         session.write_audio(&audio).unwrap();
         session.finish().unwrap();
@@ -78,7 +100,11 @@ fn nvenc_mp4_preserves_frames_color_audio_timing_and_seeking() {
             .arg(&path)
             .output()
             .unwrap();
-        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let video_stream = &info["streams"][0];
         let audio_stream = &info["streams"][1];
@@ -95,11 +121,18 @@ fn nvenc_mp4_preserves_frames_color_audio_timing_and_seeking() {
         assert_eq!(audio_stream["profile"], "LC");
         assert_eq!(audio_stream["sample_rate"], rate.to_string());
         assert_eq!(audio_stream["channels"], channels);
-        let duration: f64 = info["format"]["duration"].as_str().unwrap().parse().unwrap();
+        let duration: f64 = info["format"]["duration"]
+            .as_str()
+            .unwrap()
+            .parse()
+            .unwrap();
         assert!((duration - frames as f64 / 24.0).abs() < 0.001);
         let audio_duration: f64 = audio_stream["duration"].as_str().unwrap().parse().unwrap();
         assert!((audio_duration - (frames * rate / 24) as f64 / rate as f64).abs() < 0.0001);
-        assert_eq!(audio_stream["start_time"], "0.000000", "AAC priming must be excluded");
+        assert_eq!(
+            audio_stream["start_time"], "0.000000",
+            "AAC priming must be excluded"
+        );
         let decoded = decode(&path, "video", false);
         assert_eq!(decoded.len(), reference.data.len());
         let plane = width * height;
@@ -118,13 +151,19 @@ fn nvenc_mp4_preserves_frames_color_audio_timing_and_seeking() {
             }
         }
         let pcm = decode(&path, "audio", false);
-        let decoded: Vec<f32> = pcm.as_chunks::<4>().0.iter().map(|bytes| f32::from_le_bytes(*bytes)).collect();
+        let decoded: Vec<f32> = pcm
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
+            .collect();
         let wanted = frames * rate / 24;
         eprintln!(
             "{frames} frames: AAC decoded {} samples, wanted {wanted}",
             decoded.len() / channels
         );
-        // Some decoders return the final AAC block's padding. The MP4 edit list and duration limit its presentation.
+        // Some decoders return the final AAC block's padding. The MP4 edit list and duration limit
+        // its presentation.
         assert!(decoded.len() / channels >= wanted && decoded.len() / channels < wanted + 1024);
         let end = wanted.min(source_samples).min(rate / 2);
         for channel in 0..channels {
@@ -157,7 +196,12 @@ fn nvenc_mp4_preserves_frames_color_audio_timing_and_seeking() {
                 / plane as f64;
             assert!(mae < 3.0, "seek must reach requested frame: {mae}");
             let seek = decode(&path, "audio", true);
-            let seek: Vec<f32> = seek.as_chunks::<4>().0.iter().map(|bytes| f32::from_le_bytes(*bytes)).collect();
+            let seek: Vec<f32> = seek
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
+                .collect();
             let offset = rate * 21 / 10 * channels;
             let mse = seek
                 .iter()
@@ -190,7 +234,8 @@ fn incomplete_session_preserves_destination_and_releases_encoder() {
         channels: 2,
     };
     for _ in 0..3 {
-        let session = Mp4Session::prepare(spec, &path, AacOutput, || NvencEncoder::new(spec)).unwrap();
+        let session =
+            Mp4Session::prepare(spec, &path, AacOutput, || NvencEncoder::new(spec)).unwrap();
         assert!(session.finish().is_err());
     }
     assert_eq!(std::fs::read(&path).unwrap(), b"original");

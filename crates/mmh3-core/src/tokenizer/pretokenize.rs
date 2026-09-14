@@ -33,7 +33,11 @@ fn contraction(characters: &[char], start: usize) -> Option<usize> {
     if characters[start] != '\'' {
         return None;
     }
-    let lower = |offset: usize| characters.get(start + offset).map(|character| character.to_ascii_lowercase());
+    let lower = |offset: usize| {
+        characters
+            .get(start + offset)
+            .map(|character| character.to_ascii_lowercase())
+    };
     match (lower(1), lower(2)) {
         (Some('s' | 't' | 'm' | 'd'), _) => Some(start + 2),
         (Some('r'), Some('e')) | (Some('v'), Some('e')) | (Some('l'), Some('l')) => Some(start + 3),
@@ -44,7 +48,10 @@ fn contraction(characters: &[char], start: usize) -> Option<usize> {
 fn letters(characters: &[char], start: usize) -> Option<usize> {
     let first = characters[start];
     if !is_line_break(first) && !is_letter(first) && !is_number(first) {
-        if characters.get(start + 1).is_some_and(|&next| is_letter(next)) {
+        if characters
+            .get(start + 1)
+            .is_some_and(|&next| is_letter(next))
+        {
             return Some(run_end(characters, start + 1, is_letter));
         }
     }
@@ -52,7 +59,11 @@ fn letters(characters: &[char], start: usize) -> Option<usize> {
 }
 
 fn symbols(characters: &[char], start: usize) -> Option<usize> {
-    let begin = if characters[start] == ' ' && characters.get(start + 1).is_some_and(|&next| is_other(next)) {
+    let begin = if characters[start] == ' '
+        && characters
+            .get(start + 1)
+            .is_some_and(|&next| is_other(next))
+    {
         start + 1
     } else {
         start
@@ -70,7 +81,10 @@ fn whitespace(characters: &[char], start: usize) -> Option<usize> {
         return None;
     }
     // \s*[\r\n]+ ends right after the last line break of the run.
-    if let Some(last_break) = (start..end).rev().find(|&index| is_line_break(characters[index])) {
+    if let Some(last_break) = (start..end)
+        .rev()
+        .find(|&index| is_line_break(characters[index]))
+    {
         return Some(last_break + 1);
     }
     // \s+(?!\S) leaves the last whitespace character for the next piece when a non-space follows.
@@ -112,7 +126,12 @@ mod tests {
     #[test]
     fn splits_words_numbers_and_symbols() {
         assert_eq!(split("Hello world"), ["Hello", " world"]);
-        assert_eq!(split("I'm here, it'S 2026!"), ["I", "'m", " here", ",", " it", "'S", " ", "2", "0", "2", "6", "!"]);
+        assert_eq!(
+            split("I'm here, it'S 2026!"),
+            [
+                "I", "'m", " here", ",", " it", "'S", " ", "2", "0", "2", "6", "!"
+            ]
+        );
         assert_eq!(split("we'LL they're"), ["we", "'LL", " they", "'re"]);
         assert_eq!(split("a.b"), ["a", ".b"]);
         assert_eq!(split("(x) {y}"), ["(x", ")", " {", "y", "}"]);

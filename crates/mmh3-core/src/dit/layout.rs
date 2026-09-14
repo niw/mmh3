@@ -1,4 +1,5 @@
-//! The packed token sequence `[text | audio | video]` and the 3D positions its rotary embedding uses.
+//! The packed token sequence `[text | audio | video]` and the 3D positions its rotary embedding
+//! uses.
 
 use crate::dit::timestep::{Modality, StepTimesteps};
 
@@ -47,11 +48,14 @@ pub struct PackedLayout {
 fn patch_axis(dimension: usize, square_root_area: f64) -> Vec<f64> {
     let ratio = dimension as f64 / square_root_area;
     let count = dimension / 2;
-    (0..count).map(|index| (index as f64 * (ratio / count as f64) + (1.0 - ratio) / 2.0) * SPATIAL_EXTENT).collect()
+    (0..count)
+        .map(|index| (index as f64 * (ratio / count as f64) + (1.0 - ratio) / 2.0) * SPATIAL_EXTENT)
+        .collect()
 }
 
 impl PackedLayout {
-    /// Layout for text-to-video with audio: text, then stereo audio rows (channel-major), then video patches.
+    /// Layout for text-to-video with audio: text, then stereo audio rows (channel-major), then
+    /// video patches.
     pub fn text_to_video(
         text_tokens: usize,
         latent_frames: usize,
@@ -59,7 +63,10 @@ impl PackedLayout {
         latent_width: usize,
         audio_frames: usize,
     ) -> Self {
-        assert!(latent_height % 2 == 0 && latent_width % 2 == 0, "latent height and width must be even");
+        assert!(
+            latent_height % 2 == 0 && latent_width % 2 == 0,
+            "latent height and width must be even"
+        );
         let square_root_area = ((latent_height * latent_width) as f64).sqrt();
         let height_axis = patch_axis(latent_height, square_root_area);
         let width_axis = patch_axis(latent_width, square_root_area);
@@ -86,11 +93,30 @@ impl PackedLayout {
         let audio_start = text_tokens;
         let video_start = audio_start + 2 * audio_frames;
         let segments = vec![
-            Segment { kind: SegmentKind::Text, start: 0, end: audio_start },
-            Segment { kind: SegmentKind::Audio, start: audio_start, end: video_start },
-            Segment { kind: SegmentKind::Video, start: video_start, end: positions.len() },
+            Segment {
+                kind: SegmentKind::Text,
+                start: 0,
+                end: audio_start,
+            },
+            Segment {
+                kind: SegmentKind::Audio,
+                start: audio_start,
+                end: video_start,
+            },
+            Segment {
+                kind: SegmentKind::Video,
+                start: video_start,
+                end: positions.len(),
+            },
         ];
-        PackedLayout { segments, positions, latent_frames, latent_height, latent_width, audio_frames }
+        PackedLayout {
+            segments,
+            positions,
+            latent_frames,
+            latent_height,
+            latent_width,
+            audio_frames,
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -102,16 +128,24 @@ impl PackedLayout {
     }
 
     pub fn segment(&self, kind: SegmentKind) -> Segment {
-        *self.segments.iter().find(|segment| segment.kind == kind).expect("segment is present")
+        *self
+            .segments
+            .iter()
+            .find(|segment| segment.kind == kind)
+            .expect("segment is present")
     }
 
-    /// Rotation angles per token, flattened `[tokens, 3 × frequencies]`: time, height and width axes in order.
-    /// Positions are rounded to f32 before scaling, as the reference does.
+    /// Rotation angles per token, flattened `[tokens, 3 × frequencies]`: time, height and width
+    /// axes in order. Positions are rounded to f32 before scaling, as the reference does.
     pub fn rope_angles(&self, inverse_frequencies: &[f32]) -> Vec<f32> {
         self.positions
             .iter()
             .flat_map(|position| {
-                position.iter().flat_map(|&coordinate| inverse_frequencies.iter().map(move |&frequency| coordinate as f32 * frequency))
+                position.iter().flat_map(|&coordinate| {
+                    inverse_frequencies
+                        .iter()
+                        .map(move |&frequency| coordinate as f32 * frequency)
+                })
             })
             .collect()
     }
@@ -121,7 +155,8 @@ impl PackedLayout {
         self.segments
             .iter()
             .flat_map(|segment| {
-                let row = timesteps.modulation_row(timesteps.index_of(segment.kind), segment.kind.modality());
+                let row = timesteps
+                    .modulation_row(timesteps.index_of(segment.kind), segment.kind.modality());
                 std::iter::repeat_n(row, segment.len())
             })
             .collect()
@@ -146,13 +181,29 @@ mod tests {
     fn places_segments_and_positions() {
         let layout = PackedLayout::text_to_video(3, 6, 4, 6, 2);
         assert_eq!(layout.len(), 3 + 4 + 6 * 2 * 3);
-        assert_eq!(layout.segment(SegmentKind::Audio), Segment { kind: SegmentKind::Audio, start: 3, end: 7 });
+        assert_eq!(
+            layout.segment(SegmentKind::Audio),
+            Segment {
+                kind: SegmentKind::Audio,
+                start: 3,
+                end: 7
+            }
+        );
         assert_eq!(layout.positions[2], [2.0, 0.0, 0.0]);
         assert_eq!(layout.positions[4][0], 4.0);
         assert!(layout.positions[3][2] < 0.0 && layout.positions[5][2] > 0.0);
         let video = layout.segment(SegmentKind::Video);
-        let frame_times: Vec<f64> = (0..6).map(|frame| layout.positions[video.start + frame * 6][0]).collect();
-        let expected = [3.0, 3.0 + 5.0 / 3.0, 3.0 + 25.0 / 3.0, 3.0 + 15.0, 3.0 + 65.0 / 3.0, 3.0 + 85.0 / 3.0];
+        let frame_times: Vec<f64> = (0..6)
+            .map(|frame| layout.positions[video.start + frame * 6][0])
+            .collect();
+        let expected = [
+            3.0,
+            3.0 + 5.0 / 3.0,
+            3.0 + 25.0 / 3.0,
+            3.0 + 15.0,
+            3.0 + 65.0 / 3.0,
+            3.0 + 85.0 / 3.0,
+        ];
         for (actual, expected) in frame_times.iter().zip(expected) {
             assert!((actual - expected).abs() < 1e-12, "{frame_times:?}");
         }

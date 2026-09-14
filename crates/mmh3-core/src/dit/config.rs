@@ -1,4 +1,5 @@
-/// DiT hyperparameters. The released model has hidden 5376, 56 heads of 128, FFN 14336 and 50 blocks.
+/// DiT hyperparameters. The released model has hidden 5376, 56 heads of 128, FFN 14336 and 50
+/// blocks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct DitConfig {
     pub hidden: usize,
@@ -35,10 +36,15 @@ impl DitConfig {
         self.rope_frequencies * 6
     }
 
-    /// Infers the configuration of a pruned checkpoint from tensor shapes, keyed by checkpoint tensor name.
+    /// Infers the configuration of a pruned checkpoint from tensor shapes, keyed by checkpoint
+    /// tensor name.
     pub fn from_shapes(shape_of: impl Fn(&str) -> Option<Vec<usize>>) -> Result<Self, String> {
         let shape = |name: &str| shape_of(name).ok_or_else(|| format!("missing tensor {name}"));
-        let count = |prefix: &str| (0..).take_while(|index| shape_of(&format!("{prefix}.{index}.norm1.weight")).is_some()).count();
+        let count = |prefix: &str| {
+            (0..)
+                .take_while(|index| shape_of(&format!("{prefix}.{index}.norm1.weight")).is_some())
+                .count()
+        };
 
         let video_patch = shape("video_patch_proj.weight")?;
         let head_dim = shape("blocks.0.attn.q_norm.weight")?[0];

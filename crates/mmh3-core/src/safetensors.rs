@@ -154,10 +154,13 @@ impl SafeTensors {
             .checked_add(header_length)
             .filter(|&offset| offset <= bytes.len())
             .ok_or_else(|| format_error("header extends past the end of the file"))?;
-        let header_text =
-            std::str::from_utf8(&bytes[8..data_offset]).map_err(|_| format_error("header is not valid UTF-8"))?;
-        let header = json::parse(header_text).map_err(|error| format_error(format!("header JSON: {error}")))?;
-        let members = header.as_object().ok_or_else(|| format_error("header is not a JSON object"))?;
+        let header_text = std::str::from_utf8(&bytes[8..data_offset])
+            .map_err(|_| format_error("header is not valid UTF-8"))?;
+        let header = json::parse(header_text)
+            .map_err(|error| format_error(format!("header JSON: {error}")))?;
+        let members = header
+            .as_object()
+            .ok_or_else(|| format_error("header is not a JSON object"))?;
 
         let data_length = bytes.len() - data_offset;
         let mut tensors = Vec::with_capacity(members.len());
@@ -175,7 +178,14 @@ impl SafeTensors {
             .enumerate()
             .map(|(position, tensor)| (tensor.name.clone(), position))
             .collect();
-        Ok(Self { path: path.to_owned(), file, data_offset, tensors, index, metadata })
+        Ok(Self {
+            path: path.to_owned(),
+            file,
+            data_offset,
+            tensors,
+            index,
+            metadata,
+        })
     }
 
     /// Tensors in the order their data appears in the file.
@@ -184,7 +194,9 @@ impl SafeTensors {
     }
 
     pub fn get(&self, name: &str) -> Option<&TensorInfo> {
-        self.index.get(name).map(|&position| &self.tensors[position])
+        self.index
+            .get(name)
+            .map(|&position| &self.tensors[position])
     }
 
     pub fn path(&self) -> &Path {
@@ -215,11 +227,15 @@ impl SafeTensors {
 }
 
 fn parse_metadata(entry: &Value) -> Result<Vec<(String, String)>, Error> {
-    let members = entry.as_object().ok_or_else(|| format_error("__metadata__ is not an object"))?;
+    let members = entry
+        .as_object()
+        .ok_or_else(|| format_error("__metadata__ is not an object"))?;
     members
         .iter()
         .map(|(key, value)| {
-            let text = value.as_str().ok_or_else(|| format_error(format!("metadata value for {key} is not a string")))?;
+            let text = value
+                .as_str()
+                .ok_or_else(|| format_error(format!("metadata value for {key} is not a string")))?;
             Ok((key.clone(), text.to_owned()))
         })
         .collect()
@@ -227,14 +243,22 @@ fn parse_metadata(entry: &Value) -> Result<Vec<(String, String)>, Error> {
 
 fn parse_tensor(name: &str, entry: &Value, data_length: usize) -> Result<TensorInfo, Error> {
     let invalid = |message: &str| format_error(format!("tensor {name}: {message}"));
-    let dtype_name = entry.get("dtype").and_then(Value::as_str).ok_or_else(|| invalid("missing dtype"))?;
-    let dtype = DType::from_name(dtype_name).ok_or_else(|| invalid(&format!("unsupported dtype {dtype_name}")))?;
+    let dtype_name = entry
+        .get("dtype")
+        .and_then(Value::as_str)
+        .ok_or_else(|| invalid("missing dtype"))?;
+    let dtype = DType::from_name(dtype_name)
+        .ok_or_else(|| invalid(&format!("unsupported dtype {dtype_name}")))?;
     let shape = entry
         .get("shape")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("missing shape"))?
         .iter()
-        .map(|dimension| dimension.as_u64().and_then(|value| usize::try_from(value).ok()))
+        .map(|dimension| {
+            dimension
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+        })
         .collect::<Option<Vec<usize>>>()
         .ok_or_else(|| invalid("shape is not a list of sizes"))?;
     let offsets = entry
@@ -242,8 +266,12 @@ fn parse_tensor(name: &str, entry: &Value, data_length: usize) -> Result<TensorI
         .and_then(Value::as_array)
         .filter(|offsets| offsets.len() == 2)
         .ok_or_else(|| invalid("missing data_offsets"))?;
-    let begin = offsets[0].as_u64().and_then(|value| usize::try_from(value).ok());
-    let end = offsets[1].as_u64().and_then(|value| usize::try_from(value).ok());
+    let begin = offsets[0]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok());
+    let end = offsets[1]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok());
     let (Some(begin), Some(end)) = (begin, end) else {
         return Err(invalid("data_offsets are not sizes"));
     };
@@ -252,10 +280,20 @@ fn parse_tensor(name: &str, entry: &Value, data_length: usize) -> Result<TensorI
     }
     let expected_bytes = shape
         .iter()
-        .try_fold(dtype.size_in_bytes(), |total, &dimension| total.checked_mul(dimension))
+        .try_fold(dtype.size_in_bytes(), |total, &dimension| {
+            total.checked_mul(dimension)
+        })
         .ok_or_else(|| invalid("shape is too large"))?;
     if expected_bytes != end - begin {
-        return Err(invalid(&format!("shape needs {expected_bytes} bytes but the data has {}", end - begin)));
+        return Err(invalid(&format!(
+            "shape needs {expected_bytes} bytes but the data has {}",
+            end - begin
+        )));
     }
-    Ok(TensorInfo { name: name.to_owned(), dtype, shape, data_range: begin..end })
+    Ok(TensorInfo {
+        name: name.to_owned(),
+        dtype,
+        shape,
+        data_range: begin..end,
+    })
 }

@@ -18,10 +18,16 @@ pub enum PreparedOutput {
     Nvidia(mmh3_output::mp4::Mp4Session<mmh3_output_nvenc::NvencEncoder, mmh3_output::AacOutput>),
 }
 
-pub fn prepare(ffmpeg_arguments: Option<&[String]>, spec: MediaSpec, destination: &Path) -> Result<PreparedOutput> {
+pub fn prepare(
+    ffmpeg_arguments: Option<&[String]>,
+    spec: MediaSpec,
+    destination: &Path,
+) -> Result<PreparedOutput> {
     spec.validate()?;
     let backend: Box<dyn OutputBackend> = if let Some(arguments) = ffmpeg_arguments {
-        Box::new(FfmpegOutput::new(arguments.iter().map(Into::into).collect()))
+        Box::new(FfmpegOutput::new(
+            arguments.iter().map(Into::into).collect(),
+        ))
     } else {
         let extension = destination
             .extension()
@@ -32,15 +38,19 @@ pub fn prepare(ffmpeg_arguments: Option<&[String]>, spec: MediaSpec, destination
             "mp4" => {
                 #[cfg(feature = "mp4")]
                 {
-                    return Ok(PreparedOutput::Nvidia(mmh3_output::mp4::Mp4Session::prepare(
-                        spec,
-                        destination,
-                        mmh3_output::AacOutput,
-                        || mmh3_output_nvenc::NvencEncoder::new(spec),
-                    )?));
+                    return Ok(PreparedOutput::Nvidia(
+                        mmh3_output::mp4::Mp4Session::prepare(
+                            spec,
+                            destination,
+                            mmh3_output::AacOutput,
+                            || mmh3_output_nvenc::NvencEncoder::new(spec),
+                        )?,
+                    ));
                 }
                 #[cfg(not(feature = "mp4"))]
-                return Err("native MP4 needs --features mp4. Use --out FILE.webm or --ffmpeg".into());
+                return Err(
+                    "native MP4 needs --features mp4. Use --out FILE.webm or --ffmpeg".into(),
+                );
             }
             "webm" => {
                 #[cfg(feature = "webm")]
@@ -48,9 +58,16 @@ pub fn prepare(ffmpeg_arguments: Option<&[String]>, spec: MediaSpec, destination
                     Box::new(mmh3_output::WebmOutput::default())
                 }
                 #[cfg(not(feature = "webm"))]
-                return Err("this build has no WebM backend. Rebuild with --features webm or pass --ffmpeg".into());
+                return Err(
+                    "this build has no WebM backend. Rebuild with --features webm or pass --ffmpeg"
+                        .into(),
+                );
             }
-            _ => return Err("choose --out FILE.mp4 or FILE.webm, or pass --ffmpeg for other formats".into()),
+            _ => {
+                return Err(
+                    "choose --out FILE.mp4 or FILE.webm, or pass --ffmpeg for other formats".into(),
+                );
+            }
         }
     };
     backend.validate(&spec, destination)?;

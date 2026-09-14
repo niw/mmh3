@@ -17,7 +17,10 @@ pub enum Value {
 
 impl Value {
     pub fn get(&self, key: &str) -> Option<&Value> {
-        self.as_object()?.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+        self.as_object()?
+            .iter()
+            .find(|(name, _)| name == key)
+            .map(|(_, value)| value)
     }
 
     pub fn as_bool(&self) -> Option<bool> {
@@ -37,7 +40,9 @@ impl Value {
     /// Returns the number when it is a non-negative integer that f64 represents exactly.
     pub fn as_u64(&self) -> Option<u64> {
         match self {
-            Value::Number(value) if *value >= 0.0 && value.fract() == 0.0 && *value <= 9_007_199_254_740_992.0 => {
+            Value::Number(value)
+                if *value >= 0.0 && value.fract() == 0.0 && *value <= 9_007_199_254_740_992.0 =>
+            {
                 Some(*value as u64)
             }
             _ => None,
@@ -81,7 +86,12 @@ impl fmt::Display for ParseError {
 impl std::error::Error for ParseError {}
 
 pub fn parse(text: &str) -> Result<Value, ParseError> {
-    let mut parser = Parser { text, bytes: text.as_bytes(), position: 0, depth: 0 };
+    let mut parser = Parser {
+        text,
+        bytes: text.as_bytes(),
+        position: 0,
+        depth: 0,
+    };
     parser.skip_whitespace();
     let value = parser.parse_value()?;
     parser.skip_whitespace();
@@ -100,7 +110,10 @@ struct Parser<'a> {
 
 impl Parser<'_> {
     fn error(&self, message: &'static str) -> ParseError {
-        ParseError { offset: self.position, message }
+        ParseError {
+            offset: self.position,
+            message,
+        }
     }
 
     fn peek(&self) -> Option<u8> {
@@ -236,7 +249,9 @@ impl Parser<'_> {
     }
 
     fn parse_escape(&mut self, output: &mut String) -> Result<(), ParseError> {
-        let escaped = self.peek().ok_or_else(|| self.error("unterminated escape"))?;
+        let escaped = self
+            .peek()
+            .ok_or_else(|| self.error("unterminated escape"))?;
         self.position += 1;
         match escaped {
             b'"' => output.push('"'),
@@ -264,7 +279,9 @@ impl Parser<'_> {
                     0xDC00..=0xDFFF => return Err(self.error("unpaired surrogate")),
                     _ => first,
                 };
-                output.push(char::from_u32(code_point).ok_or_else(|| self.error("invalid code point"))?);
+                output.push(
+                    char::from_u32(code_point).ok_or_else(|| self.error("invalid code point"))?,
+                );
             }
             _ => return Err(self.error("invalid escape")),
         }
@@ -278,7 +295,9 @@ impl Parser<'_> {
             .ok_or_else(|| self.error("truncated unicode escape"))?;
         let mut value = 0;
         for &digit in digits {
-            let nibble = (digit as char).to_digit(16).ok_or_else(|| self.error("invalid hex digit"))?;
+            let nibble = (digit as char)
+                .to_digit(16)
+                .ok_or_else(|| self.error("invalid hex digit"))?;
             value = value * 16 + nibble;
         }
         self.position += 4;
@@ -315,7 +334,10 @@ impl Parser<'_> {
         self.text[start..self.position]
             .parse()
             .map(Value::Number)
-            .map_err(|_| ParseError { offset: start, message: "invalid number" })
+            .map_err(|_| ParseError {
+                offset: start,
+                message: "invalid number",
+            })
     }
 
     fn skip_digits(&mut self) {
@@ -332,8 +354,14 @@ mod tests {
     #[test]
     fn parses_nested_values() {
         let value = parse(r#" {"a": [1, -2.5e2, true, null], "b": {"c": "d"}} "#).unwrap();
-        assert_eq!(value.get("a").unwrap().as_array().unwrap()[1].as_f64(), Some(-250.0));
-        assert_eq!(value.get("b").unwrap().get("c").unwrap().as_str(), Some("d"));
+        assert_eq!(
+            value.get("a").unwrap().as_array().unwrap()[1].as_f64(),
+            Some(-250.0)
+        );
+        assert_eq!(
+            value.get("b").unwrap().get("c").unwrap().as_str(),
+            Some("d")
+        );
         assert_eq!(value.get("a").unwrap().as_array().unwrap()[3], Value::Null);
     }
 
@@ -357,7 +385,18 @@ mod tests {
 
     #[test]
     fn rejects_malformed_input() {
-        for text in ["", "{", "[1,]", "{\"a\" 1}", "01", "1.", "\"\\x\"", "\"\\ud800\"", "tru", "1 2"] {
+        for text in [
+            "",
+            "{",
+            "[1,]",
+            "{\"a\" 1}",
+            "01",
+            "1.",
+            "\"\\x\"",
+            "\"\\ud800\"",
+            "tru",
+            "1 2",
+        ] {
             assert!(parse(text).is_err(), "accepted {text:?}");
         }
     }

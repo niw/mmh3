@@ -19,7 +19,10 @@ fn full(kind: &[u8; 4], version: u8, flags: u32, data: &[u8]) -> Vec<u8> {
     atom(kind, &bytes)
 }
 fn u32s(values: &[u32]) -> Vec<u8> {
-    values.iter().flat_map(|value| value.to_be_bytes()).collect()
+    values
+        .iter()
+        .flat_map(|value| value.to_be_bytes())
+        .collect()
 }
 fn matrix() -> Vec<u8> {
     u32s(&[0x10000, 0, 0, 0, 0x10000, 0, 0, 0, 0x40000000])
@@ -47,7 +50,12 @@ fn avc1(spec: &MediaSpec, config: &H264Config) -> Result<Vec<u8>> {
     // ISO/IEC 14496-15 repeats the chroma format and bit depths for these High profiles.
     if matches!(config.sps[1], 100 | 110 | 122 | 144) {
         let [chroma_format, luma_depth, chroma_depth] = high_profile_format(&config.sps)?;
-        avcc.extend([0xfc | chroma_format, 0xf8 | luma_depth, 0xf8 | chroma_depth, 0]);
+        avcc.extend([
+            0xfc | chroma_format,
+            0xf8 | luma_depth,
+            0xf8 | chroma_depth,
+            0,
+        ]);
     }
     let mut entry = vec![0; 6];
     entry.extend(1u16.to_be_bytes());
@@ -73,7 +81,10 @@ struct BitReader {
 
 impl BitReader {
     fn bit(&mut self) -> Result<u8> {
-        let byte = self.bytes.get(self.position / 8).ok_or("truncated H.264 SPS")?;
+        let byte = self
+            .bytes
+            .get(self.position / 8)
+            .ok_or("truncated H.264 SPS")?;
         let bit = (byte >> (7 - self.position % 8)) & 1;
         self.position += 1;
         Ok(bit)
@@ -95,7 +106,8 @@ impl BitReader {
     }
 }
 
-/// Returns chroma_format_idc, bit_depth_luma_minus8 and bit_depth_chroma_minus8 of a High profile SPS.
+/// Returns chroma_format_idc, bit_depth_luma_minus8 and bit_depth_chroma_minus8 of a High profile
+/// SPS.
 fn high_profile_format(sps: &[u8]) -> Result<[u8; 3]> {
     let mut bytes = Vec::with_capacity(sps.len());
     let mut zeros = 0;
@@ -108,7 +120,10 @@ fn high_profile_format(sps: &[u8]) -> Result<[u8; 3]> {
         bytes.push(byte);
     }
     // Skip profile_idc, the constraint flags and level_idc.
-    let mut reader = BitReader { bytes, position: 24 };
+    let mut reader = BitReader {
+        bytes,
+        position: 24,
+    };
     reader.exp_golomb()?; // seq_parameter_set_id
     let chroma_format = reader.exp_golomb()?;
     if chroma_format == 3 {
@@ -139,12 +154,20 @@ fn mp4a(audio: &AudioTrack) -> Vec<u8> {
     entry.extend(full(b"esds", 0, 0, &descriptor(3, &stream)));
     atom(b"mp4a", &entry)
 }
-fn sample_table(entry: Vec<u8>, packets: &[Sample], offsets: &[u64], video: bool) -> Result<Vec<u8>> {
+fn sample_table(
+    entry: Vec<u8>,
+    packets: &[Sample],
+    offsets: &[u64],
+    video: bool,
+) -> Result<Vec<u8>> {
     let count = u32::try_from(packets.len())?;
     let mut table = full(b"stsd", 0, 0, &[u32s(&[1]), entry].concat());
     let mut runs: Vec<(u32, u32)> = Vec::new();
     for packet in packets {
-        if let Some((count, _)) = runs.last_mut().filter(|(_, duration)| *duration == packet.duration) {
+        if let Some((count, _)) = runs
+            .last_mut()
+            .filter(|(_, duration)| *duration == packet.duration)
+        {
             *count += 1;
         } else {
             runs.push((1, packet.duration));
@@ -159,7 +182,9 @@ fn sample_table(entry: Vec<u8>, packets: &[Sample], offsets: &[u64], video: bool
         let mut ctts = u32s(&[count]);
         for packet in packets {
             ctts.extend(1u32.to_be_bytes());
-            ctts.extend(i32::try_from(i128::from(packet.pts) - i128::from(packet.dts))?.to_be_bytes());
+            ctts.extend(
+                i32::try_from(i128::from(packet.pts) - i128::from(packet.dts))?.to_be_bytes(),
+            );
         }
         table.extend(full(b"ctts", 1, 0, &ctts));
     }
@@ -181,7 +206,12 @@ fn sample_table(entry: Vec<u8>, packets: &[Sample], offsets: &[u64], video: bool
             .filter(|(_, packet)| packet.keyframe)
             .map(|(index, _)| index as u32 + 1)
             .collect();
-        table.extend(full(b"stss", 0, 0, &[u32s(&[sync.len() as u32]), u32s(&sync)].concat()));
+        table.extend(full(
+            b"stss",
+            0,
+            0,
+            &[u32s(&[sync.len() as u32]), u32s(&sync)].concat(),
+        ));
     }
     Ok(atom(b"stbl", &table))
 }
@@ -193,8 +223,15 @@ fn track(
     offsets: &[u64],
     video: bool,
 ) -> Result<Vec<u8>> {
-    let timescale = if video { spec.fps as u32 } else { audio.sample_rate };
-    let duration: u64 = packets.iter().map(|packet| u64::from(packet.duration)).sum();
+    let timescale = if video {
+        spec.fps as u32
+    } else {
+        audio.sample_rate
+    };
+    let duration: u64 = packets
+        .iter()
+        .map(|packet| u64::from(packet.duration))
+        .sum();
     let mut expected = 0;
     for packet in packets {
         if packet.dts != expected || packet.duration == 0 || packet.data.is_empty() {
@@ -244,10 +281,19 @@ fn track(
     };
     minf.extend(atom(
         b"dinf",
-        &full(b"dref", 0, 0, &[u32s(&[1]), full(b"url ", 0, 1, &[])].concat()),
+        &full(
+            b"dref",
+            0,
+            0,
+            &[u32s(&[1]), full(b"url ", 0, 1, &[])].concat(),
+        ),
     ));
     minf.extend(sample_table(
-        if video { avc1(spec, config)? } else { mp4a(audio) },
+        if video {
+            avc1(spec, config)?
+        } else {
+            mp4a(audio)
+        },
         packets,
         offsets,
         video,
@@ -275,7 +321,14 @@ fn movie(
     movie_header.extend(3u32.to_be_bytes());
     let mut moov = full(b"mvhd", 1, 0, &movie_header);
     moov.extend(track(spec, config, audio, video, video_offsets, true)?);
-    moov.extend(track(spec, config, audio, &audio.packets, audio_offsets, false)?);
+    moov.extend(track(
+        spec,
+        config,
+        audio,
+        &audio.packets,
+        audio_offsets,
+        false,
+    )?);
     Ok(atom(b"moov", &moov))
 }
 pub(super) fn write(
@@ -317,7 +370,9 @@ pub(super) fn write(
             audio_offsets[index] = offset;
             &audio.packets[index]
         };
-        offset = offset.checked_add(packet.data.len() as u64).ok_or("MP4 size overflow")?;
+        offset = offset
+            .checked_add(packet.data.len() as u64)
+            .ok_or("MP4 size overflow")?;
     }
     let header = movie(spec, config, video, audio, &video_offsets, &audio_offsets)?;
     writer.write_all(&ftyp)?;
@@ -326,7 +381,11 @@ pub(super) fn write(
     writer.write_all(b"mdat")?;
     writer.write_all(&(offset - (ftyp.len() + header.len()) as u64).to_be_bytes())?;
     for (is_video, index) in order {
-        writer.write_all(if is_video { &video[index].data } else { &audio.packets[index].data })?;
+        writer.write_all(if is_video {
+            &video[index].data
+        } else {
+            &audio.packets[index].data
+        })?;
     }
     Ok(())
 }

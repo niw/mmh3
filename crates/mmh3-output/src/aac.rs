@@ -10,7 +10,9 @@ pub struct AacOutput;
 impl AudioEncoder for AacOutput {
     fn validate(&self, spec: &MediaSpec) -> Result<()> {
         spec.validate()?;
-        if spec.sample_rate > 65535 || rusty_aac::sf_index_for_rate(spec.sample_rate as u32).is_none() {
+        if spec.sample_rate > 65535
+            || rusty_aac::sf_index_for_rate(spec.sample_rate as u32).is_none()
+        {
             return Err("unsupported AAC sample rate".into());
         }
         Ok(())
@@ -18,7 +20,8 @@ impl AudioEncoder for AacOutput {
     fn encode(&self, spec: &MediaSpec, audio: &Tensor) -> Result<AudioTrack> {
         self.validate(spec)?;
         validate_audio(spec, audio)?;
-        let samples = usize::try_from(spec.frames as u128 * spec.sample_rate as u128 / spec.fps as u128)?;
+        let samples =
+            usize::try_from(spec.frames as u128 * spec.sample_rate as u128 / spec.fps as u128)?;
         if samples == 0 {
             return Err("video is shorter than one audio sample".into());
         }
@@ -35,7 +38,10 @@ impl AudioEncoder for AacOutput {
         encoder.push_pcm_planar(&planes, spec.sample_rate as u32)?;
         if retained < samples {
             let silence = vec![0.0; samples - retained];
-            encoder.push_pcm_planar(&vec![silence.as_slice(); spec.channels], spec.sample_rate as u32)?;
+            encoder.push_pcm_planar(
+                &vec![silence.as_slice(); spec.channels],
+                spec.sample_rate as u32,
+            )?;
         }
         encoder.finish();
         let mut packets = Vec::new();

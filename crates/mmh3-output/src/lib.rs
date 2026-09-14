@@ -29,11 +29,21 @@ pub struct MediaSpec {
 
 impl MediaSpec {
     pub fn validate(&self) -> Result<()> {
-        if self.width == 0 || self.height == 0 || !self.width.is_multiple_of(2) || !self.height.is_multiple_of(2) {
+        if self.width == 0
+            || self.height == 0
+            || !self.width.is_multiple_of(2)
+            || !self.height.is_multiple_of(2)
+        {
             return Err("video dimensions must be positive and even".into());
         }
-        if self.frames == 0 || self.fps == 0 || self.sample_rate == 0 || !(1..=2).contains(&self.channels) {
-            return Err("media needs frames, a positive frame/sample rate, and mono or stereo audio".into());
+        if self.frames == 0
+            || self.fps == 0
+            || self.sample_rate == 0
+            || !(1..=2).contains(&self.channels)
+        {
+            return Err(
+                "media needs frames, a positive frame/sample rate, and mono or stereo audio".into(),
+            );
         }
         self.width
             .checked_mul(self.height)
@@ -57,7 +67,8 @@ impl DecodedMedia<'_> {
     pub fn validate(&self) -> Result<()> {
         self.spec.validate()?;
         let spec = self.spec;
-        if (self.video.width, self.video.height, self.video.frames) != (spec.width, spec.height, spec.frames)
+        if (self.video.width, self.video.height, self.video.frames)
+            != (spec.width, spec.height, spec.frames)
             || self.video.data.len() != spec.frames * Yuv420::frame_bytes(spec.height, spec.width)
         {
             return Err("decoded video does not match the media specification".into());

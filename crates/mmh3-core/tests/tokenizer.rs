@@ -12,12 +12,31 @@ fn matches_hugging_face_tokenizers() {
     let mut failures = Vec::new();
     for case in cases.as_array().unwrap() {
         let text = case.get("text").unwrap().as_str().unwrap();
-        let expected: Vec<u32> = case.get("ids").unwrap().as_array().unwrap().iter().map(|id| id.as_u64().unwrap() as u32).collect();
+        let expected: Vec<u32> = case
+            .get("ids")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|id| id.as_u64().unwrap() as u32)
+            .collect();
         let actual = tokenizer.encode(text);
         if actual != expected {
-            failures.push(format!("{text:?}\n  expected {expected:?}\n  actual   {actual:?}"));
+            failures.push(format!(
+                "{text:?}\n  expected {expected:?}\n  actual   {actual:?}"
+            ));
         }
-        assert_eq!(tokenizer.decode(&actual), mmh3_core::tokenizer::nfc(text), "decode of {text:?}");
+        assert_eq!(
+            tokenizer.decode(&actual),
+            mmh3_core::tokenizer::nfc(text),
+            "decode of {text:?}"
+        );
     }
-    assert!(failures.is_empty(), "{} of {} cases differ:\n{}", failures.len(), cases.as_array().unwrap().len(), failures.join("\n"));
+    assert!(
+        failures.is_empty(),
+        "{} of {} cases differ:\n{}",
+        failures.len(),
+        cases.as_array().unwrap().len(),
+        failures.join("\n")
+    );
 }

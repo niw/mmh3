@@ -83,7 +83,9 @@ mod tests {
 
     #[test]
     fn rounds_to_half_precision() {
-        for bits in [0x0000u16, 0x0001, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x7BFF, 0x8001, 0xC000] {
+        for bits in [
+            0x0000u16, 0x0001, 0x03FF, 0x0400, 0x3C00, 0x3C01, 0x7BFF, 0x8001, 0xC000,
+        ] {
             assert_eq!(f32_to_f16(f16_to_f32(bits)), bits, "{bits:#06x}");
         }
         assert_eq!(f32_to_f16(1.0 + 2f32.powi(-11)), 0x3C00);

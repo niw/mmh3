@@ -13,7 +13,10 @@ pub fn parse_options<'a>(
     let mut options = HashMap::new();
     let mut remaining = arguments.iter();
     while let Some(argument) = remaining.next() {
-        let name = argument.strip_prefix("--").filter(|name| allowed.contains(name)).ok_or(usage)?;
+        let name = argument
+            .strip_prefix("--")
+            .filter(|name| allowed.contains(name))
+            .ok_or(usage)?;
         let value = remaining
             .next()
             .filter(|value| !value.starts_with("--"))
@@ -23,16 +26,29 @@ pub fn parse_options<'a>(
     Ok(options)
 }
 
-pub fn option_number(options: &HashMap<&str, &str>, name: &str, default: usize) -> Result<usize, Box<dyn Error>> {
+pub fn option_number(
+    options: &HashMap<&str, &str>,
+    name: &str,
+    default: usize,
+) -> Result<usize, Box<dyn Error>> {
     match options.get(name) {
-        Some(value) => Ok(value.replace('_', "").parse().map_err(|_| format!("--{name} must be a number"))?),
+        Some(value) => Ok(value
+            .replace('_', "")
+            .parse()
+            .map_err(|_| format!("--{name} must be a number"))?),
         None => Ok(default),
     }
 }
 
-pub fn option_float(options: &HashMap<&str, &str>, name: &str, default: f32) -> Result<f32, Box<dyn Error>> {
+pub fn option_float(
+    options: &HashMap<&str, &str>,
+    name: &str,
+    default: f32,
+) -> Result<f32, Box<dyn Error>> {
     let value = match options.get(name) {
-        Some(value) => value.parse::<f32>().map_err(|_| format!("--{name} must be a number"))?,
+        Some(value) => value
+            .parse::<f32>()
+            .map_err(|_| format!("--{name} must be a number"))?,
         None => default,
     };
     if !value.is_finite() {
@@ -73,20 +89,41 @@ mod tests {
 
     #[test]
     fn ffmpeg_tail_is_not_parsed_as_mmh3_options() {
-        let args = arguments(&["--out", "a b.mp4", "--ffmpeg", "-map", "0:v", "-map", "1:a", "-vf", "scale=640:-2"]);
+        let args = arguments(&[
+            "--out",
+            "a b.mp4",
+            "--ffmpeg",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-vf",
+            "scale=640:-2",
+        ]);
         let (generation, ffmpeg) = split_ffmpeg_arguments(&args);
         assert_eq!(generation, &args[..2]);
         assert_eq!(ffmpeg, Some(&args[3..]));
         let args = arguments(&["--ffmpeg"]);
-        assert_eq!(split_ffmpeg_arguments(&args), (&args[..0], Some(&args[1..])));
+        assert_eq!(
+            split_ffmpeg_arguments(&args),
+            (&args[..0], Some(&args[1..]))
+        );
         let args = arguments(&["--out", "out.webm"]);
         assert_eq!(split_ffmpeg_arguments(&args), (args.as_slice(), None));
     }
 
     #[test]
     fn parses_values_and_numeric_defaults() {
-        let arguments = arguments(&["--tokens", "38_710", "--lora-strength", "-0.5", "--prompt", "a rainy street"]);
-        let options = parse_options(&arguments, &["tokens", "lora-strength", "prompt"], USAGE).unwrap();
+        let arguments = arguments(&[
+            "--tokens",
+            "38_710",
+            "--lora-strength",
+            "-0.5",
+            "--prompt",
+            "a rainy street",
+        ]);
+        let options =
+            parse_options(&arguments, &["tokens", "lora-strength", "prompt"], USAGE).unwrap();
         assert_eq!(options["prompt"], "a rainy street");
         assert_eq!(option_number(&options, "tokens", 1).unwrap(), 38_710);
         assert_eq!(option_number(&options, "iterations", 10).unwrap(), 10);
@@ -129,8 +166,19 @@ mod tests {
         for value in ["NaN", "inf", "-inf", "1e100"] {
             let options = HashMap::from([("shift-video", value)]);
             let error = option_float(&options, "shift-video", 12.0).unwrap_err();
-            assert_eq!(error.to_string(), "--shift-video must be a finite number", "{value}");
+            assert_eq!(
+                error.to_string(),
+                "--shift-video must be a finite number",
+                "{value}"
+            );
         }
-        assert!(option_float(&HashMap::from([("shift-video", "abc")]), "shift-video", 12.0).is_err());
+        assert!(
+            option_float(
+                &HashMap::from([("shift-video", "abc")]),
+                "shift-video",
+                12.0
+            )
+            .is_err()
+        );
     }
 }

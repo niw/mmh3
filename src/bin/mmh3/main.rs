@@ -32,7 +32,9 @@ fn main() -> ExitCode {
         #[cfg(feature = "cuda")]
         Some("generate") => generate::run(&arguments[1..]),
         #[cfg(not(feature = "cuda"))]
-        Some("generate") => Err("this build has no GPU backend. Rebuild with --features cuda".into()),
+        Some("generate") => {
+            Err("this build has no GPU backend. Rebuild with --features cuda".into())
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

@@ -35,9 +35,16 @@ fn commands_belong_to_only_one_binary() {
 
 #[test]
 fn tools_inspects_a_checkpoint() {
-    let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/dit_tiny.safetensors");
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/dit_tiny.safetensors"
+    );
     let output = run(TOOLS, &["inspect", fixture, "--all"]);
-    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains(fixture));
     assert!(text.contains("tensors   "));
@@ -47,7 +54,12 @@ fn tools_inspects_a_checkpoint() {
 #[cfg(not(feature = "cuda"))]
 #[test]
 fn gpu_commands_explain_the_missing_backend() {
-    for (binary, command) in [(MMH3, "generate"), (TOOLS, "device"), (TOOLS, "bench"), (TOOLS, "check")] {
+    for (binary, command) in [
+        (MMH3, "generate"),
+        (TOOLS, "device"),
+        (TOOLS, "bench"),
+        (TOOLS, "check"),
+    ] {
         let output = run(binary, &[command]);
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("Rebuild with --features cuda"));
@@ -58,9 +70,24 @@ fn gpu_commands_explain_the_missing_backend() {
 #[test]
 fn argument_errors_use_the_correct_binary_usage() {
     for (binary, arguments, expected, absent) in [
-        (MMH3, &["generate", "--unknown", "1"][..], "mmh3 generate", "mmh3-tools"),
-        (TOOLS, &["bench", "attention", "--unknown", "1"][..], "mmh3-tools bench", "mmh3 generate"),
-        (TOOLS, &["check", "dit", "--unknown", "1"][..], "mmh3-tools check", "mmh3 generate"),
+        (
+            MMH3,
+            &["generate", "--unknown", "1"][..],
+            "mmh3 generate",
+            "mmh3-tools",
+        ),
+        (
+            TOOLS,
+            &["bench", "attention", "--unknown", "1"][..],
+            "mmh3-tools bench",
+            "mmh3 generate",
+        ),
+        (
+            TOOLS,
+            &["check", "dit", "--unknown", "1"][..],
+            "mmh3-tools check",
+            "mmh3 generate",
+        ),
     ] {
         let output = run(binary, arguments);
         assert_eq!(output.status.code(), Some(1));
@@ -73,7 +100,10 @@ fn argument_errors_use_the_correct_binary_usage() {
 #[cfg(feature = "cuda")]
 #[test]
 fn invalid_output_format_is_rejected_before_loading_models() {
-    let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.unknown"]);
+    let output = run(
+        MMH3,
+        &["generate", "--prompt", "test", "--out", "out.unknown"],
+    );
     assert_eq!(output.status.code(), Some(1));
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("FILE.webm"), "{error}");
@@ -83,7 +113,12 @@ fn invalid_output_format_is_rejected_before_loading_models() {
 #[cfg(feature = "cuda")]
 #[test]
 fn invalid_ffmpeg_template_is_rejected_before_loading_models() {
-    let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.mp4", "--ffmpeg", "-i", "{video}"]);
+    let output = run(
+        MMH3,
+        &[
+            "generate", "--prompt", "test", "--out", "out.mp4", "--ffmpeg", "-i", "{video}",
+        ],
+    );
     assert_eq!(output.status.code(), Some(1));
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(error.contains("templates must include {out}"), "{error}");

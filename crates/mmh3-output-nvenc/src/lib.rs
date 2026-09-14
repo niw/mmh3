@@ -35,7 +35,8 @@ unsafe extern "C" {
     fn mmh3_nvenc_close(handle: *mut c_void);
 }
 fn failure(error: &[c_char]) -> Box<dyn std::error::Error> {
-    // SAFETY: the buffer is zero-initialized. The C adapter writes at most size-1 bytes and NUL-terminates them.
+    // SAFETY: the buffer is zero-initialized. The C adapter writes at most size-1 bytes and
+    // NUL-terminates them.
     format!(
         "NVENC: {}. Use --out FILE.webm or --ffmpeg to select another output.",
         unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
@@ -93,12 +94,14 @@ impl NvencEncoder {
         };
         let mut data = std::ptr::null();
         let mut size = 0;
-        // SAFETY: the native handle is live. The headers remain valid until the encoder is destroyed.
+        // SAFETY: the native handle is live. The headers remain valid until the encoder is
+        // destroyed.
         unsafe { mmh3_nvenc_headers(handle.as_ptr(), &mut data, &mut size) };
         if data.is_null() || size == 0 {
             return Err("NVENC returned no codec configuration".into());
         }
-        encoder.config = H264Config::from_annex_b(unsafe { std::slice::from_raw_parts(data, size as usize) })?;
+        encoder.config =
+            H264Config::from_annex_b(unsafe { std::slice::from_raw_parts(data, size as usize) })?;
         Ok(encoder)
     }
 }
@@ -113,7 +116,9 @@ impl VideoEncoder for NvencEncoder {
             || (frames.width(), frames.height(), frames.frames())
                 != (self.spec.width, self.spec.height, self.spec.frames)
         {
-            return Err("NVENC input dimensions or frame order do not match the prepared session".into());
+            return Err(
+                "NVENC input dimensions or frame order do not match the prepared session".into(),
+            );
         }
         frames.write_nv12_frame(index, &mut self.input, self.pitch)?;
         let mut raw = RawPacket {
@@ -139,7 +144,8 @@ impl VideoEncoder for NvencEncoder {
         let result = if raw.data.is_null() || raw.size == 0 {
             Err("NVENC returned an empty frame".into())
         } else {
-            // SAFETY: NVENC keeps this bitstream locked until release below. Only compressed bytes are copied to CPU.
+            // SAFETY: NVENC keeps this bitstream locked until release below. Only compressed bytes
+            // are copied to CPU.
             annex_b_sample(unsafe { std::slice::from_raw_parts(raw.data, raw.size as usize) })
         };
         unsafe { mmh3_nvenc_release(self.handle.as_ptr()) };
@@ -161,8 +167,10 @@ impl VideoEncoder for NvencEncoder {
             return Err("incomplete or already finished NVENC stream".into());
         }
         let mut error = [0; 2048];
-        // SAFETY: all frames have been synchronously retrieved, so EOS cannot leave delayed packets.
-        if unsafe { mmh3_nvenc_finish(self.handle.as_ptr(), error.as_mut_ptr(), error.len()) } != 0 {
+        // SAFETY: all frames have been synchronously retrieved, so EOS cannot leave delayed
+        // packets.
+        if unsafe { mmh3_nvenc_finish(self.handle.as_ptr(), error.as_mut_ptr(), error.len()) } != 0
+        {
             return Err(failure(&error));
         }
         self.finished = true;
@@ -171,7 +179,8 @@ impl VideoEncoder for NvencEncoder {
 }
 impl Drop for NvencEncoder {
     fn drop(&mut self) {
-        // SAFETY: the handle is unique and live. The native destructor unregisters the input before Rust drops its allocation.
+        // SAFETY: the handle is unique and live. The native destructor unregisters the input before
+        // Rust drops its allocation.
         unsafe { mmh3_nvenc_close(self.handle.as_ptr()) };
     }
 }

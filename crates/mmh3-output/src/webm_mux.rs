@@ -60,7 +60,10 @@ fn seek_head(info: u64, tracks: u64, cues: u64) -> Vec<u8> {
 }
 
 fn seek_entry(id: u32, offset: u64) -> Vec<u8> {
-    master(0x4dbb, &[element(0x53ab, &id.to_be_bytes()), uint(0x53ac, offset)])
+    master(
+        0x4dbb,
+        &[element(0x53ab, &id.to_be_bytes()), uint(0x53ac, offset)],
+    )
 }
 
 pub(crate) fn write(
@@ -149,7 +152,10 @@ pub(crate) fn write(
                     element(0x63a2, &opus_head),
                     uint(0x56aa, timestamp(lookahead as u64, 48_000)), // CodecDelay
                     uint(0x56bb, 80_000_000),                          // SeekPreRoll
-                    master(0xe1, &[float(0xb5, 48_000.0), uint(0x9f, spec.channels as u64)]),
+                    master(
+                        0xe1,
+                        &[float(0xb5, 48_000.0), uint(0x9f, spec.channels as u64)],
+                    ),
                 ],
             ),
         ],
@@ -164,7 +170,9 @@ pub(crate) fn write(
     };
     for group in packets.chunk_by(same_time) {
         let time = group[0].timestamp_ns / TIMECODE_SCALE;
-        let has_keyframe = group.iter().any(|packet| packet.track == 1 && packet.keyframe);
+        let has_keyframe = group
+            .iter()
+            .any(|packet| packet.track == 1 && packet.keyframe);
         if !cluster.is_empty() && (has_keyframe || time - cluster_time > 30_000) {
             writer.write_all(&element(CLUSTER, &cluster))?;
             cluster.clear();
@@ -184,7 +192,8 @@ pub(crate) fn write(
                             &[
                                 uint(0xf7, 1),
                                 uint(0xf1, writer.stream_position()? - segment_start),
-                                uint(0xf0, cluster.len() as u64), // CueRelativePosition, relative to Cluster data
+                                // CueRelativePosition, relative to Cluster data
+                                uint(0xf0, cluster.len() as u64),
                             ],
                         ),
                     ],

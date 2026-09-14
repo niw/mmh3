@@ -31,7 +31,11 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let file = SafeTensors::open(Path::new(path))?;
 
     println!("file      {path}");
-    println!("size      {} bytes ({})", format_count(file.file_size()), format_bytes(file.file_size()));
+    println!(
+        "size      {} bytes ({})",
+        format_count(file.file_size()),
+        format_bytes(file.file_size())
+    );
     println!("header    {} bytes", format_count(file.header_size()));
     println!("tensors   {}", format_count(file.tensors().len()));
     for (key, value) in file.metadata() {
@@ -41,7 +45,12 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     if list_all {
         for tensor in file.tensors() {
-            println!("{:<8} {:<24} {}", tensor.dtype, format_shape(&tensor.shape), tensor.name);
+            println!(
+                "{:<8} {:<24} {}",
+                tensor.dtype,
+                format_shape(&tensor.shape),
+                tensor.name
+            );
         }
         return Ok(());
     }
@@ -73,7 +82,10 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             group.uniform_shape = false;
         }
 
-        match bytes_by_dtype.iter_mut().find(|(dtype, _)| *dtype == tensor.dtype) {
+        match bytes_by_dtype
+            .iter_mut()
+            .find(|(dtype, _)| *dtype == tensor.dtype)
+        {
             Some((_, bytes)) => *bytes += tensor.byte_count(),
             None => bytes_by_dtype.push((tensor.dtype, tensor.byte_count())),
         }
@@ -81,17 +93,27 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         if tensor.name.ends_with(".comfy_quant") && tensor.dtype == DType::U8 {
             let text = std::str::from_utf8(file.data(tensor))?;
             let description = describe_quantization(text);
-            match quantization_formats.iter_mut().find(|(known, _)| *known == description) {
+            match quantization_formats
+                .iter_mut()
+                .find(|(known, _)| *known == description)
+            {
                 Some((_, count)) => *count += 1,
                 None => quantization_formats.push((description, 1)),
             }
         }
     }
 
-    println!("{:>5}  {:<8} {:<24} {:>9}  pattern", "count", "dtype", "shape", "elements");
+    println!(
+        "{:>5}  {:<8} {:<24} {:>9}  pattern",
+        "count", "dtype", "shape", "elements"
+    );
     for group in &groups {
         let dtype = group.dtype.map_or("mixed", DType::name);
-        let shape = if group.uniform_shape { format_shape(&group.shape) } else { "(varies)".to_owned() };
+        let shape = if group.uniform_shape {
+            format_shape(&group.shape)
+        } else {
+            "(varies)".to_owned()
+        };
         println!(
             "{:>5}  {:<8} {:<24} {:>9}  {}",
             group.count,
@@ -122,7 +144,13 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 /// Replaces numeric path components with N so that per-layer tensors group together.
 fn layer_pattern(name: &str) -> String {
     name.split('.')
-        .map(|component| if component.bytes().all(|byte| byte.is_ascii_digit()) { "N" } else { component })
+        .map(|component| {
+            if component.bytes().all(|byte| byte.is_ascii_digit()) {
+                "N"
+            } else {
+                component
+            }
+        })
         .collect::<Vec<_>>()
         .join(".")
 }

@@ -39,7 +39,9 @@ fn main() -> ExitCode {
         #[cfg(feature = "cuda")]
         Some("check") => check::run(&arguments[1..]),
         #[cfg(not(feature = "cuda"))]
-        Some("device" | "bench" | "check") => Err("this build has no GPU backend. Rebuild with --features cuda".into()),
+        Some("device" | "bench" | "check") => {
+            Err("this build has no GPU backend. Rebuild with --features cuda".into())
+        }
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

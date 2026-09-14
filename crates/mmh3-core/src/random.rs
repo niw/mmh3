@@ -1,6 +1,7 @@
 //! Deterministic standard normal noise for the initial latents.
 
-/// xoshiro256** seeded through SplitMix64, turned into normal samples with the Box–Muller transform.
+/// xoshiro256** seeded through SplitMix64, turned into normal samples with the Box–Muller
+/// transform.
 pub struct NormalSampler {
     state: [u64; 4],
     spare: Option<f64>,
@@ -16,7 +17,10 @@ impl NormalSampler {
             value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             value ^ (value >> 31)
         };
-        NormalSampler { state: [next_mixed(), next_mixed(), next_mixed(), next_mixed()], spare: None }
+        NormalSampler {
+            state: [next_mixed(), next_mixed(), next_mixed(), next_mixed()],
+            spare: None,
+        }
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -59,8 +63,15 @@ mod tests {
     fn draws_standard_normal_samples() {
         let values = NormalSampler::new(7).samples(200_000);
         let mean = values.iter().map(|&value| value as f64).sum::<f64>() / values.len() as f64;
-        let variance = values.iter().map(|&value| (value as f64 - mean).powi(2)).sum::<f64>() / values.len() as f64;
-        assert!(mean.abs() < 0.01 && (variance - 1.0).abs() < 0.01, "mean {mean}, variance {variance}");
+        let variance = values
+            .iter()
+            .map(|&value| (value as f64 - mean).powi(2))
+            .sum::<f64>()
+            / values.len() as f64;
+        assert!(
+            mean.abs() < 0.01 && (variance - 1.0).abs() < 0.01,
+            "mean {mean}, variance {variance}"
+        );
         assert_eq!(NormalSampler::new(7).samples(4), values[..4]);
         assert_ne!(NormalSampler::new(8).samples(4), values[..4]);
     }

@@ -16,13 +16,20 @@ fn reads_tensors_metadata_and_data() {
     let path = write_file("valid.safetensors", header, &[0, 0, 128, 63, 1, 2, 3, 4]);
     let file = SafeTensors::open(&path).unwrap();
 
-    let names: Vec<&str> = file.tensors().iter().map(|tensor| tensor.name.as_str()).collect();
+    let names: Vec<&str> = file
+        .tensors()
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .collect();
     assert_eq!(names, ["a", "b"]);
     assert_eq!(file.metadata(), [("format".to_owned(), "pt".to_owned())]);
 
     let first = file.get("a").unwrap();
     assert_eq!(first.dtype, DType::F32);
-    assert_eq!(f32::from_le_bytes(file.data(first).try_into().unwrap()), 1.0);
+    assert_eq!(
+        f32::from_le_bytes(file.data(first).try_into().unwrap()),
+        1.0
+    );
     assert_eq!(file.data(file.get("b").unwrap()), [1, 2, 3, 4]);
 }
 

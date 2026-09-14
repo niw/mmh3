@@ -17,14 +17,26 @@ pub const VIDEO_VAE_INT8_FILE: &str = "vae/minimax_h3_video_vae_int8_convrot.saf
 pub const AUDIO_VAE_FILE: &str = "vae/minimax_h3_audio_vae_fp32.safetensors";
 pub const TEXT_ENCODER_FILE: &str = "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
 
-/// Loads the DiT from `--weights` or `--dit`, whichever `name` says, with the LoRA of `--lora` when given.
-pub fn load_dit(options: &HashMap<&str, &str>, name: &str) -> Result<mmh3_cuda::dit::CudaDit, Box<dyn Error>> {
+/// Loads the DiT from `--weights` or `--dit`, whichever `name` says, with the LoRA of `--lora` when
+/// given.
+pub fn load_dit(
+    options: &HashMap<&str, &str>,
+    name: &str,
+) -> Result<mmh3_cuda::dit::CudaDit, Box<dyn Error>> {
     use std::time::Instant;
 
-    let precision = match options.get("attention-precision").copied().unwrap_or("bf16") {
+    let precision = match options
+        .get("attention-precision")
+        .copied()
+        .unwrap_or("bf16")
+    {
         "bf16" => mmh3_cuda::attention::AttentionPrecision::Bf16,
         "int8-fp8" => mmh3_cuda::attention::AttentionPrecision::Int8Fp8,
-        other => return Err(format!("--attention-precision must be bf16 or int8-fp8, not {other}").into()),
+        other => {
+            return Err(
+                format!("--attention-precision must be bf16 or int8-fp8, not {other}").into(),
+            );
+        }
     };
     let started = Instant::now();
     let path = option_path(options, name, DIT_FILE)?;
@@ -39,7 +51,8 @@ pub fn load_dit(options: &HashMap<&str, &str>, name: &str) -> Result<mmh3_cuda::
     Ok(dit)
 }
 
-/// Sol-Attn settings from `--attention sol`, `--sparse-tau` and `--sparse-start`, or None for dense attention.
+/// Sol-Attn settings from `--attention sol`, `--sparse-tau` and `--sparse-start`, or None for dense
+/// attention.
 pub fn sparse_attention(
     options: &HashMap<&str, &str>,
 ) -> Result<Option<mmh3_core::dit::sparse::SparseAttention>, Box<dyn Error>> {
@@ -60,7 +73,11 @@ pub fn sparse_attention(
 }
 
 /// The path of `--name`, or `file` inside the models directory of `--models` or `MMH3_MODELS`.
-pub fn option_path(options: &HashMap<&str, &str>, name: &str, file: &str) -> Result<String, Box<dyn Error>> {
+pub fn option_path(
+    options: &HashMap<&str, &str>,
+    name: &str,
+    file: &str,
+) -> Result<String, Box<dyn Error>> {
     if let Some(path) = options.get(name) {
         return Ok((*path).to_owned());
     }

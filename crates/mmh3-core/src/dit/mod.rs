@@ -1,4 +1,5 @@
-//! Model definitions shared by every backend: configuration, packed sequence layout and timestep handling.
+//! Model definitions shared by every backend: configuration, packed sequence layout and timestep
+//! handling.
 
 pub mod config;
 pub mod inputs;

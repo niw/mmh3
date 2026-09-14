@@ -7,7 +7,8 @@ use std::ptr;
 
 pub const HEAD_DIM: usize = 128;
 
-/// Strides in elements of the query, key, value and output tensors, in that order, and the attention pattern.
+/// Strides in elements of the query, key, value and output tensors, in that order, and the
+/// attention pattern.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AttentionLayout {
@@ -70,10 +71,22 @@ pub struct QuantizedWorkspace {
 
 impl QuantizedWorkspace {
     pub fn new(tokens: usize, heads: usize) -> Result<Self, CudaError> {
-        assert!(tokens > 0 && tokens <= (i32::MAX - 63) as usize && heads > 0 && heads <= u16::MAX as usize, "invalid attention shape");
+        assert!(
+            tokens > 0
+                && tokens <= (i32::MAX - 63) as usize
+                && heads > 0
+                && heads <= u16::MAX as usize,
+            "invalid attention shape"
+        );
         let blocks = tokens.div_ceil(SPARSE_BLOCK);
-        let rows = tokens.checked_mul(heads).and_then(|n| n.checked_mul(HEAD_DIM)).expect("attention shape overflow");
-        let scales = heads.checked_mul(blocks).and_then(|n| n.checked_mul(4)).expect("attention scale shape overflow");
+        let rows = tokens
+            .checked_mul(heads)
+            .and_then(|n| n.checked_mul(HEAD_DIM))
+            .expect("attention shape overflow");
+        let scales = heads
+            .checked_mul(blocks)
+            .and_then(|n| n.checked_mul(4))
+            .expect("attention scale shape overflow");
         Ok(Self {
             tokens,
             heads,
@@ -210,7 +223,8 @@ unsafe extern "C" {
 /// Raw form of `attention` for pointers the caller has already checked.
 ///
 /// # Safety
-/// Every element the layout addresses for `batch`, `tokens` and `heads` must lie inside the pointed-to buffers.
+/// Every element the layout addresses for `batch`, `tokens` and `heads` must lie inside the
+/// pointed-to buffers.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn attention_pointers(
     element: Element,
@@ -244,9 +258,9 @@ pub(crate) unsafe fn attention_pointers(
     })
 }
 
-/// Softmax attention for head dimension 64 or 128 over tensors described by `layout`, reading query, key and value
-/// from `input` and writing `output`, each starting at its offset. Query head h reads key and value head
-/// h / heads_per_key_value.
+/// Softmax attention for head dimension 64 or 128 over tensors described by `layout`, reading
+/// query, key and value from `input` and writing `output`, each starting at its offset. Query head
+/// h reads key and value head h / heads_per_key_value.
 #[allow(clippy::too_many_arguments)]
 pub fn attention(
     element: Element,
@@ -261,9 +275,17 @@ pub fn attention(
     scale: f32,
 ) -> Result<(), CudaError> {
     let group = layout.heads_per_key_value.max(1) as usize;
-    assert_eq!(heads % group, 0, "heads must be a multiple of the heads per key and value head");
+    assert_eq!(
+        heads % group,
+        0,
+        "heads must be a multiple of the heads per key and value head"
+    );
     let last = |offset: usize, operand: usize| {
-        let operand_heads = if operand == 1 || operand == 2 { heads / group } else { heads };
+        let operand_heads = if operand == 1 || operand == 2 {
+            heads / group
+        } else {
+            heads
+        };
         offset as i64
             + (batch as i64 - 1) * layout.batch_stride[operand]
             + (tokens as i64 - 1) * layout.token_stride[operand]
@@ -271,10 +293,19 @@ pub fn attention(
             + head_dim as i64
     };
     let input_elements = (input.bytes() / 2) as i64;
-    for (operand, offset) in [offsets.query, offsets.key, offsets.value].into_iter().enumerate() {
-        assert!(last(offset, operand) <= input_elements, "operand {operand} reaches past the input buffer");
+    for (operand, offset) in [offsets.query, offsets.key, offsets.value]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(
+            last(offset, operand) <= input_elements,
+            "operand {operand} reaches past the input buffer"
+        );
     }
-    assert!(last(offsets.output, 3) <= (output.bytes() / 2) as i64, "the output reaches past its buffer");
+    assert!(
+        last(offsets.output, 3) <= (output.bytes() / 2) as i64,
+        "the output reaches past its buffer"
+    );
     // SAFETY: every addressed element lies inside the buffers, checked above.
     unsafe {
         attention_pointers(
@@ -327,8 +358,8 @@ pub(crate) unsafe fn dense_bf16_pointers(
 
 /// Dense bidirectional attention with head dimension 128.
 ///
-/// `qkv` is BF16 `[tokens, 3, heads, 128]` as produced by the fused qkv projection, and `output` receives BF16
-/// `[tokens, heads, 128]`.
+/// `qkv` is BF16 `[tokens, 3, heads, 128]` as produced by the fused qkv projection, and `output`
+/// receives BF16 `[tokens, heads, 128]`.
 pub fn dense_bf16(
     qkv: &DeviceBuffer,
     output: &mut DeviceBuffer,
@@ -337,8 +368,14 @@ pub fn dense_bf16(
     scale: f32,
 ) -> Result<(), CudaError> {
     let inner = heads * HEAD_DIM;
-    assert!(qkv.bytes() >= tokens * 3 * inner * 2, "qkv is smaller than tokens × 3 × heads × 128");
-    assert!(output.bytes() >= tokens * inner * 2, "output is smaller than tokens × heads × 128");
+    assert!(
+        qkv.bytes() >= tokens * 3 * inner * 2,
+        "qkv is smaller than tokens × 3 × heads × 128"
+    );
+    assert!(
+        output.bytes() >= tokens * inner * 2,
+        "output is smaller than tokens × heads × 128"
+    );
     // SAFETY: both buffers cover every token, checked above.
     unsafe { dense_bf16_pointers(qkv.pointer(), output.pointer(), tokens, heads, scale) }
 }
@@ -371,22 +408,40 @@ pub struct HeadNorm<'a> {
 
 impl HeadNorm<'_> {
     fn check(&self, qkv: &DeviceBuffer, tokens: usize, heads: usize) {
-        assert!(qkv.bytes() >= tokens * 3 * heads * HEAD_DIM * 2, "qkv is smaller than tokens × 3 × heads × 128");
-        assert!(self.query_weight.bytes() >= HEAD_DIM * 2 && self.key_weight.bytes() >= HEAD_DIM * 2, "the norm weights hold 128 BF16 values");
-        assert!(2 * self.pairs <= HEAD_DIM, "the rotary pairs exceed the head");
+        assert!(
+            qkv.bytes() >= tokens * 3 * heads * HEAD_DIM * 2,
+            "qkv is smaller than tokens × 3 × heads × 128"
+        );
+        assert!(
+            self.query_weight.bytes() >= HEAD_DIM * 2 && self.key_weight.bytes() >= HEAD_DIM * 2,
+            "the norm weights hold 128 BF16 values"
+        );
+        assert!(
+            2 * self.pairs <= HEAD_DIM,
+            "the rotary pairs exceed the head"
+        );
         if let Some(angles) = self.angles {
-            assert!(angles.bytes() >= tokens * self.pairs * 4, "the angles do not cover every token");
+            assert!(
+                angles.bytes() >= tokens * self.pairs * 4,
+                "the angles do not cover every token"
+            );
         }
     }
 
     fn angles(&self) -> *const c_void {
-        self.angles.map_or(ptr::null(), |angles| angles.pointer().cast_const())
+        self.angles
+            .map_or(ptr::null(), |angles| angles.pointer().cast_const())
     }
 }
 
-/// Per-head RMSNorm of q and k in the DiT's BF16 `[tokens, 3, heads, 128]` qkv rows, then the split-half rotary
-/// embedding of their first `2 × pairs` dimensions.
-pub fn qk_norm_rope(qkv: &mut DeviceBuffer, norm: &HeadNorm, tokens: usize, heads: usize) -> Result<(), CudaError> {
+/// Per-head RMSNorm of q and k in the DiT's BF16 `[tokens, 3, heads, 128]` qkv rows, then the
+/// split-half rotary embedding of their first `2 × pairs` dimensions.
+pub fn qk_norm_rope(
+    qkv: &mut DeviceBuffer,
+    norm: &HeadNorm,
+    tokens: usize,
+    heads: usize,
+) -> Result<(), CudaError> {
     norm.check(qkv, tokens, heads);
     // SAFETY: the buffers cover every token and head, checked above.
     check(unsafe {
@@ -413,10 +468,16 @@ pub enum PreparedAttention<'a> {
 }
 
 /// `qk_norm_rope` fused with the per-block work of the attention that follows, which then runs with
-/// `AttentionInputs::Prepared`: Sol-Attn's block statistics, and INT8 q and k with the block maxima of |v| for
-/// quantized attention. Normalized k stays unwritten in qkv when the attention reads only the INT8 keys, and so does
-/// normalized q for dense quantized attention.
-pub fn prepare_inputs(qkv: &mut DeviceBuffer, norm: &HeadNorm, tokens: usize, heads: usize, attention: PreparedAttention) -> Result<(), CudaError> {
+/// `AttentionInputs::Prepared`: Sol-Attn's block statistics, and INT8 q and k with the block maxima
+/// of |v| for quantized attention. Normalized k stays unwritten in qkv when the attention reads
+/// only the INT8 keys, and so does normalized q for dense quantized attention.
+pub fn prepare_inputs(
+    qkv: &mut DeviceBuffer,
+    norm: &HeadNorm,
+    tokens: usize,
+    heads: usize,
+    attention: PreparedAttention,
+) -> Result<(), CudaError> {
     norm.check(qkv, tokens, heads);
     // SAFETY: the buffers cover every token and head, checked above.
     unsafe {
@@ -437,8 +498,8 @@ pub fn prepare_inputs(qkv: &mut DeviceBuffer, norm: &HeadNorm, tokens: usize, he
 /// Raw form of `prepare_inputs`.
 ///
 /// # Safety
-/// `qkv` must hold `tokens × 3 × heads × 128` BF16 values, the weights 128 BF16 values each and `angles`, unless null,
-/// `tokens × pairs` FP32 values.
+/// `qkv` must hold `tokens × 3 × heads × 128` BF16 values, the weights 128 BF16 values each and
+/// `angles`, unless null, `tokens × pairs` FP32 values.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn prepare_inputs_pointers(
     qkv: *mut c_void,
@@ -453,12 +514,21 @@ pub(crate) unsafe fn prepare_inputs_pointers(
 ) -> Result<(), CudaError> {
     let (sparse, quantized) = match attention {
         PreparedAttention::DenseQuantized(workspace) => {
-            assert!(workspace.tokens == tokens && workspace.heads == heads, "the quantized workspace has another shape");
+            assert!(
+                workspace.tokens == tokens && workspace.heads == heads,
+                "the quantized workspace has another shape"
+            );
             (None, Some(workspace.raw()))
         }
         PreparedAttention::Sparse(workspace) => {
-            assert!(workspace.tokens == tokens && workspace.heads == heads, "the sparse workspace has another shape");
-            (Some(workspace.raw()), workspace.quantized.as_ref().map(QuantizedWorkspace::raw))
+            assert!(
+                workspace.tokens == tokens && workspace.heads == heads,
+                "the sparse workspace has another shape"
+            );
+            (
+                Some(workspace.raw()),
+                workspace.quantized.as_ref().map(QuantizedWorkspace::raw),
+            )
         }
     };
     // SAFETY: the caller guarantees the extents, and the workspaces match the shape, checked above.
@@ -489,13 +559,17 @@ pub fn dense_quantized(
     inputs: AttentionInputs,
 ) -> Result<(), CudaError> {
     let elements = workspace.tokens * workspace.heads * HEAD_DIM;
-    assert!(qkv.bytes() >= elements * 6 && output.bytes() >= elements * 2, "attention buffers are too small");
+    assert!(
+        qkv.bytes() >= elements * 6 && output.bytes() >= elements * 2,
+        "attention buffers are too small"
+    );
     // SAFETY: both buffers cover the workspace's sequence, checked above.
     unsafe { dense_quantized_pointers(qkv.pointer(), output.pointer(), scale, workspace, inputs) }
 }
 
 /// # Safety
-/// qkv and output must cover the workspace's sequence in the fused BF16 qkv and contiguous output layouts.
+/// qkv and output must cover the workspace's sequence in the fused BF16 qkv and contiguous output
+/// layouts.
 pub(crate) unsafe fn dense_quantized_pointers(
     qkv: *const c_void,
     output: *mut c_void,
@@ -505,17 +579,33 @@ pub(crate) unsafe fn dense_quantized_pointers(
 ) -> Result<(), CudaError> {
     let inner = workspace.heads * HEAD_DIM;
     let layout = AttentionLayout {
-        token_stride: [(3 * inner) as i64, (3 * inner) as i64, (3 * inner) as i64, inner as i64],
+        token_stride: [
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            inner as i64,
+        ],
         head_stride: [HEAD_DIM as i64; 4],
         ..AttentionLayout::default()
     };
     let raw = workspace.raw();
     let base = qkv.cast::<u16>();
-    // SAFETY: the caller guarantees the buffer extents and the workspace owns all quantization scratch.
+    // SAFETY: the caller guarantees the buffer extents and the workspace owns all quantization
+    // scratch.
     check(unsafe {
         mmh3_attention_quantized(
-            base.cast(), base.add(inner).cast(), base.add(2 * inner).cast(), output,
-            workspace.tokens as c_int, workspace.heads as c_int, &layout, scale, ptr::null(), &raw, inputs.ready(), ptr::null_mut(),
+            base.cast(),
+            base.add(inner).cast(),
+            base.add(2 * inner).cast(),
+            output,
+            workspace.tokens as c_int,
+            workspace.heads as c_int,
+            &layout,
+            scale,
+            ptr::null(),
+            &raw,
+            inputs.ready(),
+            ptr::null_mut(),
         )
     })
 }
@@ -545,7 +635,11 @@ impl SparseWorkspace {
     }
 
     /// Keeps BF16 routing and the FP32 pooled tail. Quantizes the routed products when requested.
-    pub fn with_precision(tokens: usize, heads: usize, precision: AttentionPrecision) -> Result<Self, CudaError> {
+    pub fn with_precision(
+        tokens: usize,
+        heads: usize,
+        precision: AttentionPrecision,
+    ) -> Result<Self, CudaError> {
         let blocks = tokens.div_ceil(SPARSE_BLOCK);
         let per_block = heads * blocks * HEAD_DIM * 4;
         Ok(SparseWorkspace {
@@ -594,7 +688,10 @@ impl SparseWorkspace {
     pub fn routed_fraction(&self) -> Result<f64, CudaError> {
         let mut bytes = vec![0u8; self.route_counts.bytes()];
         self.route_counts.copy_to_host(&mut bytes)?;
-        let routed: u64 = bytes.chunks_exact(4).map(|count| i32::from_le_bytes(count.try_into().unwrap()) as u64).sum();
+        let routed: u64 = bytes
+            .chunks_exact(4)
+            .map(|count| i32::from_le_bytes(count.try_into().unwrap()) as u64)
+            .sum();
         Ok(routed as f64 / (self.heads * self.blocks * self.blocks) as f64)
     }
 }
@@ -602,8 +699,8 @@ impl SparseWorkspace {
 /// Raw form of `sparse` for pointers the caller has already checked.
 ///
 /// # Safety
-/// Every element the layout addresses for `tokens` and `heads` must lie inside the pointed-to buffers, and the
-/// workspace must be sized for `tokens` and `heads`.
+/// Every element the layout addresses for `tokens` and `heads` must lie inside the pointed-to
+/// buffers, and the workspace must be sized for `tokens` and `heads`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn sparse_pointers(
     query: *const c_void,
@@ -619,10 +716,14 @@ pub(crate) unsafe fn sparse_pointers(
     workspace: &SparseWorkspace,
     inputs: AttentionInputs,
 ) -> Result<(), CudaError> {
-    assert!(workspace.tokens == tokens && workspace.heads == heads, "the sparse workspace has another shape");
+    assert!(
+        workspace.tokens == tokens && workspace.heads == heads,
+        "the sparse workspace has another shape"
+    );
     let raw = workspace.raw();
     let quantized = workspace.quantized.as_ref().map(QuantizedWorkspace::raw);
-    // SAFETY: the caller guarantees the extents, and the workspace matches the shape, checked above.
+    // SAFETY: the caller guarantees the extents, and the workspace matches the shape, checked
+    // above.
     check(unsafe {
         mmh3_sparse_attention(
             query,
@@ -646,8 +747,8 @@ pub(crate) unsafe fn sparse_pointers(
     })
 }
 
-/// Sol-Attn over BF16 heads of 128 for one sequence, reading query, key and value from `input` and writing `output`
-/// at their offsets with the token and head strides of `layout`.
+/// Sol-Attn over BF16 heads of 128 for one sequence, reading query, key and value from `input` and
+/// writing `output` at their offsets with the token and head strides of `layout`.
 #[allow(clippy::too_many_arguments)]
 pub fn sparse(
     input: &DeviceBuffer,
@@ -663,12 +764,24 @@ pub fn sparse(
     inputs: AttentionInputs,
 ) -> Result<(), CudaError> {
     let last = |offset: usize, operand: usize| {
-        offset as i64 + (tokens as i64 - 1) * layout.token_stride[operand] + (heads as i64 - 1) * layout.head_stride[operand] + HEAD_DIM as i64
+        offset as i64
+            + (tokens as i64 - 1) * layout.token_stride[operand]
+            + (heads as i64 - 1) * layout.head_stride[operand]
+            + HEAD_DIM as i64
     };
-    for (operand, offset) in [offsets.query, offsets.key, offsets.value].into_iter().enumerate() {
-        assert!(last(offset, operand) <= (input.bytes() / 2) as i64, "operand {operand} reaches past the input buffer");
+    for (operand, offset) in [offsets.query, offsets.key, offsets.value]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(
+            last(offset, operand) <= (input.bytes() / 2) as i64,
+            "operand {operand} reaches past the input buffer"
+        );
     }
-    assert!(last(offsets.output, 3) <= (output.bytes() / 2) as i64, "the output reaches past its buffer");
+    assert!(
+        last(offsets.output, 3) <= (output.bytes() / 2) as i64,
+        "the output reaches past its buffer"
+    );
     // SAFETY: every addressed element lies inside the buffers, checked above.
     unsafe {
         sparse_pointers(

@@ -30,7 +30,8 @@ pub struct StepTimesteps {
 }
 
 impl StepTimesteps {
-    /// Text follows the video timestep. Audio runs on its own shifted schedule derived from the video sigma.
+    /// Text follows the video timestep. Audio runs on its own shifted schedule derived from the
+    /// video sigma.
     pub fn new(sigma_video: f32, shift_video: f32, shift_audio: f32) -> Self {
         let sigma_video = sigma_video.max(1e-6);
         let video_t = 1.0 - sigma_video;
@@ -38,8 +39,17 @@ impl StepTimesteps {
         let mut values = vec![video_t, audio_t];
         values.sort_by(f32::total_cmp);
         values.dedup();
-        let index_of = |value: f32| values.iter().position(|&candidate| candidate == value).unwrap();
-        StepTimesteps { video: index_of(video_t), audio: index_of(audio_t), values }
+        let index_of = |value: f32| {
+            values
+                .iter()
+                .position(|&candidate| candidate == value)
+                .unwrap()
+        };
+        StepTimesteps {
+            video: index_of(video_t),
+            audio: index_of(audio_t),
+            values,
+        }
     }
 
     /// Row of the AdaLN modulation table: timestep index × modalities + modality.
@@ -49,10 +59,15 @@ impl StepTimesteps {
 
     /// Timestep index of a segment. Text follows the video timestep.
     pub fn index_of(&self, kind: SegmentKind) -> usize {
-        if kind == SegmentKind::Audio { self.audio } else { self.video }
+        if kind == SegmentKind::Audio {
+            self.audio
+        } else {
+            self.video
+        }
     }
 
-    /// Time-embedding coordinates `[timesteps, rank]`, linearly interpolated from the AdaLN curve table.
+    /// Time-embedding coordinates `[timesteps, rank]`, linearly interpolated from the AdaLN curve
+    /// table.
     pub fn time_embedding(&self, table: &Tensor) -> Vec<f32> {
         let (grid, rank) = (table.shape[0], table.shape[1]);
         let mut coordinates = Vec::with_capacity(self.values.len() * rank);
@@ -61,7 +76,10 @@ impl StepTimesteps {
             let lower = (position.floor() as usize).min(grid - 2);
             let fraction = position - lower as f32;
             for column in 0..rank {
-                let (low, high) = (table.data[lower * rank + column], table.data[(lower + 1) * rank + column]);
+                let (low, high) = (
+                    table.data[lower * rank + column],
+                    table.data[(lower + 1) * rank + column],
+                );
                 coordinates.push(low + fraction * (high - low));
             }
         }

@@ -14,8 +14,12 @@ use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::ptr;
 
-// Device buffers hold f32 and other values in the GPU's little-endian byte order, which host slices share.
-const _: () = assert!(cfg!(target_endian = "little"), "mmh3 assumes a little-endian host");
+// Device buffers hold f32 and other values in the GPU's little-endian byte order, which host slices
+// share.
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "mmh3 assumes a little-endian host"
+);
 
 #[repr(C)]
 struct RawDeviceInfo {
@@ -37,8 +41,16 @@ unsafe extern "C" {
     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
     fn mmh3_cuda_malloc(pointer: *mut *mut c_void, bytes: usize) -> c_int;
     fn mmh3_cuda_free(pointer: *mut c_void) -> c_int;
-    fn mmh3_cuda_copy_to_device(destination: *mut c_void, source: *const c_void, bytes: usize) -> c_int;
-    fn mmh3_cuda_copy_to_host(destination: *mut c_void, source: *const c_void, bytes: usize) -> c_int;
+    fn mmh3_cuda_copy_to_device(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> c_int;
+    fn mmh3_cuda_copy_to_host(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> c_int;
     fn mmh3_cuda_memset(pointer: *mut c_void, value: c_int, bytes: usize) -> c_int;
     fn mmh3_cuda_synchronize() -> c_int;
     fn mmh3_cublaslt_status_string(code: c_int) -> *const c_char;
@@ -63,9 +75,14 @@ pub(crate) fn check(code: c_int) -> Result<(), CudaError> {
     if code == 0 {
         return Ok(());
     }
-    // SAFETY: both functions return static NUL-terminated strings. Codes from 1000 up are cuBLAS statuses.
+    // SAFETY: both functions return static NUL-terminated strings. Codes from 1000 up are cuBLAS
+    // statuses.
     let message = unsafe {
-        CStr::from_ptr(if code >= 1000 { mmh3_cublaslt_status_string(code) } else { mmh3_cuda_error_string(code) })
+        CStr::from_ptr(if code >= 1000 {
+            mmh3_cublaslt_status_string(code)
+        } else {
+            mmh3_cuda_error_string(code)
+        })
     }
     .to_string_lossy()
     .into_owned();
@@ -98,7 +115,9 @@ pub fn device_info(device: usize) -> Result<DeviceInfo, CudaError> {
     // SAFETY: the call above initialized every field.
     let raw = unsafe { raw.assume_init() };
     // SAFETY: the launcher always NUL-terminates the name.
-    let name = unsafe { CStr::from_ptr(raw.name.as_ptr()) }.to_string_lossy().into_owned();
+    let name = unsafe { CStr::from_ptr(raw.name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned();
     Ok(DeviceInfo {
         name,
         compute_capability: (raw.compute_major, raw.compute_minor),
@@ -154,7 +173,9 @@ impl DeviceBuffer {
 
     pub fn from_f32(values: &[f32]) -> Result<Self, CudaError> {
         // SAFETY: the byte view covers exactly the storage of the slice.
-        Self::from_bytes(unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) })
+        Self::from_bytes(unsafe {
+            std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values))
+        })
     }
 
     pub fn to_f32(&self) -> Result<Vec<f32>, CudaError> {
@@ -164,8 +185,10 @@ impl DeviceBuffer {
     /// Copies `count` f32 values starting at value `first`.
     pub fn to_f32_range(&self, first: usize, count: usize) -> Result<Vec<f32>, CudaError> {
         let mut values = vec![0.0f32; count];
-        // SAFETY: the byte view covers exactly the storage of the vector, and every bit pattern is a valid f32.
-        let bytes = unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), count * 4) };
+        // SAFETY: the byte view covers exactly the storage of the vector, and every bit pattern is
+        // a valid f32.
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(values.as_mut_ptr().cast::<u8>(), count * 4) };
         self.copy_range_to_host(first * 4, bytes)?;
         Ok(values)
     }
@@ -188,9 +211,18 @@ impl DeviceBuffer {
 
     /// Copies `source` to `offset` bytes into the allocation.
     pub fn copy_from_host_at(&mut self, offset: usize, source: &[u8]) -> Result<(), CudaError> {
-        assert!(offset + source.len() <= self.bytes, "the range reaches past the end of the buffer");
+        assert!(
+            offset + source.len() <= self.bytes,
+            "the range reaches past the end of the buffer"
+        );
         // SAFETY: the range lies inside the allocation, checked above.
-        check(unsafe { mmh3_cuda_copy_to_device(self.pointer_at(offset), source.as_ptr().cast(), source.len()) })
+        check(unsafe {
+            mmh3_cuda_copy_to_device(
+                self.pointer_at(offset),
+                source.as_ptr().cast(),
+                source.len(),
+            )
+        })
     }
 
     pub fn copy_from_host(&mut self, source: &[u8]) -> Result<(), CudaError> {
@@ -200,16 +232,35 @@ impl DeviceBuffer {
     }
 
     /// Copies `destination.len()` bytes starting `offset` bytes into the allocation.
-    pub fn copy_range_to_host(&self, offset: usize, destination: &mut [u8]) -> Result<(), CudaError> {
-        assert!(offset + destination.len() <= self.bytes, "the range reaches past the end of the buffer");
+    pub fn copy_range_to_host(
+        &self,
+        offset: usize,
+        destination: &mut [u8],
+    ) -> Result<(), CudaError> {
+        assert!(
+            offset + destination.len() <= self.bytes,
+            "the range reaches past the end of the buffer"
+        );
         // SAFETY: the range lies inside the allocation, checked above.
-        check(unsafe { mmh3_cuda_copy_to_host(destination.as_mut_ptr().cast(), self.pointer_at(offset), destination.len()) })
+        check(unsafe {
+            mmh3_cuda_copy_to_host(
+                destination.as_mut_ptr().cast(),
+                self.pointer_at(offset),
+                destination.len(),
+            )
+        })
     }
 
     pub fn copy_to_host(&self, destination: &mut [u8]) -> Result<(), CudaError> {
-        assert_eq!(destination.len(), self.bytes, "host and device sizes differ");
+        assert_eq!(
+            destination.len(),
+            self.bytes,
+            "host and device sizes differ"
+        );
         // SAFETY: both ranges are valid for self.bytes bytes.
-        check(unsafe { mmh3_cuda_copy_to_host(destination.as_mut_ptr().cast(), self.pointer, self.bytes) })
+        check(unsafe {
+            mmh3_cuda_copy_to_host(destination.as_mut_ptr().cast(), self.pointer, self.bytes)
+        })
     }
 
     pub fn fill_f32(&mut self, value: f32) -> Result<(), CudaError> {

@@ -88,7 +88,8 @@ impl<V: VideoEncoder, A: AudioEncoder> Mp4Session<V, A> {
         }
         self.video_written = true;
         for index in 0..self.spec.frames {
-            self.video.push(self.video_encoder.encode_frame(frames, index)?);
+            self.video
+                .push(self.video_encoder.encode_frame(frames, index)?);
         }
         self.video.extend(self.video_encoder.finish()?);
         self.video_complete = true;
@@ -107,7 +108,10 @@ impl<V: VideoEncoder, A: AudioEncoder> Mp4Session<V, A> {
             return Err("incomplete MP4 video".into());
         }
         let config = self.video_encoder.config();
-        if config.sps.len() < 4 || config.sps[0] & 31 != 7 || config.pps.first().is_none_or(|header| header & 31 != 8) {
+        if config.sps.len() < 4
+            || config.sps[0] & 31 != 7
+            || config.pps.first().is_none_or(|header| header & 31 != 8)
+        {
             return Err("invalid H.264 codec configuration".into());
         }
         if audio.sample_rate == 0
@@ -140,7 +144,10 @@ fn validate(spec: &MediaSpec, destination: &Path) -> Result<()> {
     u16::try_from(spec.height)?;
     u32::try_from(spec.fps)?;
     u64::try_from(spec.frames as u128 * 1_000_000 / spec.fps as u128)?;
-    if !destination.extension().is_some_and(|extension| extension.eq_ignore_ascii_case("mp4")) {
+    if !destination
+        .extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("mp4"))
+    {
         return Err("MP4 output requires --out FILE.mp4".into());
     }
     validate_destination(destination)
@@ -165,7 +172,9 @@ fn nal_units(bytes: &[u8]) -> Vec<&[u8]> {
         .iter()
         .enumerate()
         .filter_map(|(index, &(_, start))| {
-            let mut end = start_codes.get(index + 1).map_or(bytes.len(), |next| next.0);
+            let mut end = start_codes
+                .get(index + 1)
+                .map_or(bytes.len(), |next| next.0);
             while end > start && bytes[end - 1] == 0 {
                 end -= 1;
             }

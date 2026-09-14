@@ -7,7 +7,11 @@ fn fill_kernel_writes_every_element() {
     buffer.fill_f32(3.5).unwrap();
     let mut bytes = vec![0; count * 4];
     buffer.copy_to_host(&mut bytes).unwrap();
-    assert!(bytes.chunks_exact(4).all(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()) == 3.5));
+    assert!(
+        bytes
+            .chunks_exact(4)
+            .all(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()) == 3.5)
+    );
 }
 
 #[test]

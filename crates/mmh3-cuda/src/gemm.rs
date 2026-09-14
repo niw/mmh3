@@ -34,13 +34,20 @@ unsafe extern "C" {
         adapter_scale: f32,
         stream: *mut c_void,
     ) -> c_int;
-    fn mmh3_interleave_swiglu_rows(source: *const c_void, destination: *mut c_void, rows: c_int, row_bytes: c_int, stream: *mut c_void) -> c_int;
+    fn mmh3_interleave_swiglu_rows(
+        source: *const c_void,
+        destination: *mut c_void,
+        rows: c_int,
+        row_bytes: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
 }
 
 /// Raw form of `rotate_quantize`, for BF16 or FP16 input.
 ///
 /// # Safety
-/// `input` must hold `rows × columns` 16-bit values, `output` `rows × columns` bytes and `scales` `rows` f32 values.
+/// `input` must hold `rows × columns` 16-bit values, `output` `rows × columns` bytes and `scales`
+/// `rows` f32 values.
 pub(crate) unsafe fn rotate_quantize_pointers(
     input: *const c_void,
     input_is_f16: bool,
@@ -51,13 +58,21 @@ pub(crate) unsafe fn rotate_quantize_pointers(
 ) -> Result<(), CudaError> {
     // SAFETY: the caller guarantees the extents.
     check(unsafe {
-        mmh3_rotate_quantize(input, input_is_f16 as c_int, output, scales, rows as c_int, columns as c_int, ptr::null_mut())
+        mmh3_rotate_quantize(
+            input,
+            input_is_f16 as c_int,
+            output,
+            scales,
+            rows as c_int,
+            columns as c_int,
+            ptr::null_mut(),
+        )
     })
 }
 
-/// Prepares the activations of an INT8 ConvRot layer: rotates every group of 256 columns of the BF16 rows by the
-/// normalized regular Hadamard matrix and quantizes each row to INT8 with scale max |x| / 127, rounding half to even.
-/// Columns must be a multiple of 256, up to 32,768.
+/// Prepares the activations of an INT8 ConvRot layer: rotates every group of 256 columns of the
+/// BF16 rows by the normalized regular Hadamard matrix and quantizes each row to INT8 with scale
+/// max |x| / 127, rounding half to even. Columns must be a multiple of 256, up to 32,768.
 pub fn rotate_quantize(
     input: &DeviceBuffer,
     output: &mut DeviceBuffer,
@@ -65,11 +80,26 @@ pub fn rotate_quantize(
     rows: usize,
     columns: usize,
 ) -> Result<(), CudaError> {
-    assert!(input.bytes() >= rows * columns * 2, "input is smaller than rows × columns");
-    assert!(output.bytes() >= rows * columns, "output is smaller than rows × columns");
+    assert!(
+        input.bytes() >= rows * columns * 2,
+        "input is smaller than rows × columns"
+    );
+    assert!(
+        output.bytes() >= rows * columns,
+        "output is smaller than rows × columns"
+    );
     assert!(scales.bytes() >= rows * 4, "scales are smaller than rows");
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
-    unsafe { rotate_quantize_pointers(input.pointer(), false, output.pointer(), scales.pointer(), rows, columns) }
+    unsafe {
+        rotate_quantize_pointers(
+            input.pointer(),
+            false,
+            output.pointer(),
+            scales.pointer(),
+            rows,
+            columns,
+        )
+    }
 }
 
 /// Number of tile configurations the INT8 GEMM kernel is compiled for.
@@ -78,8 +108,8 @@ pub fn int8_config_count() -> usize {
     unsafe { mmh3_int8_gemm_config_count() as usize }
 }
 
-/// A low-rank adapter added to an INT8 GEMM: `scale · down · upᵀ` with `down` `[m, rank]` and `up` `[n, rank]`, both
-/// BF16, and the rank a multiple of 64.
+/// A low-rank adapter added to an INT8 GEMM: `scale · down · upᵀ` with `down` `[m, rank]` and `up`
+/// `[n, rank]`, both BF16, and the rank a multiple of 64.
 pub struct Adapter<'a> {
     pub down: &'a DeviceBuffer,
     pub up: &'a DeviceBuffer,
@@ -96,8 +126,8 @@ pub(crate) struct AdapterPointers {
     pub(crate) scale: f32,
 }
 
-/// Where the INT8 GEMM writes its result: BF16 or FP16 `[m, n]`, after adding an optional f32 bias `[n]`, or
-/// `silu(gate) · up` as `[m, n / 2]` with `swiglu`.
+/// Where the INT8 GEMM writes its result: BF16 or FP16 `[m, n]`, after adding an optional f32 bias
+/// `[n]`, or `silu(gate) · up` as `[m, n / 2]` with `swiglu`.
 #[derive(Clone, Copy)]
 pub(crate) struct Int8Output {
     pub(crate) pointer: *mut c_void,
@@ -108,24 +138,44 @@ pub(crate) struct Int8Output {
 
 impl Int8Output {
     pub(crate) fn bf16(pointer: *mut c_void) -> Self {
-        Int8Output { pointer, f16: false, bias: ptr::null(), swiglu: false }
+        Int8Output {
+            pointer,
+            f16: false,
+            bias: ptr::null(),
+            swiglu: false,
+        }
     }
 }
 
-/// Returns the rows of a `[rows, row_bytes]` matrix whose first half are SwiGLU gates and second half the matching up
-/// projections, reordered so that each group of eight rows holds the gates of four features followed by their up
-/// projections. The INT8 GEMM's SwiGLU output needs the weights, weight scales, bias and adapter up weights of the
-/// layer in this order.
-pub fn interleave_swiglu_rows(source: &DeviceBuffer, rows: usize, row_bytes: usize) -> Result<DeviceBuffer, CudaError> {
-    assert!(source.bytes() >= rows * row_bytes, "the matrix is smaller than rows × row_bytes");
+/// Returns the rows of a `[rows, row_bytes]` matrix whose first half are SwiGLU gates and second
+/// half the matching up projections, reordered so that each group of eight rows holds the gates of
+/// four features followed by their up projections. The INT8 GEMM's SwiGLU output needs the weights,
+/// weight scales, bias and adapter up weights of the layer in this order.
+pub fn interleave_swiglu_rows(
+    source: &DeviceBuffer,
+    rows: usize,
+    row_bytes: usize,
+) -> Result<DeviceBuffer, CudaError> {
+    assert!(
+        source.bytes() >= rows * row_bytes,
+        "the matrix is smaller than rows × row_bytes"
+    );
     let destination = DeviceBuffer::new(rows * row_bytes)?;
     // SAFETY: both buffers hold `rows × row_bytes` bytes, checked above.
-    check(unsafe { mmh3_interleave_swiglu_rows(source.pointer(), destination.pointer(), rows as c_int, row_bytes as c_int, ptr::null_mut()) })?;
+    check(unsafe {
+        mmh3_interleave_swiglu_rows(
+            source.pointer(),
+            destination.pointer(),
+            rows as c_int,
+            row_bytes as c_int,
+            ptr::null_mut(),
+        )
+    })?;
     Ok(destination)
 }
 
-/// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows, such as prompts,
-/// and for reductions longer than 8,192, and 256 × 128 otherwise.
+/// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows,
+/// such as prompts, and for reductions longer than 8,192, and 256 × 128 otherwise.
 ///
 /// # Safety
 /// The pointers must cover the extents described for `int8_bf16`.
@@ -141,11 +191,29 @@ pub(crate) unsafe fn int8_pointers(
     k: usize,
     adapter: Option<AdapterPointers>,
 ) -> Result<(), CudaError> {
-    // NOTE: in the DiT at 768p, the MLP down projection (K = 14,336) takes 35 ms per layer with 128 × 256 tiles and
-    // 47 ms with 256 × 128 tiles, although both take about 31 ms when timed alone.
-    let config = if (m < 256 || k > 8192) && n % 256 == 0 { 1 } else { 0 };
+    // NOTE: in the DiT at 768p, the MLP down projection (K = 14,336) takes 35 ms per layer with
+    // 128 × 256 tiles and 47 ms with 256 × 128 tiles, although both take about 31 ms when timed
+    // alone.
+    let config = if (m < 256 || k > 8192) && n % 256 == 0 {
+        1
+    } else {
+        0
+    };
     // SAFETY: the caller guarantees the extents.
-    unsafe { int8_config(config, activations, weights, activation_scales, weight_scales, output, m, n, k, adapter) }
+    unsafe {
+        int8_config(
+            config,
+            activations,
+            weights,
+            activation_scales,
+            weight_scales,
+            output,
+            m,
+            n,
+            k,
+            adapter,
+        )
+    }
 }
 
 /// # Safety
@@ -163,7 +231,12 @@ unsafe fn int8_config(
     k: usize,
     adapter: Option<AdapterPointers>,
 ) -> Result<(), CudaError> {
-    let adapter = adapter.unwrap_or(AdapterPointers { down: ptr::null(), up: ptr::null(), rank: 0, scale: 0.0 });
+    let adapter = adapter.unwrap_or(AdapterPointers {
+        down: ptr::null(),
+        up: ptr::null(),
+        rank: 0,
+        scale: 0.0,
+    });
     // SAFETY: the caller guarantees the extents.
     check(unsafe {
         mmh3_int8_gemm(
@@ -188,8 +261,9 @@ unsafe fn int8_config(
     })
 }
 
-/// Where `int8` writes its result, `[m, n]` in BF16 or FP16, after adding an optional f32 bias `[n]`, or
-/// `silu(gate) · up` as `[m, n / 2]` with `swiglu` for operands in the order of `interleave_swiglu_rows`.
+/// Where `int8` writes its result, `[m, n]` in BF16 or FP16, after adding an optional f32 bias
+/// `[n]`, or `silu(gate) · up` as `[m, n / 2]` with `swiglu` for operands in the order of
+/// `interleave_swiglu_rows`.
 pub struct Output<'a> {
     pub buffer: &'a mut DeviceBuffer,
     pub f16: bool,
@@ -197,11 +271,12 @@ pub struct Output<'a> {
     pub swiglu: bool,
 }
 
-/// output[m, n] = round(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] · weight_scales[n] + the adapter
-/// + the bias).
+/// output[m, n] = round(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] ·
+/// weight_scales[n] + the adapter + the bias).
 ///
-/// Activations and weights are row-major INT8 with K contiguous, scales are f32. K must be a multiple of 128 and N
-/// a multiple of the config's tile width, 128 for config 0 and 256 for config 1.
+/// Activations and weights are row-major INT8 with K contiguous, scales are f32. K must be a
+/// multiple of 128 and N a multiple of the config's tile width, 128 for config 0 and 256 for
+/// config 1.
 #[allow(clippy::too_many_arguments)]
 pub fn int8(
     config: usize,
@@ -215,17 +290,35 @@ pub fn int8(
     k: usize,
     adapter: Option<&Adapter>,
 ) -> Result<(), CudaError> {
-    assert!(activations.bytes() >= m * k, "activations are smaller than m × k");
+    assert!(
+        activations.bytes() >= m * k,
+        "activations are smaller than m × k"
+    );
     assert!(weights.bytes() >= n * k, "weights are smaller than n × k");
-    assert!(activation_scales.bytes() >= m * 4, "activation scales are smaller than m");
-    assert!(weight_scales.bytes() >= n * 4, "weight scales are smaller than n");
-    assert!(output.buffer.bytes() >= m * n * if output.swiglu { 1 } else { 2 }, "output is smaller than its m rows");
+    assert!(
+        activation_scales.bytes() >= m * 4,
+        "activation scales are smaller than m"
+    );
+    assert!(
+        weight_scales.bytes() >= n * 4,
+        "weight scales are smaller than n"
+    );
+    assert!(
+        output.buffer.bytes() >= m * n * if output.swiglu { 1 } else { 2 },
+        "output is smaller than its m rows"
+    );
     if let Some(bias) = output.bias {
         assert!(bias.bytes() >= n * 4, "bias is smaller than n");
     }
     if let Some(adapter) = adapter {
-        assert!(adapter.down.bytes() >= m * adapter.rank * 2, "adapter down activations are smaller than m × rank");
-        assert!(adapter.up.bytes() >= n * adapter.rank * 2, "adapter up weights are smaller than n × rank");
+        assert!(
+            adapter.down.bytes() >= m * adapter.rank * 2,
+            "adapter down activations are smaller than m × rank"
+        );
+        assert!(
+            adapter.up.bytes() >= n * adapter.rank * 2,
+            "adapter up weights are smaller than n × rank"
+        );
     }
     let adapter = adapter.map(|adapter| AdapterPointers {
         down: adapter.down.pointer(),
@@ -236,11 +329,24 @@ pub fn int8(
     let output = Int8Output {
         pointer: output.buffer.pointer(),
         f16: output.f16,
-        bias: output.bias.map_or(ptr::null(), |bias| bias.pointer().cast_const()),
+        bias: output
+            .bias
+            .map_or(ptr::null(), |bias| bias.pointer().cast_const()),
         swiglu: output.swiglu,
     };
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
     unsafe {
-        int8_config(config, activations.pointer(), weights.pointer(), activation_scales.pointer(), weight_scales.pointer(), output, m, n, k, adapter)
+        int8_config(
+            config,
+            activations.pointer(),
+            weights.pointer(),
+            activation_scales.pointer(),
+            weight_scales.pointer(),
+            output,
+            m,
+            n,
+            k,
+            adapter,
+        )
     }
 }
