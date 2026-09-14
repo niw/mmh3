@@ -34,6 +34,16 @@ unsafe extern "C" {
         adapter_scale: f32,
         stream: *mut c_void,
     ) -> c_int;
+    fn mmh3_merge_low_rank(
+        weights: *mut c_void,
+        scales: *mut c_void,
+        up: *const c_void,
+        down: *mut c_void,
+        n: c_int,
+        k: c_int,
+        rank: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
     fn mmh3_interleave_swiglu_rows(
         source: *const c_void,
         destination: *mut c_void,
@@ -145,6 +155,42 @@ impl Int8Output {
             swiglu: false,
         }
     }
+}
+
+/// Merges a low-rank update into an INT8 ConvRot weight `[outputs, features]` with one scale per
+/// row: every row becomes `weight · scale + up · down` and is quantized again with scale
+/// max |w| / 127, rounding half to even. `up` is `[outputs, rank]` and `down` `[rank, features]`,
+/// both FP32. `down` is in the layer's input space and is rotated in place like the activations.
+pub fn merge_low_rank(
+    weights: &mut DeviceBuffer,
+    scales: &mut DeviceBuffer,
+    up: &DeviceBuffer,
+    down: &mut DeviceBuffer,
+    outputs: usize,
+    features: usize,
+    rank: usize,
+) -> Result<(), CudaError> {
+    assert!(
+        weights.bytes() >= outputs * features && scales.bytes() >= outputs * 4,
+        "the weights are smaller than outputs × features"
+    );
+    assert!(
+        up.bytes() >= outputs * rank * 4 && down.bytes() >= rank * features * 4,
+        "the update is smaller than its rank"
+    );
+    // SAFETY: every buffer covers the extent the kernels touch, checked above.
+    check(unsafe {
+        mmh3_merge_low_rank(
+            weights.pointer(),
+            scales.pointer(),
+            up.pointer(),
+            down.pointer(),
+            outputs as c_int,
+            features as c_int,
+            rank as c_int,
+            ptr::null_mut(),
+        )
+    })
 }
 
 /// Returns the rows of a `[rows, row_bytes]` matrix whose first half are SwiGLU gates and second

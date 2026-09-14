@@ -457,6 +457,119 @@ __global__ void bf16_to_f32_kernel(const __nv_bfloat16 *__restrict__ input,
     }
 }
 
+// One block per row of FP32 values, rotated in place group by group like ConvRot activations.
+__global__ void rotate_rows_kernel(float *__restrict__ rows, int columns) {
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    float *row = rows + static_cast<size_t>(blockIdx.x) * columns;
+    for (int group = warp; group < columns / CONVROT_GROUP; group += blockDim.x / 32) {
+        float *values_pointer = row + group * CONVROT_GROUP + lane * 8;
+        float values[8];
+        #pragma unroll
+        for (int index = 0; index < 8; index++) {
+            values[index] = values_pointer[index];
+        }
+        rotate_group(values, lane);
+        #pragma unroll
+        for (int index = 0; index < 8; index++) {
+            values_pointer[index] = values[index];
+        }
+    }
+}
+
+constexpr int MERGE_ROWS = 8;
+constexpr int MERGE_MAX_RANK = 512;
+
+// Blocks of MERGE_ROWS rows of an INT8 weight [n, k]: each row w · scale + up[row] · down, with
+// down [rank, k] shared by the block's rows, quantized again like rotate_quantize_row. The first
+// pass finds the rows' maxima and the second computes the same values again to quantize them.
+__global__ void __launch_bounds__(ROW_THREADS)
+    merge_low_rank_kernel(int8_t *__restrict__ weights, float *__restrict__ scales,
+                          const float *__restrict__ up, const float *__restrict__ down, int n,
+                          int k, int rank) {
+    __shared__ float up_rows[MERGE_ROWS][MERGE_MAX_RANK];
+    __shared__ float warp_maxima[ROW_THREADS / 32][MERGE_ROWS];
+    __shared__ float new_scales[MERGE_ROWS];
+    const int first_row = blockIdx.x * MERGE_ROWS;
+    const int rows = min(MERGE_ROWS, n - first_row);
+    for (int index = threadIdx.x; index < MERGE_ROWS * rank; index += blockDim.x) {
+        const int row = index / rank;
+        up_rows[row][index % rank] =
+            row < rows ? up[static_cast<size_t>(first_row + row) * rank + index % rank] : 0.0f;
+    }
+    float old_scales[MERGE_ROWS];
+    #pragma unroll
+    for (int row = 0; row < MERGE_ROWS; row++) {
+        old_scales[row] = row < rows ? scales[first_row + row] : 0.0f;
+    }
+    __syncthreads();
+
+    auto merged = [&](int column, float (&values)[MERGE_ROWS]) {
+        #pragma unroll
+        for (int row = 0; row < MERGE_ROWS; row++) {
+            values[row] = row < rows
+                              ? static_cast<float>(
+                                    weights[static_cast<size_t>(first_row + row) * k + column]) *
+                                    old_scales[row]
+                              : 0.0f;
+        }
+        for (int index = 0; index < rank; index++) {
+            const float down_value = down[static_cast<size_t>(index) * k + column];
+            #pragma unroll
+            for (int row = 0; row < MERGE_ROWS; row++) {
+                values[row] = fmaf(up_rows[row][index], down_value, values[row]);
+            }
+        }
+    };
+
+    float maxima[MERGE_ROWS] = {};
+    for (int column = threadIdx.x; column < k; column += blockDim.x) {
+        float values[MERGE_ROWS];
+        merged(column, values);
+        #pragma unroll
+        for (int row = 0; row < MERGE_ROWS; row++) {
+            maxima[row] = fmaxf(maxima[row], fabsf(values[row]));
+        }
+    }
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    #pragma unroll
+    for (int row = 0; row < MERGE_ROWS; row++) {
+        for (int offset = 16; offset > 0; offset /= 2) {
+            maxima[row] = fmaxf(maxima[row], __shfl_xor_sync(0xffffffff, maxima[row], offset));
+        }
+        if (lane == 0) {
+            warp_maxima[warp][row] = maxima[row];
+        }
+    }
+    __syncthreads();
+    if (threadIdx.x < MERGE_ROWS) {
+        float maximum = 0.0f;
+        for (int index = 0; index < static_cast<int>(blockDim.x / 32); index++) {
+            maximum = fmaxf(maximum, warp_maxima[index][threadIdx.x]);
+        }
+        new_scales[threadIdx.x] = fmaxf(maximum / 127.0f, 1e-30f);
+    }
+    __syncthreads();
+
+    // NOTE: Each thread rewrites only the weights it read itself, so the second pass sees the old
+    // values in its own columns.
+    for (int column = threadIdx.x; column < k; column += blockDim.x) {
+        float values[MERGE_ROWS];
+        merged(column, values);
+        #pragma unroll
+        for (int row = 0; row < MERGE_ROWS; row++) {
+            if (row < rows) {
+                weights[static_cast<size_t>(first_row + row) * k + column] = static_cast<int8_t>(
+                    fminf(fmaxf(rintf(values[row] / new_scales[row]), -128.0f), 127.0f));
+            }
+        }
+    }
+    if (threadIdx.x < rows) {
+        scales[first_row + threadIdx.x] = new_scales[threadIdx.x];
+    }
+}
+
 unsigned grid_for(size_t count) {
     size_t blocks = (count + ROW_THREADS - 1) / ROW_THREADS;
     return static_cast<unsigned>(blocks < 8192 ? blocks : 8192);
@@ -584,6 +697,20 @@ extern "C" int mmh3_rotate_quantize(const void *input, int input_is_f16, int8_t 
     }
     return launch_rotate_quantize(static_cast<const __nv_bfloat162 *>(input), output, scales,
                                   tokens, columns, stream);
+}
+
+// Adds up · down to an INT8 ConvRot weight [n, k] with per-row scales and quantizes its rows again,
+// which merges a LoRA into the layer. down [rank, k] is rotated in place like the activations
+// first, and up is [n, rank], both FP32.
+extern "C" int mmh3_merge_low_rank(int8_t *weights, float *scales, const float *up, float *down,
+                                   int n, int k, int rank, cudaStream_t stream) {
+    if (k % CONVROT_GROUP != 0 || rank <= 0 || rank > MERGE_MAX_RANK || n <= 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    rotate_rows_kernel<<<rank, ROW_THREADS, 0, stream>>>(down, k);
+    merge_low_rank_kernel<<<(n + MERGE_ROWS - 1) / MERGE_ROWS, ROW_THREADS, 0, stream>>>(
+        weights, scales, up, down, n, k, rank);
+    return static_cast<int>(cudaGetLastError());
 }
 
 extern "C" int mmh3_modulation(const float *time_embedding, const __half *weight,

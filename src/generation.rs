@@ -30,6 +30,7 @@ pub const OPTIONS: &[&str] = &[
     "patch",
     "lora",
     "lora-strength",
+    "lora-mode",
     "attention",
     "attention-precision",
     "sparse-tau",

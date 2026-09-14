@@ -44,15 +44,30 @@ pub fn load_dit(
     dit.set_attention_precision(precision);
     println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
     // NOTE: a patch is a LoRA file whose other tensors replace or add checkpoint tensors, and it
-    // applies at full strength.
+    // applies as adapters at full strength.
     if let Some(patch) = model_file(options, "patch", &["patches", "loras"])? {
-        let layers = dit.add_lora(&SafeTensors::open(Path::new(&patch))?, 1.0)?;
+        let layers = dit.add_lora(
+            &SafeTensors::open(Path::new(&patch))?,
+            1.0,
+            mmh3_cuda::dit::LoraMode::Adapter,
+        )?;
         println!("applied {patch} to {layers} layers and tensors");
     }
     if let Some(lora) = model_file(options, "lora", &["loras"])? {
+        let started = Instant::now();
         let strength = option_float(options, "lora-strength", 1.0)?;
-        let layers = dit.add_lora(&SafeTensors::open(Path::new(&lora))?, strength)?;
-        println!("added {lora} to {layers} layers at strength {strength}");
+        let mode = match options.get("lora-mode").copied().unwrap_or("adapter") {
+            "adapter" => mmh3_cuda::dit::LoraMode::Adapter,
+            "merge" => mmh3_cuda::dit::LoraMode::Merge,
+            other => {
+                return Err(format!("--lora-mode must be adapter or merge, not {other}").into());
+            }
+        };
+        let layers = dit.add_lora(&SafeTensors::open(Path::new(&lora))?, strength, mode)?;
+        println!(
+            "added {lora} to {layers} layers at strength {strength} in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
     }
     Ok(dit)
 }

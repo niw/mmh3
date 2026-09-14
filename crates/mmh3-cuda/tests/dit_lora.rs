@@ -6,7 +6,7 @@ use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
-use mmh3_cuda::dit::CudaDit;
+use mmh3_cuda::dit::{CudaDit, LoraMode};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -194,8 +194,12 @@ fn applies_a_lora_like_merged_weights() {
     write_safetensors(&path, &lora);
     let mut dit = CudaDit::load(&file, "weight.").unwrap();
     assert_eq!(
-        dit.add_lora(&SafeTensors::open(&path).unwrap(), STRENGTH)
-            .unwrap(),
+        dit.add_lora(
+            &SafeTensors::open(&path).unwrap(),
+            STRENGTH,
+            LoraMode::Adapter
+        )
+        .unwrap(),
         layers.len() + 2
     );
     std::fs::remove_file(&path).unwrap();

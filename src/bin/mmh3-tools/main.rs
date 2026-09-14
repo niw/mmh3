@@ -22,9 +22,9 @@ const USAGE: &str = "usage:
   mmh3-tools bench attention [--tokens N] [--heads N] [--iterations N]
   mmh3-tools bench vsa [--width N] [--height N] [--frames N] [--heads N] [--iterations N]
                    [--attention-precision bf16|int8-fp8]
-  mmh3-tools check dit --golden <directory> [--models DIR] [--weights FILE] [--patch FILE] [--lora FILE] [--lora-strength X]
+  mmh3-tools check dit --golden <directory> [--models DIR] [--weights FILE] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
                  [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--vsa-sparsity X]
-  mmh3-tools check sample --golden <directory> [--models DIR] [--weights FILE] [--patch FILE] [--lora FILE] [--lora-strength X]
+  mmh3-tools check sample --golden <directory> [--models DIR] [--weights FILE] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
                     [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
   mmh3-tools check video-vae --golden <directory> [--models DIR] [--weights FILE] [--reference FILE]
   mmh3-tools check audio-vae --golden <directory> [--models DIR] [--weights FILE]
@@ -32,8 +32,8 @@ const USAGE: &str = "usage:
   mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
                     [--models DIR] [--width N] [--height N] [--frames N] [--steps N | --schedule taomate] [--seed N]
                     [--shift-video X] [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--patch FILE] [--lora FILE]
-                    [--lora-strength X] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X]
-                    [--sparse-start X] [--vsa-sparsity X]
+                    [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
+                    [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
 
 Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.
 latent samples like the generate command of mmh3, with the same defaults, and writes the final video and audio

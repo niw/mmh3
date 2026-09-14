@@ -2,7 +2,8 @@
 //! layers.
 
 use crate::gemm::{
-    AdapterPointers, Int8Output, int8_pointers, interleave_swiglu_rows, rotate_quantize_pointers,
+    AdapterPointers, Int8Output, int8_pointers, interleave_swiglu_rows, merge_low_rank,
+    rotate_quantize_pointers,
 };
 use crate::loader::{LoadError, Uploader};
 use crate::{CudaError, DeviceBuffer, check};
@@ -151,6 +152,36 @@ impl DeviceTensors {
         let rows = tensor.shape[0];
         tensor.buffer = interleave_swiglu_rows(&tensor.buffer, rows, tensor.buffer.bytes() / rows)?;
         Ok(())
+    }
+
+    /// Merges `up · down` into the INT8 ConvRot layer `name`, see `gemm::merge_low_rank`.
+    pub(crate) fn merge_low_rank(
+        &mut self,
+        name: &str,
+        up: &DeviceBuffer,
+        down: &mut DeviceBuffer,
+        rank: usize,
+    ) -> Result<(), Error> {
+        let weight_name = format!("{name}.weight");
+        let scale_name = format!("{name}.weight_scale");
+        let (Some(mut weight), Some(mut scales)) =
+            (self.0.remove(&weight_name), self.0.remove(&scale_name))
+        else {
+            return Err(Error::Model(format!("{name} is not an INT8 ConvRot layer")));
+        };
+        let (outputs, features) = (weight.shape[0], weight.shape[1]);
+        let result = merge_low_rank(
+            &mut weight.buffer,
+            &mut scales.buffer,
+            up,
+            down,
+            outputs,
+            features,
+            rank,
+        );
+        self.0.insert(weight_name, weight);
+        self.0.insert(scale_name, scales);
+        Ok(result?)
     }
 
     /// Whether `{name}.weight` is INT8, so that `linear_swiglu` applies once its rows are

@@ -202,6 +202,17 @@ struct TextStates {
     states: DeviceBuffer,
 }
 
+/// How a LoRA reaches the INT8 ConvRot layers.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LoraMode {
+    /// A BF16 adapter next to the INT8 weights, exact but with its own work in every call.
+    #[default]
+    Adapter,
+    /// Added into the weights, which are quantized again. No work per call, one more rounding of
+    /// the weights, like ComfyUI's merge into INT8 checkpoints.
+    Merge,
+}
+
 /// Outputs of one call and the states captured along the way.
 pub struct DitOutputs {
     /// Residual stream `[tokens, hidden]` after each requested block.
@@ -321,15 +332,22 @@ impl CudaDit {
 
     /// Adds the LoRA of a ComfyUI LoRA file at `strength`: every layer `{name}` with
     /// `{name}.lora_A.weight`, `{name}.lora_B.weight` and `{name}.alpha` gains
-    /// `strength · alpha / rank · B · A` on top of its weight. Ranks that are not a multiple of 64,
-    /// as in LoRAs resized to a different rank per layer, are padded with zeros so that every
-    /// adapter runs inside the INT8 GEMM. Other tensors of the file replace the checkpoint's
-    /// tensors of the same name, or add new ones, as they are, whatever the strength. Returns the
-    /// number of layers with an adapter and of tensors replaced or added.
-    pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize, Error> {
+    /// `strength · alpha / rank · B · A` on top of its weight, in the way `mode` says for INT8
+    /// ConvRot layers. Other layers get an adapter. Adapter ranks that are not a multiple of 64, as
+    /// in LoRAs resized to a different rank per layer, are padded with zeros so that every adapter
+    /// runs inside the INT8 GEMM. Other tensors of the file replace the checkpoint's tensors of the
+    /// same name, or add new ones, as they are, whatever the strength. Returns the number of layers
+    /// merged or with an adapter and of tensors replaced or added.
+    pub fn add_lora(
+        &mut self,
+        file: &SafeTensors,
+        strength: f32,
+        mode: LoraMode,
+    ) -> Result<usize, Error> {
         const PREFIX: &str = "diffusion_model.";
         let mut uploader = Uploader::new(file);
         let mut adapters = Vec::new();
+        let mut merged = 0;
         for info in file.tensors() {
             let Some(layer) = info
                 .name
@@ -339,6 +357,7 @@ impl CudaDit {
                 continue;
             };
             let weight = self.tensors.get(&format!("{layer}.weight"))?;
+            let (weight_dtype, weight_shape) = (weight.dtype, weight.shape.clone());
             let up = file
                 .get(&format!("{PREFIX}{layer}.lora_B.weight"))
                 .ok_or_else(|| Error::Model(format!("{layer} has no lora_B")))?;
@@ -347,17 +366,30 @@ impl CudaDit {
             if info.dtype != DType::BF16
                 || up.dtype != DType::BF16
                 || up.shape[1] != rank
-                || inputs != weight.shape[1]
-                || outputs != weight.shape[0]
+                || inputs != weight_shape[1]
+                || outputs != weight_shape[0]
             {
                 return Err(Error::Model(format!(
                     "the LoRA of {layer} does not fit the layer"
                 )));
             }
-            if weight.dtype != DType::I8 && weight.dtype != DType::BF16 {
+            if weight_dtype != DType::I8 && weight_dtype != DType::BF16 {
                 return Err(Error::Model(format!(
                     "LoRA on {layer} needs BF16 activations"
                 )));
+            }
+            let scale = strength * alpha / rank as f32;
+            if mode == LoraMode::Merge && weight_dtype == DType::I8 {
+                let mut down: Vec<f32> = host_tensor(file, &info.name)?.data;
+                down.iter_mut().for_each(|value| *value *= scale);
+                let mut down = DeviceBuffer::from_f32(&down)?;
+                let mut up = DeviceBuffer::from_f32(&host_tensor(file, &up.name)?.data)?;
+                if layer.ends_with(".mlp.fc1") {
+                    up = interleave_swiglu_rows(&up, outputs, rank * 4)?;
+                }
+                self.tensors.merge_low_rank(layer, &up, &mut down, rank)?;
+                merged += 1;
+                continue;
             }
             if self.adapters.contains_key(layer) {
                 return Err(Error::Model(format!("{layer} already has a LoRA")));
@@ -387,7 +419,7 @@ impl CudaDit {
                 rank: padded_rank,
                 inputs,
                 outputs,
-                scale: strength * alpha / rank as f32,
+                scale,
             };
             adapters.push((layer.to_owned(), adapter));
         }
@@ -434,7 +466,7 @@ impl CudaDit {
                     interleave_swiglu_rows(&adapter.up, adapter.outputs, adapter.rank * 2)?;
             }
         }
-        let added = adapters.len() + replaced.len();
+        let added = merged + adapters.len() + replaced.len();
         self.adapters.extend(adapters);
         // The adapters may change the refiner.
         self.buffers.get_mut().text = None;
