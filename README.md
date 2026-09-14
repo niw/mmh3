@@ -95,6 +95,9 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - INT8 ConvRot linear layers (activations rotated by a Hadamard transform and quantized per row) on
   a dedicated INT8 GEMM, FlashAttention-2 style attention, and an FP32 residual stream.
 - Sol-Attn, a training-free block-sparse attention (arXiv:2607.24027), for the long video sequences.
+- FastVideo's
+  [FastH3](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree) 4-step
+  model with its video sparse attention (VSA), as a patch on the base DiT.
 - Optional INT8/FP8 attention in the DiT, with FP32 softmax and accumulation.
 - Kernels fused for H3's shapes, such as the normalization and quantization of each layer input in
   one pass, and SwiGLU and LoRA inside the INT8 GEMM.
@@ -176,6 +179,10 @@ directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `
 With `--precision fp16`, the script downloads the FP16 video VAE,
 `vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
 `--no-lora` skips the LoRA, and `--models DIR` downloads into another directory.
+
+Patches, such as the FastH3 patch below, go into `patches` of the models directory. `--patch` and
+`--lora` take a path, or a file name that mmh3 looks up in `patches` and then `loras` of the models
+directory for `--patch`, and in `loras` for `--lora`, so patches kept with ComfyUI's LoRAs work too.
 
 `generate` decodes with the INT8 video VAE when the models directory has it, and with the FP16 one
 otherwise. The INT8 one is faster, and its output is about 51 dB PSNR from the FP16 decode, as close
@@ -315,6 +322,20 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
   --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
 ```
 
+### FastH3
+
+FastVideo's FastH3 VSA-DataFree generates in four steps with the base schedule and video sparse
+attention (VSA), which mmh3 selects for DiTs with VSA gates. It runs as a patch on the base DiT
+with `--patch`:
+
+```sh
+target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
+  --steps 4 --attention-precision int8-fp8 \
+  --patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
+```
+
+[tools/models](tools/models/README.md) describes the patch and how to build it.
+
 INT8/FP8 attention changes image details and needs about 0.76 GiB more memory. `--sparse-start 0`
 can also change the composition. `--sparse-start 0.2` keeps the first step dense and took 98.98 s.
 So far these settings have been compared visually on one prompt and seed only.
@@ -329,10 +350,12 @@ So far these settings have been compared visually on one prompt and seed only.
 | `--steps N` | 20 | Model evaluations. The released checkpoint is guidance-distilled, so there is no CFG. |
 | `--seed N` | 0 | Seed of the initial noise. |
 | `--shift-video X`, `--shift-audio X` | 12, 3 | Sigma shifts of the two schedules. The 768p Turbo LoRA wants 6 and 3. |
-| `--attention dense\|sol` | `dense` | Sol-Attn switches to block-sparse attention. |
+| `--attention dense\|sol\|vsa` | `vsa` with VSA gates, `dense` otherwise | Sol-Attn switches to block-sparse attention. VSA is the sparse attention FastH3 was trained with. |
 | `--attention-precision bf16\|int8-fp8` | `bf16` | INT8 QK / FP8 PV in the DiT, with FP32 softmax and accumulation. Changes generated details. |
 | `--sparse-tau X` | 1.3 | Sol-Attn's routing threshold. Higher is sparser. |
-| `--sparse-start X` | 0.2 | Fraction of the steps that stay dense before Sol-Attn starts. |
+| `--sparse-start X` | 0.2 for Sol-Attn, 0 for VSA | Fraction of the steps that stay dense before the sparse attention starts. |
+| `--vsa-sparsity X` | 0.9 | Fraction of the video tiles VSA leaves out for each query tile. |
+| `--patch FILE` | none | A patch for the DiT, such as the FastH3 patch, applied before a LoRA. |
 | `--lora FILE`, `--lora-strength X` | none, 1.0 | A ComfyUI LoRA for the DiT. |
 
 H3 follows long, structured prompts well, with the picture, the sound and the music described
@@ -369,6 +392,7 @@ Inspection and development commands are available in `mmh3-tools`:
 - `tests/fixtures`: small random models with outputs computed by ComfyUI's implementation.
 - `tools/download-models.sh`: the model downloader that `make download-models` runs.
 - `tools/golden`: development tools that write golden data with a ComfyUI checkout.
+- `tools/models`: development tools that build model files, such as the FastH3 patch.
 - `tools/unicode`: the generator of the tokenizer's Unicode tables.
 
 ## Tests
