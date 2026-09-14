@@ -10,6 +10,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("memory") => bench_memory(&arguments[1..]),
         Some("mma") => bench_mma(&arguments[1..]),
         Some("attention") => bench_attention(&arguments[1..]),
+        Some("vsa") => bench_vsa(&arguments[1..]),
         _ => Err(USAGE.into()),
     }
 }
@@ -131,6 +132,160 @@ fn bench_attention(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!(
         "  {:.2} s per DiT forward ({DIT_BLOCK_COUNT} blocks)",
         milliseconds as f64 * DIT_BLOCK_COUNT as f64 / 1e3
+    );
+    Ok(())
+}
+
+/// VSA over the packed sequence of a generation shape, with random BF16 inputs and gates: the pass
+/// that normalizes q and k and prepares the tiles, then the attention.
+fn bench_vsa(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_core::dit::vsa::{FASTH3_SPARSITY, VsaPlan};
+    use mmh3_core::generation::GenerationShape;
+    use mmh3_core::numeric::f32_to_bf16;
+    use mmh3_cuda::DeviceBuffer;
+    use mmh3_cuda::attention::{
+        self, AttentionInputs, AttentionLayout, AttentionOffsets, AttentionPrecision, HEAD_DIM,
+        HeadNorm, PreparedAttention, VsaWorkspace,
+    };
+    use std::time::Instant;
+
+    let options = parse_options(
+        arguments,
+        &[
+            "width",
+            "height",
+            "frames",
+            "heads",
+            "iterations",
+            "attention-precision",
+        ],
+        USAGE,
+    )?;
+    let shape = GenerationShape::new(
+        option_number(&options, "width", 1344)?,
+        option_number(&options, "height", 768)?,
+        option_number(&options, "frames", 124)?,
+    )?;
+    let heads = option_number(&options, "heads", 56)?;
+    let iterations = option_number(&options, "iterations", 10)?;
+    let precision = match options
+        .get("attention-precision")
+        .copied()
+        .unwrap_or("bf16")
+    {
+        "bf16" => AttentionPrecision::Bf16,
+        "int8-fp8" => AttentionPrecision::Int8Fp8,
+        other => {
+            return Err(
+                format!("--attention-precision must be bf16 or int8-fp8, not {other}").into(),
+            );
+        }
+    };
+    let video = shape.video_latent_shape();
+    let layout = PackedLayout::text_to_video(
+        36,
+        video[1],
+        video[2],
+        video[3],
+        shape.audio_latent_shape()[2],
+    );
+    let plan = VsaPlan::for_layout(&layout);
+    let tokens = layout.len();
+    let inner = heads * HEAD_DIM;
+    let kept = plan.kept_video_tiles(FASTH3_SPARSITY);
+    let pairs = 48;
+
+    let mut state = 1u64;
+    let mut random = |count: usize| -> Vec<f32> {
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (state >> 40) as f32 / (1u64 << 23) as f32 - 1.0
+            })
+            .collect()
+    };
+    let bf16 = |values: &[f32]| -> Result<DeviceBuffer, Box<dyn Error>> {
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|&value| f32_to_bf16(value).to_le_bytes())
+            .collect();
+        Ok(DeviceBuffer::from_bytes(&bytes)?)
+    };
+    let mut input = bf16(&random(tokens * 3 * inner))?;
+    let gate = bf16(&random(tokens * inner))?;
+    let ones = bf16(&[1.0; HEAD_DIM])?;
+    let angles = DeviceBuffer::from_f32(&random(tokens * pairs))?;
+    let norm = HeadNorm {
+        query_weight: &ones,
+        key_weight: &ones,
+        angles: Some(&angles),
+        pairs,
+        epsilon: 1e-6,
+    };
+    let mut output = DeviceBuffer::new(tokens * inner * 2)?;
+    let layout = AttentionLayout {
+        token_stride: [
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            (3 * inner) as i64,
+            inner as i64,
+        ],
+        head_stride: [HEAD_DIM as i64; 4],
+        ..AttentionLayout::default()
+    };
+    let offsets = AttentionOffsets {
+        query: 0,
+        key: inner,
+        value: 2 * inner,
+        output: 0,
+    };
+    let workspace = VsaWorkspace::with_precision(&plan, tokens, heads, precision)?;
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let mut run = || -> Result<(), Box<dyn Error>> {
+        attention::prepare_inputs(
+            &mut input,
+            &norm,
+            tokens,
+            heads,
+            PreparedAttention::Vsa(&workspace),
+        )?;
+        attention::vsa(
+            &input,
+            Some(&gate),
+            &mut output,
+            offsets,
+            &layout,
+            scale,
+            kept,
+            &workspace,
+            AttentionInputs::Prepared,
+        )?;
+        Ok(())
+    };
+    run()?;
+    mmh3_cuda::synchronize()?;
+    let started = Instant::now();
+    for _ in 0..iterations {
+        run()?;
+    }
+    mmh3_cuda::synchronize()?;
+    let milliseconds = started.elapsed().as_secs_f64() * 1e3 / iterations as f64;
+    let fraction = workspace.selected_fraction()?;
+    println!(
+        "VSA ({precision:?}), {tokens} tokens in {} tiles, {kept} of {} video tiles kept, {heads} heads of 128, {iterations} runs",
+        plan.tiles(),
+        plan.video_tiles()
+    );
+    println!(
+        "  {milliseconds:.3} ms per call with the input pass, {:.1}% of the tile pairs selected",
+        100.0 * fraction
+    );
+    println!(
+        "  {:.2} s per DiT forward ({DIT_BLOCK_COUNT} blocks)",
+        milliseconds * DIT_BLOCK_COUNT as f64 / 1e3
     );
     Ok(())
 }

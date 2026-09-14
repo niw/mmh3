@@ -18,6 +18,8 @@ const USAGE: &str = "usage:
   mmh3-tools bench memory [--megabytes N] [--iterations N]
   mmh3-tools bench mma [--iterations N]
   mmh3-tools bench attention [--tokens N] [--heads N] [--iterations N]
+  mmh3-tools bench vsa [--width N] [--height N] [--frames N] [--heads N] [--iterations N]
+                   [--attention-precision bf16|int8-fp8]
   mmh3-tools check dit --golden <directory> [--models DIR] [--weights FILE] [--lora FILE] [--lora-strength X]
                  [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--vsa-sparsity X]
   mmh3-tools check sample --golden <directory> [--models DIR] [--weights FILE] [--lora FILE] [--lora-strength X]
