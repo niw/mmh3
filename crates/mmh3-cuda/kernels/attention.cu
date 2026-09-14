@@ -219,14 +219,10 @@ int launch(const void *query, const void *key, const void *value, void *output, 
            int heads, int batch, const Mmh3AttentionLayout &layout, float scale,
            cudaStream_t stream) {
     auto kernel = attention_kernel<Element, HEAD_DIM>;
-    static bool configured = false;
-    if (!configured) {
-        cudaError_t status = cudaFuncSetAttribute(
-            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Tiles<HEAD_DIM>::shared_bytes);
-        if (status != cudaSuccess) {
-            return static_cast<int>(status);
-        }
-        configured = true;
+    static const cudaError_t configured = cudaFuncSetAttribute(
+        kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, Tiles<HEAD_DIM>::shared_bytes);
+    if (configured != cudaSuccess) {
+        return static_cast<int>(configured);
     }
     Mmh3AttentionLayout normalized = layout;
     normalized.heads_per_key_value =

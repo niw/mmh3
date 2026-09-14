@@ -485,14 +485,10 @@ template <bool SPARSE>
 int launch_attention(const Mmh3QuantizedWorkspace &workspace, __nv_bfloat16 *output, int tokens,
                      int heads, Mmh3AttentionLayout layout, float scale, Mmh3SparseWorkspace sparse,
                      cudaStream_t stream) {
-    static bool configured = false;
-    if (!configured) {
-        cudaError_t status = cudaFuncSetAttribute(
-            attention_kernel<SPARSE>, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES);
-        if (status != cudaSuccess) {
-            return static_cast<int>(status);
-        }
-        configured = true;
+    static const cudaError_t configured = cudaFuncSetAttribute(
+        attention_kernel<SPARSE>, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES);
+    if (configured != cudaSuccess) {
+        return static_cast<int>(configured);
     }
     layout.token_stride[0] = layout.token_stride[1] = static_cast<int64_t>(heads) * HEAD_DIM;
     layout.head_stride[0] = layout.head_stride[1] = HEAD_DIM;

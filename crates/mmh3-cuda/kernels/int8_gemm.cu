@@ -480,16 +480,16 @@ using TallTile = Int8GemmConfig<256, 128, 4>;
 using WideTile = Int8GemmConfig<128, 256, 4>;
 
 PFN_cuTensorMapEncodeTiled_v12000 tensor_map_encoder() {
-    static PFN_cuTensorMapEncodeTiled_v12000 encoder = nullptr;
-    if (encoder == nullptr) {
+    static const PFN_cuTensorMapEncodeTiled_v12000 encoder = [] {
         void *function = nullptr;
         cudaDriverEntryPointQueryResult result;
         if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function, 12000,
-                                             cudaEnableDefault, &result) == cudaSuccess &&
-            result == cudaDriverEntryPointSuccess) {
-            encoder = reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(function);
+                                             cudaEnableDefault, &result) != cudaSuccess ||
+            result != cudaDriverEntryPointSuccess) {
+            return static_cast<PFN_cuTensorMapEncodeTiled_v12000>(nullptr);
         }
-    }
+        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(function);
+    }();
     return encoder;
 }
 
@@ -514,14 +514,16 @@ bool encode_tensor_map(CUtensorMap *map, const void *base, CUtensorMapDataType t
 }
 
 int multiprocessor_count() {
-    static int count = 0;
-    if (count == 0) {
+    static const int count = [] {
         int device = 0;
+        int processors = 0;
         if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess) {
-            count = 0;
+            cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device) !=
+                cudaSuccess) {
+            return 0;
         }
-    }
+        return processors;
+    }();
     return count;
 }
 
@@ -562,15 +564,11 @@ int launch(const int8_t *activations, const int8_t *weights, const float *activa
         maps.adapter_down = maps.activations;
         maps.adapter_up = maps.weights;
     }
-    static bool configured = false;
-    if (!configured) {
-        cudaError_t status =
-            cudaFuncSetAttribute(int8_gemm_kernel<Config, Output, SWIGLU>,
-                                 cudaFuncAttributeMaxDynamicSharedMemorySize, Config::shared_bytes);
-        if (status != cudaSuccess) {
-            return static_cast<int>(status);
-        }
-        configured = true;
+    static const cudaError_t configured =
+        cudaFuncSetAttribute(int8_gemm_kernel<Config, Output, SWIGLU>,
+                             cudaFuncAttributeMaxDynamicSharedMemorySize, Config::shared_bytes);
+    if (configured != cudaSuccess) {
+        return static_cast<int>(configured);
     }
     const int tiles = (m + Config::block_m - 1) / Config::block_m * (n / Config::block_n);
     const int processors = multiprocessor_count();

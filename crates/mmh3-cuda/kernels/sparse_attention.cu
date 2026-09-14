@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <mutex>
 
 #include "attention_workspace.cuh"
 #include "tensor_core.cuh"
@@ -300,15 +301,20 @@ int launch_route(const Mmh3SparseWorkspace &workspace, int tokens, int blocks, i
                                              sink_query_end, stream);
         }
     }
+    // The limit only grows, so a launch never meets a smaller limit that another thread set.
+    static std::mutex mutex;
     static size_t configured_shared = 0;
-    if (shared > 48 * 1024 && shared > configured_shared) {
-        cudaError_t status =
-            cudaFuncSetAttribute(route_kernel<QUERIES>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                 static_cast<int>(shared));
-        if (status != cudaSuccess) {
-            return static_cast<int>(status);
+    if (shared > 48 * 1024) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (shared > configured_shared) {
+            cudaError_t status = cudaFuncSetAttribute(route_kernel<QUERIES>,
+                                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                      static_cast<int>(shared));
+            if (status != cudaSuccess) {
+                return static_cast<int>(status);
+            }
+            configured_shared = shared;
         }
-        configured_shared = shared;
     }
     route_kernel<QUERIES>
         <<<dim3((blocks + QUERIES - 1) / QUERIES, heads), THREADS, shared, stream>>>(
