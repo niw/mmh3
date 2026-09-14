@@ -50,6 +50,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "attention-precision",
             "sparse-tau",
             "sparse-start",
+            "vsa-sparsity",
         ],
         USAGE,
     )?;
@@ -134,7 +135,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     {
         let dit = load_dit(&options, "dit")?;
-        let sparse = sparse_attention(&options)?;
+        let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
         let schedule = Schedule::uniform(steps, shift_video, shift_audio);
         for step in 0..steps {
             let started = Instant::now();

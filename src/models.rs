@@ -51,24 +51,46 @@ pub fn load_dit(
     Ok(dit)
 }
 
-/// Sol-Attn settings from `--attention sol`, `--sparse-tau` and `--sparse-start`, or None for dense
-/// attention.
+/// Block-sparse attention settings from `--attention sol|vsa`, `--sparse-tau`, `--sparse-start`
+/// and `--vsa-sparsity`, or None for dense attention. Without `--attention`, DiTs with VSA gates
+/// (`vsa_gates`) use VSA and others dense attention.
 pub fn sparse_attention(
     options: &HashMap<&str, &str>,
+    vsa_gates: bool,
 ) -> Result<Option<mmh3_core::dit::sparse::SparseAttention>, Box<dyn Error>> {
-    use mmh3_core::dit::sparse::SparseAttention;
+    use mmh3_core::dit::sparse::{SparseAttention, SparseMethod};
+    use mmh3_core::dit::vsa::FASTH3_SPARSITY;
 
-    match options.get("attention").copied().unwrap_or("dense") {
+    let default = if vsa_gates { "vsa" } else { "dense" };
+    match options.get("attention").copied().unwrap_or(default) {
         "dense" => Ok(None),
         "sol" => {
             let defaults = SparseAttention::default();
             Ok(Some(SparseAttention {
-                tau: option_float(options, "sparse-tau", defaults.tau)?,
+                method: SparseMethod::Sol {
+                    tau: option_float(options, "sparse-tau", 1.3)?,
+                },
                 start_fraction: option_float(options, "sparse-start", defaults.start_fraction)?,
                 ..defaults
             }))
         }
-        other => Err(format!("--attention must be dense or sol, not {other}").into()),
+        "vsa" => {
+            // NOTE: parsed as f64, so that the kept tile count rounds like FastVideo's.
+            let sparsity = match options.get("vsa-sparsity") {
+                Some(value) => value
+                    .parse::<f64>()
+                    .map_err(|_| "--vsa-sparsity must be a number")?,
+                None => FASTH3_SPARSITY,
+            };
+            if !(0.0..1.0).contains(&sparsity) {
+                return Err("--vsa-sparsity must be at least 0 and below 1".into());
+            }
+            Ok(Some(SparseAttention {
+                start_fraction: option_float(options, "sparse-start", 0.0)?,
+                ..SparseAttention::vsa(sparsity)
+            }))
+        }
+        other => Err(format!("--attention must be dense, sol or vsa, not {other}").into()),
     }
 }
 

@@ -12,12 +12,21 @@ use crate::dit::layout::{PackedLayout, SegmentKind};
 
 pub const SPARSE_BLOCK: usize = 64;
 
-/// When and how sparsely the DiT uses Sol-Attn. The defaults follow ComfyUI's Model Sparse
-/// Attention node.
+/// The block-sparse attention of the DiT.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum SparseMethod {
+    /// Sol-Attn with its routing threshold in standard deviations of the pooled scores. Higher is
+    /// sparser.
+    Sol { tau: f32 },
+    /// VSA (see `dit::vsa`), dropping this fraction of the video tiles.
+    Vsa { sparsity: f64 },
+}
+
+/// When and how sparsely the DiT uses block-sparse attention. The Sol-Attn defaults follow
+/// ComfyUI's Model Sparse Attention node.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SparseAttention {
-    /// Routing threshold in standard deviations of the pooled scores. Higher is sparser.
-    pub tau: f32,
+    pub method: SparseMethod,
     /// Fraction of the sampling steps that run dense before sparse attention starts.
     pub start_fraction: f32,
     /// Sequences shorter than this stay dense.
@@ -27,7 +36,7 @@ pub struct SparseAttention {
 impl Default for SparseAttention {
     fn default() -> Self {
         SparseAttention {
-            tau: 1.3,
+            method: SparseMethod::Sol { tau: 1.3 },
             start_fraction: 0.2,
             min_tokens: 12_288,
         }
@@ -35,6 +44,15 @@ impl Default for SparseAttention {
 }
 
 impl SparseAttention {
+    /// VSA on every step and sequence length, as FastH3 was trained.
+    pub fn vsa(sparsity: f64) -> Self {
+        SparseAttention {
+            method: SparseMethod::Vsa { sparsity },
+            start_fraction: 0.0,
+            min_tokens: 0,
+        }
+    }
+
     /// Whether step `step` of `steps` runs sparse.
     pub fn applies_to_step(&self, step: usize, steps: usize) -> bool {
         step as f32 >= self.start_fraction * steps as f32

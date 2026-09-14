@@ -2,6 +2,7 @@
 
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::dit::sparse::{SPARSE_BLOCK, SparseSinks};
+use mmh3_core::dit::vsa::{VSA_TILE, VsaPlan};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
@@ -188,6 +189,23 @@ unsafe extern "C" {
         workspace: *const RawSparseWorkspace,
         quantized: *const RawQuantizedWorkspace,
         inputs_ready: c_int,
+        stream: *mut c_void,
+    ) -> c_int;
+    #[allow(clippy::too_many_arguments)]
+    fn mmh3_vsa_attention(
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        gate: *const c_void,
+        gate_stride: i64,
+        output: *mut c_void,
+        heads: c_int,
+        layout: *const AttentionLayout,
+        scale: f32,
+        tiles: c_int,
+        prefix_tiles: c_int,
+        kept: c_int,
+        workspace: *const RawVsaWorkspace,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_attention(
@@ -747,6 +765,208 @@ pub(crate) unsafe fn sparse_pointers(
             ptr::null_mut(),
         )
     })
+}
+
+/// Device pointers of the VSA scratch buffers, see kernels/vsa_attention.cu.
+#[repr(C)]
+struct RawVsaWorkspace {
+    tile_starts: *const c_void,
+    tile_lengths: *const c_void,
+    pooled_query: *mut c_void,
+    pooled_key: *mut c_void,
+    pooled_value: *mut c_void,
+    routes: *mut c_void,
+    route_counts: *mut c_void,
+    coarse: *mut c_void,
+}
+
+/// The tiles of one VSA plan and scratch buffers for its sequence and head count.
+pub struct VsaWorkspace {
+    tokens: usize,
+    heads: usize,
+    tiles: usize,
+    prefix_tiles: usize,
+    tile_starts: DeviceBuffer,
+    tile_lengths: DeviceBuffer,
+    pooled_query: DeviceBuffer,
+    pooled_key: DeviceBuffer,
+    pooled_value: DeviceBuffer,
+    routes: DeviceBuffer,
+    route_counts: DeviceBuffer,
+    coarse: DeviceBuffer,
+}
+
+impl VsaWorkspace {
+    pub fn new(plan: &VsaPlan, tokens: usize, heads: usize) -> Result<Self, CudaError> {
+        let tiles = plan.tiles();
+        assert!(
+            tiles > 0 && tiles <= u16::MAX as usize + 1,
+            "invalid tile count {tiles}"
+        );
+        assert!(
+            plan.tile_lengths
+                .iter()
+                .all(|&length| (1..=VSA_TILE).contains(&length))
+                && plan
+                    .tile_starts
+                    .iter()
+                    .zip(&plan.tile_lengths)
+                    .all(|(&start, &length)| start + length <= tokens),
+            "the plan's tiles do not fit the sequence"
+        );
+        let int32 = |values: &[usize]| {
+            DeviceBuffer::from_bytes(
+                &values
+                    .iter()
+                    .flat_map(|&value| (value as i32).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let per_tile = heads * tiles * HEAD_DIM * 4;
+        Ok(VsaWorkspace {
+            tokens,
+            heads,
+            tiles,
+            prefix_tiles: plan.prefix_tiles,
+            tile_starts: int32(&plan.tile_starts)?,
+            tile_lengths: int32(&plan.tile_lengths)?,
+            pooled_query: DeviceBuffer::new(per_tile)?,
+            pooled_key: DeviceBuffer::new(per_tile)?,
+            pooled_value: DeviceBuffer::new(per_tile)?,
+            routes: DeviceBuffer::new(heads * tiles * tiles * 2)?,
+            route_counts: DeviceBuffer::new(heads * tiles * 4)?,
+            coarse: DeviceBuffer::new(per_tile)?,
+        })
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    fn raw(&self) -> RawVsaWorkspace {
+        RawVsaWorkspace {
+            tile_starts: self.tile_starts.pointer().cast_const(),
+            tile_lengths: self.tile_lengths.pointer().cast_const(),
+            pooled_query: self.pooled_query.pointer(),
+            pooled_key: self.pooled_key.pointer(),
+            pooled_value: self.pooled_value.pointer(),
+            routes: self.routes.pointer(),
+            route_counts: self.route_counts.pointer(),
+            coarse: self.coarse.pointer(),
+        }
+    }
+
+    /// Mean fraction of the tiles the query tiles of the last call attended token by token.
+    pub fn selected_fraction(&self) -> Result<f64, CudaError> {
+        let mut bytes = vec![0u8; self.route_counts.bytes()];
+        self.route_counts.copy_to_host(&mut bytes)?;
+        let selected: u64 = bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&count| i32::from_le_bytes(count) as u64)
+            .sum();
+        Ok(selected as f64 / (self.heads * self.tiles * self.tiles) as f64)
+    }
+}
+
+/// Raw form of `vsa` for pointers the caller has already checked.
+///
+/// # Safety
+/// Every element the layout addresses for the workspace's tokens and heads must lie inside the
+/// pointed-to buffers, and a non-null `gate` must hold `tokens` rows of `heads × 128` BF16 values
+/// `gate_stride` elements apart.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn vsa_pointers(
+    query: *const c_void,
+    key: *const c_void,
+    value: *const c_void,
+    gate: *const c_void,
+    gate_stride: usize,
+    output: *mut c_void,
+    layout: &AttentionLayout,
+    scale: f32,
+    kept: usize,
+    workspace: &VsaWorkspace,
+) -> Result<(), CudaError> {
+    let raw = workspace.raw();
+    // SAFETY: the caller guarantees the extents, and the workspace's tiles lie inside its sequence.
+    check(unsafe {
+        mmh3_vsa_attention(
+            query,
+            key,
+            value,
+            gate,
+            gate_stride as i64,
+            output,
+            workspace.heads as c_int,
+            layout,
+            scale,
+            workspace.tiles as c_int,
+            workspace.prefix_tiles as c_int,
+            kept as c_int,
+            &raw,
+            ptr::null_mut(),
+        )
+    })
+}
+
+/// VSA over BF16 heads of 128 for one sequence in the workspace's tile order, reading query, key and
+/// value from `input` and writing `output` at their offsets with the token and head strides of
+/// `layout`. Video query tiles keep `kept` video tiles, and `gate`, BF16 `[tokens, heads, 128]`,
+/// adds the coarse branch.
+#[allow(clippy::too_many_arguments)]
+pub fn vsa(
+    input: &DeviceBuffer,
+    gate: Option<&DeviceBuffer>,
+    output: &mut DeviceBuffer,
+    offsets: AttentionOffsets,
+    layout: &AttentionLayout,
+    scale: f32,
+    kept: usize,
+    workspace: &VsaWorkspace,
+) -> Result<(), CudaError> {
+    let (tokens, heads) = (workspace.tokens, workspace.heads);
+    let last = |offset: usize, operand: usize| {
+        offset as i64
+            + (tokens as i64 - 1) * layout.token_stride[operand]
+            + (heads as i64 - 1) * layout.head_stride[operand]
+            + HEAD_DIM as i64
+    };
+    for (operand, offset) in [offsets.query, offsets.key, offsets.value]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(
+            last(offset, operand) <= (input.bytes() / 2) as i64,
+            "operand {operand} reaches past the input buffer"
+        );
+    }
+    assert!(
+        last(offsets.output, 3) <= (output.bytes() / 2) as i64,
+        "the output reaches past its buffer"
+    );
+    if let Some(gate) = gate {
+        assert!(
+            gate.bytes() >= tokens * heads * HEAD_DIM * 2,
+            "the gate is smaller than tokens × heads × 128"
+        );
+    }
+    // SAFETY: every addressed element lies inside the buffers, checked above.
+    unsafe {
+        vsa_pointers(
+            input.pointer_at(offsets.query * 2),
+            input.pointer_at(offsets.key * 2),
+            input.pointer_at(offsets.value * 2),
+            gate.map_or(ptr::null(), |gate| gate.pointer().cast_const()),
+            heads * HEAD_DIM,
+            output.pointer_at(offsets.output * 2),
+            layout,
+            scale,
+            kept,
+            workspace,
+        )
+    }
 }
 
 /// Sol-Attn over BF16 heads of 128 for one sequence, reading query, key and value from `input` and

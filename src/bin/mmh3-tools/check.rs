@@ -112,6 +112,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "attention",
             "attention-precision",
             "sparse-tau",
+            "vsa-sparsity",
         ],
         USAGE,
     )?;
@@ -143,7 +144,8 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let dit = load_dit(&options, "weights")?;
     let started = Instant::now();
-    let outputs = dit.forward(&inputs, &watched, sparse_attention(&options)?.as_ref())?;
+    let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
+    let outputs = dit.forward(&inputs, &watched, sparse.as_ref())?;
     let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
         format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
     });
@@ -236,13 +238,13 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "attention-precision",
             "sparse-tau",
             "sparse-start",
+            "vsa-sparsity",
         ],
         USAGE,
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
     let text_file = GoldenFile::open(golden, "text.safetensors")?;
-    let sparse = sparse_attention(&options)?;
     let (shift_video, shift_audio): (f32, f32) = (
         dit_file.metadata("shift_video")?.parse()?,
         dit_file.metadata("shift_audio")?.parse()?,
@@ -254,6 +256,7 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     );
 
     let dit = load_dit(&options, "weights")?;
+    let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     let mut video = dit_file.unbatched("noise.video")?;
     let mut audio = dit_file.unbatched("noise.audio")?;
     let context = text_file.tensor("context")?;

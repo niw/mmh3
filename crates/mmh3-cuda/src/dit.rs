@@ -5,8 +5,8 @@
 
 use crate::attention::{
     AttentionInputs, AttentionLayout, AttentionPrecision, HEAD_DIM, PreparedAttention,
-    QuantizedWorkspace, SparseWorkspace, dense_bf16_pointers, dense_quantized_pointers,
-    prepare_inputs_pointers, sparse_pointers,
+    QuantizedWorkspace, SparseWorkspace, VsaWorkspace, dense_bf16_pointers,
+    dense_quantized_pointers, prepare_inputs_pointers, sparse_pointers, vsa_pointers,
 };
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
@@ -16,8 +16,9 @@ use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::dit::latent::{pack_audio, patchify_video, unpack_audio, unpatchify_video};
 use mmh3_core::dit::layout::{PackedLayout, SegmentKind};
-use mmh3_core::dit::sparse::{SparseAttention, SparseSinks};
+use mmh3_core::dit::sparse::{SparseAttention, SparseMethod, SparseSinks};
 use mmh3_core::dit::timestep::{MODALITY_COUNT, StepTimesteps};
+use mmh3_core::dit::vsa::VsaPlan;
 use mmh3_core::numeric::f32_to_bf16;
 use mmh3_core::safetensors::{DType, SafeTensors};
 use mmh3_core::tensor::Tensor;
@@ -126,6 +127,8 @@ struct WorkspaceShape {
     /// write SwiGLU directly.
     expanded_rows: usize,
     adapter_rank: usize,
+    /// Whether the blocks have VSA gates.
+    gated: bool,
 }
 
 /// Buffers sized for one sequence length.
@@ -144,6 +147,8 @@ struct Workspace {
     scales: DeviceBuffer,
     /// Intermediate rows of the low-rank adapters.
     adapter: DeviceBuffer,
+    /// VSA gates of the coarse branch, BF16 `[tokens, heads × 128]`.
+    gate: Option<DeviceBuffer>,
 }
 
 impl Workspace {
@@ -153,6 +158,7 @@ impl Workspace {
             tokens,
             expanded_rows,
             adapter_rank,
+            gated,
         } = shape;
         Ok(Workspace {
             shape,
@@ -168,6 +174,11 @@ impl Workspace {
             quantized: DeviceBuffer::new(tokens * hidden.max(inner).max(ffn))?,
             scales: DeviceBuffer::new(tokens * 4)?,
             adapter: DeviceBuffer::new(tokens * adapter_rank.max(1) * 2)?,
+            gate: if gated {
+                Some(DeviceBuffer::new(tokens * inner * 2)?)
+            } else {
+                None
+            },
         })
     }
 }
@@ -178,6 +189,7 @@ impl Workspace {
 struct ForwardBuffers {
     workspace: Option<Workspace>,
     sparse: Option<(AttentionPrecision, SparseWorkspace)>,
+    vsa: Option<(VsaPlan, VsaWorkspace)>,
     text: Option<TextStates>,
 }
 
@@ -200,11 +212,18 @@ pub struct DitOutputs {
     pub routed_fraction: Option<f64>,
 }
 
-/// Sol-Attn for the blocks of one call.
-struct SparsePass<'a> {
-    workspace: &'a SparseWorkspace,
-    tau: f32,
-    sinks: SparseSinks,
+/// Block-sparse attention for the blocks of one call.
+enum SparsePass<'a> {
+    Sol {
+        workspace: &'a SparseWorkspace,
+        tau: f32,
+        sinks: SparseSinks,
+    },
+    /// VSA on the sequence in the workspace's tile order, keeping `kept` video tiles.
+    Vsa {
+        workspace: &'a VsaWorkspace,
+        kept: usize,
+    },
 }
 
 pub struct CudaDit {
@@ -273,6 +292,14 @@ impl CudaDit {
 
     pub fn config(&self) -> &DitConfig {
         &self.config
+    }
+
+    /// Whether the blocks carry the gates of VSA's coarse branch, which VSA-trained checkpoints
+    /// such as FastH3 have.
+    pub fn has_vsa_gates(&self) -> bool {
+        self.tensors
+            .optional("blocks.0.attn.to_gate_compress.weight")
+            .is_some()
     }
 
     /// Refined text states `[text tokens, hidden]` of the last call's context, or `None` before the
@@ -605,6 +632,13 @@ impl CudaDit {
                 workspace,
             )?;
         }
+        let vsa_gate = match sparse {
+            Some(SparsePass::Vsa { .. }) => {
+                let fused = modulation.is_some() && self.tensors.is_int8(&qkv);
+                self.vsa_gate(prefix, workspace, tokens, fused)?
+            }
+            _ => None,
+        };
         let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
         let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
         let angles = angles.map_or(ptr::null(), |angles| angles.pointer().cast_const());
@@ -616,7 +650,10 @@ impl CudaDit {
         // Sparse and quantized attention take their per-block inputs from the pass that normalizes
         // q and k.
         let prepared = match (sparse, quantized) {
-            (Some(pass), _) => Some(PreparedAttention::Sparse(pass.workspace)),
+            (Some(SparsePass::Sol { workspace, .. }), _) => {
+                Some(PreparedAttention::Sparse(workspace))
+            }
+            (Some(SparsePass::Vsa { .. }), _) => None,
             (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
             (None, None) => None,
         };
@@ -683,20 +720,41 @@ impl CudaDit {
                         ..AttentionLayout::default()
                     };
                     let qkv = workspace.qkv.pointer().cast::<u16>();
-                    sparse_pointers(
-                        qkv.cast(),
-                        qkv.add(inner).cast(),
-                        qkv.add(2 * inner).cast(),
-                        workspace.attention.pointer(),
-                        tokens,
-                        config.heads,
-                        &layout,
-                        scale,
-                        pass.tau,
-                        pass.sinks,
-                        pass.workspace,
-                        inputs,
-                    )?
+                    match *pass {
+                        SparsePass::Sol {
+                            workspace: sparse_workspace,
+                            tau,
+                            sinks,
+                        } => sparse_pointers(
+                            qkv.cast(),
+                            qkv.add(inner).cast(),
+                            qkv.add(2 * inner).cast(),
+                            workspace.attention.pointer(),
+                            tokens,
+                            config.heads,
+                            &layout,
+                            scale,
+                            tau,
+                            sinks,
+                            sparse_workspace,
+                            inputs,
+                        )?,
+                        SparsePass::Vsa {
+                            workspace: vsa_workspace,
+                            kept,
+                        } => vsa_pointers(
+                            qkv.cast(),
+                            qkv.add(inner).cast(),
+                            qkv.add(2 * inner).cast(),
+                            vsa_gate.unwrap_or(ptr::null()),
+                            inner,
+                            workspace.attention.pointer(),
+                            &layout,
+                            scale,
+                            kept,
+                            vsa_workspace,
+                        )?,
+                    }
                 }
             }
         }
@@ -775,6 +833,47 @@ impl CudaDit {
         }
     }
 
+    /// Writes the VSA gates of block `prefix` into the workspace and returns them, or None when
+    /// the block has no gates. With `fused`, the INT8 input of the block's qkv projection is still
+    /// in the quantization buffers, and otherwise its BF16 input is in `normalized`.
+    fn vsa_gate(
+        &self,
+        prefix: &str,
+        workspace: &Workspace,
+        tokens: usize,
+        fused: bool,
+    ) -> Result<Option<*const c_void>, Error> {
+        let name = format!("{prefix}.attn.to_gate_compress");
+        let Some(gate) = workspace
+            .gate
+            .as_ref()
+            .filter(|_| self.tensors.optional(&format!("{name}.weight")).is_some())
+        else {
+            return Ok(None);
+        };
+        if fused && self.tensors.is_int8(&name) {
+            self.tensors.linear_quantized(
+                &name,
+                workspace.normalized.pointer(),
+                gate.pointer(),
+                tokens,
+                &workspace.quantized,
+                &workspace.scales,
+                None,
+                false,
+            )?;
+        } else {
+            self.linear(
+                &name,
+                workspace.normalized.pointer(),
+                gate.pointer(),
+                tokens,
+                workspace,
+            )?;
+        }
+        Ok(Some(gate.pointer().cast_const()))
+    }
+
     /// Adds the MLP output a modulated block left in `delta`, gated by the block's modulation
     /// table.
     fn add_pending(
@@ -834,7 +933,9 @@ impl CudaDit {
     }
 
     /// Runs one DiT call and returns the velocity, capturing the residual stream after the listed
-    /// blocks. `sparse` switches the blocks to Sol-Attn when the sequence is long enough.
+    /// blocks. `sparse` switches the blocks to Sol-Attn or VSA when the sequence is long enough.
+    /// VSA runs the blocks on the sequence with the video in cube order, and uses the blocks' gates
+    /// for its coarse branch when they have them.
     pub fn forward(
         &self,
         inputs: &DitInputs,
@@ -864,22 +965,36 @@ impl CudaDit {
         // The refiner's MLPs still write the gate and up projections for the text tokens.
         let fused = (0..config.layers)
             .all(|layer| self.tensors.is_int8(&format!("blocks.{layer}.mlp.fc1")));
-        let sparse_tau = sparse
+        let method = sparse
             .filter(|settings| tokens >= settings.min_tokens)
-            .map(|settings| settings.tau);
+            .map(|settings| settings.method);
+        let sparse_tau = match method {
+            Some(SparseMethod::Sol { tau }) => Some(tau),
+            _ => None,
+        };
+        let vsa_sparsity = match method {
+            Some(SparseMethod::Vsa { sparsity }) => Some(sparsity),
+            _ => None,
+        };
+        if vsa_sparsity.is_some() && self.attention_precision != AttentionPrecision::Bf16 {
+            return Err(Error::Model("VSA runs with BF16 attention only".to_owned()));
+        }
+        let plan = vsa_sparsity.map(|_| VsaPlan::for_layout(&layout));
         let quantized_dense =
-            self.attention_precision == AttentionPrecision::Int8Fp8 && sparse_tau.is_none();
+            self.attention_precision == AttentionPrecision::Int8Fp8 && method.is_none();
 
         let mut buffers = self.buffers.borrow_mut();
         let ForwardBuffers {
             workspace: cached_workspace,
             sparse: cached_sparse,
+            vsa: cached_vsa,
             text: cached_text,
         } = &mut *buffers;
         let shape = WorkspaceShape {
             tokens,
             expanded_rows: if fused { text_tokens } else { tokens },
             adapter_rank,
+            gated: plan.is_some() && self.has_vsa_gates(),
         };
         let workspace = match cached_workspace.take() {
             Some(mut workspace) if workspace.shape == shape => {
@@ -915,6 +1030,17 @@ impl CudaDit {
             }
             None => *cached_sparse = None,
         }
+        match &plan {
+            Some(plan)
+                if cached_vsa
+                    .as_ref()
+                    .is_some_and(|(cached, _)| cached == plan) => {}
+            Some(plan) => {
+                *cached_vsa = None;
+                *cached_vsa = Some((plan.clone(), VsaWorkspace::new(plan, tokens, config.heads)?));
+            }
+            None => *cached_vsa = None,
+        }
 
         let block_rows = i32_buffer(&layout.modulation_rows(&timesteps))?;
         let final_rows: Vec<usize> = layout
@@ -925,7 +1051,17 @@ impl CudaDit {
             })
             .collect();
         let final_rows = i32_buffer(&final_rows)?;
-        let angles = DeviceBuffer::from_f32(&layout.rope_angles(&self.inverse_frequencies))?;
+        let audio = layout.segment(SegmentKind::Audio);
+        let video = layout.segment(SegmentKind::Video);
+        let mut angles = layout.rope_angles(&self.inverse_frequencies);
+        let mut video_rows = patchify_video(&inputs.video);
+        if let Some(plan) = &plan {
+            let width = 3 * self.inverse_frequencies.len();
+            let reordered = plan.reorder_video(&angles[video.start * width..], width);
+            angles[video.start * width..].copy_from_slice(&reordered);
+            video_rows = plan.reorder_video(&video_rows, config.video_patch_features());
+        }
+        let angles = DeviceBuffer::from_f32(&angles)?;
         let time_embedding = DeviceBuffer::from_f32(&timesteps.time_embedding(&self.adaln_table))?;
 
         let text_bytes = text_tokens * hidden * 4;
@@ -952,10 +1088,8 @@ impl CudaDit {
             }
         }
 
-        let audio = layout.segment(SegmentKind::Audio);
-        let video = layout.segment(SegmentKind::Video);
         let audio_rows = DeviceBuffer::from_f32(&pack_audio(&inputs.audio))?;
-        let video_rows = DeviceBuffer::from_f32(&patchify_video(&inputs.video))?;
+        let video_rows = DeviceBuffer::from_f32(&video_rows)?;
         self.linear(
             "audio_patch_proj",
             audio_rows.pointer(),
@@ -971,13 +1105,24 @@ impl CudaDit {
             workspace,
         )?;
 
-        let sparse_pass = sparse_tau
-            .zip(cached_sparse.as_ref())
-            .map(|(tau, (_, workspace))| SparsePass {
-                workspace,
-                tau,
-                sinks: SparseSinks::for_layout(&layout),
-            });
+        let sparse_pass = match (sparse_tau, vsa_sparsity) {
+            (Some(tau), _) => cached_sparse
+                .as_ref()
+                .map(|(_, workspace)| SparsePass::Sol {
+                    workspace,
+                    tau,
+                    sinks: SparseSinks::for_layout(&layout),
+                }),
+            (None, Some(sparsity)) => {
+                cached_vsa
+                    .as_ref()
+                    .map(|(plan, workspace)| SparsePass::Vsa {
+                        workspace,
+                        kept: plan.kept_video_tiles(sparsity),
+                    })
+            }
+            (None, None) => None,
+        };
         let mut routed = 0.0;
         // Each block leaves its gated MLP output to the next, so the tables of two blocks are alive
         // at a time.
@@ -1006,13 +1151,18 @@ impl CudaDit {
                 sparse_pass.as_ref(),
             )?;
             pending = Some(modulation);
-            if let Some(pass) = &sparse_pass {
-                routed += pass.workspace.routed_fraction()?;
+            if let Some(SparsePass::Sol { workspace, .. }) = &sparse_pass {
+                routed += workspace.routed_fraction()?;
             }
             if capture.contains(&layer) {
                 self.add_pending(workspace, tokens, modulation, &block_rows)?;
                 pending = None;
-                blocks.push((layer, workspace.residual.to_f32()?));
+                let mut residual = workspace.residual.to_f32()?;
+                if let Some(plan) = &plan {
+                    let restored = plan.restore_video(&residual[video.start * hidden..], hidden);
+                    residual[video.start * hidden..].copy_from_slice(&restored);
+                }
+                blocks.push((layer, residual));
             }
         }
         if let Some(modulation) = pending {
@@ -1048,11 +1198,14 @@ impl CudaDit {
             )?;
             Ok(output.to_f32()?)
         };
-        let video_velocity = project(
+        let mut video_velocity = project(
             video,
             "final_layer.video_out",
             config.video_patch_features(),
         )?;
+        if let Some(plan) = &plan {
+            video_velocity = plan.restore_video(&video_velocity, config.video_patch_features());
+        }
         let audio_velocity = project(audio, "final_layer.audio_out", config.audio_channels)?;
         Ok(DitOutputs {
             blocks,
@@ -1064,7 +1217,8 @@ impl CudaDit {
                 .into_iter()
                 .map(|value| -value)
                 .collect(),
-            routed_fraction: sparse_pass.map(|_| routed / config.layers as f64),
+            routed_fraction: matches!(sparse_pass, Some(SparsePass::Sol { .. }))
+                .then(|| routed / config.layers as f64),
         })
     }
 }
