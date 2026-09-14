@@ -60,6 +60,13 @@ fn unbatched(file: &SafeTensors, name: &str) -> Tensor {
     tensor
 }
 
+fn bf16(values: &[f32]) -> Vec<u8> {
+    values
+        .iter()
+        .flat_map(|&value| f32_to_bf16(value).to_le_bytes())
+        .collect()
+}
+
 fn relative_error(actual: &[f32], expected: &[f32]) -> f64 {
     let difference: f64 = actual
         .iter()
@@ -104,7 +111,7 @@ fn applies_a_lora_like_merged_weights() {
     );
 
     // A fused qkv layer with three times the rank, as the Turbo LoRAs have, an FFN input, an FFN
-    // output and a refiner layer.
+    // output and a refiner layer, plus tensors replaced as they are.
     let layers = [
         ("blocks.0.attn.qkv_proj", 12),
         ("blocks.1.mlp.fc1", 4),
@@ -131,12 +138,6 @@ fn applies_a_lora_like_merged_weights() {
                 weight.data[output * inputs + input] += scale * delta;
             }
         }
-        let bf16 = |values: &[f32]| {
-            values
-                .iter()
-                .flat_map(|&value| f32_to_bf16(value).to_le_bytes())
-                .collect::<Vec<u8>>()
-        };
         lora.push((
             format!("diffusion_model.{layer}.lora_A.weight"),
             "BF16",
@@ -156,6 +157,31 @@ fn applies_a_lora_like_merged_weights() {
             ALPHA.to_le_bytes().to_vec(),
         ));
     }
+    // Tensors that the file replaces as they are: a norm weight and the AdaLN curve table.
+    let norm = weights.get_mut("blocks.1.norm2.weight").unwrap();
+    for value in &mut norm.data {
+        *value = bf16_to_f32(f32_to_bf16(*value * random.uniform(0.5, 1.5)));
+    }
+    lora.push((
+        "diffusion_model.blocks.1.norm2.weight".to_owned(),
+        "BF16",
+        norm.shape.clone(),
+        bf16(&norm.data),
+    ));
+    let table = weights.get_mut("adaln_t_table").unwrap();
+    for value in &mut table.data {
+        *value *= random.uniform(0.8, 1.2);
+    }
+    lora.push((
+        "diffusion_model.adaln_t_table".to_owned(),
+        "F32",
+        table.shape.clone(),
+        table
+            .data
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect(),
+    ));
     let merged = mmh3_cpu::dit::forward(&mmh3_cpu::dit::DitWeights::new(weights), &config, &inputs);
     let change = relative_error(&merged.video, &base.video);
     assert!(
@@ -170,7 +196,7 @@ fn applies_a_lora_like_merged_weights() {
     assert_eq!(
         dit.add_lora(&SafeTensors::open(&path).unwrap(), STRENGTH)
             .unwrap(),
-        layers.len()
+        layers.len() + 2
     );
     std::fs::remove_file(&path).unwrap();
     let outputs = dit.forward(&inputs, &[], None).unwrap();

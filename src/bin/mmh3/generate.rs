@@ -44,6 +44,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "video-vae",
             "audio-vae",
             "text-encoder",
+            "patch",
             "lora",
             "lora-strength",
             "attention",

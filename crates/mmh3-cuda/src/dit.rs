@@ -319,7 +319,9 @@ impl CudaDit {
 
     /// Adds the LoRA of a ComfyUI LoRA file at `strength`: every layer `{name}` with
     /// `{name}.lora_A.weight`, `{name}.lora_B.weight` and `{name}.alpha` gains
-    /// `strength · alpha / rank · B · A` on top of its weight.
+    /// `strength · alpha / rank · B · A` on top of its weight. Other tensors of the file replace
+    /// the checkpoint's tensors of the same name, or add new ones, as they are, whatever the
+    /// strength. Returns the number of layers with an adapter and of tensors replaced or added.
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize, Error> {
         const PREFIX: &str = "diffusion_model.";
         let mut uploader = Uploader::new(file);
@@ -366,14 +368,50 @@ impl CudaDit {
             };
             adapters.push((layer.to_owned(), adapter));
         }
+        let mut replaced = Vec::new();
+        for info in file.tensors() {
+            let Some(name) = info.name.strip_prefix(PREFIX) else {
+                continue;
+            };
+            if [".lora_A.weight", ".lora_B.weight", ".alpha"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                continue;
+            }
+            if name == "adaln_t_table" {
+                self.adaln_table = host_tensor(file, &info.name)?;
+            } else {
+                if let Some(existing) = self.tensors.optional(name)
+                    && (existing.dtype != info.dtype || existing.shape != info.shape)
+                {
+                    return Err(Error::Model(format!(
+                        "{name} in the LoRA does not match the checkpoint's"
+                    )));
+                }
+                self.tensors.insert(name, file, info, &mut uploader)?;
+            }
+            replaced.push(name.to_owned());
+        }
         uploader.run()?;
+        for name in &replaced {
+            let fc1 = name
+                .strip_suffix(".weight")
+                .or_else(|| name.strip_suffix(".weight_scale"))
+                .filter(|layer| layer.ends_with(".mlp.fc1"));
+            if let Some(layer) = fc1
+                && self.tensors.is_int8(layer)
+            {
+                self.tensors.interleave_swiglu(name)?;
+            }
+        }
         for (layer, adapter) in &mut adapters {
             if layer.ends_with(".mlp.fc1") && self.tensors.is_int8(layer) {
                 adapter.up =
                     interleave_swiglu_rows(&adapter.up, adapter.outputs, adapter.rank * 2)?;
             }
         }
-        let added = adapters.len();
+        let added = adapters.len() + replaced.len();
         self.adapters.extend(adapters);
         // The adapters may change the refiner.
         self.buffers.get_mut().text = None;
