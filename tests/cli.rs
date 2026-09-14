@@ -69,3 +69,40 @@ fn argument_errors_use_the_correct_binary_usage() {
         assert!(!error.contains(absent), "{error}");
     }
 }
+
+#[cfg(feature = "cuda")]
+#[test]
+fn invalid_output_format_is_rejected_before_loading_models() {
+    let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.unknown"]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("FILE.webm"), "{error}");
+    assert!(error.contains("--ffmpeg"), "{error}");
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn invalid_ffmpeg_template_is_rejected_before_loading_models() {
+    let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.mp4", "--ffmpeg", "-i", "{video}"]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("templates must include {out}"), "{error}");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "mp4")))]
+#[test]
+fn mp4_feature_error_precedes_model_loading() {
+    let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.mp4"]);
+    assert_eq!(output.status.code(), Some(1));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("--features mp4"), "{error}");
+    assert!(error.contains("--ffmpeg"), "{error}");
+}
+
+#[cfg(all(feature = "cuda", not(feature = "webm")))]
+#[test]
+fn webm_feature_error_precedes_model_loading() {
+    let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.webm"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--features webm"));
+}

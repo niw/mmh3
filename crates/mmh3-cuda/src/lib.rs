@@ -174,7 +174,8 @@ impl DeviceBuffer {
         self.bytes
     }
 
-    pub(crate) fn pointer(&self) -> *mut c_void {
+    /// Raw CUDA device address for native API interoperability. This is not a host pointer.
+    pub fn pointer(&self) -> *mut c_void {
         self.pointer
     }
 

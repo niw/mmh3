@@ -41,6 +41,15 @@ pub fn option_float(options: &HashMap<&str, &str>, name: &str, default: f32) -> 
     Ok(value)
 }
 
+/// `--ffmpeg` consumes the remaining arguments verbatim, including repeated options.
+/// Put all mmh3 options before it. An empty tail selects ffmpeg's default recipe.
+pub fn split_ffmpeg_arguments(arguments: &[String]) -> (&[String], Option<&[String]>) {
+    match arguments.iter().position(|arg| arg == "--ffmpeg") {
+        Some(index) => (&arguments[..index], Some(&arguments[index + 1..])),
+        None => (arguments, None),
+    }
+}
+
 /// Prints a command error and maps its result to a process exit code.
 pub fn exit_code(result: Result<(), Box<dyn Error>>) -> ExitCode {
     match result {
@@ -60,6 +69,18 @@ mod tests {
 
     fn arguments(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn ffmpeg_tail_is_not_parsed_as_mmh3_options() {
+        let args = arguments(&["--out", "a b.mp4", "--ffmpeg", "-map", "0:v", "-map", "1:a", "-vf", "scale=640:-2"]);
+        let (generation, ffmpeg) = split_ffmpeg_arguments(&args);
+        assert_eq!(generation, &args[..2]);
+        assert_eq!(ffmpeg, Some(&args[3..]));
+        let args = arguments(&["--ffmpeg"]);
+        assert_eq!(split_ffmpeg_arguments(&args), (&args[..0], Some(&args[1..])));
+        let args = arguments(&["--out", "out.webm"]);
+        assert_eq!(split_ffmpeg_arguments(&args), (args.as_slice(), None));
     }
 
     #[test]

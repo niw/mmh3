@@ -347,6 +347,40 @@ __global__ void yuv420_kernel(const float* __restrict__ pixels, uint8_t* __restr
     }
 }
 
+__global__ void nv12_frame_kernel(const float* __restrict__ pixels, uint8_t* __restrict__ output, int frames,
+                                  int height, int width, int frame, size_t pitch) {
+    const int half_width = width / 2;
+    const size_t plane = static_cast<size_t>(height) * width;
+    const size_t blocks = plane / 4;
+    const float* red = pixels + frame * plane;
+    const float* green = red + frames * plane;
+    const float* blue = green + frames * plane;
+    const float luma_green = __fsub_rn(__fsub_rn(1.0f, LUMA_RED), LUMA_BLUE);
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < blocks; index += stride) {
+        const int x = 2 * static_cast<int>(index % half_width);
+        const int y = 2 * static_cast<int>(index / half_width);
+        const int top_left = y * width + x;
+        for (int row = 0; row < 2; ++row) {
+            for (int column = 0; column < 2; ++column) {
+                const int corner = top_left + row * width + column;
+                output[(y + row) * pitch + x + column] =
+                    limited_range(luma(red[corner], green[corner], blue[corner], luma_green), 16.0f, 219.0f);
+            }
+        }
+        const float red_average = block_average(red, top_left, width);
+        const float blue_average = block_average(blue, top_left, width);
+        const float luma_average = luma(red_average, block_average(green, top_left, width), blue_average, luma_green);
+        const size_t chroma = (height + y / 2) * pitch + x;
+        output[chroma] =
+            limited_range(__fdiv_rn(__fsub_rn(blue_average, luma_average), __fmul_rn(2.0f, __fsub_rn(1.0f, LUMA_BLUE))),
+                          128.0f, 224.0f);
+        output[chroma + 1] =
+            limited_range(__fdiv_rn(__fsub_rn(red_average, luma_average), __fmul_rn(2.0f, __fsub_rn(1.0f, LUMA_RED))),
+                          128.0f, 224.0f);
+    }
+}
+
 }  // namespace
 
 extern "C" int mmh3_vae_norm(const float* input, const __half* weight, const __half* bias, __half* output, int tokens,
@@ -450,5 +484,12 @@ extern "C" int mmh3_vae_add_norm_quantize(float* residual, const __half* delta, 
             launch(add_norm_quantize_kernel<4>);
             break;
     }
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int mmh3_nv12_frame(const float* pixels, uint8_t* output, int frames, int height, int width, int frame,
+                               size_t pitch, cudaStream_t stream) {
+    const size_t blocks = static_cast<size_t>(height) * width / 4;
+    nv12_frame_kernel<<<grid_for(blocks), ROW_THREADS, 0, stream>>>(pixels, output, frames, height, width, frame, pitch);
     return static_cast<int>(cudaGetLastError());
 }

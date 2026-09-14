@@ -1,0 +1,18 @@
+[package]
+name = "mmh3-output-nvenc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+mmh3-core = { path = "../mmh3-core" }
+mmh3-cuda = { path = "../mmh3-cuda" }
+mmh3-output = { path = "../mmh3-output", default-features = false, features = ["mp4"] }
+
+[build-dependencies]
+cc = "1"
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

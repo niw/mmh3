@@ -1,7 +1,7 @@
 //! Text-to-video generation with a synchronized soundtrack.
 
 use crate::USAGE;
-use mmh3::cli::{option_float, option_number, parse_options};
+use mmh3::cli::{option_float, option_number, parse_options, split_ffmpeg_arguments};
 use mmh3::models::{
     AUDIO_VAE_FILE, TEXT_ENCODER_FILE, VIDEO_VAE_FILE, VIDEO_VAE_INT8_FILE, load_dit, option_path, sparse_attention,
 };
@@ -9,23 +9,21 @@ use mmh3_core::safetensors::SafeTensors;
 use std::error::Error;
 use std::path::Path;
 
-/// Generates a video with its soundtrack from a prompt, or from precomputed text states. The video is written as
-/// YUV4MPEG2 to `--out` and the audio as WAV next to it.
+/// Generates video and audio, then passes the decoded media to the selected output backend.
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::sampler::{Schedule, euler_step};
     use mmh3_core::generation::{FPS, GenerationShape};
-    use mmh3_core::media::{write_wav, write_y4m};
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tensor::Tensor;
     use mmh3_core::tokenizer::Tokenizer;
     use mmh3_cuda::audio_vae::{CudaAudioDecoder, SAMPLE_RATE};
     use mmh3_cuda::text_encoder::CudaTextEncoder;
     use mmh3_cuda::vae::{CudaVideoDecoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
-    use std::fs::File;
-    use std::io::{BufWriter, Write};
+    use mmh3_output::MediaSpec;
     use std::time::Instant;
 
+    let (arguments, ffmpeg_arguments) = split_ffmpeg_arguments(arguments);
     let options = parse_options(
         arguments,
         &[
@@ -55,15 +53,20 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         USAGE,
     )?;
     let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
-    if video_path.extension().and_then(|extension| extension.to_str()) != Some("y4m") {
-        return Err("--out must name a .y4m file. The WAV file is written next to it".into());
-    }
-    let audio_path = video_path.with_extension("wav");
     let shape = GenerationShape::new(
         option_number(&options, "width", 1344)?,
         option_number(&options, "height", 768)?,
         option_number(&options, "frames", 124)?,
     )?;
+    let spec = MediaSpec {
+        width: shape.width,
+        height: shape.height,
+        frames: shape.frames,
+        fps: FPS,
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+    };
+    let mut output = mmh3::output::prepare(ffmpeg_arguments, spec, &video_path)?;
     let steps = option_number(&options, "steps", 20)?;
     let seed = option_number(&options, "seed", 0)? as u64;
     let (shift_video, shift_audio) =
@@ -152,29 +155,19 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if Path::new(&int8_path).exists() { int8_path } else { option_path(&options, "video-vae", VIDEO_VAE_FILE)? }
         }
     };
-    let yuv =
+    let decoded =
         CudaVideoDecoder::load(&SafeTensors::open(Path::new(&path))?, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
-            .decode_yuv420(&video)?;
-    println!("decoded the video with {path} in {:.1} s", started.elapsed().as_secs_f64());
-    let mut writer = BufWriter::new(File::create(&video_path)?);
-    write_y4m(&mut writer, &yuv, FPS)?;
-    writer.flush()?;
-
+            .decode_device(&video)?;
+    output.write_cuda_video(&decoded)?;
+    drop(decoded);
+    println!("decoded and submitted the video with {path} in {:.1} s", started.elapsed().as_secs_f64());
     let started = Instant::now();
     let path = option_path(&options, "audio-vae", AUDIO_VAE_FILE)?;
     let waveform = CudaAudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
     println!("decoded the audio in {:.1} s", started.elapsed().as_secs_f64());
-    let mut writer = BufWriter::new(File::create(&audio_path)?);
-    write_wav(&mut writer, &waveform, SAMPLE_RATE)?;
-    writer.flush()?;
-
-    println!("wrote {} and {}", video_path.display(), audio_path.display());
-    let options = "-c:v libx264 -crf 18 -pix_fmt yuv420p -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 192k";
-    println!(
-        "an mp4, for example: ffmpeg -i {} -i {} {options} -shortest {}",
-        video_path.display(),
-        audio_path.display(),
-        video_path.with_extension("mp4").display()
-    );
+    let started = Instant::now();
+    output.write_audio(waveform)?;
+    output.finish()?;
+    println!("wrote {} in {:.1} s", video_path.display(), started.elapsed().as_secs_f64());
     Ok(())
 }

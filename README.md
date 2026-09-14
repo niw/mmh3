@@ -5,7 +5,9 @@ which generates video with a synchronized stereo soundtrack from text. It is wri
 CUDA C++ kernels and runs without PyTorch, ComfyUI or any other framework: the tokenizer, the
 Qwen3-VL text encoder, the diffusion transformer, the sampler and both VAE decoders are implemented
 in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints from
-[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3).
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3). It saves MP4 directly with
+NVENC H.264 video and CPU-encoded AAC audio, or WebM with VP9 and Opus. Both formats work
+without an ffmpeg installation.
 
 ## Getting started
 
@@ -18,17 +20,21 @@ make generate
 ```
 
 `make` builds mmh3, `make download-models` downloads the models into `models`, and `make generate`
-generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.y4m`,
-`out.wav` and `out.mp4`. On a DGX Spark, the generation takes about **87 seconds**
-([details](#performance)). The targets stop with a message when cargo, `hf` or ffmpeg is missing.
+generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.mp4`
+(NVENC H.264 video and AAC audio). A complete MP4 generation on a DGX Spark took about
+**86 seconds**, including model loading and encoding ([details](#performance)). The targets stop
+with a message when cargo or `hf` is missing.
 
-`PROMPT`, `SEED`, `OUT` and `MODELS` change the prompt, the seed, the output files and the models
-directory. This writes `panda.y4m`, `panda.wav` and `panda.mp4`:
+`PROMPT`, `SEED`, `OUT` and `MODELS` change the prompt, the seed, the output file and the models
+directory. This writes `panda.mp4`:
 
 ```sh
 make generate PROMPT="A red panda sips tea on a sunny wooden porch while birds chirp in the garden." \
-  SEED=2 OUT=panda.y4m
+  SEED=2 OUT=panda.mp4
 ```
+
+To save VP9 + Opus WebM, use `make generate FEATURES=cuda,webm OUT=out.webm`. The extension
+selects the native encoder. Neither command launches ffmpeg or writes intermediate Y4M/WAV files.
 
 `make generate` uses the fastest settings measured so far: the INT8 video VAE, the 4-step Turbo
 LoRA, INT8/FP8 attention and Sol-Attn from the first step. Compared with mmh3's defaults, they can
@@ -36,7 +42,8 @@ change image details and the composition. See [Usage](#usage) for the other sett
 
 ## Status
 
-- Text to video with audio (T2VA) works end to end, one video at a time.
+- Text to video with audio (T2VA) works end to end, one video at a time. Native MP4 and WebM
+  generation and complete video/audio decoding have been verified on GB10.
 - NVIDIA Blackwell GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for
   `sm_120f`, so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been
   tested yet.
@@ -61,9 +68,14 @@ tokens (38,710 tokens in all):
 | Text encoder load and encode | 3.4 s | |
 | DiT load | 2.9 s | |
 
-The settings of `make generate` took 86.76 s in one run with seed 1, from the prompt to the Y4M and
-WAV files, including model loading. With the first step dense it took 98.98 s, and with BF16
-attention and the first step dense 116.20 s.
+A complete run with the settings of `make generate`, the garden red panda prompt (75 text tokens),
+and seed 42 took **86.29 s for MP4** and **90.88 s for WebM**, including model loading and native
+encoding. Both runs produced 1344×768, 124-frame clips with stereo audio, and both files were
+verified by decoding the entire video and audio streams. These are individual runs, not averages.
+
+With the Tokyo rain prompt and seed 1, the same settings took 86.76 s without the final video and
+audio encoding, 98.98 s with the first step dense, and 116.20 s with BF16 attention and the first
+step dense.
 
 ## Accuracy
 
@@ -91,7 +103,7 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - The video VAE decoder with FP16 weights, or with INT8 ConvRot weights in its transformer.
 - The official per-stream Euler schedules for video and audio.
 - Weights stream from disk to the GPU with direct reads, without filling the page cache.
-- Output as YUV4MPEG2 video and WAV audio, written without external libraries.
+- Native NVENC H.264 + AAC MP4 output, built-in VP9 + Opus WebM, or an external ffmpeg CLI.
 
 ## Requirements
 
@@ -100,9 +112,20 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - Rust with edition 2024 support (developed with 1.98).
 - The Hugging Face CLI (`hf`) to download the models, for example installed with
   `uv tool install huggingface_hub`.
-- ffmpeg for the MP4 of `make generate`. mmh3 itself does not need it.
+- A C/C++ toolchain for the CUDA kernels and NVENC adapter.
+- With the optional `webm` feature, CMake for the bundled Opus encoder, plus
+  `curl`, `tar`, and `sha256sum` (Linux). The VP9 binding downloads
+  a versioned libvpx static library and verifies its checksum during the build. This needs
+  network access to GitHub Releases. Its Linux prebuilt libraries support Ubuntu 22.04/24.04,
+  x86-64 and aarch64. A separate runtime libvpx installation is not needed.
+- Native MP4 requires the `mp4` feature, H.264 NVENC and a driver supporting NVENC API 12.2.
+  The driver is loaded at runtime. No separately installed Video Codec SDK is required. GPUs
+  without NVENC can use WebM or ffmpeg output with a build without `mp4`.
 - About 54 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
   21 GB of weights plus activations.
+
+ffmpeg is optional: install it only to use the explicit `--ffmpeg` output path. Developers
+running the output integration tests also need ffmpeg and ffprobe as independent decoders.
 
 ## Build
 
@@ -110,7 +133,10 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 make
 ```
 
-`make` builds `mmh3` with `cargo build --release --features cuda --bin mmh3`.
+`make` builds `mmh3` with CUDA, native MP4 output and the ffmpeg CLI output:
+`cargo build --release --features cuda,mp4 --bin mmh3`. `make FEATURES=cuda,webm` builds
+native WebM output instead of MP4, for GPUs without NVENC. It needs the VP9/Opus dependencies
+and the libvpx download. `make FEATURES=cuda,mp4,webm` builds both.
 `CUDA_HOME` points at the CUDA toolkit (default `/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU
 architecture (default `sm_120f`). Without `--features cuda`, both commands can build with the CPU-side
 crates. In that case, only `mmh3-tools inspect` is available.
@@ -124,7 +150,7 @@ cargo build --release --features cuda --bin mmh3-tools
 To run a specific command through Cargo:
 
 ```sh
-cargo run --release --features cuda --bin mmh3 -- generate --prompt "A rainy street." --out out.y4m
+cargo run --release --features cuda,mp4 --bin mmh3 -- generate --prompt "A rainy street." --out out.mp4
 cargo run --release --features cuda --bin mmh3-tools -- device
 ```
 
@@ -160,23 +186,130 @@ as ComfyUI's own INT8 and FP16 decodes are to each other.
 ```sh
 export MMH3_MODELS=$PWD/models
 
-target/release/mmh3 generate --out out.y4m \
+target/release/mmh3 generate --out out.mp4 \
   --prompt "A red panda sips tea on a sunny wooden porch while birds chirp in the garden."
 ```
 
-This writes `out.y4m` and `out.wav`. mmh3 does not encode MP4 itself. `make generate` muxes the two
-with ffmpeg like this:
+This writes `out.mp4` using H.264 High profile (NVENC P4, constant QP 20, no B frames,
+keyframes at most two seconds apart) and AAC-LC at 192 kb/s. The output path extension
+selects the container. `--ffmpeg` explicitly overrides native output selection.
+
+The video VAE retains RGB float32 pixels on the GPU. CUDA converts one frame at a time
+directly into a pitched NV12 allocation registered with NVENC. Only compressed video is
+read back to the CPU. The allocation is synchronized before submission and reused only
+after NVENC has finished reading it. This path makes no assumption about shared system
+memory and supports the same design on discrete GPUs such as RTX 5090. GB10 has been
+tested. RTX 5090 has not yet been tested on hardware.
+
+Audio is encoded on the CPU using `rusty_aac`, preserving the VAE's 32 kHz sample rate.
+Audio is trimmed or silence-padded to the video duration. MP4 edit lists compensate for
+AAC priming and end padding. The MP4 header precedes media data for progressive playback.
+A decoder exporting raw PCM may still return the last AAC block's padding. The track's
+presentation duration excludes it.
+
+The encoder and output file are validated before model loading. Unsupported hardware,
+missing drivers, unsupported dimensions or unavailable build features produce an early
+error. There is no automatic switch from a requested MP4 to WebM or ffmpeg.
+
+For the software path, build with the `webm` feature and use `--out out.webm`. Video is
+encoded by libvpx (VP9 profile 0, CPU-used 4, fixed quantizer 30 on the 0–63 scale, 8-bit
+YUV420 with BT.709 limited-range colors). These encoder settings are currently library defaults, not CLI options.
+Audio is encoded by libopus at 192 kb/s after resampling from 32 to 48 kHz. Audio is trimmed
+or padded with silence to the video duration. Resampler and Opus delays are compensated. The
+file includes duration and keyframe seeking information.
+
+To use the ffmpeg CLI instead, append `--ffmpeg`. With no further arguments it uses the
+H.264 (libx264, CRF 18) + AAC (192 kb/s) recipe:
 
 ```sh
-ffmpeg -i out.y4m -i out.wav -c:v libx264 -crf 18 \
-  -colorspace bt709 -color_primaries bt709 -color_trc bt709 -c:a aac -b:a 192k -shortest out.mp4
+target/release/mmh3 generate --prompt "A rainy street." --out out.mp4 --ffmpeg
+```
+
+All arguments after `--ffmpeg` belong to ffmpeg. Put every mmh3 option before it. Custom
+arguments replace the default encoding recipe, and are inserted after the generated video
+and audio inputs (`0:v` and `1:a`) and before the output filename:
+
+```sh
+target/release/mmh3 generate --prompt "A rainy street." --out out.mp4 \
+  --ffmpeg -c:v libx264 -crf 20 -preset slow -vf scale=960:-2 \
+  -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+  -c:a aac -b:a 160k -shortest
+```
+
+For control of input options, mapping, and the entire argument order, use the whole-argument
+placeholders `{video}`, `{audio}`, and `{out}`. A template must include `{out}`. Either input
+may be omitted. In template mode, automatic input and output arguments are disabled:
+
+```sh
+target/release/mmh3 generate --prompt "A rainy street." --out out.mp4 \
+  --ffmpeg -i '{video}' -i '{audio}' -map 0:v -map 1:a \
+  -c:v libx264 -crf 18 -c:a aac -shortest '{out}'
+```
+
+Arguments are passed directly to ffmpeg, without a shell. Quote individual arguments as
+needed. Do not combine all ffmpeg arguments into one quoted string. Shell pipelines and
+redirection are not interpreted. ffmpeg runs with `-nostdin -y`. Before model loading, mmh3
+runs the same arguments on one black, silent frame and writes the result to a temporary file
+with the output's extension. Unknown options or codecs, and codecs that the container does
+not accept, are reported before generation. Generated Y4M/WAV inputs are temporary and
+removed on success or failure. The output is written to a temporary file next to the
+destination (with the same extension) and replaces it only after successful encoding.
+Additional output paths explicitly supplied in ffmpeg arguments are managed by ffmpeg itself,
+and the trial encode writes them as well.
+
+The `mmh3-output` crate owns platform-independent `VideoEncoder` / `AudioEncoder`
+interfaces, `Mp4Session`, and the MP4 writer. `VideoEncoder` has an associated native frame
+type, so the common layer never casts device handles or requires a CPU YUV buffer.
+`mmh3-output-nvenc` owns the NVENC input allocation, CUDA synchronization, driver session,
+and conversion of the H.264 bitstream into MP4 samples. The application selects and
+prepares output, submits video and audio, then finishes the file. WebM and ffmpeg output
+implement the host-input `OutputBackend` interface behind the same lifecycle.
+
+An Apple adapter can implement `VideoEncoder` using Metal-compatible CVPixelBuffer /
+IOSurface input and VideoToolbox, and `AudioEncoder` using AudioToolbox. It can reuse the
+same MP4 writer, sample timing, edit lists and destination publication. Apple generation
+and output adapters are not implemented.
+
+The `cuda` feature builds generation with the ffmpeg CLI output, which every generation build
+has. The `mp4` and `webm` features add native output formats. `mp4` encodes video with NVENC
+and implies `cuda`. No feature is enabled by default. Examples:
+
+```sh
+# Native MP4 and ffmpeg, without the VP9/Opus dependencies or the libvpx download.
+cargo build --release --features cuda,mp4 --bin mmh3
+# Native WebM and ffmpeg, for GPUs without NVENC.
+cargo build --release --features cuda,webm --bin mmh3
+# ffmpeg only.
+cargo build --release --features cuda --bin mmh3
+# Native MP4, native WebM and ffmpeg.
+cargo build --release --features cuda,mp4,webm --bin mmh3
+```
+
+The encoder dependencies have their own licenses. `rusty_aac` is Apache-2.0, libvpx and
+libopus are BSD-3-Clause, `shiguredo_libvpx` is Apache-2.0, the Rust Opus bindings are
+MIT/Apache-2.0, and rubato is MIT. The vendored NVENC API header is MIT-licensed and its
+notices are retained. The NVIDIA driver is loaded from the installed system. Codec patent
+terms remain separate from software licenses. No libx264 or FFmpeg implementation is
+linked into the native MP4 path.
+See [rusty_aac](https://crates.io/crates/rusty_aac),
+[libvpx](https://github.com/webmproject/libvpx),
+[the VP9 Rust binding](https://github.com/shiguredo/libvpx-rs), and
+[Opus](https://opus-codec.org/license/).
+
+Output integration tests use ffmpeg/ffprobe as independent decoders and do not load models.
+The portable tests need no CUDA. The native output tests require NVENC:
+
+```sh
+cargo test -p mmh3-output --features mp4,webm -- --include-ignored
+# Requires an NVIDIA GPU with NVENC and also tests GPU NV12 conversion.
+cargo test -p mmh3-output-nvenc --test output -- --ignored
 ```
 
 The fast settings of `make generate` use the Turbo LoRA with the shifts it was trained with,
 INT8/FP8 attention, and Sol-Attn from the first step:
 
 ```sh
-target/release/mmh3 generate --prompt-file prompt.txt --out out.y4m \
+target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
   --steps 4 --shift-video 6 --shift-audio 3 --attention sol \
   --attention-precision int8-fp8 --sparse-start 0 \
   --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
@@ -188,6 +321,8 @@ So far these settings have been compared visually on one prompt and seed only.
 
 | Option | Default | Meaning |
 | --- | --- | --- |
+| `--out FILE` | required (`make generate` uses `out.mp4`) | `.mp4` uses native NVENC H.264 + AAC in an `mp4` build. `.webm` uses native VP9 + Opus in a `webm` build. |
+| `--ffmpeg [ARGS...]` | off | Use an installed ffmpeg instead. All following arguments belong to ffmpeg. |
 | `--prompt TEXT`, `--prompt-file FILE` | | The prompt, raw text without a chat template. |
 | `--width N`, `--height N` | 1344, 768 | Canvas size, multiples of 32. H3 is trained with a 768-pixel short edge. |
 | `--frames N` | 124 | Frame count at 24 fps, rounded up to the next 17n + 5. |
@@ -229,6 +364,8 @@ Inspection and development commands are available in `mmh3-tools`:
 - `crates/mmh3-cuda`: the CUDA kernels (`kernels/*.cu`) and the Rust code that runs the models with
   them.
 - `crates/mmh3-cpu`: an FP32 CPU reference of the DiT for tests.
+- `crates/mmh3-output`: portable encoder interfaces, AAC encoding, MP4/WebM muxing and ffmpeg CLI output.
+- `crates/mmh3-output-nvenc`: the NVENC adapter that accepts CUDA frames for native H.264 encoding.
 - `tests/fixtures`: small random models with outputs computed by ComfyUI's implementation.
 - `tools/download-models.sh`: the model downloader that `make download-models` runs.
 - `tools/golden`: development tools that write golden data with a ComfyUI checkout.
@@ -237,7 +374,7 @@ Inspection and development commands are available in `mmh3-tools`:
 ## Tests
 
 ```sh
-cargo test --release --workspace --features cuda -- --test-threads=1
+cargo test --release --workspace --features cuda,mp4 -- --test-threads=1
 ```
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results

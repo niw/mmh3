@@ -50,6 +50,16 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_vae_swiglu(input: *const c_void, output: *mut c_void, tokens: c_int, width: c_int, stream: *mut c_void) -> c_int;
+    fn mmh3_nv12_frame(
+        pixels: *const c_void,
+        output: *mut c_void,
+        frames: c_int,
+        height: c_int,
+        width: c_int,
+        frame: c_int,
+        pitch: usize,
+        stream: *mut c_void,
+    ) -> c_int;
     fn mmh3_yuv420(pixels: *const c_void, output: *mut c_void, frames: c_int, height: c_int, width: c_int, stream: *mut c_void) -> c_int;
     fn mmh3_vae_add_norm_quantize(
         residual: *mut c_void,
@@ -235,6 +245,81 @@ pub fn yuv420(pixels: &DeviceBuffer, frames: usize, height: usize, width: usize)
     let mut data = vec![0u8; output.bytes()];
     output.copy_to_host(&mut data)?;
     Ok(Yuv420 { frames, height, width, data })
+}
+
+/// Decoded RGB float32 frames retained on the CUDA device. No host readback is performed.
+pub struct CudaVideoFrames {
+    pixels: DeviceBuffer,
+    frames: usize,
+    height: usize,
+    width: usize,
+}
+
+impl CudaVideoFrames {
+    pub fn frames(&self) -> usize {
+        self.frames
+    }
+    pub fn height(&self) -> usize {
+        self.height
+    }
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    /// Takes ownership of planar `[3, frames, height, width]` float32 pixels in [0, 1].
+    pub fn from_rgb(pixels: DeviceBuffer, frames: usize, height: usize, width: usize) -> Result<Self, Error> {
+        let bytes = frames
+            .checked_mul(height)
+            .and_then(|rows| rows.checked_mul(width))
+            .and_then(|pixels| pixels.checked_mul(12));
+        if frames == 0
+            || height == 0
+            || width == 0
+            || !height.is_multiple_of(2)
+            || !width.is_multiple_of(2)
+            || bytes != Some(pixels.bytes())
+            || [frames, height, width].iter().any(|&dimension| dimension > i32::MAX as usize)
+        {
+            return Err(Error::Model("invalid device RGB frame dimensions".into()));
+        }
+        Ok(Self {
+            pixels,
+            frames,
+            height,
+            width,
+        })
+    }
+
+    /// Converts on the GPU, then copies the YUV planes to host memory.
+    pub fn to_yuv420(&self) -> Result<Yuv420, CudaError> {
+        yuv420(&self.pixels, self.frames, self.height, self.width)
+    }
+
+    /// Converts directly into the encoder's pitched CUDA allocation. The default stream
+    /// is synchronized before returning, so a native encoder may immediately read it.
+    pub fn write_nv12_frame(&self, frame: usize, output: &mut DeviceBuffer, pitch: usize) -> Result<(), Error> {
+        let bytes = pitch
+            .checked_mul(self.height)
+            .and_then(|luma| luma.checked_mul(3))
+            .map(|size| size / 2);
+        if frame >= self.frames || pitch < self.width || bytes.is_none_or(|bytes| bytes > output.bytes()) {
+            return Err(Error::Model("invalid NV12 destination or frame index".into()));
+        }
+        // SAFETY: dimensions and allocation bounds are checked above. Both buffers stay alive through synchronization.
+        check(unsafe {
+            mmh3_nv12_frame(
+                self.pixels.pointer(),
+                output.pointer(),
+                self.frames as i32,
+                self.height as i32,
+                self.width as i32,
+                frame as i32,
+                pitch,
+                ptr::null_mut(),
+            )
+        })?;
+        crate::synchronize()?;
+        Ok(())
+    }
 }
 
 pub struct CudaVideoDecoder {
@@ -624,6 +709,12 @@ impl CudaVideoDecoder {
     pub fn decode(&self, latent: &Tensor, capture_first_tile: bool) -> Result<VideoDecoding, Error> {
         let (pixels, [frames, height, width], first_tile) = self.decode_on_device(latent, capture_first_tile)?;
         Ok(VideoDecoding { pixels: Tensor::new(vec![OUTPUT_CHANNELS, frames, height, width], pixels.to_f32()?), first_tile })
+    }
+
+    /// Decodes a latent into RGB float32 frames retained on the GPU for native encoding.
+    pub fn decode_device(&self, latent: &Tensor) -> Result<CudaVideoFrames, Error> {
+        let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false)?;
+        CudaVideoFrames::from_rgb(pixels, frames, height, width)
     }
 
     /// Decodes a latent into 4:2:0 BT.709 limited-range video, converted on the GPU. The bytes match
