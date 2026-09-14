@@ -44,6 +44,9 @@ unsafe extern "C" {
 /// ConvRot rotates activations in groups of this many features.
 pub(crate) const CONVROT_GROUP: usize = 256;
 
+/// The INT8 GEMM adds low-rank adapters whose rank is a multiple of this inside its epilogue.
+pub(crate) const ADAPTER_RANK_MULTIPLE: usize = 64;
+
 #[derive(Debug)]
 pub enum Error {
     Cuda(CudaError),
@@ -220,7 +223,7 @@ impl DeviceTensors {
         // scratch buffer.
         unsafe {
             let fused = match adapter {
-                Some((low_rank, scratch)) if low_rank.rank % 64 == 0 => {
+                Some((low_rank, scratch)) if low_rank.rank % ADAPTER_RANK_MULTIPLE == 0 => {
                     Some(low_rank.project_down(input, rows, scratch)?)
                 }
                 Some(_) if output.swiglu => {

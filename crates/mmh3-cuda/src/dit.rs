@@ -10,7 +10,9 @@ use crate::attention::{
 };
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
-use crate::model::{DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer};
+use crate::model::{
+    ADAPTER_RANK_MULTIPLE, DeviceTensors, LowRank, check_quantization, host_tensor, i32_buffer,
+};
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -319,9 +321,11 @@ impl CudaDit {
 
     /// Adds the LoRA of a ComfyUI LoRA file at `strength`: every layer `{name}` with
     /// `{name}.lora_A.weight`, `{name}.lora_B.weight` and `{name}.alpha` gains
-    /// `strength · alpha / rank · B · A` on top of its weight. Other tensors of the file replace
-    /// the checkpoint's tensors of the same name, or add new ones, as they are, whatever the
-    /// strength. Returns the number of layers with an adapter and of tensors replaced or added.
+    /// `strength · alpha / rank · B · A` on top of its weight. Ranks that are not a multiple of 64,
+    /// as in LoRAs resized to a different rank per layer, are padded with zeros so that every
+    /// adapter runs inside the INT8 GEMM. Other tensors of the file replace the checkpoint's
+    /// tensors of the same name, or add new ones, as they are, whatever the strength. Returns the
+    /// number of layers with an adapter and of tensors replaced or added.
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize, Error> {
         const PREFIX: &str = "diffusion_model.";
         let mut uploader = Uploader::new(file);
@@ -358,10 +362,29 @@ impl CudaDit {
             if self.adapters.contains_key(layer) {
                 return Err(Error::Model(format!("{layer} already has a LoRA")));
             }
+            let padded_rank = rank.next_multiple_of(ADAPTER_RANK_MULTIPLE);
+            let (down, up) = if padded_rank == rank {
+                (uploader.allocate(file, info)?, uploader.allocate(file, up)?)
+            } else {
+                let mut down = file.data(info).to_vec();
+                down.resize(padded_rank * inputs * 2, 0);
+                let mut padded_up = vec![0; outputs * padded_rank * 2];
+                for (source, destination) in file
+                    .data(up)
+                    .chunks_exact(rank * 2)
+                    .zip(padded_up.chunks_exact_mut(padded_rank * 2))
+                {
+                    destination[..rank * 2].copy_from_slice(source);
+                }
+                (
+                    DeviceBuffer::from_bytes(&down)?,
+                    DeviceBuffer::from_bytes(&padded_up)?,
+                )
+            };
             let adapter = LowRank {
-                down: uploader.allocate(file, info)?,
-                up: uploader.allocate(file, up)?,
-                rank,
+                down,
+                up,
+                rank: padded_rank,
                 inputs,
                 outputs,
                 scale: strength * alpha / rank as f32,
