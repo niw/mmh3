@@ -160,9 +160,9 @@ __global__ void __launch_bounds__(THREADS)
     const float *keys = workspace.block_keys + static_cast<size_t>(head) * blocks * HEAD;
     for (int first = warp * ROUTE_BATCH; first < blocks; first += THREADS / 32 * ROUTE_BATCH) {
         float loaded[ROUTE_BATCH][HEAD / 32];
-#pragma unroll
+        #pragma unroll
         for (int batch = 0; batch < ROUTE_BATCH; batch++) {
-#pragma unroll
+            #pragma unroll
             for (int part = 0; part < HEAD / 32; part++) {
                 loaded[batch][part] =
                     first + batch < blocks
@@ -171,12 +171,12 @@ __global__ void __launch_bounds__(THREADS)
             }
         }
         float partials[32];
-#pragma unroll
+        #pragma unroll
         for (int query = 0; query < QUERIES; query++) {
-#pragma unroll
+            #pragma unroll
             for (int batch = 0; batch < ROUTE_BATCH; batch++) {
                 float partial = 0.0f;
-#pragma unroll
+                #pragma unroll
                 for (int part = 0; part < HEAD / 32; part++) {
                     partial =
                         __fmaf_rn(centroids[query][lane + part * 32], loaded[batch][part], partial);
@@ -186,10 +186,10 @@ __global__ void __launch_bounds__(THREADS)
         }
         // Each step adds the partner lane's half of the pairs, so lane l ends up with the sum of
         // pair l.
-#pragma unroll
+        #pragma unroll
         for (int offset = 16; offset > 0; offset /= 2) {
             const bool upper = lane & offset;
-#pragma unroll
+            #pragma unroll
             for (int index = 0; index < offset; index++) {
                 const float kept = upper ? partials[index + offset] : partials[index];
                 const float sent = upper ? partials[index] : partials[index + offset];
@@ -240,15 +240,15 @@ __global__ void __launch_bounds__(THREADS)
     float tails[QUERIES] = {};
     for (int first = 0; first < blocks; first += TAIL_BATCH) {
         float loaded[TAIL_BATCH];
-#pragma unroll
+        #pragma unroll
         for (int batch = 0; batch < TAIL_BATCH; batch++) {
             loaded[batch] =
                 first + batch < blocks ? values[static_cast<size_t>(first + batch) * HEAD] : 0.0f;
         }
-#pragma unroll
+        #pragma unroll
         for (int batch = 0; batch < TAIL_BATCH; batch++) {
             const int key_block = first + batch;
-#pragma unroll
+            #pragma unroll
             for (int query = 0; query < QUERIES; query++) {
                 if (query < queries && key_block < blocks && !routed[query * blocks + key_block]) {
                     tails[query] =
@@ -257,7 +257,7 @@ __global__ void __launch_bounds__(THREADS)
             }
         }
     }
-#pragma unroll
+    #pragma unroll
     for (int query = 0; query < QUERIES; query++) {
         if (query < queries) {
             workspace.tail_values[(first_row + query) * HEAD + threadIdx.x] = tails[query];
@@ -383,7 +383,7 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
     __syncthreads();
 
     uint32_t query_fragments[HEAD / 16][4];
-#pragma unroll
+    #pragma unroll
     for (int k_step = 0; k_step < HEAD / 16; k_step++) {
         const int tile_row = warp * 16 + (matrix % 2) * 8 + matrix_row;
         load_matrix_x4(query_fragments[k_step],
@@ -397,7 +397,7 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
 
     const int group_id = lane / 4;
     float offsets[2];
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         const int token = first_query + warp * 16 + half * 8 + group_id;
         offsets[half] = token < tokens
@@ -410,9 +410,9 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
 
     for (int entry = 0; entry < count; entry++) {
         float scores[BLOCK / 8][4] = {};
-#pragma unroll
+        #pragma unroll
         for (int k_step = 0; k_step < HEAD / 16; k_step++) {
-#pragma unroll
+            #pragma unroll
             for (int key_pair = 0; key_pair < BLOCK / 16; key_pair++) {
                 const int tile_row = key_pair * 16 + (matrix / 2) * 8 + matrix_row;
                 uint32_t registers[4];
@@ -434,9 +434,9 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
         const int first_key = route[entry] * BLOCK;
         const bool partial_block = first_key + BLOCK > tokens;
         float block_max[2] = {-FLT_MAX, -FLT_MAX};
-#pragma unroll
+        #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK / 8; key_tile_index++) {
-#pragma unroll
+            #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float score = scores[key_tile_index][element] * scale_log2 - offsets[element / 2];
                 if (partial_block &&
@@ -448,7 +448,7 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
             }
         }
         float correction[2];
-#pragma unroll
+        #pragma unroll
         for (int half = 0; half < 2; half++) {
             block_max[half] =
                 fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
@@ -459,9 +459,9 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
             row_max[half] = new_max;
             row_sum[half] *= correction[half];
         }
-#pragma unroll
+        #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK / 8; key_tile_index++) {
-#pragma unroll
+            #pragma unroll
             for (int element = 0; element < 4; element++) {
                 const float probability =
                     exp2f(scores[key_tile_index][element] - row_max[element / 2]);
@@ -469,14 +469,14 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
                 row_sum[element / 2] += probability;
             }
         }
-#pragma unroll
+        #pragma unroll
         for (int dimension_tile = 0; dimension_tile < HEAD / 8; dimension_tile++) {
             output_accumulators[dimension_tile][0] *= correction[0];
             output_accumulators[dimension_tile][1] *= correction[0];
             output_accumulators[dimension_tile][2] *= correction[1];
             output_accumulators[dimension_tile][3] *= correction[1];
         }
-#pragma unroll
+        #pragma unroll
         for (int key_step = 0; key_step < BLOCK / 16; key_step++) {
             const uint32_t probability_fragment[4] = {
                 N::pack(scores[key_step * 2][0], scores[key_step * 2][1]),
@@ -484,7 +484,7 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
                 N::pack(scores[key_step * 2 + 1][0], scores[key_step * 2 + 1][1]),
                 N::pack(scores[key_step * 2 + 1][2], scores[key_step * 2 + 1][3]),
             };
-#pragma unroll
+            #pragma unroll
             for (int dimension_pair = 0; dimension_pair < HEAD / 16; dimension_pair++) {
                 const int tile_row = key_step * 16 + (matrix % 2) * 8 + matrix_row;
                 uint32_t registers[4];
@@ -511,7 +511,7 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
     const float tail_sum = workspace.tail_sum[row];
     const float *tail_values = workspace.tail_values + row * HEAD;
     __nv_bfloat16 *output_head = output + head * layout.head_stride[OUTPUT];
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 1);
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 2);
@@ -525,7 +525,7 @@ __global__ void __launch_bounds__(THREADS, 2) sparse_attention_kernel(
         const float inverse_sum = 1.0f / (row_sum[half] * routed_weight + tail_sum * tail_weight);
         __nv_bfloat16 *output_row =
             output_head + static_cast<int64_t>(token) * layout.token_stride[OUTPUT];
-#pragma unroll
+        #pragma unroll
         for (int dimension_tile = 0; dimension_tile < HEAD / 8; dimension_tile++) {
             const int dimension = dimension_tile * 8 + (lane % 4) * 2;
             const float first = (output_accumulators[dimension_tile][half * 2] * routed_weight +

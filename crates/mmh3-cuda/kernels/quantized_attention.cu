@@ -244,7 +244,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     uint32_t key_shared[CHUNKS], value_shared[CHUNKS];
     int64_t key_offsets[CHUNKS];
     int key_rows[CHUNKS], value_offsets[CHUNKS];
-#pragma unroll
+    #pragma unroll
     for (int chunk = 0; chunk < CHUNKS; chunk++) {
         const int index = threadIdx.x + chunk * THREADS;
         key_rows[chunk] = index / 8;
@@ -260,13 +260,13 @@ __global__ void __launch_bounds__(THREADS, 3)
             key_head + static_cast<int64_t>(block) * BLOCK_N * layout.token_stride[KEY];
         const uint8_t *value_block = value_head + block * BLOCK_N;
         const uint32_t base = stage_address(stage);
-#pragma unroll
+        #pragma unroll
         for (int chunk = 0; chunk < CHUNKS; chunk++) {
             const bool valid = block * BLOCK_N + key_rows[chunk] < tokens;
             copy_async_16(base + key_shared[chunk],
                           valid ? key_block + key_offsets[chunk] : key_head, valid);
         }
-#pragma unroll
+        #pragma unroll
         for (int chunk = 0; chunk < CHUNKS; chunk++) {
             copy_async_16(base + value_shared[chunk], value_block + value_offsets[chunk], true);
         }
@@ -282,7 +282,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     __syncthreads();
 
     uint32_t query_fragments[HEAD_DIM / 32][4];
-#pragma unroll
+    #pragma unroll
     for (int k_step = 0; k_step < HEAD_DIM / 32; k_step++) {
         int row = warp * 16 + (matrix % 2) * 8 + matrix_row;
         int chunk = k_step * 2 + matrix / 2;
@@ -296,7 +296,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     const int blocks = SPARSE ? workspace.route_counts[route_row] : route_blocks;
     const uint16_t *route = SPARSE ? workspace.routes + route_row * route_blocks : nullptr;
     float offsets[2];
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         const int token = first_query + warp * 16 + half * 8 + lane / 4;
         offsets[half] = SPARSE && token < tokens
@@ -317,9 +317,9 @@ __global__ void __launch_bounds__(THREADS, 3)
 
         QKAccumulator raw_scores[BLOCK_N / 8][4] = {};
         float scores[BLOCK_N / 8][4];
-#pragma unroll
+        #pragma unroll
         for (int k_step = 0; k_step < HEAD_DIM / 32; k_step++) {
-#pragma unroll
+            #pragma unroll
             for (int key_pair = 0; key_pair < BLOCK_N / 16; key_pair++) {
                 int row = key_pair * 16 + (matrix / 2) * 8 + matrix_row;
                 int chunk = k_step * 2 + matrix % 2;
@@ -335,9 +335,9 @@ __global__ void __launch_bounds__(THREADS, 3)
         const int key_block = SPARSE ? route[block] : block;
         const bool masked_block = (key_block + 1) * BLOCK_N > tokens;
         float block_max[2] = {-FLT_MAX, -FLT_MAX};
-#pragma unroll
+        #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
-#pragma unroll
+            #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float score = static_cast<float>(raw_scores[key_tile_index][element]) *
                                   (scale_log2 *
@@ -356,7 +356,7 @@ __global__ void __launch_bounds__(THREADS, 3)
             }
         }
         float correction[2];
-#pragma unroll
+        #pragma unroll
         for (int half = 0; half < 2; half++) {
             block_max[half] =
                 fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
@@ -367,9 +367,9 @@ __global__ void __launch_bounds__(THREADS, 3)
             row_max[half] = new_max;
             row_sum[half] *= correction[half];
         }
-#pragma unroll
+        #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
-#pragma unroll
+            #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float probability =
                     exp2_flushed(scores[key_tile_index][element] - row_max[element / 2]);
@@ -377,7 +377,7 @@ __global__ void __launch_bounds__(THREADS, 3)
                 row_sum[element / 2] += probability;
             }
         }
-#pragma unroll
+        #pragma unroll
         for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
             output_accumulators[dimension_tile][0] *= correction[0];
             output_accumulators[dimension_tile][1] *= correction[0];
@@ -386,14 +386,14 @@ __global__ void __launch_bounds__(THREADS, 3)
         }
 
         // Repack two adjacent FP8 pairs with word shuffles into MMA's four A registers.
-#pragma unroll
+        #pragma unroll
         for (int key_step = 0; key_step < BLOCK_N / 32; key_step++) {
             uint32_t probability_fragment[4];
-#pragma unroll
+            #pragma unroll
             for (int key_half = 0; key_half < 2; key_half++) {
                 const int tile_base = key_step * 4 + key_half * 2;
                 const int source_lane = (lane & ~3) + 2 * (lane % 2);
-#pragma unroll
+                #pragma unroll
                 for (int half = 0; half < 2; half++) {
                     uint32_t pairs = static_cast<uint32_t>(__nv_cvt_float2_to_fp8x2(
                         make_float2(scores[tile_base][half * 2] * 448.0f,
@@ -411,7 +411,7 @@ __global__ void __launch_bounds__(THREADS, 3)
                     probability_fragment[key_half * 2 + half] = (first & 0xffffu) | (second << 16);
                 }
             }
-#pragma unroll
+            #pragma unroll
             for (int dimension_pair = 0; dimension_pair < HEAD_DIM / 16; dimension_pair++) {
                 const int row = dimension_pair * 16 + (matrix / 2) * 8 + matrix_row;
                 const int chunk = key_step * 2 + matrix % 2;
@@ -427,7 +427,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     }
     copy_async_wait<0>();
 
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 1);
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 2);
@@ -436,7 +436,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     const int group_id = lane / 4;
     Element *output_head =
         output + batch * layout.batch_stride[OUTPUT] + head * layout.head_stride[OUTPUT];
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         const int token = first_query + warp * 16 + half * 8 + group_id;
         if (token >= tokens) {
@@ -454,7 +454,7 @@ __global__ void __launch_bounds__(THREADS, 3)
             const float tail_weight = exp2f(tail_max - merged_max);
             const float inverse_sum =
                 1.0f / (row_sum[half] * routed_weight + tail_sum * tail_weight);
-#pragma unroll
+            #pragma unroll
             for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
                 const int dimension = dimension_tile * 8 + (lane % 4) * 2;
                 const float first =
@@ -469,7 +469,7 @@ __global__ void __launch_bounds__(THREADS, 3)
             }
         } else {
             const float inverse_sum = value_factor / row_sum[half];
-#pragma unroll
+            #pragma unroll
             for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
                 const int dimension = dimension_tile * 8 + (lane % 4) * 2;
                 *reinterpret_cast<uint32_t *>(output_row + dimension) =

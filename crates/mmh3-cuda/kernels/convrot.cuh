@@ -27,7 +27,7 @@ constexpr int MAX_GROUPS_PER_WARP = 4;
 // bit whichever lane computes it. The rewritten forms below only use a + b == b + a and a + (-b) ==
 // a - b, which hold exactly.
 __device__ __forceinline__ void rotate_group(float (&values)[8], int lane) {
-#pragma unroll
+    #pragma unroll
     for (int base = 0; base < 8; base += 4) {
         const float x0 = values[base], x1 = values[base + 1], x2 = values[base + 2],
                     x3 = values[base + 3];
@@ -39,7 +39,7 @@ __device__ __forceinline__ void rotate_group(float (&values)[8], int lane) {
     // Stride 4: even lanes hold x0 and x1 and compute y0 and y1, odd lanes hold x2 and x3 and
     // compute y2 and y3.
     const bool odd_lane = lane & 1;
-#pragma unroll
+    #pragma unroll
     for (int low = 0; low < 4; low++) {
         const float own_0 = values[low], own_1 = values[low + 4];
         const float other_0 = __shfl_xor_sync(0xffffffff, own_0, 1);
@@ -52,12 +52,12 @@ __device__ __forceinline__ void rotate_group(float (&values)[8], int lane) {
     // Strides 16 and 64: the lane with digit j finds x_(j ^ k) at xor distance k << shift. With v_k
     // read from there, y0 = (v0 + v1 + v2) - v3, y1 = (v0 + v1 - v3) + v2, y2 = (v2 - v3 + v0) + v1
     // and y3 = (v2 - v3 + v1) + v0.
-#pragma unroll
+    #pragma unroll
     for (int shift = 1; shift <= 3; shift += 2) {
         const int digit = (lane >> shift) & 3;
         const bool high = digit & 2;
         const bool odd = digit & 1;
-#pragma unroll
+        #pragma unroll
         for (int index = 0; index < 8; index++) {
             const float v0 = values[index];
             const float v1 = __shfl_xor_sync(0xffffffff, v0, 1 << shift);
@@ -69,7 +69,7 @@ __device__ __forceinline__ void rotate_group(float (&values)[8], int lane) {
             values[index] = first + second + third;
         }
     }
-#pragma unroll
+    #pragma unroll
     for (int index = 0; index < 8; index++) {
         values[index] *= 1.0f / 16.0f;
     }
@@ -95,21 +95,21 @@ __device__ __forceinline__ void rotate_quantize_row(const Pair *row, int8_t *out
 
     float values[GROUPS_PER_WARP][8];
     float maximum = 0.0f;
-#pragma unroll
+    #pragma unroll
     for (int slot = 0; slot < GROUPS_PER_WARP; slot++) {
         const int group = warp + slot * warps;
         if (group < groups) {
             const uint4 packed =
                 *reinterpret_cast<const uint4 *>(row + (group * CONVROT_GROUP + lane * 8) / 2);
             const Pair *pairs = reinterpret_cast<const Pair *>(&packed);
-#pragma unroll
+            #pragma unroll
             for (int pair = 0; pair < 4; pair++) {
                 const float2 value = to_float2(pairs[pair]);
                 values[slot][pair * 2] = value.x;
                 values[slot][pair * 2 + 1] = value.y;
             }
             rotate_group(values[slot], lane);
-#pragma unroll
+            #pragma unroll
             for (int index = 0; index < 8; index++) {
                 maximum = fmaxf(maximum, fabsf(values[slot][index]));
             }
@@ -130,12 +130,12 @@ __device__ __forceinline__ void rotate_quantize_row(const Pair *row, int8_t *out
     if (threadIdx.x == 0) {
         *scale_output = scale;
     }
-#pragma unroll
+    #pragma unroll
     for (int slot = 0; slot < GROUPS_PER_WARP; slot++) {
         const int group = warp + slot * warps;
         if (group < groups) {
             uint32_t words[2] = {0, 0};
-#pragma unroll
+            #pragma unroll
             for (int index = 0; index < 8; index++) {
                 const int quantized = static_cast<int>(
                     fminf(fmaxf(rintf(values[slot][index] / scale), -128.0f), 127.0f));

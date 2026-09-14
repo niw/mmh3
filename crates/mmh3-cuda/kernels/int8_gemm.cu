@@ -180,17 +180,17 @@ multiply_stage(Accumulator (&accumulators)[Config::m_tiles][Config::n_tiles][4],
     const uint32_t stage_b = stage_a + Config::a_bytes;
     const int matrix = lane / 8;
     const int matrix_row = lane % 8;
-#pragma unroll
+    #pragma unroll
     for (int k_step = 0; k_step < BLOCK_K / 32; k_step++) {
         uint32_t a_fragments[Config::m_tiles][4];
         uint32_t b_fragments[Config::n_tiles][2];
-#pragma unroll
+        #pragma unroll
         for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
             const int row = warp_row + m_tile * 16 + (matrix % 2) * 8 + matrix_row;
             load_matrix_x4(a_fragments[m_tile],
                            stage_a + swizzled_offset(row, k_step * 2 + matrix / 2));
         }
-#pragma unroll
+        #pragma unroll
         for (int n_pair = 0; n_pair < Config::n_tiles / 2; n_pair++) {
             // NOTE: Within each group of 32 weight rows, MMA column 2t + e of n-tile j reads row
             // 8t + 2((j + t) % 4) + e. Lane t of every quad then holds eight adjacent output
@@ -207,9 +207,9 @@ multiply_stage(Accumulator (&accumulators)[Config::m_tiles][Config::n_tiles][4],
             b_fragments[n_pair * 2 + 1][0] = registers[2];
             b_fragments[n_pair * 2 + 1][1] = registers[3];
         }
-#pragma unroll
+        #pragma unroll
         for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+            #pragma unroll
             for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
                 mma(accumulators[m_tile][n_tile], a_fragments[m_tile], b_fragments[n_tile][0],
                     b_fragments[n_tile][1]);
@@ -326,11 +326,11 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         int tile_m, tile_n;
         grid.coordinates(tile, tile_m, tile_n);
         int32_t accumulators[Config::m_tiles][Config::n_tiles][4];
-#pragma unroll
+        #pragma unroll
         for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+            #pragma unroll
             for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
-#pragma unroll
+                #pragma unroll
                 for (int index = 0; index < 4; index++) {
                     accumulators[m_tile][n_tile][index] = 0;
                 }
@@ -344,25 +344,25 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         // 4) and the one after among the lane's eight.
         float values[Config::m_tiles][Config::n_tiles][4];
         float row_scales[Config::m_tiles][2];
-#pragma unroll
+        #pragma unroll
         for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+            #pragma unroll
             for (int half = 0; half < 2; half++) {
                 const int row =
                     tile_m * Config::block_m + warp_row + m_tile * 16 + half * 8 + group_id;
                 row_scales[m_tile][half] = row < m ? activation_scales[row] : 0.0f;
             }
         }
-#pragma unroll
+        #pragma unroll
         for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
             const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
-#pragma unroll
+            #pragma unroll
             for (int slot = 0; slot < 4; slot++) {
                 const float2 column_scale = *reinterpret_cast<const float2 *>(
                     weight_scales + column + ((slot + quad_lane) & 3) * 2);
-#pragma unroll
+                #pragma unroll
                 for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+                    #pragma unroll
                     for (int half = 0; half < 2; half++) {
                         const int32_t *products = accumulators[m_tile][quad * 4 + slot] + half * 2;
                         float *scaled = values[m_tile][quad * 4 + slot] + half * 2;
@@ -379,11 +379,11 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         // adapter.
         if (adapter_blocks > 0) {
             const float inverse_scale = 1.0f / adapter_scale;
-#pragma unroll
+            #pragma unroll
             for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+                #pragma unroll
                 for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
-#pragma unroll
+                    #pragma unroll
                     for (int index = 0; index < 4; index++) {
                         values[m_tile][n_tile][index] *= inverse_scale;
                     }
@@ -392,11 +392,11 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             for (int block = 0; block < adapter_blocks; block++) {
                 consume(values);
             }
-#pragma unroll
+            #pragma unroll
             for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+                #pragma unroll
                 for (int n_tile = 0; n_tile < Config::n_tiles; n_tile++) {
-#pragma unroll
+                    #pragma unroll
                     for (int index = 0; index < 4; index++) {
                         values[m_tile][n_tile][index] *= adapter_scale;
                     }
@@ -405,17 +405,17 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
         }
 
         if (bias != nullptr) {
-#pragma unroll
+            #pragma unroll
             for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
                 const int column =
                     tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
-#pragma unroll
+                #pragma unroll
                 for (int slot = 0; slot < 4; slot++) {
                     const float2 column_bias = *reinterpret_cast<const float2 *>(
                         bias + column + ((slot + quad_lane) & 3) * 2);
-#pragma unroll
+                    #pragma unroll
                     for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+                        #pragma unroll
                         for (int half = 0; half < 2; half++) {
                             values[m_tile][quad * 4 + slot][half * 2] += column_bias.x;
                             values[m_tile][quad * 4 + slot][half * 2 + 1] += column_bias.y;
@@ -425,15 +425,15 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             }
         }
 
-#pragma unroll
+        #pragma unroll
         for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
             const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
-#pragma unroll
+            #pragma unroll
             for (int m_tile = 0; m_tile < Config::m_tiles; m_tile++) {
-#pragma unroll
+                #pragma unroll
                 for (int half = 0; half < 2; half++) {
                     uint32_t words[4];
-#pragma unroll
+                    #pragma unroll
                     for (int slot = 0; slot < 4; slot++) {
                         const float *scaled = values[m_tile][quad * 4 + slot] + half * 2;
                         words[slot] = pack(output, scaled[0], scaled[1]);

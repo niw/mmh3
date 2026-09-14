@@ -70,7 +70,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     __syncthreads();
 
     uint32_t query_fragments[HEAD_DIM / 16][4];
-#pragma unroll
+    #pragma unroll
     for (int k_step = 0; k_step < HEAD_DIM / 16; k_step++) {
         int row = warp * 16 + (matrix % 2) * 8 + matrix_row;
         int chunk = k_step * 2 + matrix / 2;
@@ -98,9 +98,9 @@ __global__ void __launch_bounds__(THREADS, 1)
         const uint32_t value_tile = key_tile + T::tile_bytes;
 
         float scores[BLOCK_N / 8][4] = {};
-#pragma unroll
+        #pragma unroll
         for (int k_step = 0; k_step < HEAD_DIM / 16; k_step++) {
-#pragma unroll
+            #pragma unroll
             for (int key_pair = 0; key_pair < BLOCK_N / 16; key_pair++) {
                 int row = key_pair * 16 + (matrix / 2) * 8 + matrix_row;
                 int chunk = k_step * 2 + matrix % 2;
@@ -117,9 +117,9 @@ __global__ void __launch_bounds__(THREADS, 1)
         const bool masked_block = (block + 1) * BLOCK_N > tokens ||
                                   (layout.causal && (block + 1) * BLOCK_N - 1 > first_query);
         float block_max[2] = {-FLT_MAX, -FLT_MAX};
-#pragma unroll
+        #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
-#pragma unroll
+            #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float score = scores[key_tile_index][element] * scale_log2;
                 if (masked_block) {
@@ -135,7 +135,7 @@ __global__ void __launch_bounds__(THREADS, 1)
             }
         }
         float correction[2];
-#pragma unroll
+        #pragma unroll
         for (int half = 0; half < 2; half++) {
             block_max[half] =
                 fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
@@ -146,16 +146,16 @@ __global__ void __launch_bounds__(THREADS, 1)
             row_max[half] = new_max;
             row_sum[half] *= correction[half];
         }
-#pragma unroll
+        #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
-#pragma unroll
+            #pragma unroll
             for (int element = 0; element < 4; element++) {
                 float probability = exp2f(scores[key_tile_index][element] - row_max[element / 2]);
                 scores[key_tile_index][element] = probability;
                 row_sum[element / 2] += probability;
             }
         }
-#pragma unroll
+        #pragma unroll
         for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
             output_accumulators[dimension_tile][0] *= correction[0];
             output_accumulators[dimension_tile][1] *= correction[0];
@@ -163,7 +163,7 @@ __global__ void __launch_bounds__(THREADS, 1)
             output_accumulators[dimension_tile][3] *= correction[1];
         }
 
-#pragma unroll
+        #pragma unroll
         for (int key_step = 0; key_step < BLOCK_N / 16; key_step++) {
             uint32_t probability_fragment[4] = {
                 N::pack(scores[key_step * 2][0], scores[key_step * 2][1]),
@@ -171,7 +171,7 @@ __global__ void __launch_bounds__(THREADS, 1)
                 N::pack(scores[key_step * 2 + 1][0], scores[key_step * 2 + 1][1]),
                 N::pack(scores[key_step * 2 + 1][2], scores[key_step * 2 + 1][3]),
             };
-#pragma unroll
+            #pragma unroll
             for (int dimension_pair = 0; dimension_pair < HEAD_DIM / 16; dimension_pair++) {
                 int row = key_step * 16 + (matrix % 2) * 8 + matrix_row;
                 int chunk = dimension_pair * 2 + matrix / 2;
@@ -187,7 +187,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     }
     copy_async_wait<0>();
 
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 1);
         row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 2);
@@ -195,7 +195,7 @@ __global__ void __launch_bounds__(THREADS, 1)
     const int group_id = lane / 4;
     Element *output_head =
         output + batch * layout.batch_stride[OUTPUT] + head * layout.head_stride[OUTPUT];
-#pragma unroll
+    #pragma unroll
     for (int half = 0; half < 2; half++) {
         const int token = first_query + warp * 16 + half * 8 + group_id;
         if (token >= tokens) {
@@ -204,7 +204,7 @@ __global__ void __launch_bounds__(THREADS, 1)
         const float inverse_sum = 1.0f / row_sum[half];
         Element *output_row =
             output_head + static_cast<int64_t>(token) * layout.token_stride[OUTPUT];
-#pragma unroll
+        #pragma unroll
         for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
             const int dimension = dimension_tile * 8 + (lane % 4) * 2;
             *reinterpret_cast<uint32_t *>(output_row + dimension) =

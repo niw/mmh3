@@ -213,7 +213,7 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
 
     uint4 chunks[CHUNKS_PER_THREAD];
     auto load = [&](int part) {
-#pragma unroll
+        #pragma unroll
         for (int index = 0; index < CHUNKS_PER_THREAD; index++) {
             const int chunk = threadIdx.x + index * INPUT_THREADS;
             if (chunk / 16 < rows) {
@@ -224,7 +224,7 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
     };
     load(0);
     for (int part = 0; part < 2; part++) {
-#pragma unroll
+        #pragma unroll
         for (int index = 0; index < CHUNKS_PER_THREAD; index++) {
             const int chunk = threadIdx.x + index * INPUT_THREADS;
             if (chunk / 16 < rows) {
@@ -267,7 +267,7 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
             const int dimension = threadIdx.x - HEAD_DIM;
             const __nv_bfloat16 *value = block_rows + 2 * inner + dimension;
             float sum = 0.0f, maximum = 0.0f;
-#pragma unroll 8
+            #pragma unroll 8
             for (int row = 0; row < rows; row++) {
                 const float element = __bfloat162float(value[row * row_stride]);
                 sum += element;
@@ -309,10 +309,10 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
                 const uint4 halves[2] = {source[0], source[1]};
                 const __nv_bfloat16 *values = reinterpret_cast<const __nv_bfloat16 *>(halves);
                 uint32_t words[4];
-#pragma unroll
+                #pragma unroll
                 for (int word = 0; word < 4; word++) {
                     uint32_t packed = 0;
-#pragma unroll
+                    #pragma unroll
                     for (int byte = 0; byte < 4; byte++) {
                         const int8_t value = static_cast<int8_t>(
                             __float2int_rn(__bfloat162float(values[word * 4 + byte]) / scale));

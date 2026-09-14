@@ -91,7 +91,7 @@ __global__ void __launch_bounds__(THREADS_PER_BLOCK)
     const uint32_t b[2] = {operand, operand};
     typename Form::Accumulator accumulators[CHAINS] = {};
     for (int iteration = 0; iteration < iterations; iteration++) {
-#pragma unroll
+        #pragma unroll
         for (int chain = 0; chain < CHAINS; chain++) {
             Form::run(accumulators[chain], a, b);
         }
