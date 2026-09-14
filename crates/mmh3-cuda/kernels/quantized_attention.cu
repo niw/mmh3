@@ -432,7 +432,7 @@ __global__ void __launch_bounds__(THREADS, 3)
     }
 }
 
-// No allocations or host downloads in the launch path; all scratch belongs to the caller.
+// The launch path makes no allocations or host downloads. All scratch belongs to the caller.
 template <bool SPARSE>
 int launch_attention(const Mmh3QuantizedWorkspace& workspace, __nv_bfloat16* output, int tokens, int heads,
                      Mmh3AttentionLayout layout, float scale, Mmh3SparseWorkspace sparse, cudaStream_t stream) {

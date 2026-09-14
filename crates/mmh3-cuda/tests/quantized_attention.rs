@@ -59,7 +59,7 @@ fn bounded_error_with_ragged_tiles_and_reused_scales() {
 #[test]
 fn zero_queries_produce_uniform_means_including_the_last_key() {
     // Values +/-448 are exactly representable in E4M3 and force a scale of one.
-    // Alternating values cancel; an odd sequence leaves a known nonzero mean.
+    // Alternating values cancel. An odd-length sequence leaves a known nonzero mean.
     for tokens in [1usize, 63, 64, 65, 129] {
         let mut qkv = vec![0u16; tokens * 3 * HEAD_DIM];
         for token in 0..tokens {

@@ -113,7 +113,7 @@ make
 `make` builds `mmh3` with `cargo build --release --features cuda --bin mmh3`.
 `CUDA_HOME` points at the CUDA toolkit (default `/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU
 architecture (default `sm_120f`). Without `--features cuda`, both commands can build with the CPU-side
-crates; only `mmh3-tools inspect` is available.
+crates. In that case, only `mmh3-tools inspect` is available.
 
 Build the inspection and development tools separately with:
 

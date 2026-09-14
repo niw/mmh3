@@ -544,7 +544,7 @@ impl SparseWorkspace {
         Self::with_precision(tokens, heads, AttentionPrecision::Bf16)
     }
 
-    /// Keeps BF16 routing and the FP32 pooled tail; quantizes the routed products when requested.
+    /// Keeps BF16 routing and the FP32 pooled tail. Quantizes the routed products when requested.
     pub fn with_precision(tokens: usize, heads: usize, precision: AttentionPrecision) -> Result<Self, CudaError> {
         let blocks = tokens.div_ceil(SPARSE_BLOCK);
         let per_block = heads * blocks * HEAD_DIM * 4;
