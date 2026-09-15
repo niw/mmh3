@@ -54,6 +54,9 @@ make generate \
   its down projection on the layer's INT8 input. `merge` adds it into the INT8 weights at load time,
   like ComfyUI, so the steps run as fast as without a LoRA, but updates smaller than the INT8 step
   are lost: most of the TaoMate LoRA, with visibly worse detail.
+- `--linear-precision int8|nvfp4` (default `int8`): `nvfp4` runs the video rows of the DiT blocks'
+  linear layers in NVFP4, which takes about a quarter off each step and loses some detail.
+  Experimental, see [NVFP4 linear layers](nvfp4.md).
 
 ## Prompts
 

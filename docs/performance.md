@@ -12,6 +12,7 @@ tokens (38,710 tokens in all):
 | DiT step, dense INT8/FP8 attention | 26.7 s | |
 | DiT step, Sol-Attn in BF16 | 16.5 s | 23.0 s |
 | DiT step, Sol-Attn in INT8/FP8 | 14.6 s | |
+| DiT step, Sol-Attn in INT8/FP8, [NVFP4](nvfp4.md) linear layers | 10.7 s | |
 | Video VAE decode, FP16 VAE | 30.9 s | 59.2 s |
 | Video VAE decode, INT8 ConvRot VAE | 20.2 s | |
 | Audio VAE decode | 0.3 s | |
@@ -40,3 +41,5 @@ mmh3 is checked against ComfyUI's implementation, stage by stage, with the golde
 - The tokenizer gives the same token ids as Hugging Face tokenizers.
 - Sol-Attn is an approximation by design, and mmh3's differs from dense attention as much as
   ComfyUI's does.
+- The experimental [NVFP4 linear layers](nvfp4.md) are further from the reference than the INT8
+  ones.

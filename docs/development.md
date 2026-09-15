@@ -11,6 +11,8 @@
 - Optional INT8/FP8 attention in the DiT, with FP32 softmax and accumulation.
 - Kernels fused for H3's shapes, such as the normalization and quantization of each layer input in
   one pass, and SwiGLU and LoRA inside the INT8 GEMM.
+- Experimental NVFP4 linear layers on cuBLASLt's block-scaled FP4 GEMM, requantized from the INT8
+  weights at load time, with LoRAs as extra GEMM columns.
 - LoRAs such as the [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo) for
   4-step generation, applied on top of the INT8 weights at run time without requantizing them.
 - The video VAE decoder with FP16 weights, or with INT8 ConvRot weights in its transformer.
