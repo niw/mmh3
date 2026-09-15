@@ -291,8 +291,8 @@ pub struct CudaDit {
     tensors: DeviceTensors,
     /// Low-rank adapters by layer name.
     adapters: HashMap<String, LowRank>,
-    /// NVFP4 versions of block linear layers by name, which replace their INT8 weights and carry
-    /// their adapters.
+    /// NVFP4 versions of block linear layers by name, with their adapters, which run the video
+    /// rows in place of the INT8 weights.
     nvfp4: HashMap<String, Nvfp4Weight>,
     /// Tensor scale histories of the NVFP4 layers' inputs, by layer. A VSA gate shares the input of
     /// its block's qkv projection.
@@ -539,8 +539,8 @@ impl CudaDit {
     /// Runs the linear layers of the main blocks in NVFP4, requantized from their INT8 ConvRot
     /// weights, and returns how many layers changed. A block's first call quantizes the inputs
     /// from BF16 rows to find their tensor scales, and later calls quantize them in the passes that
-    /// produce them. The adapters of these layers move into their NVFP4 weights, so LoRAs come
-    /// first.
+    /// produce them. The adapters of these layers go into their NVFP4 weights too, so LoRAs come
+    /// first. The INT8 weights and adapters stay for the text and audio rows.
     pub fn use_nvfp4(&mut self) -> Result<usize, Error> {
         for layer in 0..self.config.layers {
             let qkv = format!("blocks.{layer}.attn.qkv_proj");
@@ -558,8 +558,7 @@ impl CudaDit {
                 {
                     continue;
                 }
-                let adapter = self.adapters.remove(&name);
-                let columns = match &adapter {
+                let columns = match self.adapters.get(&name) {
                     Some(_) if part == "attn.to_gate_compress" => {
                         return Err(Error::Model(format!(
                             "{name}: NVFP4 VSA gates do not take LoRAs"
@@ -620,14 +619,16 @@ impl CudaDit {
             .ok_or_else(|| Error::Model(format!("{layer} has no NVFP4 input scale")))
     }
 
-    /// `add_norm_quantize` for the NVFP4 layer `layer`. The first call finds the exact tensor
-    /// scale in a pass of its own, and later calls take the scale of the call before.
+    /// `add_norm_quantize` for the NVFP4 layer `layer` on `tokens` rows from `first_row`. The first
+    /// call finds the exact tensor scale in a pass of its own, and later calls take the scale of
+    /// the call before.
     #[allow(clippy::too_many_arguments)]
     fn add_norm_quantize_nvfp4(
         &self,
         weight: &str,
         layer: &str,
         workspace: &Workspace,
+        first_row: usize,
         tokens: usize,
         (table, rows): (&DeviceBuffer, &DeviceBuffer),
         gate: Option<(&DeviceBuffer, usize)>,
@@ -640,17 +641,22 @@ impl CudaDit {
         let layer_weight = &self.nvfp4[layer];
         activations.check_fits(tokens, layer_weight.columns);
         let slots = history.next_call();
-        // SAFETY: the residual and delta buffers hold `tokens × hidden` values, the activation
-        // buffers fit, checked above, and the modulation rows index the table.
+        // SAFETY: the residual and delta buffers hold the rows up to `first_row + tokens`, the
+        // activation buffers fit, checked above, and the modulation rows index the table.
         check(unsafe {
             mmh3_add_norm_quantize_nvfp4(
-                workspace.residual.pointer(),
-                gate.map_or(ptr::null(), |_| workspace.delta.pointer().cast_const()),
+                workspace.residual.pointer_at(first_row * hidden * 4),
+                gate.map_or(ptr::null(), |_| {
+                    workspace
+                        .delta
+                        .pointer_at(first_row * hidden * 2)
+                        .cast_const()
+                }),
                 gate.map_or(ptr::null(), |(gate_table, _)| {
                     gate_table.pointer().cast_const()
                 }),
                 table.pointer(),
-                rows.pointer(),
+                rows.pointer_at(first_row * 4),
                 BLOCK_CHUNKS as c_int,
                 gate.map_or(0, |(_, chunk)| chunk) as c_int,
                 shift as c_int,
@@ -673,42 +679,61 @@ impl CudaDit {
         Ok(())
     }
 
+    /// Applies layer `name` to `rows` rows. NVFP4 layers run the first `head` rows through their
+    /// INT8 weights.
     fn linear(
         &self,
         name: &str,
         input: *const c_void,
         output: *mut c_void,
         rows: usize,
+        head: usize,
         workspace: &Workspace,
     ) -> Result<(), Error> {
-        if let Some(weight) = self.nvfp4.get(name) {
-            let activations = self.nvfp4_activations(workspace);
-            // SAFETY: the caller passes `rows` rows of input and output for the layer.
-            unsafe {
-                nvfp4::quantize_pointers(
-                    Nvfp4Input::Rows(input),
-                    rows,
-                    weight,
-                    self.nvfp4_scale(name)?,
-                    activations,
-                )?;
-                nvfp4::gemm_pointers(weight, activations, output, rows)?;
-            }
-            return Ok(());
-        }
         let adapter = self
             .adapters
             .get(name)
             .map(|adapter| (adapter, &workspace.adapter));
-        self.tensors.linear(
-            name,
-            input,
-            output,
-            rows,
-            &workspace.quantized,
-            &workspace.scales,
-            adapter,
-        )
+        let Some(weight) = self.nvfp4.get(name) else {
+            return self.tensors.linear(
+                name,
+                input,
+                output,
+                rows,
+                &workspace.quantized,
+                &workspace.scales,
+                adapter,
+            );
+        };
+        if head > 0 {
+            self.tensors.linear(
+                name,
+                input,
+                output,
+                head,
+                &workspace.quantized,
+                &workspace.scales,
+                adapter,
+            )?;
+        }
+        let activations = self.nvfp4_activations(workspace);
+        // SAFETY: the caller passes `rows` rows of input and output for the layer.
+        unsafe {
+            nvfp4::quantize_pointers(
+                Nvfp4Input::Rows(input.byte_add(head * weight.features * 2)),
+                rows - head,
+                weight,
+                self.nvfp4_scale(name)?,
+                activations,
+            )?;
+            nvfp4::gemm_pointers(
+                weight,
+                activations,
+                output.byte_add(head * weight.outputs * 2),
+                rows - head,
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -873,7 +898,8 @@ impl CudaDit {
     }
 
     /// Attention and MLP halves of a block or refiner block. `modulation` carries the block
-    /// modulation and `sparse` replaces dense attention with Sol-Attn.
+    /// modulation and `sparse` replaces dense attention with Sol-Attn. NVFP4 layers run the first
+    /// `head` rows through their INT8 weights.
     ///
     /// A modulated block leaves its MLP output in `delta` instead of adding it to the residual, so
     /// that the next block adds it in its first normalization. `pending` is the modulation table of
@@ -884,6 +910,7 @@ impl CudaDit {
         prefix: &str,
         workspace: &Workspace,
         tokens: usize,
+        head: usize,
         angles: Option<&DeviceBuffer>,
         modulation: Option<(&DeviceBuffer, &DeviceBuffer)>,
         pending: Option<&DeviceBuffer>,
@@ -902,49 +929,54 @@ impl CudaDit {
                 .map(|adapter| (adapter, &workspace.adapter))
         };
         // Modulated blocks normalize and quantize the inputs of their INT8 and NVFP4 layers in one
-        // pass.
-        if let (Some(weight), Some(modulation)) = (self.nvfp4.get(&qkv), modulation) {
+        // pass. NVFP4 layers keep their INT8 weights.
+        let nvfp4_qkv = self.nvfp4.get(&qkv).filter(|_| modulation.is_some());
+        if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&qkv)) {
             let pending_gate = pending.map(|table| (table, MLP_GATE_CHUNK));
-            self.add_norm_quantize_nvfp4(
-                &format!("{prefix}.norm1.weight"),
-                &qkv,
-                workspace,
-                tokens,
-                modulation,
-                pending_gate,
-                0,
-                1,
-            )?;
-            // SAFETY: qkv holds `tokens × 3 × inner` values.
-            unsafe {
-                nvfp4::gemm_pointers(
-                    weight,
-                    self.nvfp4_activations(workspace),
+            let int8_rows = if nvfp4_qkv.is_some() { head } else { tokens };
+            if int8_rows > 0 {
+                self.add_norm_quantize(
+                    &format!("{prefix}.norm1.weight"),
+                    &qkv,
+                    workspace,
+                    int8_rows,
+                    modulation,
+                    pending_gate,
+                    0,
+                    1,
+                )?;
+                self.tensors.linear_quantized(
+                    &qkv,
                     workspace.qkv.pointer(),
-                    tokens,
-                )?
-            };
-        } else if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&qkv)) {
-            let pending_gate = pending.map(|table| (table, MLP_GATE_CHUNK));
-            self.add_norm_quantize(
-                &format!("{prefix}.norm1.weight"),
-                &qkv,
-                workspace,
-                tokens,
-                modulation,
-                pending_gate,
-                0,
-                1,
-            )?;
-            self.tensors.linear_quantized(
-                &qkv,
-                workspace.qkv.pointer(),
-                tokens,
-                &workspace.quantized,
-                &workspace.scales,
-                adapter(&qkv),
-                false,
-            )?;
+                    int8_rows,
+                    &workspace.quantized,
+                    &workspace.scales,
+                    adapter(&qkv),
+                    false,
+                )?;
+            }
+            if let Some(weight) = nvfp4_qkv {
+                self.add_norm_quantize_nvfp4(
+                    &format!("{prefix}.norm1.weight"),
+                    &qkv,
+                    workspace,
+                    head,
+                    tokens - head,
+                    modulation,
+                    pending_gate,
+                    0,
+                    1,
+                )?;
+                // SAFETY: qkv holds `tokens × 3 × inner` values.
+                unsafe {
+                    nvfp4::gemm_pointers(
+                        weight,
+                        self.nvfp4_activations(workspace),
+                        workspace.qkv.pointer_at(head * weight.outputs * 2),
+                        tokens - head,
+                    )?
+                };
+            }
         } else {
             if let Some((table, rows)) = pending.zip(modulation.map(|(_, rows)| rows)) {
                 self.add_pending(workspace, tokens, table, rows)?;
@@ -962,13 +994,14 @@ impl CudaDit {
                 workspace.normalized.pointer(),
                 workspace.qkv.pointer(),
                 tokens,
+                head,
                 workspace,
             )?;
         }
         let vsa_gate = match sparse {
             Some(SparsePass::Vsa { .. }) => {
                 let fused = modulation.is_some() && self.tensors.is_int8(&qkv);
-                self.vsa_gate(prefix, workspace, tokens, fused)?
+                self.vsa_gate(prefix, workspace, tokens, head, fused)?
             }
             _ => None,
         };
@@ -1097,77 +1130,39 @@ impl CudaDit {
             workspace.attention.pointer(),
             workspace.delta.pointer(),
             tokens,
+            head,
             workspace,
         )?;
 
         let fc1 = format!("{prefix}.mlp.fc1");
         let fc2 = format!("{prefix}.mlp.fc2");
-        if let (Some(weight), Some(modulation)) = (self.nvfp4.get(&fc1), modulation) {
-            self.add_norm_quantize_nvfp4(
-                &format!("{prefix}.norm2.weight"),
-                &fc1,
-                workspace,
-                tokens,
-                modulation,
-                Some((modulation.0, 2)),
-                3,
-                4,
-            )?;
-            let activations = self.nvfp4_activations(workspace);
-            // SAFETY: expanded holds `tokens × 2 × ffn` values and delta `tokens × hidden`.
-            unsafe {
-                nvfp4::gemm_pointers(weight, activations, workspace.expanded.pointer(), tokens)?;
-                match self.nvfp4.get(&fc2) {
-                    Some(down) => {
-                        nvfp4::quantize_pointers(
-                            Nvfp4Input::SwiGlu(workspace.expanded.pointer()),
-                            tokens,
-                            down,
-                            self.nvfp4_scale(&fc2)?,
-                            activations,
-                        )?;
-                        nvfp4::gemm_pointers(down, activations, workspace.delta.pointer(), tokens)?;
-                    }
-                    None => {
-                        check(mmh3_swiglu(
-                            workspace.expanded.pointer(),
-                            workspace.activated.pointer(),
-                            tokens as c_int,
-                            config.ffn as c_int,
-                            ptr::null_mut(),
-                        ))?;
-                        self.linear(
-                            &fc2,
-                            workspace.activated.pointer(),
-                            workspace.delta.pointer(),
-                            tokens,
-                            workspace,
-                        )?;
-                    }
-                }
-            }
-            return Ok(());
-        }
+        let nvfp4_fc1 = self.nvfp4.get(&fc1).filter(|_| modulation.is_some());
         if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&fc1)) {
-            self.add_norm_quantize(
-                &format!("{prefix}.norm2.weight"),
-                &fc1,
-                workspace,
-                tokens,
-                modulation,
-                Some((modulation.0, 2)),
-                3,
-                4,
-            )?;
-            self.tensors.linear_quantized(
-                &fc1,
-                workspace.activated.pointer(),
-                tokens,
-                &workspace.quantized,
-                &workspace.scales,
-                adapter(&fc1),
-                true,
-            )?;
+            let int8_rows = if nvfp4_fc1.is_some() { head } else { tokens };
+            if int8_rows > 0 {
+                self.add_norm_quantize(
+                    &format!("{prefix}.norm2.weight"),
+                    &fc1,
+                    workspace,
+                    int8_rows,
+                    modulation,
+                    Some((modulation.0, 2)),
+                    3,
+                    4,
+                )?;
+                self.tensors.linear_quantized(
+                    &fc1,
+                    workspace.activated.pointer(),
+                    int8_rows,
+                    &workspace.quantized,
+                    &workspace.scales,
+                    adapter(&fc1),
+                    true,
+                )?;
+            }
+            if let Some(weight) = nvfp4_fc1 {
+                return self.nvfp4_mlp(prefix, weight, workspace, tokens, head, modulation);
+            }
         } else if self.tensors.is_int8(&fc1) {
             return Err(Error::Model(format!(
                 "{fc1}: an INT8 MLP needs the block modulation"
@@ -1187,6 +1182,7 @@ impl CudaDit {
                 workspace.normalized.pointer(),
                 workspace.expanded.pointer(),
                 tokens,
+                head,
                 workspace,
             )?;
             // SAFETY: expanded holds `tokens × 2 × ffn` values and activated `tokens × ffn`.
@@ -1205,6 +1201,7 @@ impl CudaDit {
             workspace.activated.pointer(),
             workspace.delta.pointer(),
             tokens,
+            head,
             workspace,
         )?;
         match modulation {
@@ -1213,15 +1210,95 @@ impl CudaDit {
         }
     }
 
+    /// The MLP of block `prefix` with the NVFP4 gate and up projections `weight`, after the first
+    /// `head` rows went through the INT8 ones into `activated`.
+    fn nvfp4_mlp(
+        &self,
+        prefix: &str,
+        weight: &Nvfp4Weight,
+        workspace: &Workspace,
+        tokens: usize,
+        head: usize,
+        modulation: (&DeviceBuffer, &DeviceBuffer),
+    ) -> Result<(), Error> {
+        let fc1 = format!("{prefix}.mlp.fc1");
+        let fc2 = format!("{prefix}.mlp.fc2");
+        let tail = tokens - head;
+        self.add_norm_quantize_nvfp4(
+            &format!("{prefix}.norm2.weight"),
+            &fc1,
+            workspace,
+            head,
+            tail,
+            modulation,
+            Some((modulation.0, 2)),
+            3,
+            4,
+        )?;
+        let activations = self.nvfp4_activations(workspace);
+        let ffn = self.config.ffn;
+        // SAFETY: expanded holds `tokens × 2 × ffn` values, activated `tokens × ffn` and delta
+        // `tokens × hidden`.
+        unsafe {
+            nvfp4::gemm_pointers(weight, activations, workspace.expanded.pointer(), tail)?;
+            let Some(down) = self.nvfp4.get(&fc2) else {
+                check(mmh3_swiglu(
+                    workspace.expanded.pointer(),
+                    workspace.activated.pointer_at(head * ffn * 2),
+                    tail as c_int,
+                    ffn as c_int,
+                    ptr::null_mut(),
+                ))?;
+                return self.linear(
+                    &fc2,
+                    workspace.activated.pointer(),
+                    workspace.delta.pointer(),
+                    tokens,
+                    0,
+                    workspace,
+                );
+            };
+            if head > 0 {
+                self.tensors.linear(
+                    &fc2,
+                    workspace.activated.pointer(),
+                    workspace.delta.pointer(),
+                    head,
+                    &workspace.quantized,
+                    &workspace.scales,
+                    self.adapters
+                        .get(&fc2)
+                        .map(|adapter| (adapter, &workspace.adapter)),
+                )?;
+            }
+            nvfp4::quantize_pointers(
+                Nvfp4Input::SwiGlu(workspace.expanded.pointer()),
+                tail,
+                down,
+                self.nvfp4_scale(&fc2)?,
+                activations,
+            )?;
+            nvfp4::gemm_pointers(
+                down,
+                activations,
+                workspace.delta.pointer_at(head * down.outputs * 2),
+                tail,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Writes the VSA gates of block `prefix` into the workspace and returns them, or None when
-    /// the block has no gates. NVFP4 gates take the NVFP4 input of the block's qkv projection. With
-    /// `fused`, the INT8 input of the block's qkv projection is still in the quantization buffers,
-    /// and otherwise its BF16 input is in `normalized`.
+    /// the block has no gates. NVFP4 gates take the NVFP4 input of the block's qkv projection, and
+    /// its INT8 input for the first `head` rows. With `fused`, the INT8 input of the block's qkv
+    /// projection is still in the quantization buffers, and otherwise its BF16 input is in
+    /// `normalized`.
     fn vsa_gate(
         &self,
         prefix: &str,
         workspace: &Workspace,
         tokens: usize,
+        head: usize,
         fused: bool,
     ) -> Result<Option<*const c_void>, Error> {
         let name = format!("{prefix}.attn.to_gate_compress");
@@ -1233,14 +1310,25 @@ impl CudaDit {
             return Ok(None);
         };
         if let Some(weight) = self.nvfp4.get(&name) {
+            if head > 0 {
+                self.tensors.linear_quantized(
+                    &name,
+                    gate.pointer(),
+                    head,
+                    &workspace.quantized,
+                    &workspace.scales,
+                    None,
+                    false,
+                )?;
+            }
             // SAFETY: the gate holds `tokens × inner` values, and the NVFP4 activations still hold
             // the input of the block's qkv projection.
             unsafe {
                 nvfp4::gemm_pointers(
                     weight,
                     self.nvfp4_activations(workspace),
-                    gate.pointer(),
-                    tokens,
+                    gate.pointer_at(head * weight.outputs * 2),
+                    tokens - head,
                 )?
             };
         } else if fused && self.tensors.is_int8(&name) {
@@ -1259,6 +1347,7 @@ impl CudaDit {
                 workspace.normalized.pointer(),
                 gate.pointer(),
                 tokens,
+                head,
                 workspace,
             )?;
         }
@@ -1291,6 +1380,7 @@ impl CudaDit {
             context_buffer.pointer(),
             workspace.normalized.pointer(),
             tokens,
+            0,
             workspace,
         )?;
         // SAFETY: both buffers hold at least `tokens × hidden` values.
@@ -1307,6 +1397,7 @@ impl CudaDit {
                 &format!("token_refiner.blocks.{layer}"),
                 workspace,
                 tokens,
+                0,
                 None,
                 None,
                 None,
@@ -1506,6 +1597,7 @@ impl CudaDit {
             audio_rows.pointer(),
             workspace.residual.pointer_at(audio.start * hidden * 4),
             audio.len(),
+            0,
             workspace,
         )?;
         self.linear(
@@ -1513,8 +1605,18 @@ impl CudaDit {
             video_rows.pointer(),
             workspace.residual.pointer_at(video.start * hidden * 4),
             video.len(),
+            0,
             workspace,
         )?;
+        // NOTE: NVFP4 layers run the text and audio rows, about 1% of the rows at 768p, through
+        // their INT8 weights. At 448×256 against the FP32 reference, this takes the velocity from
+        // 3.3e-1 to 2.0e-1 for video and from 2.6e-1 to 9.2e-2 for audio (INT8 6.7e-2 and
+        // 3.9e-2). The text rows alone give 2.4e-1 and 2.3e-1.
+        let head = if self.nvfp4.is_empty() {
+            0
+        } else {
+            video.start
+        };
 
         let sparse_pass = match (sparse_tau, vsa_sparsity) {
             (Some(tau), _) => cached_sparse
@@ -1556,6 +1658,7 @@ impl CudaDit {
                 &prefix,
                 workspace,
                 tokens,
+                head,
                 Some(&angles),
                 Some((modulation, &block_rows)),
                 pending,
@@ -1596,15 +1699,16 @@ impl CudaDit {
             Some((&final_modulation, &final_rows, FINAL_CHUNKS, 0, 1)),
         )?;
         let project = |segment: mmh3_core::dit::layout::Segment,
-                       head: &str,
+                       layer: &str,
                        width: usize|
          -> Result<Vec<f32>, Error> {
             let output = DeviceBuffer::new(segment.len() * width * 4)?;
             self.linear(
-                head,
+                layer,
                 workspace.projected.pointer_at(segment.start * hidden * 4),
                 output.pointer(),
                 segment.len(),
+                0,
                 workspace,
             )?;
             Ok(output.to_f32()?)
