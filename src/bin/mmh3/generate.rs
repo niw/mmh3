@@ -19,7 +19,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let (arguments, ffmpeg_arguments) = split_ffmpeg_arguments(arguments);
     let options = parse_options(arguments, &[OPTIONS, &["out", "audio-vae"]].concat(), USAGE)?;
     let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
-    let settings = Settings::parse(&options)?;
+    let settings = Settings::parse(&options, arguments)?;
     let spec = MediaSpec {
         width: settings.shape.width,
         height: settings.shape.height,

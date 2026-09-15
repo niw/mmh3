@@ -1,11 +1,11 @@
 //! Sampling shared by `mmh3 generate` and `mmh3-tools latent`: the generation settings, the
 //! prompt's text states and the DiT's Euler steps from the seed's noise, with the keyframes of
-//! first and last frame generation.
+//! first and last frame generation or the reference pictures of reference to video generation.
 
-use crate::cli::{option_float, option_number};
+use crate::cli::{option_float, option_number, option_values};
 use crate::models::{
-    DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path, save_algorithm_cache, sparse_attention,
-    video_vae_path,
+    DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path, save_algorithm_cache,
+    sparse_attention, video_vae_path,
 };
 use crate::pictures::load_picture;
 use mmh3_core::dit::sampler::Schedule;
@@ -27,6 +27,7 @@ pub const OPTIONS: &[&str] = &[
     "frames",
     "first-frame",
     "last-frame",
+    "reference",
     "steps",
     "schedule",
     "seed",
@@ -47,12 +48,14 @@ pub const OPTIONS: &[&str] = &[
     "vsa-sparsity",
 ];
 
-/// The seed of the noise the keyframes sample from the video VAE's posterior, as the reference
-/// pipeline fixes it.
+/// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
+/// as the reference pipeline fixes it.
 const KEYFRAME_POSTERIOR_SEED: u64 = 42;
-/// Mixed into the seed for the noise of the keyframes, which comes from its own stream so that a
-/// seed keeps the target noise it has without keyframes.
+/// Mixed into the seed for the noise of keyframes and reference pictures, which comes from its own
+/// stream so that a seed keeps the target noise it has without them.
 const KEYFRAME_NOISE_STREAM: u64 = 0x6b65_7966_7261_6d65;
+/// The most reference pictures the official pipeline takes.
+const MAX_REFERENCE_PICTURES: usize = 9;
 
 /// A picture that a frame of the generation starts from or reaches, fitted to the canvas.
 pub struct KeyframePicture {
@@ -64,6 +67,8 @@ pub struct Settings {
     pub shape: GenerationShape,
     /// The first frame, then the last frame, when given.
     pub keyframes: Vec<KeyframePicture>,
+    /// Pictures of `--reference` in their order, each scaled to its size for the DiT.
+    pub references: Vec<mmh3_core::picture::Picture>,
     pub schedule: Schedule,
     pub steps: usize,
     pub seed: u64,
@@ -73,7 +78,11 @@ pub struct Settings {
 
 impl Settings {
     /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
-    pub fn parse(options: &HashMap<&str, &str>) -> Result<Self, Box<dyn Error>> {
+    /// `arguments` gives the repeated `--reference` options.
+    pub fn parse(
+        options: &HashMap<&str, &str>,
+        arguments: &[String],
+    ) -> Result<Self, Box<dyn Error>> {
         let shift_video = option_float(options, "shift-video", 12.0)?;
         let shift_audio = option_float(options, "shift-audio", 3.0)?;
         let schedule = match options.get("schedule").copied().unwrap_or("uniform") {
@@ -103,7 +112,20 @@ impl Settings {
                         .map(|path| load_picture(Path::new(path)).map(|picture| (first, picture)))
                 })
                 .collect::<Result<_, _>>()?;
-        // Without a canvas size, the first picture gives the aspect ratio.
+        let references = option_values(arguments, "reference");
+        if references.len() > MAX_REFERENCE_PICTURES {
+            return Err(
+                format!("pass at most {MAX_REFERENCE_PICTURES} --reference pictures").into(),
+            );
+        }
+        let references = references
+            .into_iter()
+            .map(|path| load_picture(Path::new(path)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if !pictures.is_empty() && !references.is_empty() {
+            return Err("--reference cannot be combined with --first-frame or --last-frame".into());
+        }
+        // Without a canvas size, the first keyframe gives the aspect ratio.
         let (width, height) = match (
             pictures.first(),
             options.contains_key("width") || options.contains_key("height"),
@@ -127,9 +149,23 @@ impl Settings {
                 picture: picture.fit(width, height, index == 0),
             })
             .collect();
+        // Each reference keeps its aspect ratio, stretched to its size on the 32-pixel grid.
+        let references = references
+            .into_iter()
+            .map(|picture| {
+                let (reference_width, reference_height) = mmh3_core::picture::reference_size(
+                    picture.width,
+                    picture.height,
+                    width,
+                    height,
+                );
+                picture.resize(reference_width, reference_height)
+            })
+            .collect();
         Ok(Settings {
             shape,
             keyframes,
+            references,
             steps: schedule.steps(),
             schedule,
             seed: option_number(options, "seed", 0)? as u64,
@@ -145,7 +181,7 @@ pub fn sample(
     options: &HashMap<&str, &str>,
     settings: &Settings,
 ) -> Result<(Tensor, Tensor), Box<dyn Error>> {
-    use mmh3_core::dit::inputs::DitInputs;
+    use mmh3_core::dit::inputs::{DitInputs, Keyframe, Reference};
     use mmh3_core::dit::sampler::euler_step;
     use mmh3_core::generation::FPS;
     use mmh3_core::random::NormalSampler;
@@ -159,10 +195,13 @@ pub fn sample(
         (None, None) => None,
         _ => return Err("pass either --prompt or --prompt-file".into()),
     };
+    // The prompt holds the keyframes or the references, whichever the settings have.
     let pictures: Vec<Tensor> = settings
         .keyframes
         .iter()
-        .map(|keyframe| keyframe.picture.to_tensor())
+        .map(|keyframe| &keyframe.picture)
+        .chain(&settings.references)
+        .map(|picture| picture.to_tensor())
         .collect();
     let mut context_modalities = Vec::new();
     let context = match (prompt, options.get("context")) {
@@ -215,9 +254,27 @@ pub fn sample(
         _ => return Err("pass a prompt or --context, not both".into()),
     };
     if options.contains_key("context") && !pictures.is_empty() {
-        return Err("keyframes need a prompt, not --context".into());
+        return Err("keyframes and references need a prompt, not --context".into());
     }
-    let keyframes = encode_keyframes(options, settings, &pictures)?;
+    let latents = encode_pictures(options, settings.seed, &pictures)?;
+    let (keyframes, references) = if settings.references.is_empty() {
+        let keyframes = settings
+            .keyframes
+            .iter()
+            .zip(latents)
+            .map(|(keyframe, latent)| Keyframe {
+                frame_index: keyframe.frame_index,
+                video: Some(latent),
+                audio: None,
+            })
+            .collect();
+        (keyframes, Vec::new())
+    } else {
+        (
+            Vec::new(),
+            latents.into_iter().map(Reference::Picture).collect(),
+        )
+    };
     // NOTE: the video noise is drawn before the audio noise, the order of the official pipeline.
     let shape = &settings.shape;
     let mut noise = NormalSampler::new(settings.seed);
@@ -240,7 +297,12 @@ pub fn sample(
         context.shape[0]
     );
 
-    let dit = load_dit(options, "dit", DIT_FILE)?;
+    let dit_file = if references.is_empty() {
+        DIT_FILE
+    } else {
+        REFERENCE_DIT_FILE
+    };
+    let dit = load_dit(options, "dit", dit_file)?;
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
     let schedule = &settings.schedule;
     for step in 0..steps {
@@ -251,7 +313,7 @@ pub fn sample(
             context: context.clone(),
             context_modalities: context_modalities.clone(),
             keyframes: keyframes.clone(),
-            references: Vec::new(),
+            references: references.clone(),
             sigma: schedule.video[step],
             shift_video: settings.shift_video,
             shift_audio: settings.shift_audio,
@@ -284,14 +346,13 @@ pub fn sample(
     Ok((video, audio))
 }
 
-/// The keyframe latents as the DiT sees them: a sample of the video VAE's posterior for each picture
-/// with 0.1% of noise mixed in.
-fn encode_keyframes(
+/// The latents of keyframes or reference pictures as the DiT sees them: a sample of the video VAE's
+/// posterior for each picture with 0.1% of noise mixed in.
+fn encode_pictures(
     options: &HashMap<&str, &str>,
-    settings: &Settings,
+    seed: u64,
     pictures: &[Tensor],
-) -> Result<Vec<mmh3_core::dit::inputs::Keyframe>, Box<dyn Error>> {
-    use mmh3_core::dit::inputs::Keyframe;
+) -> Result<Vec<Tensor>, Box<dyn Error>> {
     use mmh3_core::dit::timestep::VIDEO_CONDITION_TIMESTEP;
     use mmh3_core::random::NormalSampler;
     use mmh3_cuda::video_encoder::CudaVideoEncoder;
@@ -303,12 +364,10 @@ fn encode_keyframes(
     let started = Instant::now();
     let path = video_vae_path(options)?;
     let encoder = CudaVideoEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
-    let mut noise = NormalSampler::new(settings.seed ^ KEYFRAME_NOISE_STREAM);
-    let keyframes = settings
-        .keyframes
+    let mut noise = NormalSampler::new(seed ^ KEYFRAME_NOISE_STREAM);
+    let latents = pictures
         .iter()
-        .zip(pictures)
-        .map(|(keyframe, picture)| {
+        .map(|picture| {
             let posterior = encoder.encode_picture(picture)?;
             let count = posterior.mean.data.len();
             let mut latent = posterior
@@ -317,17 +376,13 @@ fn encode_keyframes(
                 *value =
                     VIDEO_CONDITION_TIMESTEP * *value + (1.0 - VIDEO_CONDITION_TIMESTEP) * noise;
             }
-            Ok(Keyframe {
-                frame_index: keyframe.frame_index,
-                video: Some(latent),
-                audio: None,
-            })
+            Ok(latent)
         })
         .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
     println!(
-        "encoded {} keyframes with {path} in {:.1} s",
-        keyframes.len(),
+        "encoded {} pictures with {path} in {:.1} s",
+        latents.len(),
         started.elapsed().as_secs_f64()
     );
-    Ok(keyframes)
+    Ok(latents)
 }

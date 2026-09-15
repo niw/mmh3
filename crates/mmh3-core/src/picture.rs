@@ -42,6 +42,26 @@ pub fn canvas_for(width: usize, height: usize) -> (usize, usize) {
     (snap(canvas_width), snap(canvas_height))
 }
 
+/// The size of a reference picture of `width × height` for a generation on a canvas of
+/// `canvas_width × canvas_height`: scaled down, never up, to the canvas's area at the picture's
+/// aspect ratio, each side rounded to a multiple of 32.
+pub fn reference_size(
+    width: usize,
+    height: usize,
+    canvas_width: usize,
+    canvas_height: usize,
+) -> (usize, usize) {
+    let scale = ((canvas_width * canvas_height) as f64 / (width * height) as f64)
+        .sqrt()
+        .min(1.0);
+    let snap = |side: usize| {
+        let multiple = CANVAS_MULTIPLE as f64;
+        ((side as f64 * scale / multiple).round_ties_even() as usize * CANVAS_MULTIPLE)
+            .max(CANVAS_MULTIPLE)
+    };
+    (snap(width), snap(height))
+}
+
 fn sinc(x: f64) -> f64 {
     if x == 0.0 {
         return 1.0;
@@ -200,6 +220,16 @@ mod tests {
         assert_eq!(canvas_for(4000, 3000), (1024, 768));
         // Wider than 1344 × 768 shrinks to its area.
         assert_eq!(canvas_for(2400, 1000), (1568, 640));
+    }
+
+    #[test]
+    fn scales_reference_pictures_down_to_the_canvas_area() {
+        // A 4000 × 3000 photo keeps its 4:3 aspect at the area of 1344 × 768.
+        assert_eq!(reference_size(4000, 3000, 1344, 768), (1184, 864));
+        assert_eq!(reference_size(1080, 1920, 1344, 768), (768, 1344));
+        // Smaller pictures are not scaled up, only rounded to the 32-pixel grid.
+        assert_eq!(reference_size(500, 300, 1344, 768), (512, 288));
+        assert_eq!(reference_size(10, 10, 1344, 768), (32, 32));
     }
 
     #[test]

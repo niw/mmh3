@@ -26,6 +26,16 @@ pub fn parse_options<'a>(
     Ok(options)
 }
 
+/// Every value of `--name` in `arguments` in their order, for an option that may repeat. Parse the
+/// arguments with `parse_options` first, which rejects values that start with `--`.
+pub fn option_values<'a>(arguments: &'a [String], name: &str) -> Vec<&'a str> {
+    arguments
+        .windows(2)
+        .filter(|pair| pair[0].strip_prefix("--") == Some(name))
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
 pub fn option_number(
     options: &HashMap<&str, &str>,
     name: &str,
@@ -136,6 +146,24 @@ mod tests {
         let arguments = arguments(&["--steps", "20", "--steps", "4"]);
         let options = parse_options(&arguments, &["steps"], USAGE).unwrap();
         assert_eq!(option_number(&options, "steps", 1).unwrap(), 4);
+    }
+
+    #[test]
+    fn collects_every_value_of_a_repeated_option() {
+        let arguments = arguments(&[
+            "--reference",
+            "cat.png",
+            "--seed",
+            "3",
+            "--reference",
+            "dog.jpg",
+        ]);
+        parse_options(&arguments, &["reference", "seed"], USAGE).unwrap();
+        assert_eq!(
+            option_values(&arguments, "reference"),
+            ["cat.png", "dog.jpg"]
+        );
+        assert!(option_values(&arguments, "prompt").is_empty());
     }
 
     #[test]

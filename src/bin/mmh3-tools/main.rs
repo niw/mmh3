@@ -32,7 +32,7 @@ const USAGE: &str = "usage:
   mmh3-tools check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
   mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
                     [--models DIR] [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE]
-                    [--steps N | --schedule taomate] [--seed N]
+                    [--reference FILE]... [--steps N | --schedule taomate] [--seed N]
                     [--shift-video X] [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--video-vae FILE]
                     [--patch FILE] [--lora FILE]
                     [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
