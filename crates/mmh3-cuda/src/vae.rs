@@ -195,7 +195,12 @@ struct Workspace {
 }
 
 impl Workspace {
-    fn new(config: &VideoDecoderConfig, tokens: usize, quantized: bool) -> Result<Self, Error> {
+    fn new(
+        config: &VideoDecoderConfig,
+        tokens: usize,
+        quantized: bool,
+        dense_ffn: bool,
+    ) -> Result<Self, Error> {
         let dim = config.dim;
         let quantized_rows = if quantized { tokens } else { 1 };
         Ok(Workspace {
@@ -205,11 +210,11 @@ impl Workspace {
             qkv: DeviceBuffer::new(tokens * 3 * dim * 2)?,
             attention: DeviceBuffer::new(tokens * dim * 2)?,
             delta: DeviceBuffer::new(tokens * dim * 2)?,
-            // INT8 decoders write SwiGLU straight from the GEMM.
-            expanded: DeviceBuffer::new(if quantized {
-                1
-            } else {
+            // INT8 feed-forward layers write SwiGLU straight from the GEMM.
+            expanded: DeviceBuffer::new(if dense_ffn {
                 tokens * 2 * config.ffn * 2
+            } else {
+                1
             })?,
             activated: DeviceBuffer::new(tokens * config.ffn * 2)?,
             projected: DeviceBuffer::new(tokens * PATCH_FEATURES * 2)?,
@@ -395,6 +400,8 @@ pub struct CudaVideoDecoder {
     tensors: DeviceTensors,
     /// Whether any linear layer has INT8 ConvRot weights.
     quantized: bool,
+    /// Whether any feed-forward layer has FP16 weights and applies SwiGLU separately.
+    dense_ffn: bool,
     /// `post_quant_conv` folded into `x_embedder`, FP16 `[dim, latent channels]` and `[dim]`.
     embed_weight: DeviceBuffer,
     embed_bias: DeviceBuffer,
@@ -519,12 +526,15 @@ impl CudaVideoDecoder {
             quantized |= info.dtype == DType::I8;
         }
         uploader.run()?;
+        let mut dense_ffn = false;
         for layer in 0..config.layers {
             let w1 = format!("transformer_blocks.{layer}.ff.w1");
             if tensors.is_int8(&w1) {
                 for suffix in ["weight", "weight_scale", "bias"] {
                     tensors.interleave_swiglu(&format!("{w1}.{suffix}"))?;
                 }
+            } else {
+                dense_ffn = true;
             }
         }
 
@@ -553,6 +563,7 @@ impl CudaVideoDecoder {
             config,
             tensors,
             quantized,
+            dense_ffn,
             tile_size,
             tile_overlap_min,
         })
@@ -1106,7 +1117,7 @@ impl CudaVideoDecoder {
         let tile_tokens = patches + config.registers + 1;
         let tokens = tiles * tile_tokens;
 
-        let mut workspace = Workspace::new(config, tokens, self.quantized)?;
+        let mut workspace = Workspace::new(config, tokens, self.quantized, self.dense_ffn)?;
         let angles = DeviceBuffer::from_f32(&rope_angles(
             chunk_frames,
             grid.latent_height(),
