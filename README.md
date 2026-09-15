@@ -41,11 +41,11 @@ See [Usage](docs/usage.md) for the other settings.
 
 - Text to video with audio (T2VA) works end to end, one video at a time. Native MP4 and WebM
   generation and complete video/audio decoding have been verified on GB10.
+- Videos from a first frame, a last frame or both ([FL2VA](docs/fl2va.md)) work too.
 - NVIDIA Blackwell GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for
   `sm_120f`, so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been
   tested yet.
-- Not yet: first and last frame conditioning (FL2VA), reference conditioning (Ref2VA), an HTTP
-  server, and a Metal backend for Apple Silicon.
+- Not yet: reference conditioning (Ref2VA), an HTTP server, and a Metal backend for Apple Silicon.
 
 ## Requirements
 

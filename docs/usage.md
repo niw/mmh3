@@ -32,6 +32,9 @@ make generate \
 - `--width N`, `--height N` (default 1344, 768): Canvas size, multiples of 32. H3 is trained with a
   768-pixel short edge.
 - `--frames N` (default 124): Frame count at 24 fps, rounded up to the next 17n + 5.
+- `--first-frame FILE`, `--last-frame FILE` (default none): PNG or JPEG pictures the video starts
+  from and ends on. Without `--width` and `--height` the first picture sets the canvas. See
+  [First and last frames](fl2va.md) for the prompt they need.
 - `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
   there is no CFG.
 - `--schedule uniform|taomate` (default `uniform`): `taomate` runs the three steps the TaoMate-H3

@@ -3,6 +3,8 @@
 - [Usage](usage.md): the options of `mmh3 generate` and prompts.
 - [FastH3](fasth3.md), [lightx2v Turbo LoRA](lightx2v-turbo.md) and [TaoMate-H3](taomate.md): the
   few-step models, where to get them and how to run them.
+- [First and last frames](fl2va.md): generating from pictures with `--first-frame` and
+  `--last-frame`.
 - [NVFP4 linear layers](nvfp4.md): the experimental `--linear-precision nvfp4`, its speed and
   accuracy.
 - [Models](models.md): the models directory and what `make download-models` downloads.
