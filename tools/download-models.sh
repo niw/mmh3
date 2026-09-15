@@ -12,7 +12,7 @@ Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI
 it downloads the ones make generate uses: the INT8 ConvRot DiT, text encoder and video VAE, the FP32
 audio VAE and the FastH3 VSA-DataFree patch.
 
-  --video-vae int8     The INT8 ConvRot video VAE from Kijai/MiniMax-H3-experimental (default).
+  --video-vae int8     The INT8 ConvRot video VAE from yniw/MiniMax-H3-mmh3 (default).
   --video-vae fp16     The FP16 video VAE from Comfy-Org/MiniMax-H3 instead. The DiT and the text
                        encoder are INT8 ConvRot either way.
   --fasth3             The FastH3 VSA-DataFree patch from yniw/MiniMax-H3-mmh3, into patches
@@ -85,15 +85,17 @@ if [[ $video_vae == fp16 ]]; then
   files+=(vae/minimax_h3_video_vae_fp16.safetensors)
 fi
 hf download Comfy-Org/MiniMax-H3 "${files[@]}" --local-dir "$models"
+mmh3_files=()
 if [[ $video_vae == int8 ]]; then
-  hf download Kijai/MiniMax-H3-experimental minimax_h3_video_vae_int8_convrot.safetensors \
-    --local-dir "$models/vae"
+  mmh3_files+=(vae/minimax_h3_video_vae_int8_convrot.safetensors)
+fi
+if [[ $fasth3 == 1 ]]; then
+  mmh3_files+=(patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors)
+fi
+if [[ ${#mmh3_files[@]} -gt 0 ]]; then
+  hf download yniw/MiniMax-H3-mmh3 "${mmh3_files[@]}" --local-dir "$models"
 fi
 if [[ $turbo == 1 ]]; then
   hf download lightx2v/Minimax-h3-Turbo minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
     --local-dir "$models/loras"
-fi
-if [[ $fasth3 == 1 ]]; then
-  hf download yniw/MiniMax-H3-mmh3 patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors \
-    --local-dir "$models"
 fi

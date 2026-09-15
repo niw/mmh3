@@ -174,7 +174,7 @@ directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `
 | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors` | Comfy-Org/MiniMax-H3 |
 | `text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors` | Comfy-Org/MiniMax-H3 |
 | `vae/minimax_h3_audio_vae_fp32.safetensors` | Comfy-Org/MiniMax-H3 |
-| `vae/minimax_h3_video_vae_int8_convrot.safetensors` | Kijai/MiniMax-H3-experimental |
+| `vae/minimax_h3_video_vae_int8_convrot.safetensors` | yniw/MiniMax-H3-mmh3 |
 | `patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors` | yniw/MiniMax-H3-mmh3 |
 
 With `--video-vae fp16`, the script downloads the FP16 video VAE,
@@ -188,8 +188,8 @@ Patches, such as the FastH3 patch below, go into `patches` of the models directo
 directory for `--patch`, and in `loras` for `--lora`, so patches kept with ComfyUI's LoRAs work too.
 
 `generate` decodes with the INT8 video VAE when the models directory has it, and with the FP16 one
-otherwise. The INT8 one is faster, and its output is about 51 dB PSNR from the FP16 decode, as close
-as ComfyUI's own INT8 and FP16 decodes are to each other.
+otherwise. The INT8 one is faster, and on FastH3 videos its pixels are about 61 dB PSNR from the FP16
+decode, closer than rounding them to 8 bits. `tools/models/video_vae_int8.py` builds it.
 
 ## Usage
 
