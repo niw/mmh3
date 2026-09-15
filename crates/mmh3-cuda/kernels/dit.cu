@@ -6,6 +6,7 @@
 
 #include "attention_workspace.cuh"
 #include "convrot.cuh"
+#include "nvfp4.cuh"
 
 // Elementwise and row-wise kernels of the DiT blocks. The residual stream is FP32 and the inputs of
 // the linear layers are BF16. Modulation tables are FP32 `[rows, chunks, hidden]`, and every token
@@ -365,28 +366,22 @@ __global__ void rotate_quantize_kernel(const Pair *__restrict__ input, int8_t *_
                                          scales + blockIdx.x, columns);
 }
 
-// For each token: residual += gate ⊙ delta when a delta is given, with the gate from
+// For token `token`: residual += gate ⊙ delta when a delta is given, with the gate from
 // `gate_modulation`, then rms_norm(residual) ⊙ weight ⊙ (1 + scale) + shift in BF16 with shift and
-// scale from `modulation`, kept in `normalized` when it is not null, and its ConvRot rotation
-// quantized to INT8 with the row's scale. Both modulation tables share the token's row.
+// scale from `modulation`, left in `normalized_row` in shared memory and kept in `normalized` when
+// it is not null. Both modulation tables share the token's row. Without UPDATE, the residual keeps
+// its values and the sum is taken on the fly.
 //
-// NOTE: The result matches gated_residual_add_kernel, rms_norm_modulate_kernel and
-// rotate_quantize_kernel run one after the other in every bit. The compiler fuses the residual
-// update, the sum of squares and the modulation of those kernels into multiply-adds, which the _rn
-// intrinsics spell out here, and the normalized row reaches the rotation through shared memory in
-// BF16.
-template <int GROUPS_PER_WARP>
-__global__ void __launch_bounds__(ROW_THREADS)
-    add_norm_quantize_kernel(float *__restrict__ residual, const __nv_bfloat16 *__restrict__ delta,
-                             const float *__restrict__ gate_modulation,
-                             const float *__restrict__ modulation, const int32_t *__restrict__ rows,
-                             int chunks, int gate_chunk, int shift_chunk, int scale_chunk,
-                             const __nv_bfloat16 *__restrict__ weight,
-                             __nv_bfloat16 *__restrict__ normalized, int8_t *__restrict__ quantized,
-                             float *__restrict__ scales, int hidden, float epsilon) {
-    extern __shared__ __align__(16) __nv_bfloat16 normalized_row[];
-    __shared__ float scratch[ROW_THREADS / 32];
-    const int64_t token = blockIdx.x;
+// NOTE: The result matches gated_residual_add_kernel and rms_norm_modulate_kernel run one after
+// the other in every bit. The compiler fuses the residual update, the sum of squares and the
+// modulation of those kernels into multiply-adds, which the _rn intrinsics spell out here.
+template <bool UPDATE = true>
+__device__ __forceinline__ void add_normalize_row(
+    int64_t token, float *__restrict__ residual, const __nv_bfloat16 *__restrict__ delta,
+    const float *__restrict__ gate_modulation, const float *__restrict__ modulation,
+    const int32_t *__restrict__ rows, int chunks, int gate_chunk, int shift_chunk, int scale_chunk,
+    const __nv_bfloat16 *__restrict__ weight, __nv_bfloat16 *__restrict__ normalized,
+    __nv_bfloat16 *normalized_row, float *scratch, int hidden, float epsilon) {
     float *row = residual + token * hidden;
     const float *vectors = modulation != nullptr
                                ? modulation + static_cast<size_t>(rows[token]) * chunks * hidden
@@ -396,23 +391,30 @@ __global__ void __launch_bounds__(ROW_THREADS)
             ? gate_modulation + static_cast<size_t>(rows[token]) * chunks * hidden
             : nullptr;
 
+    auto updated = [&](int index) {
+        const float value = row[index];
+        if (delta == nullptr) {
+            return value;
+        }
+        const float change = __bfloat162float(delta[token * hidden + index]);
+        return gate_vectors != nullptr
+                   ? __fmaf_rn(change,
+                               gate_vectors[static_cast<size_t>(gate_chunk) * hidden + index],
+                               value)
+                   : __fadd_rn(value, change);
+    };
     float squares = 0.0f;
     for (int index = threadIdx.x; index < hidden; index += blockDim.x) {
-        float value = row[index];
-        if (delta != nullptr) {
-            const float change = __bfloat162float(delta[token * hidden + index]);
-            value = gate_vectors != nullptr
-                        ? __fmaf_rn(change,
-                                    gate_vectors[static_cast<size_t>(gate_chunk) * hidden + index],
-                                    value)
-                        : __fadd_rn(value, change);
+        const float value = updated(index);
+        if (UPDATE && delta != nullptr) {
             row[index] = value;
         }
         squares = __fmaf_rn(value, value, squares);
     }
     const float inverse = rsqrtf(block_sum(squares, scratch) / hidden + epsilon);
     for (int index = threadIdx.x; index < hidden; index += blockDim.x) {
-        float value = __fmul_rn(__fmul_rn(row[index], inverse), __bfloat162float(weight[index]));
+        const float sum = UPDATE ? row[index] : updated(index);
+        float value = __fmul_rn(__fmul_rn(sum, inverse), __bfloat162float(weight[index]));
         if (vectors != nullptr) {
             value = __fmaf_rn(
                 value, __fadd_rn(1.0f, vectors[static_cast<size_t>(scale_chunk) * hidden + index]),
@@ -425,8 +427,109 @@ __global__ void __launch_bounds__(ROW_THREADS)
         }
     }
     __syncthreads();
+}
+
+// add_normalize_row, then the row's ConvRot rotation quantized to INT8 with the row's scale. The
+// normalized row reaches the rotation through shared memory in BF16, so the result matches
+// rotate_quantize_kernel on the kept BF16 rows in every bit.
+template <int GROUPS_PER_WARP>
+__global__ void __launch_bounds__(ROW_THREADS)
+    add_norm_quantize_kernel(float *__restrict__ residual, const __nv_bfloat16 *__restrict__ delta,
+                             const float *__restrict__ gate_modulation,
+                             const float *__restrict__ modulation, const int32_t *__restrict__ rows,
+                             int chunks, int gate_chunk, int shift_chunk, int scale_chunk,
+                             const __nv_bfloat16 *__restrict__ weight,
+                             __nv_bfloat16 *__restrict__ normalized, int8_t *__restrict__ quantized,
+                             float *__restrict__ scales, int hidden, float epsilon) {
+    extern __shared__ __align__(16) __nv_bfloat16 normalized_row[];
+    __shared__ float scratch[ROW_THREADS / 32];
+    const int64_t token = blockIdx.x;
+    add_normalize_row(token, residual, delta, gate_modulation, modulation, rows, chunks, gate_chunk,
+                      shift_chunk, scale_chunk, weight, normalized, normalized_row, scratch, hidden,
+                      epsilon);
     rotate_quantize_row<GROUPS_PER_WARP>(reinterpret_cast<const __nv_bfloat162 *>(normalized_row),
                                          quantized + token * hidden, scales + token, hidden);
+}
+
+// Loads the eight values lane `lane` holds of 256-column group `group` of a normalized row in
+// shared memory and rotates the group, returning their largest magnitude.
+__device__ __forceinline__ float load_rotated_group(const __nv_bfloat16 *normalized_row, int group,
+                                                    int lane, float (&values)[8]) {
+    const uint4 packed =
+        *reinterpret_cast<const uint4 *>(normalized_row + group * CONVROT_GROUP + lane * 8);
+    const __nv_bfloat162 *pairs = reinterpret_cast<const __nv_bfloat162 *>(&packed);
+    #pragma unroll
+    for (int pair = 0; pair < 4; pair++) {
+        const float2 value = __bfloat1622float2(pairs[pair]);
+        values[pair * 2] = value.x;
+        values[pair * 2 + 1] = value.y;
+    }
+    rotate_group(values, lane);
+    float maximum = 0.0f;
+    #pragma unroll
+    for (int index = 0; index < 8; index++) {
+        maximum = fmaxf(maximum, fabsf(values[index]));
+    }
+    return maximum;
+}
+
+// add_normalize_row without the residual update, then the row's largest rotated magnitude, folded
+// into `maximum`.
+__global__ void __launch_bounds__(ROW_THREADS)
+    add_norm_maximum_kernel(float *__restrict__ residual, const __nv_bfloat16 *__restrict__ delta,
+                            const float *__restrict__ gate_modulation,
+                            const float *__restrict__ modulation, const int32_t *__restrict__ rows,
+                            int chunks, int gate_chunk, int shift_chunk, int scale_chunk,
+                            const __nv_bfloat16 *__restrict__ weight, unsigned *maximum, int hidden,
+                            float epsilon) {
+    extern __shared__ __align__(16) __nv_bfloat16 normalized_row[];
+    __shared__ float scratch[ROW_THREADS / 32];
+    const int64_t token = blockIdx.x;
+    add_normalize_row<false>(token, residual, delta, gate_modulation, modulation, rows, chunks,
+                             gate_chunk, shift_chunk, scale_chunk, weight, nullptr, normalized_row,
+                             scratch, hidden, epsilon);
+    float local = 0.0f;
+    for (int group = threadIdx.x / 32; group < hidden / CONVROT_GROUP; group += ROW_THREADS / 32) {
+        float group_values[8];
+        local =
+            fmaxf(local, load_rotated_group(normalized_row, group, threadIdx.x % 32, group_values));
+    }
+    nvfp4_fold_maximum(local, maximum, scratch);
+}
+
+// add_normalize_row, then the row's ConvRot rotation quantized to NVFP4 with the tensor scale of
+// margin · reference, which also goes to `tensor_scale`. The rows' largest rotated magnitude goes
+// to `observed` when it is not null.
+__global__ void __launch_bounds__(ROW_THREADS) add_norm_quantize_nvfp4_kernel(
+    float *__restrict__ residual, const __nv_bfloat16 *__restrict__ delta,
+    const float *__restrict__ gate_modulation, const float *__restrict__ modulation,
+    const int32_t *__restrict__ rows, int chunks, int gate_chunk, int shift_chunk, int scale_chunk,
+    const __nv_bfloat16 *__restrict__ weight, uint8_t *__restrict__ values,
+    uint8_t *__restrict__ scales, float *tensor_scale, const unsigned *reference, float margin,
+    unsigned *observed, int hidden, float epsilon) {
+    extern __shared__ __align__(16) __nv_bfloat16 normalized_row[];
+    __shared__ float scratch[ROW_THREADS / 32];
+    const int64_t token = blockIdx.x;
+    add_normalize_row(token, residual, delta, gate_modulation, modulation, rows, chunks, gate_chunk,
+                      shift_chunk, scale_chunk, weight, nullptr, normalized_row, scratch, hidden,
+                      epsilon);
+    const float scale = nvfp4_tensor_scale(__uint_as_float(*reference) * margin);
+    const float inverse_tensor_scale = 1.0f / scale;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    float local = 0.0f;
+    for (int group = warp; group < hidden / CONVROT_GROUP; group += ROW_THREADS / 32) {
+        float group_values[8];
+        local = fmaxf(local, load_rotated_group(normalized_row, group, lane, group_values));
+        nvfp4_store_group(group_values, lane, static_cast<int>(token), group, hidden,
+                          inverse_tensor_scale, values, scales);
+    }
+    if (observed != nullptr) {
+        nvfp4_fold_maximum(local, observed, scratch);
+    }
+    if (token == 0 && threadIdx.x == 0) {
+        *tensor_scale = scale;
+    }
 }
 
 // output[step, o] = Σ_r time_embedding[step, r] · weight[o, r] + bias[o], with FP16 weights.
@@ -710,6 +813,38 @@ extern "C" int mmh3_merge_low_rank(int8_t *weights, float *scales, const float *
     rotate_rows_kernel<<<rank, ROW_THREADS, 0, stream>>>(down, k);
     merge_low_rank_kernel<<<(n + MERGE_ROWS - 1) / MERGE_ROWS, ROW_THREADS, 0, stream>>>(
         weights, scales, up, down, n, k, rank);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// mmh3_add_norm_quantize with NVFP4 output, see add_norm_quantize_nvfp4_kernel. With `exact`, the
+// tensor scale comes from the rows' own largest magnitude, found in a first pass and left in
+// `reference`, like mmh3_nvfp4_quantize.
+extern "C" int mmh3_add_norm_quantize_nvfp4(
+    float *residual, const __nv_bfloat16 *delta, const float *gate_modulation,
+    const float *modulation, const int32_t *rows, int chunks, int gate_chunk, int shift_chunk,
+    int scale_chunk, const __nv_bfloat16 *weight, uint8_t *values, uint8_t *scales,
+    float *tensor_scale, unsigned *reference, float margin, unsigned *observed, int exact,
+    int tokens, int hidden, float epsilon, cudaStream_t stream) {
+    if (hidden % CONVROT_GROUP != 0 || tokens <= 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const cudaError_t status =
+        cudaMemsetAsync(exact ? reference : observed, 0, sizeof(unsigned), stream);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    const size_t shared_bytes = static_cast<size_t>(hidden) * sizeof(__nv_bfloat16);
+    if (exact) {
+        add_norm_maximum_kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(
+            residual, delta, gate_modulation, modulation, rows, chunks, gate_chunk, shift_chunk,
+            scale_chunk, weight, reference, hidden, epsilon);
+        margin = 1.0f;
+        observed = nullptr;
+    }
+    add_norm_quantize_nvfp4_kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(
+        residual, delta, gate_modulation, modulation, rows, chunks, gate_chunk, shift_chunk,
+        scale_chunk, weight, values, scales, tensor_scale, reference, margin, observed, hidden,
+        epsilon);
     return static_cast<int>(cudaGetLastError());
 }
 

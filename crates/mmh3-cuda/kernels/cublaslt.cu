@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <cublasLt.h>
 #include <cuda_runtime.h>
+#include <map>
+#include <tuple>
 
 // y[m, n] = x[m, k] · w[n, k]ᵀ + bias[n] through cuBLASLt, for the linear layers that stay in BF16
 // or FP32.
@@ -143,4 +145,107 @@ extern "C" int mmh3_cublaslt_linear(int kind, const void *input, const void *wei
                                     const void *bias, void *output, int64_t m, int64_t n, int64_t k,
                                     cudaStream_t stream) {
     return mmh3_cublaslt_matmul(kind, input, weight, bias, output, m, n, k, 1.0f, 0.0f, stream);
+}
+
+// output[m, n] = alpha · activations[m, k] · weightsᵀ in BF16 for NVFP4 operands laid out as in
+// nvfp4.cu, with alpha and beta = 0 read from the device at `alpha_beta`.
+extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scales,
+                                   const void *activations, const void *activation_scales,
+                                   const float *alpha_beta, void *output, int64_t m, int64_t n,
+                                   int64_t k, cudaStream_t stream) {
+    thread_local const ThreadState state;
+    if (state.status != 0) {
+        return state.status;
+    }
+    Descriptors descriptors;
+    cublasStatus_t status;
+    if ((status = cublasLtMatmulDescCreate(&descriptors.operation, CUBLAS_COMPUTE_32F,
+                                           CUDA_R_32F)) != CUBLAS_STATUS_SUCCESS) {
+        return status_code(status);
+    }
+    const cublasOperation_t transpose = CUBLAS_OP_T;
+    const cublasOperation_t no_transpose = CUBLAS_OP_N;
+    const cublasLtPointerMode_t pointer_mode = CUBLASLT_POINTER_MODE_DEVICE;
+    const cublasLtMatmulMatrixScale_t scale_mode = CUBLASLT_MATMUL_MATRIX_SCALE_VEC16_UE4M3;
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_TRANSA, &transpose,
+                                   sizeof(transpose));
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_TRANSB,
+                                   &no_transpose, sizeof(no_transpose));
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_POINTER_MODE,
+                                   &pointer_mode, sizeof(pointer_mode));
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_A_SCALE_MODE,
+                                   &scale_mode, sizeof(scale_mode));
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_B_SCALE_MODE,
+                                   &scale_mode, sizeof(scale_mode));
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_A_SCALE_POINTER,
+                                   &weight_scales, sizeof(weight_scales));
+    cublasLtMatmulDescSetAttribute(descriptors.operation, CUBLASLT_MATMUL_DESC_B_SCALE_POINTER,
+                                   &activation_scales, sizeof(activation_scales));
+    // Column-major view: D[n, m] = W^T[k, n]^T · X^T[k, m], which is row-major y[m, n].
+    if ((status = cublasLtMatrixLayoutCreate(&descriptors.weight, CUDA_R_4F_E2M1, k, n, k)) !=
+            CUBLAS_STATUS_SUCCESS ||
+        (status = cublasLtMatrixLayoutCreate(&descriptors.input, CUDA_R_4F_E2M1, k, m, k)) !=
+            CUBLAS_STATUS_SUCCESS ||
+        (status = cublasLtMatrixLayoutCreate(&descriptors.output, CUDA_R_16BF, n, m, n)) !=
+            CUBLAS_STATUS_SUCCESS ||
+        (status = cublasLtMatmulPreferenceCreate(&descriptors.preference)) !=
+            CUBLAS_STATUS_SUCCESS) {
+        return status_code(status);
+    }
+    size_t workspace_bytes = WORKSPACE_BYTES;
+    cublasLtMatmulPreferenceSetAttribute(descriptors.preference,
+                                         CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes,
+                                         sizeof(workspace_bytes));
+    // NOTE: the first heuristic result for the MLP down projection (K = 14,336) is a stream-K
+    // kernel that takes 57 ms at 768p, against 16 ms for the fastest candidate. The first call of
+    // each shape times the candidates on its own operands and keeps the fastest. One run each is
+    // enough: a second run takes within 1% of the first, which includes loading the kernel.
+    thread_local std::map<std::tuple<int64_t, int64_t, int64_t>, cublasLtMatmulAlgo_t> chosen;
+    const auto key = std::make_tuple(m, n, k);
+    auto run = [&](const cublasLtMatmulAlgo_t *algorithm) {
+        return cublasLtMatmul(state.handle, descriptors.operation, alpha_beta, weights,
+                              descriptors.weight, activations, descriptors.input, alpha_beta + 1,
+                              output, descriptors.output, output, descriptors.output, algorithm,
+                              state.workspace, WORKSPACE_BYTES, stream);
+    };
+    auto found = chosen.find(key);
+    if (found == chosen.end()) {
+        constexpr int CANDIDATES = 8;
+        cublasLtMatmulHeuristicResult_t results[CANDIDATES];
+        int returned = 0;
+        status = cublasLtMatmulAlgoGetHeuristic(
+            state.handle, descriptors.operation, descriptors.weight, descriptors.input,
+            descriptors.output, descriptors.output, descriptors.preference, CANDIDATES, results,
+            &returned);
+        if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
+            return status_code(status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED
+                                                               : status);
+        }
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        float best = 0.0f;
+        int best_index = -1;
+        for (int index = 0; index < returned; index++) {
+            cudaEventRecord(start, stream);
+            const cublasStatus_t timed = run(&results[index].algo);
+            cudaEventRecord(stop, stream);
+            float elapsed = 0.0f;
+            if (timed != CUBLAS_STATUS_SUCCESS || cudaEventSynchronize(stop) != cudaSuccess ||
+                cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
+                continue;
+            }
+            if (best_index < 0 || elapsed < best) {
+                best = elapsed;
+                best_index = index;
+            }
+        }
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        if (best_index < 0) {
+            return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
+        }
+        found = chosen.emplace(key, results[best_index].algo).first;
+    }
+    return status_code(run(&found->second));
 }

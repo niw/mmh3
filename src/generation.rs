@@ -33,6 +33,7 @@ pub const OPTIONS: &[&str] = &[
     "lora-mode",
     "attention",
     "attention-precision",
+    "linear-precision",
     "sparse-tau",
     "sparse-start",
     "vsa-sparsity",

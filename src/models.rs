@@ -53,6 +53,20 @@ pub fn load_dit(
         )?;
         println!("applied {patch} to {layers} layers and tensors");
     }
+    match options.get("linear-precision").copied().unwrap_or("int8") {
+        "int8" => {}
+        "nvfp4" => {
+            let started = Instant::now();
+            let layers = dit.use_nvfp4()?;
+            println!(
+                "requantized {layers} layers to NVFP4 in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        other => {
+            return Err(format!("--linear-precision must be int8 or nvfp4, not {other}").into());
+        }
+    }
     if let Some(lora) = model_file(options, "lora", &["loras"])? {
         let started = Instant::now();
         let strength = option_float(options, "lora-strength", 1.0)?;

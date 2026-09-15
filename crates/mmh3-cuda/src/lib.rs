@@ -7,6 +7,7 @@ pub mod dit;
 pub mod gemm;
 pub mod loader;
 pub mod model;
+pub mod nvfp4;
 pub mod text_encoder;
 pub mod vae;
 
