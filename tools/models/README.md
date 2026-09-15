@@ -132,7 +132,10 @@ Converts the [TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3) adapter
 LoRA, which mmh3 applies with `--lora` and runs in three steps with `--schedule taomate`. The
 adapter is a rank-128 FP32 LoRA of the 208 linear layers of the blocks and the text refiner, under
 the names of the pruned DiT with `lora_a` and `lora_b`, which neither mmh3 nor ComfyUI reads as it
-is. The Hugging Face CLI prints where it puts the adapter:
+is. The LoRA built with the defaults is published at
+[yniw/MiniMax-H3-mmh3](https://huggingface.co/yniw/MiniMax-H3-mmh3), and
+`tools/download-models.sh --taomate` downloads it. The Hugging Face CLI prints where it puts the
+adapter:
 
 ```sh
 hf download TaoLiveAIGC/TaoMate-H3 adapter_config.json adapter_model.safetensors

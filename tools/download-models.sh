@@ -6,7 +6,7 @@ set -euo pipefail
 usage() {
   cat <<EOF
 usage: $0 [--video-vae int8|fp16] [--fasth3 | --no-fasth3] [--lightx2v-turbo | --no-lightx2v-turbo]
-       [--models DIR]
+       [--taomate | --no-taomate] [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf). By default
 it downloads the ones make generate uses: the INT8 ConvRot DiT, text encoder and video VAE, the FP32
@@ -20,6 +20,8 @@ audio VAE and the FastH3 VSA-DataFree patch.
   --no-fasth3          No FastH3 patch.
   --lightx2v-turbo     The 768p 4-step Turbo LoRA from lightx2v/Minimax-h3-Turbo, into loras.
   --no-lightx2v-turbo  No Turbo LoRA (default).
+  --taomate            The 3-step TaoMate-H3 LoRA from yniw/MiniMax-H3-mmh3, into loras.
+  --no-taomate         No TaoMate LoRA (default).
   --models DIR         The models directory (default: models in the repository).
 EOF
 }
@@ -32,6 +34,7 @@ fail() {
 video_vae=int8
 fasth3=1
 turbo=0
+taomate=0
 models=$(cd "$(dirname "$0")/.." && pwd)/models
 
 while [[ $# -gt 0 ]]; do
@@ -45,6 +48,8 @@ while [[ $# -gt 0 ]]; do
     --no-fasth3) fasth3=0 ;;
     --lightx2v-turbo) turbo=1 ;;
     --no-lightx2v-turbo) turbo=0 ;;
+    --taomate) taomate=1 ;;
+    --no-taomate) taomate=0 ;;
     --models)
       [[ $# -ge 2 ]] || fail "--models needs a directory"
       models=$2
@@ -91,6 +96,9 @@ if [[ $video_vae == int8 ]]; then
 fi
 if [[ $fasth3 == 1 ]]; then
   mmh3_files+=(patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors)
+fi
+if [[ $taomate == 1 ]]; then
+  mmh3_files+=(loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors)
 fi
 if [[ ${#mmh3_files[@]} -gt 0 ]]; then
   hf download yniw/MiniMax-H3-mmh3 "${mmh3_files[@]}" --local-dir "$models"
