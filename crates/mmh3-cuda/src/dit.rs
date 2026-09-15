@@ -14,7 +14,9 @@ use crate::model::{
     ADAPTER_RANK_MULTIPLE, DeviceTensors, Down, LowRank, check_quantization, host_tensor,
     i32_buffer,
 };
-use crate::nvfp4::{self, Nvfp4Activations, Nvfp4Input, Nvfp4Scale, Nvfp4Weight};
+use crate::nvfp4::{
+    self, AdapterSource, Columns, Nvfp4Activations, Nvfp4Input, Nvfp4Scale, Nvfp4Weight,
+};
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -115,6 +117,7 @@ unsafe extern "C" {
         exact: c_int,
         tokens: c_int,
         hidden: c_int,
+        columns: c_int,
         epsilon: f32,
         stream: *mut c_void,
     ) -> c_int;
@@ -156,8 +159,10 @@ struct WorkspaceShape {
     adapter_rank: usize,
     /// Whether the blocks have VSA gates.
     gated: bool,
-    /// Whether the blocks have NVFP4 layers.
-    nvfp4: bool,
+    /// Values per row of the NVFP4 layers' activations, or 0 without NVFP4 layers.
+    nvfp4_columns: usize,
+    /// The largest rank of the NVFP4 layers' adapters.
+    nvfp4_adapter_rank: usize,
 }
 
 /// Buffers sized for one sequence length.
@@ -190,7 +195,8 @@ impl Workspace {
             expanded_rows,
             adapter_rank,
             gated,
-            nvfp4,
+            nvfp4_columns,
+            nvfp4_adapter_rank,
         } = shape;
         Ok(Workspace {
             shape,
@@ -211,8 +217,12 @@ impl Workspace {
             } else {
                 None
             },
-            nvfp4: if nvfp4 {
-                Some(Nvfp4Activations::new(tokens, hidden.max(inner).max(ffn))?)
+            nvfp4: if nvfp4_columns > 0 {
+                Some(Nvfp4Activations::new(
+                    tokens,
+                    nvfp4_columns,
+                    nvfp4_adapter_rank,
+                )?)
             } else {
                 None
             },
@@ -281,7 +291,8 @@ pub struct CudaDit {
     tensors: DeviceTensors,
     /// Low-rank adapters by layer name.
     adapters: HashMap<String, LowRank>,
-    /// NVFP4 versions of block linear layers by name, which replace their INT8 weights.
+    /// NVFP4 versions of block linear layers by name, which replace their INT8 weights and carry
+    /// their adapters.
     nvfp4: HashMap<String, Nvfp4Weight>,
     /// Tensor scale histories of the NVFP4 layers' inputs, by layer. A VSA gate shares the input of
     /// its block's qkv projection.
@@ -423,7 +434,7 @@ impl CudaDit {
             }
             if self.nvfp4.contains_key(layer) {
                 return Err(Error::Model(format!(
-                    "{layer}: NVFP4 layers do not take LoRAs"
+                    "{layer}: add LoRAs before switching to NVFP4"
                 )));
             }
             let scale = strength * alpha / rank as f32;
@@ -528,7 +539,8 @@ impl CudaDit {
     /// Runs the linear layers of the main blocks in NVFP4, requantized from their INT8 ConvRot
     /// weights, and returns how many layers changed. A block's first call quantizes the inputs
     /// from BF16 rows to find their tensor scales, and later calls quantize them in the passes that
-    /// produce them. LoRA adapters on these layers are not supported.
+    /// produce them. The adapters of these layers move into their NVFP4 weights, so LoRAs come
+    /// first.
     pub fn use_nvfp4(&mut self) -> Result<usize, Error> {
         for layer in 0..self.config.layers {
             let qkv = format!("blocks.{layer}.attn.qkv_proj");
@@ -546,19 +558,45 @@ impl CudaDit {
                 {
                     continue;
                 }
-                if self.adapters.contains_key(&name) {
-                    return Err(Error::Model(format!(
-                        "{name}: NVFP4 layers do not take LoRA adapters"
-                    )));
-                }
+                let adapter = self.adapters.remove(&name);
+                let columns = match &adapter {
+                    Some(_) if part == "attn.to_gate_compress" => {
+                        return Err(Error::Model(format!(
+                            "{name}: NVFP4 VSA gates do not take LoRAs"
+                        )));
+                    }
+                    Some(adapter) => {
+                        let Down::Int8 {
+                            weights, scales, ..
+                        } = &adapter.down
+                        else {
+                            return Err(Error::Model(format!(
+                                "{name}: the adapter has no quantized down projection"
+                            )));
+                        };
+                        Columns::Adapter(AdapterSource {
+                            down: weights,
+                            down_scales: scales,
+                            up: &adapter.up,
+                            rank: adapter.rank,
+                            scale: adapter.scale,
+                        })
+                    }
+                    // The gate takes the activations of the block's qkv projection.
+                    None if part == "attn.to_gate_compress" => {
+                        Columns::Zeros(self.nvfp4[&qkv].columns)
+                    }
+                    None => Columns::Inputs,
+                };
                 let weight = self.tensors.get(&format!("{name}.weight"))?;
                 let scales = self.tensors.get(&format!("{name}.weight_scale"))?;
-                let converted = Nvfp4Weight::from_int8(
+                let converted = Nvfp4Weight::from_int8_with(
                     &weight.buffer,
                     &scales.buffer,
                     weight.shape[0],
                     weight.shape[1],
                     part == "mlp.fc1",
+                    columns,
                 )?;
                 self.nvfp4.insert(name.clone(), converted);
                 if part != "attn.to_gate_compress" {
@@ -599,7 +637,8 @@ impl CudaDit {
         let hidden = self.config.hidden;
         let history = self.nvfp4_scale(layer)?;
         let activations = self.nvfp4_activations(workspace);
-        activations.check_fits(tokens, hidden);
+        let layer_weight = &self.nvfp4[layer];
+        activations.check_fits(tokens, layer_weight.columns);
         let slots = history.next_call();
         // SAFETY: the residual and delta buffers hold `tokens × hidden` values, the activation
         // buffers fit, checked above, and the modulation rows index the table.
@@ -626,6 +665,7 @@ impl CudaDit {
                 slots.exact as c_int,
                 tokens as c_int,
                 hidden as c_int,
+                layer_weight.columns as c_int,
                 self.config.norm_eps,
                 ptr::null_mut(),
             )
@@ -648,7 +688,7 @@ impl CudaDit {
                 nvfp4::quantize_pointers(
                     Nvfp4Input::Rows(input),
                     rows,
-                    weight.features,
+                    weight,
                     self.nvfp4_scale(name)?,
                     activations,
                 )?;
@@ -1082,7 +1122,7 @@ impl CudaDit {
                         nvfp4::quantize_pointers(
                             Nvfp4Input::SwiGlu(workspace.expanded.pointer()),
                             tokens,
-                            config.ffn,
+                            down,
                             self.nvfp4_scale(&fc2)?,
                             activations,
                         )?;
@@ -1345,7 +1385,18 @@ impl CudaDit {
             expanded_rows: if fused { text_tokens } else { tokens },
             adapter_rank,
             gated: plan.is_some() && self.has_vsa_gates(),
-            nvfp4: !self.nvfp4.is_empty(),
+            nvfp4_columns: self
+                .nvfp4
+                .values()
+                .map(|weight| weight.columns)
+                .max()
+                .unwrap_or(0),
+            nvfp4_adapter_rank: self
+                .nvfp4
+                .values()
+                .map(Nvfp4Weight::adapter_rank)
+                .max()
+                .unwrap_or(0),
         };
         let workspace = match cached_workspace.take() {
             Some(mut workspace) if workspace.shape == shape => {

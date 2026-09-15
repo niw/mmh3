@@ -18,7 +18,8 @@ pub const AUDIO_VAE_FILE: &str = "vae/minimax_h3_audio_vae_fp32.safetensors";
 pub const TEXT_ENCODER_FILE: &str = "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
 
 /// Loads the DiT from `--weights` or `--dit`, whichever `name` says, with the patch of `--patch`
-/// and the LoRA of `--lora` when given.
+/// and the LoRA of `--lora` when given. NVFP4 layers take them into their weights, so they come
+/// before `--linear-precision`.
 pub fn load_dit(
     options: &HashMap<&str, &str>,
     name: &str,
@@ -53,20 +54,6 @@ pub fn load_dit(
         )?;
         println!("applied {patch} to {layers} layers and tensors");
     }
-    match options.get("linear-precision").copied().unwrap_or("int8") {
-        "int8" => {}
-        "nvfp4" => {
-            let started = Instant::now();
-            let layers = dit.use_nvfp4()?;
-            println!(
-                "requantized {layers} layers to NVFP4 in {:.1} s",
-                started.elapsed().as_secs_f64()
-            );
-        }
-        other => {
-            return Err(format!("--linear-precision must be int8 or nvfp4, not {other}").into());
-        }
-    }
     if let Some(lora) = model_file(options, "lora", &["loras"])? {
         let started = Instant::now();
         let strength = option_float(options, "lora-strength", 1.0)?;
@@ -82,6 +69,20 @@ pub fn load_dit(
             "added {lora} to {layers} layers at strength {strength} in {:.1} s",
             started.elapsed().as_secs_f64()
         );
+    }
+    match options.get("linear-precision").copied().unwrap_or("int8") {
+        "int8" => {}
+        "nvfp4" => {
+            let started = Instant::now();
+            let layers = dit.use_nvfp4()?;
+            println!(
+                "requantized {layers} layers to NVFP4 in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+        }
+        other => {
+            return Err(format!("--linear-precision must be int8 or nvfp4, not {other}").into());
+        }
     }
     Ok(dit)
 }

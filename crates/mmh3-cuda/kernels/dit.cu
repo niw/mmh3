@@ -498,15 +498,15 @@ __global__ void __launch_bounds__(ROW_THREADS)
 }
 
 // add_normalize_row, then the row's ConvRot rotation quantized to NVFP4 with the tensor scale of
-// margin · reference, which also goes to `tensor_scale`. The rows' largest rotated magnitude goes
-// to `observed` when it is not null.
+// margin · reference, which also goes to `tensor_scale`, into the first `hidden` of `columns`
+// columns. The rows' largest rotated magnitude goes to `observed` when it is not null.
 __global__ void __launch_bounds__(ROW_THREADS) add_norm_quantize_nvfp4_kernel(
     float *__restrict__ residual, const __nv_bfloat16 *__restrict__ delta,
     const float *__restrict__ gate_modulation, const float *__restrict__ modulation,
     const int32_t *__restrict__ rows, int chunks, int gate_chunk, int shift_chunk, int scale_chunk,
     const __nv_bfloat16 *__restrict__ weight, uint8_t *__restrict__ values,
     uint8_t *__restrict__ scales, float *tensor_scale, const unsigned *reference, float margin,
-    unsigned *observed, int hidden, float epsilon) {
+    unsigned *observed, int hidden, int columns, float epsilon) {
     extern __shared__ __align__(16) __nv_bfloat16 normalized_row[];
     __shared__ float scratch[ROW_THREADS / 32];
     const int64_t token = blockIdx.x;
@@ -521,7 +521,7 @@ __global__ void __launch_bounds__(ROW_THREADS) add_norm_quantize_nvfp4_kernel(
     for (int group = warp; group < hidden / CONVROT_GROUP; group += ROW_THREADS / 32) {
         float group_values[8];
         local = fmaxf(local, load_rotated_group(normalized_row, group, lane, group_values));
-        nvfp4_store_group(group_values, lane, static_cast<int>(token), group, hidden,
+        nvfp4_store_group(group_values, lane, static_cast<int>(token), group, columns,
                           inverse_tensor_scale, values, scales);
     }
     if (observed != nullptr) {
@@ -824,8 +824,8 @@ extern "C" int mmh3_add_norm_quantize_nvfp4(
     const float *modulation, const int32_t *rows, int chunks, int gate_chunk, int shift_chunk,
     int scale_chunk, const __nv_bfloat16 *weight, uint8_t *values, uint8_t *scales,
     float *tensor_scale, unsigned *reference, float margin, unsigned *observed, int exact,
-    int tokens, int hidden, float epsilon, cudaStream_t stream) {
-    if (hidden % CONVROT_GROUP != 0 || tokens <= 0) {
+    int tokens, int hidden, int columns, float epsilon, cudaStream_t stream) {
+    if (hidden % CONVROT_GROUP != 0 || columns < hidden || columns % 64 != 0 || tokens <= 0) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const cudaError_t status =
@@ -844,7 +844,7 @@ extern "C" int mmh3_add_norm_quantize_nvfp4(
     add_norm_quantize_nvfp4_kernel<<<tokens, ROW_THREADS, shared_bytes, stream>>>(
         residual, delta, gate_modulation, modulation, rows, chunks, gate_chunk, shift_chunk,
         scale_chunk, weight, values, scales, tensor_scale, reference, margin, observed, hidden,
-        epsilon);
+        columns, epsilon);
     return static_cast<int>(cudaGetLastError());
 }
 

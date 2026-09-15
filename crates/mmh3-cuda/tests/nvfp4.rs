@@ -1,7 +1,9 @@
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
 use mmh3_cuda::gemm::{self, Output};
-use mmh3_cuda::nvfp4::{self, Nvfp4Activations, Nvfp4Scale, Nvfp4Weight};
+use mmh3_cuda::nvfp4::{
+    self, ADAPTER_DOWN_NORM, AdapterSource, Columns, Nvfp4Activations, Nvfp4Scale, Nvfp4Weight,
+};
 use std::ffi::{c_int, c_void};
 
 unsafe extern "C" {
@@ -99,7 +101,7 @@ fn matches_the_exact_product_within_fp4_rounding() {
 
     let (int8_weights, row_scales) = quantize(&weights, n, k);
     let input = bf16_buffer(&activations);
-    let buffers = Nvfp4Activations::new(m, k).unwrap();
+    let buffers = Nvfp4Activations::new(m, k, 0).unwrap();
     let weight = Nvfp4Weight::from_int8(&int8_weights, &row_scales, n, k, false).unwrap();
     let mut output = DeviceBuffer::new(m * n * 2).unwrap();
     nvfp4::linear(
@@ -141,22 +143,45 @@ fn matches_the_exact_product_within_fp4_rounding() {
 
 #[test]
 fn undoes_the_swiglu_interleave() {
-    let (m, n, k) = (130, 256, 512);
+    let (m, n, k, rank) = (130, 256, 512, 64);
     let mut random = Random(6);
     let activations = random.bf16_values(m * k);
     let weights = random.bf16_values(n * k);
     let (int8_weights, row_scales) = quantize(&weights, n, k);
     let interleaved_weights = gemm::interleave_swiglu_rows(&int8_weights, n, k).unwrap();
     let interleaved_scales = gemm::interleave_swiglu_rows(&row_scales, n, 4).unwrap();
+    let (down, down_scales) = quantize(&random.bf16_values(rank * k), rank, k);
+    let up = bf16_buffer(&random.bf16_values(n * rank));
+    let interleaved_up = gemm::interleave_swiglu_rows(&up, n, rank * 2).unwrap();
     let input = bf16_buffer(&activations);
-    let buffers = Nvfp4Activations::new(m, k).unwrap();
+    let buffers = Nvfp4Activations::new(m, k + 256, rank).unwrap();
 
     let mut outputs = Vec::new();
-    for (weights, scales, deinterleave) in [
-        (&int8_weights, &row_scales, false),
-        (&interleaved_weights, &interleaved_scales, true),
+    for (weights, scales, up, deinterleave) in [
+        (&int8_weights, &row_scales, &up, false),
+        (
+            &interleaved_weights,
+            &interleaved_scales,
+            &interleaved_up,
+            true,
+        ),
     ] {
-        let weight = Nvfp4Weight::from_int8(weights, scales, n, k, deinterleave).unwrap();
+        let adapter = AdapterSource {
+            down: &down,
+            down_scales: &down_scales,
+            up,
+            rank,
+            scale: 0.01,
+        };
+        let weight = Nvfp4Weight::from_int8_with(
+            weights,
+            scales,
+            n,
+            k,
+            deinterleave,
+            Columns::Adapter(adapter),
+        )
+        .unwrap();
         let mut output = DeviceBuffer::new(m * n * 2).unwrap();
         nvfp4::linear(
             &weight,
@@ -226,7 +251,8 @@ fn e4m3_table() -> Vec<f64> {
         .collect()
 }
 
-/// Quantizes and dequantizes rows like the NVFP4 kernels with `tensor_scale`.
+/// Quantizes and dequantizes rows like the NVFP4 kernels with `tensor_scale`, in blocks of 16
+/// values.
 fn fake_quantize(rows: &mut [f64], tensor_scale: f64) {
     let (e4m3, e2m1) = (e4m3_table(), [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]);
     for block in rows.as_chunks_mut::<16>().0 {
@@ -258,7 +284,7 @@ fn matches_a_host_model_of_the_quantization() {
     let weights = random.bf16_values(n * k);
     let (int8_weights, row_scales) = quantize(&weights, n, k);
     let input = bf16_buffer(&activations);
-    let buffers = Nvfp4Activations::new(m, k).unwrap();
+    let buffers = Nvfp4Activations::new(m, k, 0).unwrap();
     let weight = Nvfp4Weight::from_int8(&int8_weights, &row_scales, n, k, false).unwrap();
     let mut output = DeviceBuffer::new(m * n * 2).unwrap();
     nvfp4::linear(
@@ -318,7 +344,7 @@ fn keeps_the_result_with_the_delayed_scale() {
     let (int8_weights, row_scales) = quantize(&weights, n, k);
     let weight = Nvfp4Weight::from_int8(&int8_weights, &row_scales, n, k, false).unwrap();
     let input = bf16_buffer(&activations);
-    let buffers = Nvfp4Activations::new(m, k).unwrap();
+    let buffers = Nvfp4Activations::new(m, k, 0).unwrap();
     let scale = Nvfp4Scale::new().unwrap();
     // The first call finds the tensor scale, and the later ones use it with a margin of a power
     // of two, which moves the block scales by whole exponents.
@@ -361,7 +387,7 @@ fn quantizes_the_swiglu_of_its_input() {
         )
     };
     assert_eq!(status, 0);
-    let buffers = Nvfp4Activations::new(m, ffn).unwrap();
+    let buffers = Nvfp4Activations::new(m, ffn, 0).unwrap();
     let mut separate = DeviceBuffer::new(m * n * 2).unwrap();
     nvfp4::linear(
         &weight,
@@ -385,5 +411,173 @@ fn quantizes_the_swiglu_of_its_input() {
     assert_eq!(
         download_bf16(&separate, m * n),
         download_bf16(&fused, m * n)
+    );
+}
+
+/// Dequantizes INT8 rows of `columns` values with one scale per row.
+fn dequantize(
+    quantized: &DeviceBuffer,
+    scales: &DeviceBuffer,
+    rows: usize,
+    columns: usize,
+) -> Vec<f64> {
+    let mut bytes = vec![0u8; rows * columns];
+    quantized.copy_to_host(&mut bytes).unwrap();
+    let scales = scales.to_f32_range(0, rows).unwrap();
+    bytes
+        .iter()
+        .enumerate()
+        .map(|(index, &byte)| byte as i8 as f64 * scales[index / columns] as f64)
+        .collect()
+}
+
+fn largest(values: impl IntoIterator<Item = f32>) -> f32 {
+    values
+        .into_iter()
+        .fold(0.0f32, |maximum, value| maximum.max(value.abs()))
+}
+
+/// `[rows, inner] · [columns, inner]ᵀ`.
+fn product(left: &[f64], right: &[f64], rows: usize, columns: usize, inner: usize) -> Vec<f64> {
+    (0..rows * columns)
+        .map(|index| {
+            let (row, column) = (index / columns, index % columns);
+            (0..inner)
+                .map(|position| left[row * inner + position] * right[column * inner + position])
+                .sum()
+        })
+        .collect()
+}
+
+#[test]
+fn matches_a_host_model_with_an_adapter() {
+    let (m, n, k, rank, scale) = (200, 256, 512, 64, 0.05f32);
+    let mut random = Random(10);
+    let activations = random.bf16_values(m * k);
+    let (int8_weights, row_scales) = quantize(&random.bf16_values(n * k), n, k);
+    let (down, down_scales) = quantize(&random.bf16_values(rank * k), rank, k);
+    let up_values = random.bf16_values(n * rank);
+    let up = bf16_buffer(&up_values);
+    let adapter = AdapterSource {
+        down: &down,
+        down_scales: &down_scales,
+        up: &up,
+        rank,
+        scale,
+    };
+    let weight = Nvfp4Weight::from_int8_with(
+        &int8_weights,
+        &row_scales,
+        n,
+        k,
+        false,
+        Columns::Adapter(adapter),
+    )
+    .unwrap();
+    assert_eq!((weight.columns, weight.adapter_rank()), (k + 256, rank));
+    let buffers = Nvfp4Activations::new(m, weight.columns, rank).unwrap();
+    let mut output = DeviceBuffer::new(m * n * 2).unwrap();
+    nvfp4::linear(
+        &weight,
+        &bf16_buffer(&activations),
+        &mut output,
+        m,
+        &Nvfp4Scale::new().unwrap(),
+        &buffers,
+    )
+    .unwrap();
+    let actual = download_bf16(&output, m * n);
+
+    let mut model_activations: Vec<f64> = activations.iter().map(|&value| value as f64).collect();
+    model_activations.chunks_exact_mut(k).for_each(rotate);
+    let activation_scale =
+        (largest(model_activations.iter().map(|&value| value as f32)) / (6.0 * 448.0)) as f64;
+    fake_quantize(&mut model_activations, activation_scale);
+
+    // The down projection is scaled so that its longest row has norm ADAPTER_DOWN_NORM, and the
+    // up projection by the inverse.
+    let mut model_down = dequantize(&down, &down_scales, rank, k);
+    let down_norm = model_down
+        .chunks_exact(k)
+        .map(|row| row.iter().map(|value| value * value).sum::<f64>().sqrt() as f32)
+        .fold(0.0f32, f32::max);
+    let balance = ADAPTER_DOWN_NORM / down_norm;
+    let down_row_scales = down_scales.to_f32_range(0, rank).unwrap();
+    fake_quantize(
+        &mut model_down,
+        (128.0 * largest(down_row_scales) / (6.0 * 448.0)) as f64,
+    );
+    let mut adapter_activations: Vec<f64> = product(&model_activations, &model_down, m, rank, k)
+        .into_iter()
+        .map(|value| bf16_to_f32(f32_to_bf16((value * balance as f64) as f32)) as f64)
+        .collect();
+    fake_quantize(&mut adapter_activations, activation_scale);
+
+    let multiplier = scale / balance;
+    let mut model_weights = dequantize(&int8_weights, &row_scales, n, k);
+    let mut model_up: Vec<f64> = up_values
+        .iter()
+        .map(|&value| (value * multiplier) as f64)
+        .collect();
+    let weight_scale = (128.0 * largest(row_scales.to_f32().unwrap()))
+        .max(largest(up_values.iter().copied()) * multiplier)
+        / (6.0 * 448.0);
+    fake_quantize(&mut model_weights, weight_scale as f64);
+    fake_quantize(&mut model_up, weight_scale as f64);
+    let expected: Vec<f64> = product(&model_activations, &model_weights, m, n, k)
+        .into_iter()
+        .zip(product(&adapter_activations, &model_up, m, n, rank))
+        .map(|(layer, adapter)| layer + adapter)
+        .collect();
+    let error = relative_error(&actual, &expected);
+    let adapter_share = relative_error(
+        &product(&model_activations, &model_weights, m, n, k)
+            .into_iter()
+            .map(|value| value as f32)
+            .collect::<Vec<_>>(),
+        &expected,
+    );
+    eprintln!("against the host model {error:.3e}, the adapter's share {adapter_share:.3e}");
+    assert!(
+        adapter_share > 0.1,
+        "the adapter changes too little to check"
+    );
+    assert!(
+        error < 1e-2,
+        "relative error {error} against the host model"
+    );
+}
+
+#[test]
+fn ignores_zero_columns() {
+    let (m, n, k) = (200, 256, 512);
+    let mut random = Random(11);
+    let input = bf16_buffer(&random.bf16_values(m * k));
+    let (int8_weights, row_scales) = quantize(&random.bf16_values(n * k), n, k);
+    let buffers = Nvfp4Activations::new(m, k + 128, 0).unwrap();
+    let outputs: Vec<Vec<f32>> = [Columns::Inputs, Columns::Zeros(k + 128)]
+        .into_iter()
+        .map(|columns| {
+            let weight =
+                Nvfp4Weight::from_int8_with(&int8_weights, &row_scales, n, k, false, columns)
+                    .unwrap();
+            let mut output = DeviceBuffer::new(m * n * 2).unwrap();
+            nvfp4::linear(
+                &weight,
+                &input,
+                &mut output,
+                m,
+                &Nvfp4Scale::new().unwrap(),
+                &buffers,
+            )
+            .unwrap();
+            download_bf16(&output, m * n)
+        })
+        .collect();
+    let expected: Vec<f64> = outputs[0].iter().map(|&value| value as f64).collect();
+    let difference = relative_error(&outputs[1], &expected);
+    assert!(
+        difference < 1e-3,
+        "zero columns change the result by {difference}"
     );
 }
