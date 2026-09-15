@@ -125,3 +125,43 @@ alone gives about 58.9 dB.
 | Smoothing and GPTQ, 12 tiles | 60.4 dB |
 | Smoothing and GPTQ, 48 tiles | 60.8 dB |
 | Smoothing and GPTQ, 96 tiles (the defaults) | 60.9 dB |
+
+## taomate_lora.py
+
+Converts the [TaoMate-H3](https://huggingface.co/TaoLiveAIGC/TaoMate-H3) adapter into a ComfyUI
+LoRA, which mmh3 applies with `--lora` and runs in three steps with `--schedule taomate`. The
+adapter is a rank-128 FP32 LoRA of the 208 linear layers of the blocks and the text refiner, under
+the names of the pruned DiT with `lora_a` and `lora_b`, which neither mmh3 nor ComfyUI reads as it
+is. The Hugging Face CLI prints where it puts the adapter:
+
+```sh
+hf download TaoLiveAIGC/TaoMate-H3 adapter_config.json adapter_model.safetensors
+
+uv run tools/models/taomate_lora.py \
+  --adapter /path/to/TaoMate-H3 \
+  --out models/loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors
+```
+
+It computes on the CPU with NumPy and takes about 30 seconds on a DGX Spark. Each layer's update
+B·A is factored again by its SVD and kept at `--rank`, 128 by default, which is the adapter itself
+rounded to BF16. `--rank 64` cuts every layer to rank 64, and `--energy X` gives each layer the
+smallest multiple of 64 up to `--rank` that keeps the fraction X of the update's squared Frobenius
+norm.
+
+Smaller ranks only make the file smaller. mmh3 pads the down projections of INT8 layers to 128
+rows, so every variant below runs at the same speed: 14.3, 13.8 and 13.9 s for the three steps of
+Tokyo rain at 1344×768 with Sol-Attn and INT8/FP8 attention, against 13.8, 13.5 and 13.5 s without
+a LoRA.
+
+| LoRA | Ranks | Size | Relative error of the updates |
+| --- | --- | ---: | ---: |
+| Rank 128 (the default) | 128 | 1.24 GB | 2.3e-3 (BF16 rounding) |
+| `--energy 0.98` | 64, 128 for 14 fc2 layers | 656 MB | 4.8e-2 |
+| `--rank 64` | 64 | 620 MB | 5.2e-2 |
+
+Three sampling steps turn small numeric differences into different pictures, so the final latents
+of these variants differ as much as those of the adapter's own A and B rounded to BF16 without the
+SVD. One dense step at sigma 1 tells them apart better. There, against rank 128, the video velocity
+of every variant deviates by about 0.24 to 0.26 of TaoMate's own change of the velocity, as much as
+the BF16 rounding alone, and the audio velocity by 0.08 for the rounding and 0.09 for `--rank 64` and
+`--energy 0.98`. In one listening test on two prompts, rank 128 sounded best.
