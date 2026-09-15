@@ -21,13 +21,21 @@ make generate
 
 `make` builds mmh3, `make download-models` downloads the models into `models`, and `make generate`
 generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.mp4` (NVENC
-H.264 video and AAC audio). A complete MP4 generation on a DGX Spark took about **87 seconds**,
-including model loading and encoding.
+H.264 video and AAC audio).
 
 `make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT,
 with its video sparse attention, INT8/FP8 attention and the INT8 video VAE. Compared with mmh3's
-defaults, they can change image details and the composition. See [Usage](docs/usage.md) for the
-other settings.
+defaults, they can change image details and the composition. mmh3 also runs two other few-step
+models with the settings on their pages. On a DGX Spark, a complete generation, including model
+loading and encoding, took:
+
+| Model | Steps | Time |
+| --- | ---: | ---: |
+| [FastH3](docs/fasth3.md) | 4 | 87 s |
+| [lightx2v Turbo LoRA](docs/lightx2v-turbo.md) | 4 | 86 s |
+| [TaoMate-H3](docs/taomate.md) | 3 | 70 s |
+
+See [Usage](docs/usage.md) for the other settings.
 
 ## Status
 
