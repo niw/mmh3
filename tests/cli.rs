@@ -19,7 +19,7 @@ fn each_binary_lists_its_own_commands() {
     let tools = run(TOOLS, &[]);
     assert_eq!(tools.status.code(), Some(2));
     let usage = String::from_utf8(tools.stderr).unwrap();
-    for command in ["inspect", "device", "bench", "check"] {
+    for command in ["inspect", "device", "bench", "check", "latent"] {
         assert!(usage.contains(&format!("mmh3-tools {command}")));
     }
     assert!(!usage.contains("mmh3 generate"));
@@ -27,7 +27,7 @@ fn each_binary_lists_its_own_commands() {
 
 #[test]
 fn commands_belong_to_only_one_binary() {
-    for command in ["inspect", "device", "bench", "check"] {
+    for command in ["inspect", "device", "bench", "check", "latent"] {
         assert_eq!(run(MMH3, &[command]).status.code(), Some(2));
     }
     assert_eq!(run(TOOLS, &["generate"]).status.code(), Some(2));
@@ -59,6 +59,7 @@ fn gpu_commands_explain_the_missing_backend() {
         (TOOLS, "device"),
         (TOOLS, "bench"),
         (TOOLS, "check"),
+        (TOOLS, "latent"),
     ] {
         let output = run(binary, &[command]);
         assert_eq!(output.status.code(), Some(1));
@@ -86,6 +87,12 @@ fn argument_errors_use_the_correct_binary_usage() {
             TOOLS,
             &["check", "dit", "--unknown", "1"][..],
             "mmh3-tools check",
+            "mmh3 generate",
+        ),
+        (
+            TOOLS,
+            &["latent", "--unknown", "1"][..],
+            "mmh3-tools latent",
             "mmh3 generate",
         ),
     ] {

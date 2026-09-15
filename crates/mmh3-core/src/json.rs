@@ -85,6 +85,25 @@ impl fmt::Display for ParseError {
 
 impl std::error::Error for ParseError {}
 
+/// `text` as a JSON string literal.
+pub fn quote(text: &str) -> String {
+    let mut quoted = String::with_capacity(text.len() + 2);
+    quoted.push('"');
+    for character in text.chars() {
+        match character {
+            '"' => quoted.push_str("\\\""),
+            '\\' => quoted.push_str("\\\\"),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            control if control < ' ' => quoted.push_str(&format!("\\u{:04x}", control as u32)),
+            other => quoted.push(other),
+        }
+    }
+    quoted.push('"');
+    quoted
+}
+
 pub fn parse(text: &str) -> Result<Value, ParseError> {
     let mut parser = Parser {
         text,
@@ -350,6 +369,18 @@ impl Parser<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quotes_strings_that_parse_back() {
+        for text in [
+            "plain",
+            "a \"quoted\" \\ path",
+            "line\nbreak\ttab\u{1}",
+            "日本語",
+        ] {
+            assert_eq!(parse(&quote(text)).unwrap(), Value::String(text.to_owned()));
+        }
+    }
 
     #[test]
     fn parses_nested_values() {

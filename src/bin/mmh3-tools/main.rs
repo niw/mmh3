@@ -7,6 +7,8 @@ mod bench;
 mod check;
 #[cfg(feature = "cuda")]
 mod device;
+#[cfg(feature = "cuda")]
+mod latent;
 
 use std::error::Error;
 use std::process::ExitCode;
@@ -27,8 +29,15 @@ const USAGE: &str = "usage:
   mmh3-tools check video-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3-tools check audio-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3-tools check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
+  mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
+                    [--models DIR] [--width N] [--height N] [--frames N] [--steps N] [--seed N] [--shift-video X]
+                    [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--patch FILE] [--lora FILE] [--lora-strength X]
+                    [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X]
+                    [--vsa-sparsity X]
 
-Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.";
+Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.
+latent samples like the generate command of mmh3, with the same defaults, and writes the final video and audio
+latents without decoding them.";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
@@ -40,8 +49,10 @@ fn main() -> ExitCode {
         Some("bench") => bench::run(&arguments[1..]),
         #[cfg(feature = "cuda")]
         Some("check") => check::run(&arguments[1..]),
+        #[cfg(feature = "cuda")]
+        Some("latent") => latent::run(&arguments[1..]),
         #[cfg(not(feature = "cuda"))]
-        Some("device" | "bench" | "check") => {
+        Some("device" | "bench" | "check" | "latent") => {
             Err("this build has no GPU backend. Rebuild with --features cuda".into())
         }
         _ => {

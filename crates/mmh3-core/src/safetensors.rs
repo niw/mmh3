@@ -1,10 +1,10 @@
-//! Read-only access to safetensors files through a memory mapping.
+//! Safetensors files: read-only access through a memory mapping, and writing FP32 tensors.
 
 use crate::json::{self, Value};
 use crate::mapped_file::MappedFile;
 use std::collections::HashMap;
 use std::fmt;
-use std::io;
+use std::io::{self, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -226,6 +226,48 @@ impl SafeTensors {
     }
 }
 
+/// Writes FP32 tensors `(name, shape, values)` and string metadata as a safetensors file.
+pub fn write_f32(
+    path: &Path,
+    tensors: &[(&str, &[usize], &[f32])],
+    metadata: &[(&str, &str)],
+) -> io::Result<()> {
+    let entries: Vec<String> = metadata
+        .iter()
+        .map(|(key, value)| format!("{}:{}", json::quote(key), json::quote(value)))
+        .collect();
+    let mut header = format!("{{\"__metadata__\":{{{}}}", entries.join(","));
+    let mut offset = 0;
+    for (name, shape, values) in tensors {
+        assert_eq!(
+            shape.iter().product::<usize>(),
+            values.len(),
+            "{name}: the shape does not match the values"
+        );
+        let end = offset + values.len() * 4;
+        let dimensions: Vec<String> = shape.iter().map(usize::to_string).collect();
+        header.push_str(&format!(
+            ",{}:{{\"dtype\":\"F32\",\"shape\":[{}],\"data_offsets\":[{offset},{end}]}}",
+            json::quote(name),
+            dimensions.join(",")
+        ));
+        offset = end;
+    }
+    header.push('}');
+    while !header.len().is_multiple_of(8) {
+        header.push(' ');
+    }
+    let mut writer = io::BufWriter::new(std::fs::File::create(path)?);
+    writer.write_all(&(header.len() as u64).to_le_bytes())?;
+    writer.write_all(header.as_bytes())?;
+    for (_, _, values) in tensors {
+        for value in values.iter() {
+            writer.write_all(&value.to_le_bytes())?;
+        }
+    }
+    writer.flush()
+}
+
 fn parse_metadata(entry: &Value) -> Result<Vec<(String, String)>, Error> {
     let members = entry
         .as_object()
@@ -296,4 +338,40 @@ fn parse_tensor(name: &str, entry: &Value, data_length: usize) -> Result<TensorI
         shape,
         data_range: begin..end,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_back_written_tensors_and_metadata() {
+        let path =
+            std::env::temp_dir().join(format!("mmh3-write-{}.safetensors", std::process::id()));
+        let values = [1.0f32, -2.5, 3.25, 0.0, 5.0, 6.0];
+        write_f32(
+            &path,
+            &[("video", &[2, 3], &values), ("audio", &[1], &[7.0])],
+            &[("prompt", "a \"quoted\" prompt")],
+        )
+        .unwrap();
+        let file = SafeTensors::open(&path).unwrap();
+        assert_eq!(
+            file.metadata(),
+            &[("prompt".to_owned(), "a \"quoted\" prompt".to_owned())]
+        );
+        let video = file.get("video").unwrap();
+        assert_eq!(
+            (video.dtype, video.shape.as_slice()),
+            (DType::F32, &[2, 3][..])
+        );
+        let read: Vec<f32> = file
+            .data(video)
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect();
+        assert_eq!(read, values);
+        assert_eq!(file.data(file.get("audio").unwrap()), 7.0f32.to_le_bytes());
+        std::fs::remove_file(&path).unwrap();
+    }
 }

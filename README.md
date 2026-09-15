@@ -386,6 +386,8 @@ Inspection and development commands are available in `mmh3-tools`:
 - `mmh3-tools bench gemm|memory|mma|attention` measures kernels and the GPU.
 - `mmh3-tools check dit|sample|video-vae|audio-vae|text-encoder` compares a stage with golden data
   written by `tools/golden`.
+- `mmh3-tools latent` samples like `mmh3 generate` and writes the final latents without decoding
+  them.
 
 ## Repository layout
 
@@ -395,8 +397,8 @@ Inspection and development commands are available in `mmh3-tools`:
 - `src/lib.rs`: support shared by both commands, with argument parsing in `src/cli.rs`,
   checkpoint loading options in `src/models.rs` and the sampling in `src/generation.rs`.
 - `crates/mmh3-core`: everything that does not depend on a GPU backend, such as the safetensors
-  reader, the tokenizer, the packed token layout, schedules, VAE tiling plans, Sol-Attn's reference
-  and the media writers.
+  reader and writer, the tokenizer, the packed token layout, schedules, VAE tiling plans, Sol-Attn's
+  reference and the media writers.
 - `crates/mmh3-cuda`: the CUDA kernels (`kernels/*.cu`) and the Rust code that runs the models with
   them.
 - `crates/mmh3-cpu`: an FP32 CPU reference of the DiT for tests.
