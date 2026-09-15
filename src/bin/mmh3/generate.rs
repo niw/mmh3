@@ -3,7 +3,7 @@
 use crate::USAGE;
 use mmh3::cli::{parse_options, split_ffmpeg_arguments};
 use mmh3::generation::{OPTIONS, Settings, sample};
-use mmh3::models::{AUDIO_VAE_FILE, VIDEO_VAE_FILE, VIDEO_VAE_INT8_FILE, option_path};
+use mmh3::models::{AUDIO_VAE_FILE, option_path, video_vae_path};
 use mmh3_core::safetensors::SafeTensors;
 use std::error::Error;
 use std::path::Path;
@@ -17,11 +17,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use std::time::Instant;
 
     let (arguments, ffmpeg_arguments) = split_ffmpeg_arguments(arguments);
-    let options = parse_options(
-        arguments,
-        &[OPTIONS, &["out", "video-vae", "audio-vae"]].concat(),
-        USAGE,
-    )?;
+    let options = parse_options(arguments, &[OPTIONS, &["out", "audio-vae"]].concat(), USAGE)?;
     let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
     let settings = Settings::parse(&options)?;
     let spec = MediaSpec {
@@ -36,19 +32,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let (video, audio) = sample(&options, &settings)?;
 
     let started = Instant::now();
-    // Without --video-vae, the INT8 ConvRot VAE decodes when the models directory has it, and the
-    // FP16 one otherwise.
-    let path = match options.get("video-vae") {
-        Some(path) => (*path).to_owned(),
-        None => {
-            let int8_path = option_path(&options, "video-vae", VIDEO_VAE_INT8_FILE)?;
-            if Path::new(&int8_path).exists() {
-                int8_path
-            } else {
-                option_path(&options, "video-vae", VIDEO_VAE_FILE)?
-            }
-        }
-    };
+    let path = video_vae_path(&options)?;
     let decoded = CudaVideoDecoder::load(
         &SafeTensors::open(Path::new(&path))?,
         "",

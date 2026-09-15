@@ -96,6 +96,20 @@ pub fn load_dit(
     Ok(dit)
 }
 
+/// The video VAE of `--video-vae`, or without it the INT8 ConvRot VAE when the models directory has
+/// it and the FP16 one otherwise.
+pub fn video_vae_path(options: &HashMap<&str, &str>) -> Result<String, Box<dyn Error>> {
+    if let Some(path) = options.get("video-vae") {
+        return Ok((*path).to_owned());
+    }
+    let int8_path = option_path(options, "video-vae", VIDEO_VAE_INT8_FILE)?;
+    if Path::new(&int8_path).exists() {
+        Ok(int8_path)
+    } else {
+        option_path(options, "video-vae", VIDEO_VAE_FILE)
+    }
+}
+
 /// File that keeps the cuBLASLt algorithms chosen for the NVFP4 GEMMs between runs, in
 /// `$XDG_CACHE_HOME/mmh3` or `~/.cache/mmh3`.
 fn algorithm_cache() -> Option<PathBuf> {

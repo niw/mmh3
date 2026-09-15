@@ -2,6 +2,7 @@
 
 pub mod cli;
 pub mod output;
+pub mod pictures;
 
 #[cfg(feature = "cuda")]
 pub mod generation;

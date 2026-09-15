@@ -6,7 +6,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
-                [--width N] [--height N] [--frames N] [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
+                [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE]
+                [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
                 [--ffmpeg [FFMPEG_ARGUMENTS...]]
@@ -17,6 +18,8 @@ Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
   text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors
   vae/minimax_h3_video_vae_fp16.safetensors
   vae/minimax_h3_audio_vae_fp32.safetensors
+--first-frame and --last-frame take PNG or JPEG pictures the video starts from and ends on. Without --width and
+--height the first picture sets the canvas's aspect ratio.
 MP4 uses NVENC H.264 + AAC on CUDA; WebM uses built-in VP9 + Opus.
 --ffmpeg overrides native output and consumes all remaining arguments.
 With no ffmpeg arguments it uses H.264 + AAC. Set --out to a .mp4 file.
