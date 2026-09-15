@@ -387,7 +387,7 @@ Inspection and development commands are available in `mmh3-tools`:
 - `mmh3-tools check dit|sample|video-vae|audio-vae|text-encoder` compares a stage with golden data
   written by `tools/golden`.
 - `mmh3-tools latent` samples like `mmh3 generate` and writes the final latents without decoding
-  them.
+  them, for example as calibration input of `tools/models/video_vae_int8.py`.
 
 ## Repository layout
 

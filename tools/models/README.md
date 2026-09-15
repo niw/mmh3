@@ -65,3 +65,63 @@ FastH3 amplifies such differences: a GPU build gives 1.79e-1 and 3.81e-2 here. O
 different SVD seeds on the CPU and the GPU, the video deviation against FP32 golden data with every
 VSA tile kept (`--vsa-sparsity 0`) spreads from 1.65e-1 to 2.11e-1, with the published patch at
 1.75e-1.
+
+## video_vae_int8.py
+
+Builds the INT8 ConvRot video VAE, `vae/minimax_h3_video_vae_int8_convrot.safetensors`, from the
+FP16 video VAE of Comfy-Org/MiniMax-H3 and calibration latents. It converts the linear layers of the
+36 decoder blocks and keeps every other tensor in FP16, so mmh3 decodes it as fast as Kijai's INT8
+video VAE of the same format, and ComfyUI loads it too. The file is 2.8 GB.
+
+The calibration latents come from `mmh3-tools latent`, which samples like `mmh3 generate` and
+writes the final latents instead of decoding them. The results below use six 1344×768, 39-frame
+FastH3 latents of the prompts in `video_vae_calibration_prompts.txt`, with seeds 11 to 16. With
+`MMH3_MODELS` set as for `mmh3` and `mmh3-tools` built with the `cuda` feature:
+
+```sh
+seed=11
+while read -r prompt; do
+  target/release/mmh3-tools latent --prompt "$prompt" --seed $seed --steps 4 --frames 39 \
+    --attention-precision int8-fp8 \
+    --patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors \
+    --out latents/$seed.safetensors
+  seed=$((seed + 1))
+done < tools/models/video_vae_calibration_prompts.txt
+
+hf download Comfy-Org/MiniMax-H3 vae/minimax_h3_video_vae_fp16.safetensors
+
+uv run tools/models/video_vae_int8.py \
+  --vae /path/to/minimax_h3_video_vae_fp16.safetensors \
+  --latents 'latents/*.safetensors' \
+  --out models/vae/minimax_h3_video_vae_int8_convrot.safetensors
+```
+
+`--latents` also takes golden files of `tools/golden/h3_reference.py`, whose last step it uses. The
+tool draws `--tiles` tiles, 96 by default, from all the latents. A tile is what mmh3 decodes at
+once: 7 latent frames of 16 × 16 positions. It runs the decoder on the GPU in FP32 block by block,
+with the blocks before already quantized, and quantizes each layer in two steps, described in the
+script:
+
+- Smoothing divides each input channel by `sqrt(rms(x) / |w|)` and multiplies the weight column by
+  it. The division folds into the RMSNorm weight or into the rows of the layer before, so the
+  decoder computes the same function, and the per-row INT8 activations lose less to rounding.
+- GPTQ rounds the rotated weights column by column and spreads each rounding error over the columns
+  left, through the inverse Hessian of the layer's calibration inputs.
+
+On a DGX Spark the six latents take about 4 minutes, and the tool about 4 minutes and 4.5 GB of host
+memory.
+
+`mmh3-tools check video-vae --reference` compares an INT8 decode with the FP16 one. The table gives
+the PSNR of the pixels, averaged over five 1344×768 latents of FastH3 outside the calibration: four
+39-frame latents of other prompts and the 124-frame golden latent. Rounding the pixels to 8 bits
+alone gives about 58.9 dB.
+
+| INT8 video VAE | PSNR |
+| --- | ---: |
+| Kijai/MiniMax-H3-experimental | 58.2 dB |
+| Rounding to nearest (`--method rtn --no-smoothing`) | 58.2 dB |
+| Smoothing only (`--method rtn`), 12 tiles | 59.5 dB |
+| GPTQ only (`--no-smoothing`), 12 tiles | 59.7 dB |
+| Smoothing and GPTQ, 12 tiles | 60.4 dB |
+| Smoothing and GPTQ, 48 tiles | 60.8 dB |
+| Smoothing and GPTQ, 96 tiles (the defaults) | 60.9 dB |
