@@ -3,7 +3,8 @@
 use crate::USAGE;
 use mmh3::cli::parse_options;
 use mmh3::models::{
-    AUDIO_VAE_FILE, TEXT_ENCODER_FILE, VIDEO_VAE_FILE, load_dit, option_path, sparse_attention,
+    AUDIO_VAE_FILE, DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, VIDEO_VAE_FILE, load_dit,
+    option_path, sparse_attention,
 };
 use mmh3_core::json;
 use mmh3_core::safetensors::SafeTensors;
@@ -111,6 +112,33 @@ impl GoldenFile {
             })
             .collect()
     }
+
+    /// The reference pictures as the DiT sees them, with ComfyUI's condition noise.
+    fn references(&self) -> Result<Vec<mmh3_core::dit::inputs::Reference>, Box<dyn Error>> {
+        if !self.has_metadata("reference_pictures") {
+            return Ok(Vec::new());
+        }
+        let count: usize = self
+            .metadata("reference_pictures")?
+            .parse()
+            .map_err(|_| "bad reference_pictures")?;
+        (0..count)
+            .map(|index| {
+                Ok(mmh3_core::dit::inputs::Reference::Picture(
+                    self.tensor(&format!("reference.{index}.augmented"))?,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// The DiT file in the models directory for golden data with or without references.
+fn dit_file_for(references: &[mmh3_core::dit::inputs::Reference]) -> &'static str {
+    if references.is_empty() {
+        DIT_FILE
+    } else {
+        REFERENCE_DIT_FILE
+    }
 }
 
 /// Similarity of `actual` to `expected`: cosine, relative L2 error and the largest absolute error
@@ -155,6 +183,7 @@ fn compare(actual: &[f32], expected: &[f32]) -> (f64, f64, f32, f32) {
 /// tools/golden/h3_reference.py.
 fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
+    use mmh3_core::dit::layout::{PackedLayout, SegmentKind};
     use std::time::Instant;
 
     let options = parse_options(
@@ -198,12 +227,13 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         context: text_file.tensor("context")?,
         context_modalities: text_file.context_modalities()?,
         keyframes: dit_file.keyframes()?,
+        references: dit_file.references()?,
         sigma: sigma as f32,
         shift_video: dit_file.metadata("shift_video")?.parse()?,
         shift_audio: dit_file.metadata("shift_audio")?.parse()?,
     };
 
-    let dit = load_dit(&options, "weights")?;
+    let dit = load_dit(&options, "weights", dit_file_for(&inputs.references))?;
     let started = Instant::now();
     let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     let outputs = dit.forward(&inputs, &watched, sparse.as_ref())?;
@@ -224,12 +254,17 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         println!("{name:<12} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3}");
     };
     let hidden = dit.config().hidden;
-    let text_tokens = inputs.context.shape[0];
-    let audio_rows = 2 * inputs.audio.shape[2];
-    let segment_of = |token: usize| match token {
-        token if token < text_tokens => "text",
-        token if token < text_tokens + audio_rows => "audio",
-        _ => "video",
+    let layout = PackedLayout::for_inputs(&inputs);
+    let segment_of = |token: usize| match layout
+        .segments
+        .iter()
+        .find(|segment| (segment.start..segment.end).contains(&token))
+        .map(|segment| segment.kind)
+    {
+        Some(SegmentKind::Text) => "text",
+        Some(SegmentKind::Audio) => "audio",
+        Some(SegmentKind::Video) => "video",
+        _ => "conditions",
     };
     for (index, residual) in &outputs.blocks {
         let expected = dit_file.tensor(&format!("step{step}.block.{index}"))?;
@@ -240,7 +275,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             .copied()
             .collect();
         report(&format!("block {index}"), &sampled, &expected.data);
-        for segment in ["text", "audio", "video"] {
+        for segment in ["text", "conditions", "audio", "video"] {
             let (mut actual, mut reference) = (Vec::new(), Vec::new());
             for (sample, (row, expected_row)) in sampled
                 .chunks_exact(hidden)
@@ -319,13 +354,14 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         shift_audio,
     );
 
-    let dit = load_dit(&options, "weights")?;
-    let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     let mut video = dit_file.unbatched("noise.video")?;
     let mut audio = dit_file.unbatched("noise.audio")?;
     let context = text_file.tensor("context")?;
     let context_modalities = text_file.context_modalities()?;
     let keyframes = dit_file.keyframes()?;
+    let references = dit_file.references()?;
+    let dit = load_dit(&options, "weights", dit_file_for(&references))?;
+    let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     println!(
         "{:<6} {:>8} {:>11} {:>11} {:>11} {:>11} {:>7}",
         "step", "sigma", "video cos", "video L2", "audio cos", "audio L2", "s"
@@ -338,6 +374,7 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             context: context.clone(),
             context_modalities: context_modalities.clone(),
             keyframes: keyframes.clone(),
+            references: references.clone(),
             sigma: schedule.video[step],
             shift_video,
             shift_audio,
@@ -374,10 +411,9 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Decodes the final video latent of a golden directory and compares the pixels with ComfyUI's,
-/// or with the decode of the checkpoint given by `--reference`.
-/// Encodes the keyframe pictures of a golden directory with the video VAE's encoder and compares
-/// the latents with ComfyUI's, or with those of `--reference`, a file of the same tensors.
+/// Encodes the keyframe or reference pictures of a golden directory with the video VAE's encoder
+/// and compares the latents with ComfyUI's, or with those of `--reference`, a file of the same
+/// tensors.
 fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::video_encoder::CudaVideoEncoder;
     use std::time::Instant;
@@ -389,15 +425,27 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
-    let keyframes = GoldenFile::open(golden, "keyframes.safetensors")?;
+    let (name, file) = if golden.join("keyframes.safetensors").exists() {
+        ("keyframe", "keyframes.safetensors")
+    } else {
+        ("reference", "references.safetensors")
+    };
+    let pictures = GoldenFile::open(golden, file)?;
     let reference = match options.get("reference") {
         Some(path) => GoldenFile(SafeTensors::open(Path::new(path))?),
-        None => GoldenFile::open(golden, "keyframes.safetensors")?,
+        None => GoldenFile::open(golden, file)?,
     };
-    let count = json::parse(&keyframes.metadata("frame_indices")?)?
-        .as_array()
-        .ok_or("bad frame_indices")?
-        .len();
+    let count = if name == "keyframe" {
+        json::parse(&pictures.metadata("frame_indices")?)?
+            .as_array()
+            .ok_or("bad frame_indices")?
+            .len()
+    } else {
+        pictures
+            .metadata("reference_pictures")?
+            .parse()
+            .map_err(|_| "bad reference_pictures")?
+    };
 
     let started = Instant::now();
     let encoder = CudaVideoEncoder::load(&SafeTensors::open(Path::new(&weights_path))?)?;
@@ -410,8 +458,8 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "latent", "cosine", "rel L2", "max error", "scale"
     );
     for index in 0..count {
-        let picture = keyframes.tensor(&format!("keyframe.{index}.pixels"))?;
-        let expected = reference.tensor(&format!("keyframe.{index}.latent"))?;
+        let picture = pictures.tensor(&format!("{name}.{index}.pixels"))?;
+        let expected = reference.tensor(&format!("{name}.{index}.latent"))?;
         let started = Instant::now();
         let latent = encoder.encode_picture(&picture)?.mean_latent();
         let elapsed = started.elapsed().as_secs_f64();
@@ -425,12 +473,14 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         let (cosine, relative, worst, scale) = compare(&latent.data, &expected.data);
         println!(
             "{:<12} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.2} s)",
-            format!("keyframe {index}")
+            format!("{name} {index}")
         );
     }
     Ok(())
 }
 
+/// Decodes the final video latent of a golden directory and compares the pixels with ComfyUI's,
+/// or with the decode of the checkpoint given by `--reference`.
 fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::vae::{CudaVideoDecoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
     use std::time::Instant;

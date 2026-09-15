@@ -98,6 +98,7 @@ fn matches_comfyui_golden_forward() {
         context: unbatched(tensor(&file, "input.context")),
         context_modalities: Vec::new(),
         keyframes: Vec::new(),
+        references: Vec::new(),
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),

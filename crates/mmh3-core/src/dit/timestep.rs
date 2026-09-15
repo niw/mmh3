@@ -107,8 +107,8 @@ impl StepTimesteps {
         };
         match kind {
             SegmentKind::Audio => self.audio,
-            SegmentKind::KeyframeVideo(_) => conditions().0,
-            SegmentKind::KeyframeAudio(_) => conditions().1,
+            SegmentKind::KeyframeVideo(_) | SegmentKind::ReferenceVideo(_) => conditions().0,
+            SegmentKind::KeyframeAudio(_) | SegmentKind::ReferenceAudio(_) => conditions().1,
             SegmentKind::Text | SegmentKind::Video => self.video,
         }
     }

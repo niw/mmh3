@@ -10,7 +10,10 @@ for example:
 The defaults describe the small case (448x256, 22 frames). The 768p case is --width 1344
 --height 768 --frames 124 --block-row-stride 16 --no-decode. --compute-dtype float32
 runs the DiT with an FP32 residual stream and FP32 activations instead of ComfyUI's
-default BF16, as a tighter reference. --lora applies a LoRA from models/loras to the
+default BF16, as a tighter reference. --reference, repeatable, adds a reference picture
+the way ComfyUI's MiniMaxH3ReferenceToVideo does with its default sizing (scaled down to
+the canvas area at its own aspect ratio, never up), and switches the default DiT to the
+ref2va one. --lora applies a LoRA from models/loras to the
 DiT, for example the 768p Turbo LoRA with --steps 4 --shift-video 6. ComfyUI merges a
 LoRA into quantized weights and requantizes them with stochastic rounding, and
 --lora-rounding nearest rounds to nearest instead. --sparse-attention sol patches in
@@ -20,7 +23,7 @@ with an FP32 implementation of FastVideo's VSA-H3 on every step, for FastH3 chec
 such as diffusion_models/minimax_h3_fastvideo_vsa_datafree_1300step_4step_int8_convrot
 .safetensors.
 
-It writes up to three files into the output directory:
+It writes up to four files into the output directory:
 
 - text.safetensors: prompt token ids, the text encoder hidden states and the per-token
   modality tags. An existing file is reused, so copying it from another case skips the
@@ -37,6 +40,10 @@ It writes up to three files into the output directory:
   from the video VAE's encoder. The pictures also go to the text encoder, and
   dit.safetensors then holds the keyframe latents with the condition noise ComfyUI mixes
   in, as the DiT sees them.
+- references.safetensors, with --reference: the reference pictures in [0, 1] at their
+  sizes and their normalized latents. The pictures also go to the text encoder as
+  <Picture i>, and dit.safetensors then holds their latents with the condition noise
+  ComfyUI mixes in, as the DiT sees them.
 - decode.safetensors: video pixels in [0, 1] and the stereo waveform decoded from the
   final latents, before ComfyUI's audio loudness normalization. The waveform comes from
   ComfyUI's default audio VAE setup as "audio" and from strict FP32, with PyTorch's TF32
@@ -57,6 +64,7 @@ import torch
 from safetensors.torch import save_file
 
 DIT = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors"
+REFERENCE_DIT = "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors"
 TEXT_ENCODER = "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VIDEO_VAE = "vae/minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "vae/minimax_h3_audio_vae_fp32.safetensors"
@@ -284,9 +292,12 @@ def main():
         default="stochastic",
         help="how ComfyUI requantizes quantized weights after merging the LoRA",
     )
-    parser.add_argument("--dit", default=DIT, help="DiT file in the models directory")
+    parser.add_argument("--dit", help="DiT file in the models directory")
     parser.add_argument("--first-frame", help="picture file for the first frame")
     parser.add_argument("--last-frame", help="picture file for the last frame")
+    parser.add_argument(
+        "--reference", action="append", default=[], help="reference picture file"
+    )
     parser.add_argument(
         "--sparse-attention", choices=["off", "sol", "vsa"], default="off"
     )
@@ -300,6 +311,8 @@ def main():
         help="fraction of the steps that stay dense before Sol-Attn starts",
     )
     arguments = parser.parse_args()
+    if arguments.dit is None:
+        arguments.dit = REFERENCE_DIT if arguments.reference else DIT
     sys.path.insert(0, arguments.comfyui)
     os.makedirs(arguments.out, exist_ok=True)
 
@@ -355,9 +368,27 @@ def main():
                     "image": _resize(picture, arguments.width, arguments.height, crop),
                 }
             )
-    images = [keyframe["image"] for keyframe in keyframes]
-    # Each picture becomes one vision token per 32 × 32 pixels.
-    vision_tokens = (arguments.width // 32) * (arguments.height // 32)
+    references = []
+    for path in arguments.reference:
+        import numpy
+        from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE, _resize
+        from PIL import Image
+
+        picture = numpy.asarray(Image.open(path).convert("RGB"), dtype=numpy.float32)
+        picture = torch.from_numpy(picture / 255.0)[None]
+        height, width = picture.shape[1], picture.shape[2]
+        # MiniMaxH3ReferenceToVideo's "match" sizing.
+        scale = min(
+            1.0, math.sqrt((arguments.width * arguments.height) / (width * height))
+        )
+        size = [
+            max(
+                CANVAS_MULTIPLE, round(side * scale / CANVAS_MULTIPLE) * CANVAS_MULTIPLE
+            )
+            for side in (width, height)
+        ]
+        references.append({"image": _resize(picture, size[0], size[1], "disabled")})
+    images = [item["image"] for item in keyframes + references]
 
     started = time.time()
     text_path = os.path.join(arguments.out, "text.safetensors")
@@ -372,12 +403,20 @@ def main():
             ckpt_paths=[os.path.join(models, TEXT_ENCODER)],
             clip_type=comfy.sd.CLIPType.MINIMAX,
         )
-        tokens = clip.tokenize(arguments.prompt, images=images)
-        # A vision block's embeddings count as -1.
+        if references:
+            items = [{"type": "image", "data": item["image"]} for item in references]
+            tokens = clip.tokenize(arguments.prompt, minimax_ref_items=items)
+        else:
+            tokens = clip.tokenize(arguments.prompt, images=images)
+        # A vision block's embeddings count as -1, one per 32 × 32 pixels of its picture.
         token_ids = []
+        pictures = iter(images)
         for entry in next(iter(tokens.values()))[0]:
             if isinstance(entry[0], dict):
-                token_ids.extend([-1] * vision_tokens)
+                picture = next(pictures)
+                token_ids.extend(
+                    [-1] * ((picture.shape[1] // 32) * (picture.shape[2] // 32))
+                )
             else:
                 token_ids.append(entry[0])
         conditioning = clip.encode_from_tokens_scheduled(tokens)
@@ -402,7 +441,7 @@ def main():
         model_management.unload_all_models()
         model_management.soft_empty_cache()
 
-    if keyframes:
+    if keyframes or references:
         started = time.time()
         with torch.inference_mode():
             video_vae = comfy.sd.VAE(
@@ -410,29 +449,38 @@ def main():
                     os.path.join(models, arguments.video_vae)
                 )
             )
-            for keyframe in keyframes:
-                keyframe["latent"] = video_vae.encode(keyframe["image"]).float()
-        save_file(
-            {
-                name: value.contiguous()
-                for index, keyframe in enumerate(keyframes)
-                for name, value in (
-                    (f"keyframe.{index}.pixels", keyframe["image"][0].float()),
-                    (f"keyframe.{index}.latent", keyframe["latent"][0].cpu()),
-                )
-            },
-            os.path.join(arguments.out, "keyframes.safetensors"),
-            metadata={
-                **metadata,
-                "frame_indices": json.dumps(
-                    [keyframe["resolved_frame_index"] for keyframe in keyframes]
-                ),
-            },
-        )
-        print(
-            f"keyframes: {len(keyframes)} encoded with {arguments.video_vae}, {time.time() - started:.1f} s",
-            flush=True,
-        )
+            for item in keyframes + references:
+                item["latent"] = video_vae.encode(item["image"]).float()
+        for name, items, extra in (
+            (
+                "keyframe",
+                keyframes,
+                {
+                    "frame_indices": json.dumps(
+                        [keyframe["resolved_frame_index"] for keyframe in keyframes]
+                    )
+                },
+            ),
+            ("reference", references, {"reference_pictures": str(len(references))}),
+        ):
+            if not items:
+                continue
+            save_file(
+                {
+                    tensor_name: value.contiguous()
+                    for index, item in enumerate(items)
+                    for tensor_name, value in (
+                        (f"{name}.{index}.pixels", item["image"][0].float()),
+                        (f"{name}.{index}.latent", item["latent"][0].cpu()),
+                    )
+                },
+                os.path.join(arguments.out, f"{name}s.safetensors"),
+                metadata={**metadata, **extra},
+            )
+            print(
+                f"{name}s: {len(items)} encoded with {arguments.video_vae}, {time.time() - started:.1f} s",
+                flush=True,
+            )
         del video_vae
         model_management.unload_all_models()
         model_management.soft_empty_cache()
@@ -547,6 +595,35 @@ def main():
         metadata["frame_indices"] = json.dumps(
             [keyframe["resolved_frame_index"] for keyframe in keyframes]
         )
+    if references:
+        payload["refs"] = [
+            {
+                "kind": "image",
+                "latent_h": reference["latent"].shape[3],
+                "latent_w": reference["latent"].shape[4],
+                "latent": reference["latent"],
+            }
+            for reference in references
+        ]
+        payload["cond_video_latents"] = [
+            reference["latent"] for reference in references
+        ]
+        # The reference rows with ComfyUI's noise, back in each picture's latent layout.
+        rows = model._cond_video_rows(payload, device).float().cpu()
+        start = 0
+        for index, reference in enumerate(references):
+            channels, _, height, width = reference["latent"].shape[1:]
+            count = (height // 2) * (width // 2)
+            part = rows[start : start + count].view(
+                1, height // 2, width // 2, channels, 1, 2, 2
+            )
+            start += count
+            tensors[f"reference.{index}.augmented"] = (
+                part.permute(3, 0, 4, 1, 5, 2, 6)
+                .reshape(channels, 1, height, width)
+                .contiguous()
+            )
+        metadata["reference_pictures"] = str(len(references))
     with torch.inference_mode():
         for step in range(arguments.steps):
             timestep = torch.tensor([sigmas_video[step] * 1000.0], device=device)

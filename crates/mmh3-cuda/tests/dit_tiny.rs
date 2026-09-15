@@ -76,6 +76,7 @@ fn check_forward(precision: AttentionPrecision) {
         context: unbatched(tensor(&file, "input.context")),
         context_modalities: Vec::new(),
         keyframes: Vec::new(),
+        references: Vec::new(),
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
@@ -127,12 +128,45 @@ fn frames(latent: &Tensor, first: usize, count: usize) -> Tensor {
     Tensor::new(shape, data)
 }
 
+/// The CPU reference's outputs for `inputs` with the fixture's weights.
+fn cpu_forward(file: &SafeTensors, inputs: &DitInputs) -> mmh3_cpu::dit::DitTrace {
+    use mmh3_core::dit::config::DitConfig;
+    use std::collections::HashMap;
+
+    let mut tensors = HashMap::new();
+    for info in file.tensors() {
+        if let Some(name) = info.name.strip_prefix("weight.") {
+            tensors.insert(name.to_owned(), Tensor::load(file, info).unwrap());
+        }
+    }
+    let config =
+        DitConfig::from_shapes(|name| tensors.get(name).map(|tensor| tensor.shape.clone()))
+            .unwrap();
+    mmh3_cpu::dit::forward(&mmh3_cpu::dit::DitWeights::new(tensors), &config, inputs)
+}
+
+/// The largest difference between the video outputs of two calls.
+fn video_change(left: &[f32], right: &[f32]) -> f32 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max)
+}
+
+/// The first `count` frames of a stereo audio latent `[channels, 2, frames]`.
+fn audio_frames(audio: &Tensor, count: usize) -> Tensor {
+    let mut shape = audio.shape.clone();
+    shape[2] = count;
+    let data = (0..audio.shape[0] * 2)
+        .flat_map(|row| audio.data[row * audio.shape[2]..][..count].to_vec())
+        .collect();
+    Tensor::new(shape, data)
+}
+
 #[test]
 fn follows_the_cpu_reference_with_keyframes() {
-    use mmh3_core::dit::config::DitConfig;
     use mmh3_core::dit::inputs::Keyframe;
     use mmh3_core::dit::timestep::Modality;
-    use std::collections::HashMap;
 
     let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
     let video = unbatched(tensor(&file, "input.video"));
@@ -142,11 +176,6 @@ fn follows_the_cpu_reference_with_keyframes() {
     // the first audio frames, anchored at the last pixel frame.
     let latent_frames = video.shape[1];
     let pixel_frames = (latent_frames - 2) / 5 * 17 + 5;
-    let mut audio_frames = audio.clone();
-    audio_frames.shape[2] = 3;
-    audio_frames.data = (0..audio.shape[0] * 2)
-        .flat_map(|row| audio.data[row * audio.shape[2]..][..3].to_vec())
-        .collect();
     let keyframes = vec![
         Keyframe {
             frame_index: 0,
@@ -156,7 +185,7 @@ fn follows_the_cpu_reference_with_keyframes() {
         Keyframe {
             frame_index: pixel_frames - 1,
             video: Some(frames(&video, latent_frames - 1, 1)),
-            audio: Some(audio_frames),
+            audio: Some(audio_frames(&audio, 3)),
         },
     ];
     let context_modalities: Vec<Modality> = (0..context.shape[0])
@@ -174,22 +203,12 @@ fn follows_the_cpu_reference_with_keyframes() {
         context,
         context_modalities,
         keyframes,
+        references: Vec::new(),
         sigma: 0.6,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
     };
-
-    let mut tensors = HashMap::new();
-    for info in file.tensors() {
-        if let Some(name) = info.name.strip_prefix("weight.") {
-            tensors.insert(name.to_owned(), Tensor::load(&file, info).unwrap());
-        }
-    }
-    let config =
-        DitConfig::from_shapes(|name| tensors.get(name).map(|tensor| tensor.shape.clone()))
-            .unwrap();
-    let expected =
-        mmh3_cpu::dit::forward(&mmh3_cpu::dit::DitWeights::new(tensors), &config, &inputs);
+    let expected = cpu_forward(&file, &inputs);
 
     let dit = CudaDit::load(&file, "weight.").unwrap();
     let outputs = dit.forward(&inputs, &[], None).unwrap();
@@ -203,11 +222,59 @@ fn follows_the_cpu_reference_with_keyframes() {
         ..inputs
     };
     let without = dit.forward(&plain, &[], None).unwrap();
-    let change: f32 = without
-        .video
-        .iter()
-        .zip(&outputs.video)
-        .map(|(left, right)| (left - right).abs())
-        .fold(0.0, f32::max);
+    let change = video_change(&without.video, &outputs.video);
     assert!(change > 1e-3, "keyframes change the video by only {change}");
+}
+
+#[test]
+fn follows_the_cpu_reference_with_references() {
+    use mmh3_core::dit::inputs::Reference;
+
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let video = unbatched(tensor(&file, "input.video"));
+    let audio = unbatched(tensor(&file, "input.audio"));
+    let context = unbatched(tensor(&file, "input.context"));
+    // A picture on a grid of its own, 2 × 8 latents from the input's values, a clip of the
+    // input's first two latent frames with a soundtrack, and a sound.
+    let channels = video.shape[0];
+    let picture = Tensor::new(
+        vec![channels, 1, 2, 8],
+        video.data[..channels * 2 * 8].to_vec(),
+    );
+    let references = vec![
+        Reference::Picture(picture),
+        Reference::Video {
+            video: frames(&video, 0, 2),
+            audio: Some(audio_frames(&audio, 4)),
+        },
+        Reference::Audio(audio_frames(&audio, 5)),
+    ];
+    let inputs = DitInputs {
+        video,
+        audio,
+        context,
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references,
+        sigma: 0.6,
+        shift_video: metadata_number(&file, "shift_video"),
+        shift_audio: metadata_number(&file, "shift_audio"),
+    };
+    let expected = cpu_forward(&file, &inputs);
+
+    let dit = CudaDit::load(&file, "weight.").unwrap();
+    let outputs = dit.forward(&inputs, &[], None).unwrap();
+    assert_close("video", &outputs.video, &expected.video);
+    assert_close("audio", &outputs.audio, &expected.audio);
+
+    let plain = DitInputs {
+        references: Vec::new(),
+        ..inputs
+    };
+    let without = dit.forward(&plain, &[], None).unwrap();
+    let change = video_change(&without.video, &outputs.video);
+    assert!(
+        change > 1e-3,
+        "references change the video by only {change}"
+    );
 }

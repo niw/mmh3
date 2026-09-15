@@ -329,6 +329,12 @@ pub fn forward(weights: &DitWeights, config: &DitConfig, inputs: &DitInputs) -> 
             SegmentKind::KeyframeAudio(index) => {
                 hidden.extend(embed_audio(inputs.keyframes[index].audio.as_ref().unwrap()))
             }
+            SegmentKind::ReferenceVideo(index) => {
+                hidden.extend(embed_video(inputs.references[index].video().unwrap()))
+            }
+            SegmentKind::ReferenceAudio(index) => {
+                hidden.extend(embed_audio(inputs.references[index].audio().unwrap()))
+            }
             SegmentKind::Audio => hidden.extend(embed_audio(&inputs.audio)),
             SegmentKind::Video => hidden.extend(embed_video(&inputs.video)),
         }

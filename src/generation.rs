@@ -4,7 +4,7 @@
 
 use crate::cli::{option_float, option_number};
 use crate::models::{
-    TEXT_ENCODER_FILE, load_dit, option_path, save_algorithm_cache, sparse_attention,
+    DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path, save_algorithm_cache, sparse_attention,
     video_vae_path,
 };
 use crate::pictures::load_picture;
@@ -240,7 +240,7 @@ pub fn sample(
         context.shape[0]
     );
 
-    let dit = load_dit(options, "dit")?;
+    let dit = load_dit(options, "dit", DIT_FILE)?;
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
     let schedule = &settings.schedule;
     for step in 0..steps {
@@ -251,6 +251,7 @@ pub fn sample(
             context: context.clone(),
             context_modalities: context_modalities.clone(),
             keyframes: keyframes.clone(),
+            references: Vec::new(),
             sigma: schedule.video[step],
             shift_video: settings.shift_video,
             shift_audio: settings.shift_audio,

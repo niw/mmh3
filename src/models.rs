@@ -10,19 +10,24 @@ use std::path::{Path, PathBuf};
 const MODELS_VARIABLE: &str = "MMH3_MODELS";
 
 // Files inside the models directory.
-const DIT_FILE: &str = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+/// The DiT for text, first frame and last frame to video.
+pub const DIT_FILE: &str = "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors";
+/// The DiT for reference to video.
+pub const REFERENCE_DIT_FILE: &str =
+    "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors";
 pub const VIDEO_VAE_FILE: &str = "vae/minimax_h3_video_vae_fp16.safetensors";
 /// The faster INT8 ConvRot video VAE, which generate prefers when the models directory has it.
 pub const VIDEO_VAE_INT8_FILE: &str = "vae/minimax_h3_video_vae_int8_convrot.safetensors";
 pub const AUDIO_VAE_FILE: &str = "vae/minimax_h3_audio_vae_fp32.safetensors";
 pub const TEXT_ENCODER_FILE: &str = "text_encoders/qwen3vl_32b_minimax_h3_int8_convrot.safetensors";
 
-/// Loads the DiT from `--weights` or `--dit`, whichever `name` says, with the patch of `--patch`
-/// and the LoRA of `--lora` when given. NVFP4 layers take them into their weights, so they come
-/// before `--linear-precision`.
+/// Loads the DiT from `--weights` or `--dit`, whichever `name` says, or `file` in the models
+/// directory, with the patch of `--patch` and the LoRA of `--lora` when given. NVFP4 layers take
+/// them into their weights, so they come before `--linear-precision`.
 pub fn load_dit(
     options: &HashMap<&str, &str>,
     name: &str,
+    file: &str,
 ) -> Result<mmh3_cuda::dit::CudaDit, Box<dyn Error>> {
     use std::time::Instant;
 
@@ -40,7 +45,7 @@ pub fn load_dit(
         }
     };
     let started = Instant::now();
-    let path = option_path(options, name, DIT_FILE)?;
+    let path = option_path(options, name, file)?;
     let mut dit = mmh3_cuda::dit::CudaDit::load(&SafeTensors::open(Path::new(&path))?, "")?;
     dit.set_attention_precision(precision);
     println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());

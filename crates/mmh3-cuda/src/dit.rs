@@ -1617,6 +1617,14 @@ impl CudaDit {
                     "audio_patch_proj",
                     pack_audio(inputs.keyframes[index].audio.as_ref().unwrap()),
                 ),
+                SegmentKind::ReferenceVideo(index) => (
+                    "video_patch_proj",
+                    patchify_video(inputs.references[index].video().unwrap()),
+                ),
+                SegmentKind::ReferenceAudio(index) => (
+                    "audio_patch_proj",
+                    pack_audio(inputs.references[index].audio().unwrap()),
+                ),
                 _ => continue,
             };
             let rows = DeviceBuffer::from_f32(&rows)?;
