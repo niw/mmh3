@@ -1,8 +1,10 @@
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 #include <map>
+#include <mutex>
 #include <tuple>
 
 // y[m, n] = x[m, k] · w[n, k]ᵀ + bias[n] through cuBLASLt, for the linear layers that stay in BF16
@@ -75,7 +77,25 @@ struct Descriptors {
     }
 };
 
+// Bumped whenever the descriptors of mmh3_cublaslt_nvfp4 change, so that algorithms chosen for the
+// old ones are not taken over.
+constexpr int NVFP4_ALGORITHM_FORMAT = 1;
+
+using Shape = std::tuple<int64_t, int64_t, int64_t>;
+
+// The algorithm chosen for each NVFP4 GEMM shape (m, n, k), shared by the threads of the process.
+std::mutex nvfp4_algorithms_mutex;
+std::map<Shape, cublasLtMatmulAlgo_t> nvfp4_algorithms;
+
 } // namespace
+
+// An algorithm chosen for an NVFP4 GEMM shape, see mmh3_cublaslt_nvfp4_algorithms.
+struct Mmh3Nvfp4Algorithm {
+    int64_t m;
+    int64_t n;
+    int64_t k;
+    uint64_t data[8];
+};
 
 extern "C" const char *mmh3_cublaslt_status_string(int code) {
     return cublasLtGetStatusString(static_cast<cublasStatus_t>(code - 1000));
@@ -200,52 +220,109 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
     // kernel that takes 57 ms at 768p, against 16 ms for the fastest candidate. The first call of
     // each shape times the candidates on its own operands and keeps the fastest. One run each is
     // enough: a second run takes within 1% of the first, which includes loading the kernel.
-    thread_local std::map<std::tuple<int64_t, int64_t, int64_t>, cublasLtMatmulAlgo_t> chosen;
-    const auto key = std::make_tuple(m, n, k);
+    const Shape key = std::make_tuple(m, n, k);
     auto run = [&](const cublasLtMatmulAlgo_t *algorithm) {
         return cublasLtMatmul(state.handle, descriptors.operation, alpha_beta, weights,
                               descriptors.weight, activations, descriptors.input, alpha_beta + 1,
                               output, descriptors.output, output, descriptors.output, algorithm,
                               state.workspace, WORKSPACE_BYTES, stream);
     };
-    auto found = chosen.find(key);
-    if (found == chosen.end()) {
-        constexpr int CANDIDATES = 8;
-        cublasLtMatmulHeuristicResult_t results[CANDIDATES];
-        int returned = 0;
-        status = cublasLtMatmulAlgoGetHeuristic(
-            state.handle, descriptors.operation, descriptors.weight, descriptors.input,
-            descriptors.output, descriptors.output, descriptors.preference, CANDIDATES, results,
-            &returned);
-        if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
-            return status_code(status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED
-                                                               : status);
+    const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
+    const auto found = nvfp4_algorithms.find(key);
+    if (found != nvfp4_algorithms.end()) {
+        status = run(&found->second);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            return 0;
         }
-        cudaEvent_t start, stop;
-        cudaEventCreate(&start);
-        cudaEventCreate(&stop);
-        float best = 0.0f;
-        int best_index = -1;
-        for (int index = 0; index < returned; index++) {
-            cudaEventRecord(start, stream);
-            const cublasStatus_t timed = run(&results[index].algo);
-            cudaEventRecord(stop, stream);
-            float elapsed = 0.0f;
-            if (timed != CUBLAS_STATUS_SUCCESS || cudaEventSynchronize(stop) != cudaSuccess ||
-                cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
-                continue;
-            }
-            if (best_index < 0 || elapsed < best) {
-                best = elapsed;
-                best_index = index;
-            }
-        }
-        cudaEventDestroy(start);
-        cudaEventDestroy(stop);
-        if (best_index < 0) {
-            return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
-        }
-        found = chosen.emplace(key, results[best_index].algo).first;
+        // An algorithm taken over from an earlier process may not run here.
+        nvfp4_algorithms.erase(found);
     }
-    return status_code(run(&found->second));
+    constexpr int CANDIDATES = 8;
+    cublasLtMatmulHeuristicResult_t results[CANDIDATES];
+    int returned = 0;
+    status =
+        cublasLtMatmulAlgoGetHeuristic(state.handle, descriptors.operation, descriptors.weight,
+                                       descriptors.input, descriptors.output, descriptors.output,
+                                       descriptors.preference, CANDIDATES, results, &returned);
+    if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
+        return status_code(status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED : status);
+    }
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float best = 0.0f;
+    int best_index = -1;
+    for (int index = 0; index < returned; index++) {
+        cudaEventRecord(start, stream);
+        const cublasStatus_t timed = run(&results[index].algo);
+        cudaEventRecord(stop, stream);
+        float elapsed = 0.0f;
+        if (timed != CUBLAS_STATUS_SUCCESS || cudaEventSynchronize(stop) != cudaSuccess ||
+            cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
+            continue;
+        }
+        if (best_index < 0 || elapsed < best) {
+            best = elapsed;
+            best_index = index;
+        }
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    if (best_index < 0) {
+        return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+    nvfp4_algorithms[key] = results[best_index].algo;
+    return status_code(run(&results[best_index].algo));
+}
+
+// Copies up to `capacity` of the algorithms chosen for NVFP4 GEMM shapes to `algorithms` and
+// returns how many there are.
+extern "C" int mmh3_cublaslt_nvfp4_algorithms(Mmh3Nvfp4Algorithm *algorithms, int capacity) {
+    const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
+    int index = 0;
+    for (const auto &[shape, algorithm] : nvfp4_algorithms) {
+        if (index < capacity) {
+            algorithms[index].m = std::get<0>(shape);
+            algorithms[index].n = std::get<1>(shape);
+            algorithms[index].k = std::get<2>(shape);
+            for (int word = 0; word < 8; word++) {
+                algorithms[index].data[word] = algorithm.data[word];
+            }
+        }
+        index++;
+    }
+    return index;
+}
+
+// Takes over algorithms for NVFP4 GEMM shapes that have none chosen yet.
+extern "C" void mmh3_cublaslt_nvfp4_adopt(const Mmh3Nvfp4Algorithm *algorithms, int count) {
+    const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
+    for (int index = 0; index < count; index++) {
+        cublasLtMatmulAlgo_t algorithm;
+        for (int word = 0; word < 8; word++) {
+            algorithm.data[word] = algorithms[index].data[word];
+        }
+        nvfp4_algorithms.emplace(
+            std::make_tuple(algorithms[index].m, algorithms[index].n, algorithms[index].k),
+            algorithm);
+    }
+}
+
+// Writes a line naming what the chosen NVFP4 algorithms depend on, the cuBLASLt version, the GPU
+// and the descriptors, to `key`, which holds `capacity` bytes.
+extern "C" int mmh3_cublaslt_nvfp4_algorithm_key(char *key, int capacity) {
+    int device = 0;
+    cudaDeviceProp properties;
+    cudaError_t status = cudaGetDevice(&device);
+    if (status == cudaSuccess) {
+        status = cudaGetDeviceProperties(&properties, device);
+    }
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    const int written = std::snprintf(
+        key, static_cast<size_t>(capacity), "cuBLASLt %zu, %s, sm_%d%d, %d SMs, format %d",
+        cublasLtGetVersion(), properties.name, properties.major, properties.minor,
+        properties.multiProcessorCount, NVFP4_ALGORITHM_FORMAT);
+    return written < 0 || written >= capacity ? static_cast<int>(cudaErrorInvalidValue) : 0;
 }

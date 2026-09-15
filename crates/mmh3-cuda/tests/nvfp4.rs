@@ -581,3 +581,36 @@ fn ignores_zero_columns() {
         "zero columns change the result by {difference}"
     );
 }
+
+#[test]
+fn saves_and_loads_the_chosen_algorithms() {
+    let (m, n, k) = (72, 128, 256);
+    let mut random = Random(12);
+    let (int8_weights, row_scales) = quantize(&random.bf16_values(n * k), n, k);
+    let weight = Nvfp4Weight::from_int8(&int8_weights, &row_scales, n, k, false).unwrap();
+    let mut output = DeviceBuffer::new(m * n * 2).unwrap();
+    nvfp4::linear(
+        &weight,
+        &bf16_buffer(&random.bf16_values(m * k)),
+        &mut output,
+        m,
+        &Nvfp4Scale::new().unwrap(),
+        &Nvfp4Activations::new(m, k, 0).unwrap(),
+    )
+    .unwrap();
+
+    let directory = std::env::temp_dir().join(format!("mmh3-nvfp4-{}", std::process::id()));
+    let path = directory.join("algorithms.txt");
+    assert!(nvfp4::save_algorithms(&path).unwrap());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&format!("{m} {n} {k} ")))
+    );
+    let saved = text.lines().count() - 2;
+    assert!(nvfp4::load_algorithms(&path).unwrap() >= saved);
+
+    std::fs::write(&path, text.replacen("format", "other format", 1)).unwrap();
+    assert_eq!(nvfp4::load_algorithms(&path).unwrap(), 0);
+    std::fs::remove_dir_all(&directory).unwrap();
+}

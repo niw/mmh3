@@ -2,7 +2,9 @@
 //! prompt's text states and the DiT's Euler steps from the seed's noise.
 
 use crate::cli::{option_float, option_number};
-use crate::models::{TEXT_ENCODER_FILE, load_dit, option_path, sparse_attention};
+use crate::models::{
+    TEXT_ENCODER_FILE, load_dit, option_path, save_algorithm_cache, sparse_attention,
+};
 use mmh3_core::dit::sampler::Schedule;
 use mmh3_core::generation::GenerationShape;
 use mmh3_core::safetensors::SafeTensors;
@@ -193,5 +195,6 @@ pub fn sample(
             started.elapsed().as_secs_f64()
         );
     }
+    save_algorithm_cache();
     Ok((video, audio))
 }

@@ -79,12 +79,43 @@ pub fn load_dit(
                 "requantized {layers} layers to NVFP4 in {:.1} s",
                 started.elapsed().as_secs_f64()
             );
+            if let Some(cache) = algorithm_cache() {
+                match mmh3_cuda::nvfp4::load_algorithms(&cache) {
+                    Ok(0) => {}
+                    Ok(count) => {
+                        println!("took {count} cuBLASLt algorithms from {}", cache.display())
+                    }
+                    Err(error) => eprintln!("warning: reading {}: {error}", cache.display()),
+                }
+            }
         }
         other => {
             return Err(format!("--linear-precision must be int8 or nvfp4, not {other}").into());
         }
     }
     Ok(dit)
+}
+
+/// File that keeps the cuBLASLt algorithms chosen for the NVFP4 GEMMs between runs, in
+/// `$XDG_CACHE_HOME/mmh3` or `~/.cache/mmh3`.
+fn algorithm_cache() -> Option<PathBuf> {
+    let directory = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(directory.join("mmh3/cublaslt-nvfp4-algorithms.txt"))
+}
+
+/// Keeps the cuBLASLt algorithms this run chose for NVFP4 GEMMs for later runs.
+pub fn save_algorithm_cache() {
+    let Some(cache) = algorithm_cache() else {
+        return;
+    };
+    match mmh3_cuda::nvfp4::save_algorithms(&cache) {
+        Ok(true) => println!("saved the cuBLASLt algorithms to {}", cache.display()),
+        Ok(false) => {}
+        Err(error) => eprintln!("warning: writing {}: {error}", cache.display()),
+    }
 }
 
 /// Block-sparse attention settings from `--attention sol|vsa`, `--sparse-tau`, `--sparse-start`
