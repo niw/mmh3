@@ -181,7 +181,9 @@ With `--video-vae fp16`, the script downloads the FP16 video VAE,
 `vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
 `--no-fasth3` skips the FastH3 patch, `--lightx2v-turbo` also downloads the Turbo LoRA,
 `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` from
-lightx2v/Minimax-h3-Turbo, and `--models DIR` downloads into another directory.
+lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the TaoMate-H3 LoRA,
+`loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, and
+`--models DIR` downloads into another directory.
 
 Patches, such as the FastH3 patch below, go into `patches` of the models directory. `--patch` and
 `--lora` take a path, or a file name that mmh3 looks up in `patches` and then `loras` of the models
@@ -325,6 +327,15 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
   --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
 ```
 
+The TaoMate-H3 LoRA, which `tools/download-models.sh --taomate` downloads, runs in three steps with
+its own schedule. [tools/models](tools/models/README.md) describes how it is built:
+
+```sh
+target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
+  --schedule taomate --attention sol --attention-precision int8-fp8 --sparse-start 0 \
+  --lora models/loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors
+```
+
 ### FastH3
 
 FastVideo's FastH3 VSA-DataFree generates in four steps with the base schedule and video sparse
@@ -355,6 +366,8 @@ So far these settings have been compared visually on one prompt and seed only.
 - `--frames N` (default 124): Frame count at 24 fps, rounded up to the next 17n + 5.
 - `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
   there is no CFG.
+- `--schedule uniform|taomate` (default `uniform`): `taomate` runs the three steps the TaoMate-H3
+  LoRA was distilled for, states 0, 16, 33 and 49 of the 50-step schedule, in place of `--steps`.
 - `--seed N` (default 0): Seed of the initial noise.
 - `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
   Turbo LoRA wants 6 and 3.
@@ -369,6 +382,10 @@ So far these settings have been compared visually on one prompt and seed only.
 - `--patch FILE` (default none): A patch for the DiT, such as the FastH3 patch, applied before a
   LoRA.
 - `--lora FILE`, `--lora-strength X` (default none, 1.0): A ComfyUI LoRA for the DiT.
+- `--lora-mode adapter|merge` (default `adapter`): `adapter` runs the LoRA next to the INT8 weights,
+  its down projection on the layer's INT8 input. `merge` adds it into the INT8 weights at load time,
+  like ComfyUI, so the steps run as fast as without a LoRA, but updates smaller than the INT8 step
+  are lost: most of the TaoMate LoRA, with visibly worse detail.
 
 H3 follows long, structured prompts well, with the picture, the sound and the music described
 separately, one section per line:
