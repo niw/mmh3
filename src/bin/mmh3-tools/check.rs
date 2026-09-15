@@ -308,12 +308,17 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Decodes the final video latent of a golden directory and compares the pixels with ComfyUI's.
+/// Decodes the final video latent of a golden directory and compares the pixels with ComfyUI's,
+/// or with the decode of the checkpoint given by `--reference`.
 fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::vae::{CudaVideoDecoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights"], USAGE)?;
+    let options = parse_options(
+        arguments,
+        &["golden", "models", "weights", "reference"],
+        USAGE,
+    )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
@@ -336,11 +341,18 @@ fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         pixels.shape,
         started.elapsed().as_secs_f64()
     );
-    if !golden.join("decode.safetensors").exists() {
+    drop(decoder);
+    let expected = if let Some(reference) = options.get("reference") {
+        let weights = SafeTensors::open(Path::new(reference))?;
+        CudaVideoDecoder::load(&weights, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
+            .decode(&latent, false)?
+            .pixels
+    } else if golden.join("decode.safetensors").exists() {
+        GoldenFile::open(golden, "decode.safetensors")?.unbatched("video")?
+    } else {
         println!("no decode.safetensors in the golden directory, nothing to compare");
         return Ok(());
-    }
-    let expected = GoldenFile::open(golden, "decode.safetensors")?.unbatched("video")?;
+    };
     if pixels.shape != expected.shape {
         return Err(format!(
             "decoded shape {:?} differs from the golden {:?}",

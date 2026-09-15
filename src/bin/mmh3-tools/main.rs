@@ -26,7 +26,7 @@ const USAGE: &str = "usage:
                  [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--vsa-sparsity X]
   mmh3-tools check sample --golden <directory> [--models DIR] [--weights FILE] [--patch FILE] [--lora FILE] [--lora-strength X]
                     [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
-  mmh3-tools check video-vae --golden <directory> [--models DIR] [--weights FILE]
+  mmh3-tools check video-vae --golden <directory> [--models DIR] [--weights FILE] [--reference FILE]
   mmh3-tools check audio-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3-tools check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
   mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
