@@ -35,6 +35,9 @@ make generate \
 - `--first-frame FILE`, `--last-frame FILE` (default none): PNG or JPEG pictures the video starts
   from and ends on. Without `--width` and `--height` the first picture sets the canvas. See
   [First and last frames](fl2va.md) for the prompt they need.
+- `--reference FILE` (default none, repeatable): A PNG or JPEG picture the prompt refers to as
+  `<Picture 1>`, `<Picture 2>` and so on, in the order of the options. Switches the default DiT to
+  the ref2va one. See [Reference pictures](ref2va.md).
 - `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
   there is no CFG.
 - `--schedule uniform|taomate` (default `uniform`): `taomate` runs the three steps the TaoMate-H3

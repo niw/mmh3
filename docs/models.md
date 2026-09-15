@@ -17,9 +17,11 @@ directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `
 
 With `--video-vae fp16`, the script downloads the FP16 video VAE,
 `vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
-`--no-fasth3` skips the [FastH3](fasth3.md) patch, `--lightx2v-turbo` also downloads the [Turbo
-LoRA](lightx2v-turbo.md), `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors`
-from lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the [TaoMate-H3](taomate.md) LoRA,
+`--ref2va` also downloads the ref2va DiT and its 8-step Turbo LoRA for [reference
+pictures](ref2va.md), `--no-fasth3` skips the [FastH3](fasth3.md) patch, `--lightx2v-turbo` also
+downloads the [Turbo LoRA](lightx2v-turbo.md),
+`loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` from
+lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the [TaoMate-H3](taomate.md) LoRA,
 `loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, and
 `--models DIR` downloads into another directory.
 
