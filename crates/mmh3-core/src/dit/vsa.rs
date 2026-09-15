@@ -1,12 +1,13 @@
 //! Video Sparse Attention as FastVideo trained FastH3 with it (VSA-H3, 64-token tiles): the tiling
 //! of the packed sequence and a CPU reference of the attention.
 //!
-//! The text and audio segments are cut into tiles of up to 64 consecutive tokens each. The video
-//! patches are grouped into 4 × 4 × 4 cubes of (latent frame, patch row, patch column), smaller at
-//! the far edges of the grid, and the DiT runs on the sequence with the video in cube order. Each
-//! head scores every query tile against every key tile with the mean query and the mean key of the
-//! tiles. A video query tile attends token by token to every text and audio tile and to the
-//! best-scoring fraction of the video tiles, and a text or audio query tile attends to everything.
+//! The segments before the video (text, conditions, audio) are each cut into tiles of up to 64
+//! consecutive tokens. The video patches are grouped into 4 × 4 × 4 cubes of (latent frame, patch
+//! row, patch column), smaller at the far edges of the grid, and the DiT runs on the sequence with
+//! the video in cube order. Each head scores every query tile against every key tile with the mean
+//! query and the mean key of the tiles. A video query tile attends token by token to every tile
+//! before the video and to the best-scoring fraction of the video tiles, and a query tile before the
+//! video attends to everything.
 //! A coarse branch adds `gate · softmax(scores) · mean values` to every row of the query tile,
 //! where the gate is a learned projection of the block input.
 
@@ -25,7 +26,7 @@ pub struct VsaPlan {
     pub tile_starts: Vec<usize>,
     /// Tokens in each tile, at most `VSA_TILE`.
     pub tile_lengths: Vec<usize>,
-    /// Text and audio tiles, which come first.
+    /// Tiles of the segments before the video, which come first.
     pub prefix_tiles: usize,
     /// First token of the video.
     pub video_start: usize,
@@ -38,8 +39,11 @@ impl VsaPlan {
     pub fn for_layout(layout: &PackedLayout) -> Self {
         let mut tile_starts = Vec::new();
         let mut tile_lengths = Vec::new();
-        for kind in [SegmentKind::Text, SegmentKind::Audio] {
-            let segment = layout.segment(kind);
+        for segment in layout
+            .segments
+            .iter()
+            .filter(|segment| segment.kind != SegmentKind::Video)
+        {
             for start in (segment.start..segment.end).step_by(VSA_TILE) {
                 tile_starts.push(start);
                 tile_lengths.push((segment.end - start).min(VSA_TILE));

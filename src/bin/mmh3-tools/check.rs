@@ -55,6 +55,61 @@ impl GoldenFile {
         tensor.shape.remove(0);
         Ok(tensor)
     }
+
+    fn has_metadata(&self, key: &str) -> bool {
+        self.0.metadata().iter().any(|(name, _)| name == key)
+    }
+
+    /// The modality of each text token from `token_tags`, empty when every token is text.
+    fn context_modalities(
+        &self,
+    ) -> Result<Vec<mmh3_core::dit::timestep::Modality>, Box<dyn Error>> {
+        use mmh3_core::dit::timestep::Modality;
+
+        let info = self
+            .0
+            .get("token_tags")
+            .ok_or("golden data lacks token_tags")?;
+        let tags: Vec<i64> = self
+            .0
+            .data(info)
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|&bytes| i64::from_le_bytes(bytes))
+            .collect();
+        if tags.iter().all(|&tag| tag == Modality::Text as i64) {
+            return Ok(Vec::new());
+        }
+        Ok(tags
+            .into_iter()
+            .map(|tag| match tag {
+                0 => Modality::Video,
+                2 => Modality::Audio,
+                _ => Modality::Text,
+            })
+            .collect())
+    }
+
+    /// The keyframes as the DiT sees them, with ComfyUI's condition noise.
+    fn keyframes(&self) -> Result<Vec<mmh3_core::dit::inputs::Keyframe>, Box<dyn Error>> {
+        if !self.has_metadata("frame_indices") {
+            return Ok(Vec::new());
+        }
+        json::parse(&self.metadata("frame_indices")?)?
+            .as_array()
+            .ok_or("bad frame_indices")?
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| {
+                Ok(mmh3_core::dit::inputs::Keyframe {
+                    frame_index: frame.as_u64().ok_or("bad frame_indices")? as usize,
+                    video: Some(self.tensor(&format!("keyframe.{index}.augmented"))?),
+                    audio: None,
+                })
+            })
+            .collect()
+    }
 }
 
 /// Similarity of `actual` to `expected`: cosine, relative L2 error and the largest absolute error
@@ -140,6 +195,8 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         video: dit_file.unbatched(&format!("step{step}.input.video"))?,
         audio: dit_file.unbatched(&format!("step{step}.input.audio"))?,
         context: text_file.tensor("context")?,
+        context_modalities: text_file.context_modalities()?,
+        keyframes: dit_file.keyframes()?,
         sigma: sigma as f32,
         shift_video: dit_file.metadata("shift_video")?.parse()?,
         shift_audio: dit_file.metadata("shift_audio")?.parse()?,
@@ -266,6 +323,8 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut video = dit_file.unbatched("noise.video")?;
     let mut audio = dit_file.unbatched("noise.audio")?;
     let context = text_file.tensor("context")?;
+    let context_modalities = text_file.context_modalities()?;
+    let keyframes = dit_file.keyframes()?;
     println!(
         "{:<6} {:>8} {:>11} {:>11} {:>11} {:>11} {:>7}",
         "step", "sigma", "video cos", "video L2", "audio cos", "audio L2", "s"
@@ -276,6 +335,8 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             video: video.clone(),
             audio: audio.clone(),
             context: context.clone(),
+            context_modalities: context_modalities.clone(),
+            keyframes: keyframes.clone(),
             sigma: schedule.video[step],
             shift_video,
             shift_audio,

@@ -74,6 +74,8 @@ fn check_forward(precision: AttentionPrecision) {
         video: unbatched(tensor(&file, "input.video")),
         audio: unbatched(tensor(&file, "input.audio")),
         context: unbatched(tensor(&file, "input.context")),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
         sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
         shift_video: metadata_number(&file, "shift_video"),
         shift_audio: metadata_number(&file, "shift_audio"),
@@ -109,4 +111,103 @@ fn matches_comfyui_golden_forward() {
 #[test]
 fn quantized_matches_golden_with_the_same_bounds() {
     check_forward(AttentionPrecision::Int8Fp8);
+}
+
+/// Frames `[first, first + count)` of a latent `[channels, frames, ...]`.
+fn frames(latent: &Tensor, first: usize, count: usize) -> Tensor {
+    let (channels, total) = (latent.shape[0], latent.shape[1]);
+    let frame_values: usize = latent.shape[2..].iter().product();
+    let mut data = Vec::with_capacity(channels * count * frame_values);
+    for channel in 0..channels {
+        let start = (channel * total + first) * frame_values;
+        data.extend_from_slice(&latent.data[start..start + count * frame_values]);
+    }
+    let mut shape = latent.shape.clone();
+    shape[1] = count;
+    Tensor::new(shape, data)
+}
+
+#[test]
+fn follows_the_cpu_reference_with_keyframes() {
+    use mmh3_core::dit::config::DitConfig;
+    use mmh3_core::dit::inputs::Keyframe;
+    use mmh3_core::dit::timestep::Modality;
+    use std::collections::HashMap;
+
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let video = unbatched(tensor(&file, "input.video"));
+    let audio = unbatched(tensor(&file, "input.audio"));
+    let context = unbatched(tensor(&file, "input.context"));
+    // Keyframes made from the input's own latents: the first frame, and the last latent frame with
+    // the first audio frames, anchored at the last pixel frame.
+    let latent_frames = video.shape[1];
+    let pixel_frames = (latent_frames - 2) / 5 * 17 + 5;
+    let mut audio_frames = audio.clone();
+    audio_frames.shape[2] = 3;
+    audio_frames.data = (0..audio.shape[0] * 2)
+        .flat_map(|row| audio.data[row * audio.shape[2]..][..3].to_vec())
+        .collect();
+    let keyframes = vec![
+        Keyframe {
+            frame_index: 0,
+            video: Some(frames(&video, 0, 1)),
+            audio: None,
+        },
+        Keyframe {
+            frame_index: pixel_frames - 1,
+            video: Some(frames(&video, latent_frames - 1, 1)),
+            audio: Some(audio_frames),
+        },
+    ];
+    let context_modalities: Vec<Modality> = (0..context.shape[0])
+        .map(|token| {
+            if (2..6).contains(&token) {
+                Modality::Video
+            } else {
+                Modality::Text
+            }
+        })
+        .collect();
+    let inputs = DitInputs {
+        video,
+        audio,
+        context,
+        context_modalities,
+        keyframes,
+        sigma: 0.6,
+        shift_video: metadata_number(&file, "shift_video"),
+        shift_audio: metadata_number(&file, "shift_audio"),
+    };
+
+    let mut tensors = HashMap::new();
+    for info in file.tensors() {
+        if let Some(name) = info.name.strip_prefix("weight.") {
+            tensors.insert(name.to_owned(), Tensor::load(&file, info).unwrap());
+        }
+    }
+    let config =
+        DitConfig::from_shapes(|name| tensors.get(name).map(|tensor| tensor.shape.clone()))
+            .unwrap();
+    let expected =
+        mmh3_cpu::dit::forward(&mmh3_cpu::dit::DitWeights::new(tensors), &config, &inputs);
+
+    let dit = CudaDit::load(&file, "weight.").unwrap();
+    let outputs = dit.forward(&inputs, &[], None).unwrap();
+    assert_close("video", &outputs.video, &expected.video);
+    assert_close("audio", &outputs.audio, &expected.audio);
+
+    // The keyframes change the result.
+    let plain = DitInputs {
+        keyframes: Vec::new(),
+        context_modalities: Vec::new(),
+        ..inputs
+    };
+    let without = dit.forward(&plain, &[], None).unwrap();
+    let change: f32 = without
+        .video
+        .iter()
+        .zip(&outputs.video)
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0, f32::max);
+    assert!(change > 1e-3, "keyframes change the video by only {change}");
 }

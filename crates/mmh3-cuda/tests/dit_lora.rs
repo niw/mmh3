@@ -97,6 +97,8 @@ fn applies_a_lora_like_merged_weights() {
         video: unbatched(&file, "input.video"),
         audio: unbatched(&file, "input.audio"),
         context: unbatched(&file, "input.context"),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
         sigma: Tensor::load(&file, file.get("input.timestep").unwrap())
             .unwrap()
             .data[0]

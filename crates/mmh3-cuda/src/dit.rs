@@ -1428,15 +1428,14 @@ impl CudaDit {
         let hidden = config.hidden;
         let video_shape = &inputs.video.shape;
         let text_tokens = inputs.context.shape[0];
-        let layout = PackedLayout::text_to_video(
-            text_tokens,
-            video_shape[1],
-            video_shape[2],
-            video_shape[3],
-            inputs.audio.shape[2],
-        );
+        let layout = PackedLayout::for_inputs(inputs);
         let tokens = layout.len();
-        let timesteps = StepTimesteps::new(inputs.sigma, inputs.shift_video, inputs.shift_audio);
+        let timesteps = StepTimesteps::for_layout(
+            &layout,
+            inputs.sigma,
+            inputs.shift_video,
+            inputs.shift_audio,
+        );
         let steps = timesteps.values.len();
         let adapter_rank = self
             .adapters
@@ -1608,8 +1607,30 @@ impl CudaDit {
             0,
             workspace,
         )?;
-        // NOTE: NVFP4 layers run the text and audio rows, about 1% of the rows at 768p, through
-        // their INT8 weights. At 448×256 against the FP32 reference, this takes the velocity from
+        for segment in &layout.segments {
+            let (projection, rows) = match segment.kind {
+                SegmentKind::KeyframeVideo(index) => (
+                    "video_patch_proj",
+                    patchify_video(inputs.keyframes[index].video.as_ref().unwrap()),
+                ),
+                SegmentKind::KeyframeAudio(index) => (
+                    "audio_patch_proj",
+                    pack_audio(inputs.keyframes[index].audio.as_ref().unwrap()),
+                ),
+                _ => continue,
+            };
+            let rows = DeviceBuffer::from_f32(&rows)?;
+            self.linear(
+                projection,
+                rows.pointer(),
+                workspace.residual.pointer_at(segment.start * hidden * 4),
+                segment.len(),
+                0,
+                workspace,
+            )?;
+        }
+        // NOTE: NVFP4 layers run the rows before the video (text, conditions and audio), about 1% of
+        // the rows at 768p without conditions, through their INT8 weights. At 448×256 against the FP32 reference, this takes the velocity from
         // 3.3e-1 to 2.0e-1 for video and from 2.6e-1 to 9.2e-2 for audio (INT8 6.7e-2 and
         // 3.9e-2). The text rows alone give 2.4e-1 and 2.3e-1.
         let head = if self.nvfp4.is_empty() {

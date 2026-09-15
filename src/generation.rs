@@ -167,6 +167,8 @@ pub fn sample(
             video: video.clone(),
             audio: audio.clone(),
             context: context.clone(),
+            context_modalities: Vec::new(),
+            keyframes: Vec::new(),
             sigma: schedule.video[step],
             shift_video: settings.shift_video,
             shift_audio: settings.shift_audio,

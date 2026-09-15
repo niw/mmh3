@@ -295,28 +295,44 @@ impl Modulation {
 pub fn forward(weights: &DitWeights, config: &DitConfig, inputs: &DitInputs) -> DitTrace {
     let width = config.hidden;
     let video_shape = &inputs.video.shape;
-    let layout = PackedLayout::text_to_video(
-        inputs.context.shape[0],
-        video_shape[1],
-        video_shape[2],
-        video_shape[3],
-        inputs.audio.shape[2],
+    let layout = PackedLayout::for_inputs(inputs);
+    let timesteps = StepTimesteps::for_layout(
+        &layout,
+        inputs.sigma,
+        inputs.shift_video,
+        inputs.shift_audio,
     );
-    let timesteps = StepTimesteps::new(inputs.sigma, inputs.shift_video, inputs.shift_audio);
     let rows = layout.modulation_rows(&timesteps);
 
     let text_states = refine_text(weights, config, &inputs.context);
-    let audio_embed = linear(
-        &pack_audio(&inputs.audio),
-        weights.get("audio_patch_proj.weight"),
-        Some(weights.get("audio_patch_proj.bias")),
-    );
-    let video_embed = linear(
-        &patchify_video(&inputs.video),
-        weights.get("video_patch_proj.weight"),
-        Some(weights.get("video_patch_proj.bias")),
-    );
-    let mut hidden = [text_states.as_slice(), &audio_embed, &video_embed].concat();
+    let embed_audio = |latent: &Tensor| {
+        linear(
+            &pack_audio(latent),
+            weights.get("audio_patch_proj.weight"),
+            Some(weights.get("audio_patch_proj.bias")),
+        )
+    };
+    let embed_video = |latent: &Tensor| {
+        linear(
+            &patchify_video(latent),
+            weights.get("video_patch_proj.weight"),
+            Some(weights.get("video_patch_proj.bias")),
+        )
+    };
+    let mut hidden = Vec::with_capacity(layout.len() * width);
+    for segment in &layout.segments {
+        match segment.kind {
+            SegmentKind::Text => hidden.extend_from_slice(&text_states),
+            SegmentKind::KeyframeVideo(index) => {
+                hidden.extend(embed_video(inputs.keyframes[index].video.as_ref().unwrap()))
+            }
+            SegmentKind::KeyframeAudio(index) => {
+                hidden.extend(embed_audio(inputs.keyframes[index].audio.as_ref().unwrap()))
+            }
+            SegmentKind::Audio => hidden.extend(embed_audio(&inputs.audio)),
+            SegmentKind::Video => hidden.extend(embed_video(&inputs.video)),
+        }
+    }
     assert_eq!(hidden.len(), layout.len() * width);
 
     let time_embedding = timesteps.time_embedding(weights.get("adaln_t_table"));

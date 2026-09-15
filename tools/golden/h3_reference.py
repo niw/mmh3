@@ -31,6 +31,12 @@ It writes up to three files into the output directory:
   sigma · u, which is the negated flow velocity ComfyUI's model returns. Step 0 runs at
   sigma 1 where the video and audio timesteps coincide, so step 1 is captured by
   default.
+- keyframes.safetensors, with --first-frame and --last-frame: the keyframe pictures on the
+  canvas in [0, 1], the way ComfyUI's MiniMaxH3ImageToVideo resizes them (the first one
+  stretched, the last one cover-cropped, both with Lanczos), and their normalized latents
+  from the video VAE's encoder. The pictures also go to the text encoder, and
+  dit.safetensors then holds the keyframe latents with the condition noise ComfyUI mixes
+  in, as the DiT sees them.
 - decode.safetensors: video pixels in [0, 1] and the stereo waveform decoded from the
   final latents, before ComfyUI's audio loudness normalization. The waveform comes from
   ComfyUI's default audio VAE setup as "audio" and from strict FP32, with PyTorch's TF32
@@ -279,6 +285,8 @@ def main():
         help="how ComfyUI requantizes quantized weights after merging the LoRA",
     )
     parser.add_argument("--dit", default=DIT, help="DiT file in the models directory")
+    parser.add_argument("--first-frame", help="picture file for the first frame")
+    parser.add_argument("--last-frame", help="picture file for the last frame")
     parser.add_argument(
         "--sparse-attention", choices=["off", "sol", "vsa"], default="off"
     )
@@ -324,6 +332,33 @@ def main():
         decode(arguments, models, device, video, audio, metadata)
         return
 
+    frames, _, _ = temporal_shape(arguments.frames)
+    keyframes = []
+    if arguments.first_frame or arguments.last_frame:
+        import numpy
+        from comfy_extras.nodes_minimax_h3 import _resize
+        from PIL import Image
+
+        for path, frame_index, crop in (
+            (arguments.first_frame, 0, "disabled"),
+            (arguments.last_frame, frames - 1, "center"),
+        ):
+            if path is None:
+                continue
+            picture = numpy.asarray(
+                Image.open(path).convert("RGB"), dtype=numpy.float32
+            )
+            picture = torch.from_numpy(picture / 255.0)[None]
+            keyframes.append(
+                {
+                    "resolved_frame_index": frame_index,
+                    "image": _resize(picture, arguments.width, arguments.height, crop),
+                }
+            )
+    images = [keyframe["image"] for keyframe in keyframes]
+    # Each picture becomes one vision token per 32 × 32 pixels.
+    vision_tokens = (arguments.width // 32) * (arguments.height // 32)
+
     started = time.time()
     text_path = os.path.join(arguments.out, "text.safetensors")
     if os.path.exists(text_path):
@@ -337,8 +372,14 @@ def main():
             ckpt_paths=[os.path.join(models, TEXT_ENCODER)],
             clip_type=comfy.sd.CLIPType.MINIMAX,
         )
-        tokens = clip.tokenize(arguments.prompt)
-        token_ids = [entry[0] for entry in next(iter(tokens.values()))[0]]
+        tokens = clip.tokenize(arguments.prompt, images=images)
+        # A vision block's embeddings count as -1.
+        token_ids = []
+        for entry in next(iter(tokens.values()))[0]:
+            if isinstance(entry[0], dict):
+                token_ids.extend([-1] * vision_tokens)
+            else:
+                token_ids.append(entry[0])
         conditioning = clip.encode_from_tokens_scheduled(tokens)
         context = conditioning[0][0]
         tags = conditioning[0][1].get("minimax_token_tags")
@@ -358,6 +399,41 @@ def main():
             flush=True,
         )
         del clip
+        model_management.unload_all_models()
+        model_management.soft_empty_cache()
+
+    if keyframes:
+        started = time.time()
+        with torch.inference_mode():
+            video_vae = comfy.sd.VAE(
+                sd=comfy.utils.load_torch_file(
+                    os.path.join(models, arguments.video_vae)
+                )
+            )
+            for keyframe in keyframes:
+                keyframe["latent"] = video_vae.encode(keyframe["image"]).float()
+        save_file(
+            {
+                name: value.contiguous()
+                for index, keyframe in enumerate(keyframes)
+                for name, value in (
+                    (f"keyframe.{index}.pixels", keyframe["image"][0].float()),
+                    (f"keyframe.{index}.latent", keyframe["latent"][0].cpu()),
+                )
+            },
+            os.path.join(arguments.out, "keyframes.safetensors"),
+            metadata={
+                **metadata,
+                "frame_indices": json.dumps(
+                    [keyframe["resolved_frame_index"] for keyframe in keyframes]
+                ),
+            },
+        )
+        print(
+            f"keyframes: {len(keyframes)} encoded with {arguments.video_vae}, {time.time() - started:.1f} s",
+            flush=True,
+        )
+        del video_vae
         model_management.unload_all_models()
         model_management.soft_empty_cache()
 
@@ -446,7 +522,31 @@ def main():
         "minimax_h3_sigma_shift_video": arguments.shift_video,
         "minimax_h3_sigma_shift_audio": arguments.shift_audio,
     }
-    payload = {"text_token_tags": tags}
+    payload = {"text_token_tags": tags, "seed": arguments.seed}
+    if keyframes:
+        payload["keyframes"] = [
+            {
+                "resolved_frame_index": keyframe["resolved_frame_index"],
+                "latent": keyframe["latent"],
+            }
+            for keyframe in keyframes
+        ]
+        payload["cond_video_latents"] = [keyframe["latent"] for keyframe in keyframes]
+        # The condition rows with ComfyUI's noise, back in the latent layout.
+        rows = model._cond_video_rows(payload, device).float().cpu()
+        channels, _, height, width = keyframes[0]["latent"].shape[1:]
+        per_keyframe = (height // 2) * (width // 2)
+        for index in range(len(keyframes)):
+            part = rows[index * per_keyframe : (index + 1) * per_keyframe]
+            part = part.view(1, height // 2, width // 2, channels, 1, 2, 2)
+            tensors[f"keyframe.{index}.augmented"] = (
+                part.permute(3, 0, 4, 1, 5, 2, 6)
+                .reshape(channels, 1, height, width)
+                .contiguous()
+            )
+        metadata["frame_indices"] = json.dumps(
+            [keyframe["resolved_frame_index"] for keyframe in keyframes]
+        )
     with torch.inference_mode():
         for step in range(arguments.steps):
             timestep = torch.tensor([sigmas_video[step] * 1000.0], device=device)
