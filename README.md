@@ -392,8 +392,8 @@ Inspection and development commands are available in `mmh3-tools`:
 - `src/bin/mmh3/`: the `mmh3` entry point and video generation.
 - `src/bin/mmh3-tools/`: the `mmh3-tools` entry point, checkpoint inspection, benchmarks and
   reference checks.
-- `src/lib.rs`: support shared by both commands, with argument parsing in `src/cli.rs` and
-  checkpoint loading options in `src/models.rs`.
+- `src/lib.rs`: support shared by both commands, with argument parsing in `src/cli.rs`,
+  checkpoint loading options in `src/models.rs` and the sampling in `src/generation.rs`.
 - `crates/mmh3-core`: everything that does not depend on a GPU backend, such as the safetensors
   reader, the tokenizer, the packed token layout, schedules, VAE tiling plans, Sol-Attn's reference
   and the media writers.

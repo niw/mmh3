@@ -4,4 +4,6 @@ pub mod cli;
 pub mod output;
 
 #[cfg(feature = "cuda")]
+pub mod generation;
+#[cfg(feature = "cuda")]
 pub mod models;
