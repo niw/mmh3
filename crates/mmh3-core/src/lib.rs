@@ -10,3 +10,4 @@ pub mod safetensors;
 pub mod tensor;
 pub mod tokenizer;
 pub mod vae;
+pub mod vision;

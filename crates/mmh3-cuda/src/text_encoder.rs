@@ -4,13 +4,19 @@
 //! The residual stream stays in FP32 and the linear layers run through the INT8 ConvRot GEMM like
 //! the DiT's. The q, k and v projections, and the gate and up projections, are concatenated on load
 //! so each pair or triple takes one GEMM.
+//!
+//! Pictures in the prompt come from the vision tower: their embeddings replace the vision pad
+//! tokens, their DeepStack features add to them after the first layers, and the rotary embedding
+//! takes the 3D positions of Qwen3-VL's interleaved MRoPE.
 
 use crate::attention::{AttentionLayout, Element, attention_pointers};
 use crate::loader::Uploader;
 use crate::model::{CONVROT_GROUP, DeviceTensors, Error, check_quantization};
-use crate::{DeviceBuffer, check};
+use crate::vision::{VisionEmbeddings, mmh3_vision_add};
+use crate::{DeviceBuffer, check, copy_device};
 use mmh3_core::safetensors::{DType, SafeTensors, TensorInfo};
 use mmh3_core::tensor::Tensor;
+use mmh3_core::vision::VisionPrompt;
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
@@ -334,23 +340,67 @@ impl CudaTextEncoder {
         Ok(())
     }
 
-    /// Rotary angles `[tokens, 64]` of consecutive text positions.
-    fn rope_angles(tokens: usize) -> Vec<f32> {
-        let inverse: Vec<f32> = (0..HEAD_DIM / 2)
+    /// Rotary angles `[tokens, 64]` of (time, height, width) positions with Qwen3-VL's interleaved
+    /// MRoPE: frequency i rotates by the height for i % 3 == 1 and by the width for i % 3 == 2
+    /// among the first 60, and by the time otherwise.
+    fn rope_angles(positions: &[[usize; 3]]) -> Vec<f32> {
+        let frequencies = HEAD_DIM / 2;
+        let inverse: Vec<f32> = (0..frequencies)
             .map(|index| 1.0 / ROPE_THETA.powf((2 * index) as f32 / HEAD_DIM as f32))
             .collect();
-        (0..tokens)
+        let axis = |index: usize| match index % 3 {
+            1 if index < 60 => 1,
+            2 if index < 60 => 2,
+            _ => 0,
+        };
+        positions
+            .iter()
             .flat_map(|position| {
                 inverse
                     .iter()
-                    .map(move |&frequency| position as f32 * frequency)
+                    .enumerate()
+                    .map(move |(index, &frequency)| position[axis(index)] as f32 * frequency)
             })
             .collect()
     }
 
     /// Encodes token ids and returns the conditioning `[tokens, hidden]`, capturing the hidden
-    /// states after the listed layers.
+    /// states after the listed layers, before any DeepStack features add to them.
     pub fn encode(&self, ids: &[u32], capture: &[usize]) -> Result<TextEncoding, Error> {
+        let positions: Vec<[usize; 3]> = (0..ids.len()).map(|position| [position; 3]).collect();
+        self.encode_positions(ids, &positions, &[], capture)
+    }
+
+    /// Encodes a prompt with the embeddings of its pictures, in order.
+    pub fn encode_prompt(
+        &self,
+        prompt: &VisionPrompt,
+        pictures: &[VisionEmbeddings],
+        capture: &[usize],
+    ) -> Result<TextEncoding, Error> {
+        if pictures.len() != prompt.picture_starts.len() {
+            return Err(Error::Model(format!(
+                "the prompt holds {} pictures, not {}",
+                prompt.picture_starts.len(),
+                pictures.len()
+            )));
+        }
+        let pictures: Vec<(usize, &VisionEmbeddings)> = prompt
+            .picture_starts
+            .iter()
+            .copied()
+            .zip(pictures)
+            .collect();
+        self.encode_positions(&prompt.ids, &prompt.positions, &pictures, capture)
+    }
+
+    fn encode_positions(
+        &self,
+        ids: &[u32],
+        positions: &[[usize; 3]],
+        pictures: &[(usize, &VisionEmbeddings)],
+        capture: &[usize],
+    ) -> Result<TextEncoding, Error> {
         let config = &self.config;
         let tokens = ids.len();
         if tokens == 0 || ids.iter().any(|&id| id as usize >= config.vocabulary) {
@@ -377,7 +427,25 @@ impl CudaTextEncoder {
                 ptr::null_mut(),
             )
         })?;
-        let angles = DeviceBuffer::from_f32(&Self::rope_angles(tokens))?;
+        let hidden = config.hidden;
+        for &(start, picture) in pictures {
+            if start + picture.tokens > tokens
+                || picture.merged.bytes() != picture.tokens * hidden * 4
+            {
+                return Err(Error::Model(
+                    "a picture's embeddings do not fit the prompt".to_owned(),
+                ));
+            }
+            // SAFETY: both ranges hold `picture tokens × hidden` values, checked above.
+            unsafe {
+                copy_device(
+                    workspace.residual.pointer_at(start * hidden * 4),
+                    picture.merged.pointer(),
+                    picture.merged.bytes(),
+                )?
+            };
+        }
+        let angles = DeviceBuffer::from_f32(&Self::rope_angles(positions))?;
 
         let qkv_width = config.qkv_width();
         let key_offset = config.query_heads * HEAD_DIM;
@@ -485,6 +553,20 @@ impl CudaTextEncoder {
                     layer,
                     Tensor::new(vec![tokens, config.hidden], workspace.residual.to_f32()?),
                 ));
+            }
+            for &(start, picture) in pictures {
+                if let Some(features) = picture.deepstack.get(layer) {
+                    // SAFETY: the features hold `picture tokens × hidden` values, like the
+                    // picture's rows of the residual, checked above.
+                    check(unsafe {
+                        mmh3_vision_add(
+                            workspace.residual.pointer_at(start * hidden * 4),
+                            features.pointer(),
+                            picture.tokens * hidden,
+                            ptr::null_mut(),
+                        )
+                    })?;
+                }
             }
         }
         Ok(TextEncoding {

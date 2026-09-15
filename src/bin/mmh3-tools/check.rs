@@ -597,21 +597,42 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .0
         .get("token_ids")
         .ok_or("golden data lacks token_ids")?;
+    // Vision embeddings count as -1 in the golden ids.
     let expected_ids: Vec<u32> = golden
         .0
         .data(id_info)
         .as_chunks::<8>()
         .0
         .iter()
-        .map(|&bytes| i64::from_le_bytes(bytes) as u32)
+        .map(|&bytes| match i64::from_le_bytes(bytes) {
+            -1 => mmh3_core::vision::IMAGE_PAD,
+            id => id as u32,
+        })
         .collect();
-    let ids = Tokenizer::h3().encode(&prompt);
+    let pictures: Vec<mmh3_core::tensor::Tensor> = (0..)
+        .map_while(|index| golden.tensor(&format!("picture.{index}.pixels")).ok())
+        .collect();
+    let grids: Vec<mmh3_core::vision::VisionGrid> = pictures
+        .iter()
+        .map(|picture| {
+            mmh3_core::vision::VisionGrid::for_picture(picture.shape[0], picture.shape[1])
+        })
+        .collect();
+    let prompt = mmh3_core::vision::vision_prompt(&Tokenizer::h3(), &prompt, &grids);
+    let ids = prompt.ids.clone();
     if ids != expected_ids {
         return Err(
             format!("token ids differ from the golden data:\n  expected {expected_ids:?}\n  actual   {ids:?}").into()
         );
     }
     println!("{} tokens match", ids.len());
+    if !pictures.is_empty() {
+        let tags = golden.context_modalities()?;
+        if tags != prompt.modalities {
+            return Err("token tags differ from the golden data".into());
+        }
+        println!("{} pictures, token tags match", pictures.len());
+    }
 
     let started = Instant::now();
     let weights_path = option_path(&options, "weights", TEXT_ENCODER_FILE)?;
@@ -626,18 +647,57 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .iter()
         .filter_map(|info| info.name.strip_prefix("layer.")?.parse().ok())
         .collect();
+    let report = |name: &str, actual: &[f32], expected: &[f32]| {
+        let (cosine, relative, worst, scale) = compare(actual, expected);
+        println!("{name:<12} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>11.3}");
+    };
+    let mut embeddings = Vec::new();
+    if !pictures.is_empty() {
+        let started = Instant::now();
+        let vision = mmh3_cuda::vision::CudaVisionEncoder::load(&SafeTensors::open(Path::new(
+            &weights_path,
+        ))?)?;
+        println!(
+            "loaded the vision tower in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        println!(
+            "{:<12} {:>11} {:>11} {:>11} {:>11}",
+            "vision", "cosine", "rel L2", "max error", "scale"
+        );
+        for (index, picture) in pictures.iter().enumerate() {
+            let started = Instant::now();
+            let embedded = vision.encode(picture)?;
+            mmh3_cuda::synchronize()?;
+            println!(
+                "picture {index} embedded in {:.3} s",
+                started.elapsed().as_secs_f64()
+            );
+            report(
+                &format!("  merged {index}"),
+                &embedded.merged.to_f32()?,
+                &golden.tensor(&format!("picture.{index}.merged"))?.data,
+            );
+            for (layer, features) in embedded.deepstack.iter().enumerate() {
+                report(
+                    &format!("  stack {index}.{layer}"),
+                    &features.to_f32()?,
+                    &golden
+                        .tensor(&format!("picture.{index}.deepstack.{layer}"))?
+                        .data,
+                );
+            }
+            embeddings.push(embedded);
+        }
+    }
     let started = Instant::now();
-    let encoding = encoder.encode(&ids, &captured)?;
+    let encoding = encoder.encode_prompt(&prompt, &embeddings, &captured)?;
     println!("encoded in {:.3} s", started.elapsed().as_secs_f64());
 
     println!(
         "{:<12} {:>11} {:>11} {:>11} {:>11}",
         "tensor", "cosine", "rel L2", "max error", "scale"
     );
-    let report = |name: &str, actual: &[f32], expected: &[f32]| {
-        let (cosine, relative, worst, scale) = compare(actual, expected);
-        println!("{name:<12} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>11.3}");
-    };
     for (layer, hidden) in &encoding.layers {
         report(
             &format!("layer {layer}"),
@@ -647,9 +707,28 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let expected = golden.tensor("context")?;
     report("context", &encoding.context.data, &expected.data);
+    let hidden = encoder.config().hidden;
+    let mut boundaries = vec![0];
+    for (&start, embedded) in prompt.picture_starts.iter().zip(&embeddings) {
+        boundaries.extend([start, start + embedded.tokens]);
+    }
+    boundaries.push(ids.len());
+    for (index, pair) in boundaries.windows(2).enumerate() {
+        if pair[1] > pair[0] {
+            let name = if index % 2 == 1 {
+                format!("  picture {}", index / 2)
+            } else {
+                format!("  text {}", index / 2)
+            };
+            report(
+                &name,
+                &encoding.context.data[pair[0] * hidden..pair[1] * hidden],
+                &expected.data[pair[0] * hidden..pair[1] * hidden],
+            );
+        }
+    }
     // NOTE: the first token carries the model's massive activations, so it is reported apart from
     // the rest.
-    let hidden = encoder.config().hidden;
     report(
         "  token 0",
         &encoding.context.data[..hidden],
