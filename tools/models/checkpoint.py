@@ -40,8 +40,8 @@ class SafeTensors:
     def shape(self, name):
         return self.header[name]["shape"]
 
-    def load(self, name):
-        """The tensor as float32, or as stored for integer dtypes."""
+    def read(self, name):
+        """The tensor as stored, BF16 as its uint16 bits."""
         info = self.header[name]
         start, end = info["data_offsets"]
         dtype = np.dtype(DTYPES[info["dtype"]])
@@ -52,7 +52,12 @@ class SafeTensors:
             os.posix_fadvise(
                 file.fileno(), self.base + start, end - start, os.POSIX_FADV_DONTNEED
             )
-        values = values.reshape(info["shape"])
+        return values.reshape(info["shape"])
+
+    def load(self, name):
+        """The tensor as float32, or as stored for integer dtypes."""
+        info = self.header[name]
+        values = self.read(name)
         if info["dtype"] == "BF16":
             return (values.astype(np.uint32) << 16).view(np.float32)
         if info["dtype"] in ("F16", "F32"):

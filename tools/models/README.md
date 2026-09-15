@@ -27,8 +27,9 @@ uv run tools/models/fasth3_vsa_patch.py \
   --out models/patches/minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
 ```
 
-On a DGX Spark it takes about six minutes and 8 GB of memory. It reads one tensor at a time and drops
-it from the page cache.
+It computes on a CUDA GPU with PyTorch, which `uv run` installs for CUDA 13.0. On a DGX Spark it
+takes about 70 seconds and 4 GB of host memory. It reads the tensors in threads a few layers ahead
+of the computation and drops them from the page cache.
 
 The patch is a LoRA plus the tensors that a LoRA cannot carry, under ComfyUI's names:
 
@@ -57,3 +58,10 @@ DiT velocity deviates as follows:
 
 Ranks 64 and 128 are within the spread of this comparison and run at the same speed, so the
 default is the smaller file.
+
+The rank-64 numbers are those of the published patch. A patch built again gives the same LoRA
+energy but not the same bits, because the randomized SVD rounds differently on another device, and
+FastH3 amplifies such differences: a GPU build gives 1.79e-1 and 3.81e-2 here. Over five builds with
+different SVD seeds on the CPU and the GPU, the video deviation against FP32 golden data with every
+VSA tile kept (`--vsa-sparsity 0`) spreads from 1.65e-1 to 2.11e-1, with the published patch at
+1.75e-1.

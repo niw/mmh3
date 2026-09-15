@@ -1,6 +1,14 @@
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["numpy>=2"]
+# dependencies = ["numpy>=2", "torch>=2.9"]
+#
+# [[tool.uv.index]]
+# name = "pytorch-cu130"
+# url = "https://download.pytorch.org/whl/cu130"
+# explicit = true
+#
+# [tool.uv.sources]
+# torch = { index = "pytorch-cu130" }
 # ///
 """Builds a patch that turns the MiniMax H3 FL2VA DiT into FastVideo's FastH3 VSA-DataFree.
 
@@ -8,7 +16,8 @@ Development tool. It reads the full BF16 FL2VA DiT in ComfyUI's layout, such as
 diffusion_models/minimax_h3_fl2va_bf16.safetensors of Comfy-Org/MiniMax-H3, and the
 transformer directory of FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree in
 diffusers' layout, and writes one safetensors file that mmh3 applies with --patch on top of
-the pruned INT8 ConvRot FL2VA DiT. Run it with uv, which installs numpy, for example:
+the pruned INT8 ConvRot FL2VA DiT. It computes on a CUDA GPU. Run it with uv, which installs
+numpy and PyTorch for CUDA 13.0, for example:
 
     uv run tools/models/fasth3_vsa_patch.py \\
         --base /path/to/minimax_h3_fl2va_bf16.safetensors \\
@@ -36,15 +45,19 @@ diffusion_model.:
 import argparse
 import json
 import sys
+from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
+import torch
 
 from checkpoint import CONVROT_GROUP, SafeTensors, hadamard, write_safetensors
 
 PREFIX = "diffusion_model."
 CURVE_POINTS = 1025
 CURVE_RANK = 8
+DEVICE = torch.device("cuda")
 
 
 class ShardedSafeTensors:
@@ -65,21 +78,42 @@ class ShardedSafeTensors:
     def __contains__(self, name):
         return name in self.owner
 
+    def dtype(self, name):
+        return self.owner[name].dtype(name)
+
+    def read(self, name):
+        return self.owner[name].read(name)
+
     def load(self, name):
         return self.owner[name].load(name)
 
 
-def to_bf16_bits(values):
-    """Rounds float32 values to BF16, to nearest even, as uint16 bits."""
-    bits = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32)
-    rounding = ((bits >> 16) & 1) + 0x7FFF
-    return ((bits + rounding) >> 16).astype(np.uint16)
+def stored_tensor(file, name):
+    """A tensor of a checkpoint in host memory, in its stored dtype."""
+    values = torch.from_numpy(file.read(name))
+    return values.view(torch.bfloat16) if file.dtype(name) == "BF16" else values
+
+
+def read_ahead(items, read, depth=4):
+    """Yields read(item) for each item while threads read the next `depth` items."""
+    with ThreadPoolExecutor(max_workers=depth) as pool:
+        pending = deque(pool.submit(read, item) for item in items[:depth])
+        for index in range(len(items)):
+            values = pending.popleft().result()
+            if index + depth < len(items):
+                pending.append(pool.submit(read, items[index + depth]))
+            yield values
+
+
+def bf16_bytes(values):
+    """Little-endian bytes of a tensor rounded to BF16, to nearest even."""
+    return values.to(torch.bfloat16).view(torch.int16).cpu().numpy().tobytes()
 
 
 def encode(values, dtype):
     """Little-endian bytes of float32 values stored as `dtype`."""
     if dtype == "BF16":
-        return to_bf16_bits(values).tobytes()
+        return bf16_bytes(torch.from_numpy(np.asarray(values, dtype=np.float32)))
     if dtype == "F16":
         return np.asarray(values, dtype=np.float16).tobytes()
     if dtype == "F32":
@@ -90,30 +124,31 @@ def encode(values, dtype):
 
 
 def quantize_convrot(weight):
-    """Rotates the rows of a weight [n, k] in 256-column groups and quantizes each row to
+    """Rotates the rows of a GPU weight [n, k] in 256-column groups and quantizes each row to
     INT8 with scale max |w| / 127, rounding half to even. Returns (int8, scales [n, 1])."""
     rows, columns = weight.shape
+    rotation = torch.from_numpy(hadamard()).to(DEVICE)
     rotated = (
-        weight.astype(np.float64).reshape(rows, columns // CONVROT_GROUP, CONVROT_GROUP)
-        @ hadamard()
+        weight.double().reshape(rows, columns // CONVROT_GROUP, CONVROT_GROUP)
+        @ rotation
     ).reshape(rows, columns)
-    scales = np.maximum(np.abs(rotated).max(axis=1, keepdims=True) / 127.0, 1e-30)
-    quantized = np.clip(np.rint(rotated / scales), -128, 127).astype(np.int8)
-    return quantized, scales.astype(np.float32)
+    scales = torch.clamp(rotated.abs().amax(dim=1, keepdim=True) / 127.0, min=1e-30)
+    quantized = torch.clamp(torch.round(rotated / scales), -128, 127).to(torch.int8)
+    return quantized.cpu().numpy(), scales.float().cpu().numpy()
 
 
 def truncated_svd(matrix, rank, oversampling=16, iterations=3, seed=0):
-    """The top `rank` singular triplets of a float32 matrix by randomized SVD with power
+    """The top `rank` singular triplets of a float32 GPU matrix by randomized SVD with power
     iterations."""
     generator = np.random.default_rng(seed)
     probe = generator.standard_normal(
         (matrix.shape[1], rank + oversampling), dtype=np.float32
     )
-    basis, _ = np.linalg.qr(matrix @ probe)
+    basis, _ = torch.linalg.qr(matrix @ torch.from_numpy(probe).to(DEVICE))
     for _ in range(iterations):
-        basis, _ = np.linalg.qr(matrix.T @ basis)
-        basis, _ = np.linalg.qr(matrix @ basis)
-    left, singular, right = np.linalg.svd(basis.T @ matrix, full_matrices=False)
+        basis, _ = torch.linalg.qr(matrix.T @ basis)
+        basis, _ = torch.linalg.qr(matrix @ basis)
+    left, singular, right = torch.linalg.svd(basis.T @ matrix, full_matrices=False)
     return (basis @ left)[:, :rank], singular[:rank], right[:rank]
 
 
@@ -221,45 +256,59 @@ def main():
         (f"token_refiner.blocks.{index}", f"token_refiner.refiner_blocks.{index}")
         for index in range(refiner_layers)
     ]
-    for prefix, fasth3_prefix in blocks if arguments.rank > 0 else []:
-        for name, sources, swap_halves in linear_layers(prefix, fasth3_prefix):
-            fine_tuned = np.concatenate([fasth3.load(source) for source in sources])
-            if swap_halves:
-                half = fine_tuned.shape[0] // 2
-                fine_tuned = np.concatenate([fine_tuned[half:], fine_tuned[:half]])
-            weight = base.load(f"{name}.weight")
-            update = fine_tuned - weight
-            relative = np.linalg.norm(update) / np.linalg.norm(weight)
-            if relative > 0.5:
-                sys.exit(
-                    f"{name}: the checkpoints differ by {relative:.2f}, wrong mapping?"
-                )
-            total = float(np.sum(update.astype(np.float64) ** 2))
-            rank = arguments.rank
-            left, singular, right = truncated_svd(update, rank)
-            kept = float(np.sum(singular.astype(np.float64) ** 2) / total)
-            root = np.sqrt(singular)
-            tensors[f"{PREFIX}{name}.lora_B.weight"] = (
-                "BF16",
-                (weight.shape[0], rank),
-                encode(left * root, "BF16"),
+    linears = [
+        linear
+        for prefix, fasth3_prefix in blocks
+        for linear in linear_layers(prefix, fasth3_prefix)
+    ]
+    if arguments.rank == 0:
+        linears = []
+
+    def read_linear(linear):
+        name, sources, _ = linear
+        fine_tuned = [stored_tensor(fasth3, source) for source in sources]
+        return fine_tuned, stored_tensor(base, f"{name}.weight")
+
+    for (name, _, swap_halves), (fine_tuned, weight) in zip(
+        linears, read_ahead(linears, read_linear)
+    ):
+        fine_tuned = torch.cat([values.to(DEVICE).float() for values in fine_tuned])
+        if swap_halves:
+            fine_tuned = torch.cat(fine_tuned.chunk(2)[::-1])
+        weight = weight.to(DEVICE).float()
+        update = fine_tuned - weight
+        del fine_tuned
+        relative = float(torch.linalg.norm(update) / torch.linalg.norm(weight))
+        if relative > 0.5:
+            sys.exit(
+                f"{name}: the checkpoints differ by {relative:.2f}, wrong mapping?"
             )
-            tensors[f"{PREFIX}{name}.lora_A.weight"] = (
-                "BF16",
-                (rank, weight.shape[1]),
-                encode(root[:, None] * right, "BF16"),
-            )
-            tensors[f"{PREFIX}{name}.alpha"] = (
-                "BF16",
-                (),
-                encode([float(rank)], "BF16"),
-            )
-            report.append((name, relative, kept))
-            print(
-                f"{name:40} update {relative:.3e} of the weight, "
-                f"rank {rank} keeps {kept:.3f} of it",
-                flush=True,
-            )
+        total = float(torch.sum(update.double() ** 2))
+        rank = arguments.rank
+        left, singular, right = truncated_svd(update, rank)
+        kept = float(torch.sum(singular.double() ** 2) / total)
+        root = torch.sqrt(singular)
+        tensors[f"{PREFIX}{name}.lora_B.weight"] = (
+            "BF16",
+            (weight.shape[0], rank),
+            bf16_bytes(left * root),
+        )
+        tensors[f"{PREFIX}{name}.lora_A.weight"] = (
+            "BF16",
+            (rank, weight.shape[1]),
+            bf16_bytes(root[:, None] * right),
+        )
+        tensors[f"{PREFIX}{name}.alpha"] = (
+            "BF16",
+            (),
+            encode([float(rank)], "BF16"),
+        )
+        report.append((name, relative, kept))
+        print(
+            f"{name:40} update {relative:.3e} of the weight, "
+            f"rank {rank} keeps {kept:.3f} of it",
+            flush=True,
+        )
 
     # Tensors replaced as they are, in the base's dtypes.
     for name, source in replaced_tensors(converted_layers, refiner_layers):
@@ -292,33 +341,56 @@ def main():
         for index in range(converted_layers)
     ] + [("final_layer.adaln_proj.linear", "norm_out.linear")]
     worst = 0.0
-    for name, source in projections:
-        weight = fasth3.load(f"{source}.weight").astype(np.float64)
-        bias = fasth3.load(f"{source}.bias").astype(np.float64)
-        folded_weight = (weight @ basis).astype(np.float16)
-        folded_bias = (bias + weight @ mean).astype(np.float16)
-        # Every eighth timestep is enough to measure the fit.
-        exact = curve[::8] @ weight.T + bias
-        approximate = table[::8] @ folded_weight.astype(np.float64).T + folded_bias
-        worst = max(worst, np.linalg.norm(approximate - exact) / np.linalg.norm(exact))
+    # Every eighth timestep is enough to measure the fit.
+    curve_samples = torch.from_numpy(curve[::8].copy()).to(DEVICE)
+    table_samples = torch.from_numpy(table[::8].copy()).to(DEVICE)
+    basis = torch.from_numpy(basis.copy()).to(DEVICE)
+    mean = torch.from_numpy(mean).to(DEVICE)
+    for (name, _), (weight, bias) in zip(
+        projections,
+        read_ahead(
+            projections,
+            lambda projection: [
+                stored_tensor(fasth3, f"{projection[1]}.{suffix}")
+                for suffix in ("weight", "bias")
+            ],
+        ),
+    ):
+        weight = weight.to(DEVICE).double()
+        bias = bias.to(DEVICE).double()
+        folded_weight = (weight @ basis).half()
+        folded_bias = (bias + weight @ mean).half()
+        exact = curve_samples @ weight.T + bias
+        approximate = table_samples @ folded_weight.double().T + folded_bias
+        worst = max(
+            worst,
+            float(torch.linalg.norm(approximate - exact) / torch.linalg.norm(exact)),
+        )
         tensors[f"{PREFIX}{name}.weight"] = (
             "F16",
-            folded_weight.shape,
-            folded_weight.tobytes(),
+            tuple(folded_weight.shape),
+            folded_weight.cpu().numpy().tobytes(),
         )
         tensors[f"{PREFIX}{name}.bias"] = (
             "F16",
-            folded_bias.shape,
-            folded_bias.tobytes(),
+            tuple(folded_bias.shape),
+            folded_bias.cpu().numpy().tobytes(),
         )
     print(f"pruned AdaLN: modulations within {worst:.3e} of the full ones", flush=True)
 
     # The VSA gates, which the base does not have, in INT8 ConvRot.
-    for index in range(converted_layers):
+    gates = list(range(converted_layers))
+    for index, weight in zip(
+        gates,
+        read_ahead(
+            gates,
+            lambda index: stored_tensor(
+                fasth3, f"transformer_blocks.{index}.attn.to_gate_compress.weight"
+            ),
+        ),
+    ):
         name = f"blocks.{index}.attn.to_gate_compress"
-        quantized, scales = quantize_convrot(
-            fasth3.load(f"transformer_blocks.{index}.attn.to_gate_compress.weight")
-        )
+        quantized, scales = quantize_convrot(weight.to(DEVICE))
         tensors[f"{PREFIX}{name}.weight"] = ("I8", quantized.shape, quantized.tobytes())
         tensors[f"{PREFIX}{name}.weight_scale"] = (
             "F32",
