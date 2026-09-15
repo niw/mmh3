@@ -15,6 +15,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("dit") => check_dit(&arguments[1..]),
         Some("sample") => check_sample(&arguments[1..]),
         Some("video-vae") => check_video_vae(&arguments[1..]),
+        Some("keyframes") => check_keyframes(&arguments[1..]),
         Some("audio-vae") => check_audio_vae(&arguments[1..]),
         Some("text-encoder") => check_text_encoder(&arguments[1..]),
         _ => Err(USAGE.into()),
@@ -375,6 +376,61 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// Decodes the final video latent of a golden directory and compares the pixels with ComfyUI's,
 /// or with the decode of the checkpoint given by `--reference`.
+/// Encodes the keyframe pictures of a golden directory with the video VAE's encoder and compares
+/// the latents with ComfyUI's, or with those of `--reference`, a file of the same tensors.
+fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use mmh3_cuda::video_encoder::CudaVideoEncoder;
+    use std::time::Instant;
+
+    let options = parse_options(
+        arguments,
+        &["golden", "models", "weights", "reference"],
+        USAGE,
+    )?;
+    let golden = Path::new(options.get("golden").ok_or(USAGE)?);
+    let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
+    let keyframes = GoldenFile::open(golden, "keyframes.safetensors")?;
+    let reference = match options.get("reference") {
+        Some(path) => GoldenFile(SafeTensors::open(Path::new(path))?),
+        None => GoldenFile::open(golden, "keyframes.safetensors")?,
+    };
+    let count = json::parse(&keyframes.metadata("frame_indices")?)?
+        .as_array()
+        .ok_or("bad frame_indices")?
+        .len();
+
+    let started = Instant::now();
+    let encoder = CudaVideoEncoder::load(&SafeTensors::open(Path::new(&weights_path))?)?;
+    println!(
+        "loaded the encoder of {weights_path} in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    println!(
+        "{:<12} {:>11} {:>11} {:>11} {:>9}",
+        "latent", "cosine", "rel L2", "max error", "scale"
+    );
+    for index in 0..count {
+        let picture = keyframes.tensor(&format!("keyframe.{index}.pixels"))?;
+        let expected = reference.tensor(&format!("keyframe.{index}.latent"))?;
+        let started = Instant::now();
+        let latent = encoder.encode_picture(&picture)?.mean_latent();
+        let elapsed = started.elapsed().as_secs_f64();
+        if latent.shape != expected.shape {
+            return Err(format!(
+                "latent shape {:?} differs from the golden {:?}",
+                latent.shape, expected.shape
+            )
+            .into());
+        }
+        let (cosine, relative, worst, scale) = compare(&latent.data, &expected.data);
+        println!(
+            "{:<12} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.2} s)",
+            format!("keyframe {index}")
+        );
+    }
+    Ok(())
+}
+
 fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::vae::{CudaVideoDecoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
     use std::time::Instant;

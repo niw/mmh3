@@ -10,6 +10,7 @@ pub mod model;
 pub mod nvfp4;
 pub mod text_encoder;
 pub mod vae;
+pub mod video_encoder;
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;

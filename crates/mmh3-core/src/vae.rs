@@ -65,6 +65,79 @@ pub fn split_tiles(length: usize, tile_size: usize, overlap_min: usize) -> TileA
     }
 }
 
+/// Joins the encoder outputs of the tiles of a picture, `[tile latent pixels, channels]` each in
+/// row-major tile order, into `[latent pixels, channels]`, as the reference does: each tile blends
+/// linearly with the unblended tile above over their overlap, then with the unblended tile to its
+/// left, and keeps its rows and columns up to the next tile.
+pub fn blend_encoded_tiles(
+    tiles: &[Vec<f32>],
+    rows: &TileAxis,
+    columns: &TileAxis,
+    channels: usize,
+) -> Vec<f32> {
+    let (tile_height, tile_width) = (rows.length / SPATIAL_RATIO, columns.length / SPATIAL_RATIO);
+    let height = rows.starts.last().unwrap() / SPATIAL_RATIO + tile_height;
+    let width = columns.starts.last().unwrap() / SPATIAL_RATIO + tile_width;
+    assert_eq!(tiles.len(), rows.starts.len() * columns.starts.len());
+    let at = |tile: &[f32], y: usize, x: usize, channel: usize| {
+        tile[(y * tile_width + x) * channels + channel]
+    };
+    let mut output = vec![0.0f32; height * width * channels];
+    for (row, &top) in rows.starts.iter().enumerate() {
+        for (column, &left) in columns.starts.iter().enumerate() {
+            let tile = &tiles[row * columns.starts.len() + column];
+            let mut blended = tile.clone();
+            if row > 0 {
+                let above = &tiles[(row - 1) * columns.starts.len() + column];
+                let extent = (rows.overlaps[row - 1] / SPATIAL_RATIO).min(tile_height);
+                for y in 0..extent {
+                    let weight = y as f32 / extent as f32;
+                    for x in 0..tile_width {
+                        for channel in 0..channels {
+                            blended[(y * tile_width + x) * channels + channel] =
+                                at(above, tile_height - extent + y, x, channel) * (1.0 - weight)
+                                    + at(tile, y, x, channel) * weight;
+                        }
+                    }
+                }
+            }
+            if column > 0 {
+                let left_tile = &tiles[row * columns.starts.len() + column - 1];
+                let extent = (columns.overlaps[column - 1] / SPATIAL_RATIO).min(tile_width);
+                let vertical = blended.clone();
+                for y in 0..tile_height {
+                    for x in 0..extent {
+                        let weight = x as f32 / extent as f32;
+                        for channel in 0..channels {
+                            blended[(y * tile_width + x) * channels + channel] =
+                                at(left_tile, y, tile_width - extent + x, channel) * (1.0 - weight)
+                                    + at(&vertical, y, x, channel) * weight;
+                        }
+                    }
+                }
+            }
+            let kept_height = rows
+                .overlaps
+                .get(row)
+                .map_or(tile_height, |overlap| tile_height - overlap / SPATIAL_RATIO);
+            let kept_width = columns
+                .overlaps
+                .get(column)
+                .map_or(tile_width, |overlap| tile_width - overlap / SPATIAL_RATIO);
+            let (top, left) = (top / SPATIAL_RATIO, left / SPATIAL_RATIO);
+            for y in 0..kept_height {
+                for x in 0..kept_width {
+                    let destination = ((top + y) * width + left + x) * channels;
+                    let source = (y * tile_width + x) * channels;
+                    output[destination..destination + channels]
+                        .copy_from_slice(&blended[source..source + channels]);
+                }
+            }
+        }
+    }
+    output
+}
+
 /// How a latent of `latent_frames` frames decodes in chunks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TemporalPlan {
@@ -167,6 +240,24 @@ pub fn rope_angles(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blends_encoded_tiles_over_their_overlap() {
+        // 448 pixels make two tiles 192 pixels apart, overlapping by 64 pixels, 4 latent columns.
+        let (rows, columns) = (split_tiles(256, 256, 64), split_tiles(448, 256, 64));
+        assert_eq!(
+            (columns.starts.clone(), columns.overlaps.clone()),
+            (vec![0, 192], vec![64])
+        );
+        let tile = |value: f32| vec![value; 16 * 16];
+        let blended = blend_encoded_tiles(&[tile(1.0), tile(3.0)], &rows, &columns, 1);
+        assert_eq!(blended.len(), 16 * 28);
+        let row: Vec<f32> = blended[..28].to_vec();
+        assert_eq!(&row[..12], &[1.0; 12]);
+        // The second tile starts at latent column 12 and ramps in over 4 columns.
+        assert_eq!(&row[12..16], &[1.0, 1.5, 2.0, 2.5]);
+        assert_eq!(&row[16..], &[3.0; 12]);
+    }
 
     #[test]
     fn splits_like_the_reference() {
