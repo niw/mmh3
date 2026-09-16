@@ -37,7 +37,11 @@ make generate \
   [First and last frames](fl2va.md) for the prompt they need.
 - `--reference FILE` (default none, repeatable): A PNG or JPEG picture the prompt refers to as
   `<Picture 1>`, `<Picture 2>` and so on, in the order of the options. Switches the default DiT to
-  the ref2va one. See [Reference pictures](ref2va.md).
+  the ref2va one. See [Reference pictures and sounds](ref2va.md).
+- `--reference-audio FILE` (default none, repeatable): A sound the prompt refers to as `<Audio 1>`,
+  `<Audio 2>` and so on, in the order of the options, from a WAV, FLAC, MP3, AAC, ALAC, Ogg Vorbis,
+  MP4 or Matroska file, resampled to the audio VAE's 32 kHz. Switches the default DiT to the ref2va
+  one as well.
 - `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
   there is no CFG.
 - `--schedule uniform|taomate` (default `uniform`): `taomate` runs the three steps the TaoMate-H3
