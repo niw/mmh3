@@ -75,20 +75,30 @@ impl VisionGrid {
 
 /// The patches `[patches, 1536]` of a picture `[height, width, 3]` in [0, 1], normalized to [−1, 1]
 /// and ordered like `VisionGrid::patch_order`, each with its values ordered (channel, frame, row,
-/// column).
+/// column). A picture fills both temporal slots of its patches with itself.
 pub fn patchify_picture(picture: &Tensor) -> (VisionGrid, Vec<f32>) {
-    let [height, width, 3] = picture.shape[..] else {
-        panic!("a picture is [height, width, 3]");
+    patchify_frames(&[picture, picture])
+}
+
+/// The patches of the two frames of one block of a clip, which take a temporal slot each. Both
+/// frames are `[height, width, 3]` in [0, 1] and of the same size.
+pub fn patchify_frames(frames: &[&Tensor; TEMPORAL_PATCH]) -> (VisionGrid, Vec<f32>) {
+    let [height, width, 3] = frames[0].shape[..] else {
+        panic!("a frame is [height, width, 3]");
     };
+    assert_eq!(
+        frames[0].shape, frames[1].shape,
+        "the frames differ in size"
+    );
     let grid = VisionGrid::for_picture(height, width);
     let mut patches = Vec::with_capacity(grid.patches() * PATCH_VALUES);
     for (row, column) in grid.patch_order() {
         for channel in 0..3 {
-            for _ in 0..TEMPORAL_PATCH {
+            for frame in frames {
                 for y in 0..PATCH {
                     for x in 0..PATCH {
                         let (pixel_y, pixel_x) = (row * PATCH + y, column * PATCH + x);
-                        let value = picture.data[(pixel_y * width + pixel_x) * 3 + channel];
+                        let value = frame.data[(pixel_y * width + pixel_x) * 3 + channel];
                         patches.push((value - 0.5) / 0.5);
                     }
                 }
@@ -202,18 +212,24 @@ pub struct VisionPrompt {
     pub positions: Vec<[usize; 3]>,
 }
 
-/// A reference the prompt introduces: a picture, which the vision tower embeds, or a sound, which
-/// only gets a label since H3 has no audio tower.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A reference the prompt introduces: a picture or a clip, which the vision tower embeds, or a
+/// sound, which only gets a label since H3 has no audio tower.
+#[derive(Clone, Debug, PartialEq)]
 pub enum PromptReference {
     Picture(VisionGrid),
     Sound,
+    /// A clip, as one vision block per pair of frames sampled at 2 frames per second, with the
+    /// seconds each pair sits at.
+    Clip {
+        grid: VisionGrid,
+        timestamps: Vec<f32>,
+    },
 }
 
 /// H3's presentation of a prompt with references, without a chat template: for each picture
 /// `"<Picture i>: "`, `<|vision_start|>`, its vision embeddings and `<|vision_end|>`, for each
-/// sound `"<Audio j>: "`, and then the prompt. Both kinds are numbered from one within their own
-/// kind. Text tokens take consecutive positions on all three axes, and a picture's embeddings
+/// sound `"<Audio j>: "`, and for each clip `"<Video k>: "` and then a `"<T.T seconds>"` label and
+/// a vision block per pair of its frames. Every kind is numbered from one within its own kind. Text tokens take consecutive positions on all three axes, and a picture's embeddings
 /// share the time position of their first one and spread over its rows and columns, after which
 /// the text continues past the picture's largest position.
 pub fn vision_prompt(
@@ -237,34 +253,45 @@ pub fn vision_prompt(
         positions: Vec::new(),
     };
     let mut next = 0;
-    let (mut pictures, mut sounds) = (0, 0);
-    for reference in references {
-        let grid = match reference {
-            PromptReference::Picture(grid) => {
-                pictures += 1;
-                let label = tokenizer.encode(&format!("<Picture {pictures}>: "));
-                push_text(&mut result, &mut next, &label, Modality::Text);
-                grid
-            }
-            PromptReference::Sound => {
-                sounds += 1;
-                let label = tokenizer.encode(&format!("<Audio {sounds}>: "));
-                push_text(&mut result, &mut next, &label, Modality::Text);
-                continue;
-            }
-        };
-        push_text(&mut result, &mut next, &[VISION_START], Modality::Video);
+    let (mut pictures, mut sounds, mut clips) = (0, 0, 0);
+    let block = |result: &mut VisionPrompt, next: &mut usize, grid: &VisionGrid| {
+        push_text(result, next, &[VISION_START], Modality::Video);
         result.picture_starts.push(result.ids.len());
         let (rows, columns) = (grid.height / MERGE, grid.width / MERGE);
         for row in 0..rows {
             for column in 0..columns {
                 result.ids.push(IMAGE_PAD);
                 result.modalities.push(Modality::Video);
-                result.positions.push([next, next + row, next + column]);
+                result.positions.push([*next, *next + row, *next + column]);
             }
         }
-        next += rows.max(columns);
-        push_text(&mut result, &mut next, &[VISION_END], Modality::Video);
+        *next += rows.max(columns);
+        push_text(result, next, &[VISION_END], Modality::Video);
+    };
+    for reference in references {
+        match reference {
+            PromptReference::Picture(grid) => {
+                pictures += 1;
+                let label = tokenizer.encode(&format!("<Picture {pictures}>: "));
+                push_text(&mut result, &mut next, &label, Modality::Text);
+                block(&mut result, &mut next, grid);
+            }
+            PromptReference::Sound => {
+                sounds += 1;
+                let label = tokenizer.encode(&format!("<Audio {sounds}>: "));
+                push_text(&mut result, &mut next, &label, Modality::Text);
+            }
+            PromptReference::Clip { grid, timestamps } => {
+                clips += 1;
+                let label = tokenizer.encode(&format!("<Video {clips}>: "));
+                push_text(&mut result, &mut next, &label, Modality::Text);
+                for seconds in timestamps {
+                    let label = tokenizer.encode(&format!("<{seconds:.1} seconds>"));
+                    push_text(&mut result, &mut next, &label, Modality::Text);
+                    block(&mut result, &mut next, grid);
+                }
+            }
+        }
     }
     push_text(
         &mut result,
@@ -295,7 +322,7 @@ mod tests {
         let grid = VisionGrid::for_picture(768, 1344);
         assert_eq!((grid.height, grid.width, grid.tokens()), (48, 84, 1008));
         let picture = PromptReference::Picture(grid);
-        let prompt = vision_prompt(&Tokenizer::h3(), "Rain.", &[picture, picture]);
+        let prompt = vision_prompt(&Tokenizer::h3(), "Rain.", &[picture.clone(), picture]);
         assert_eq!(&prompt.ids[..6], &[21604, 3826, 220, 16, 26818, 220]);
         assert_eq!(prompt.ids[6], VISION_START);
         assert_eq!(prompt.picture_starts, vec![7, 7 + 1008 + 1 + 6 + 1]);
@@ -353,6 +380,34 @@ mod tests {
             let first = prompt.positions[after][0];
             assert_eq!(*position, [first + offset; 3]);
         }
+    }
+
+    #[test]
+    fn labels_the_pairs_of_a_clip() {
+        let tokenizer = Tokenizer::h3();
+        let grid = VisionGrid {
+            height: 4,
+            width: 4,
+        };
+        let prompt = vision_prompt(
+            &tokenizer,
+            "Rain.",
+            &[PromptReference::Clip {
+                grid,
+                timestamps: vec![0.25, 1.25, 2.0],
+            }],
+        );
+        // One vision block per pair, each after its own timestamp label.
+        assert_eq!(prompt.picture_starts.len(), 3);
+        let ids = tokenizer.encode("<Video 1>: ");
+        assert_eq!(&prompt.ids[..ids.len()], &ids[..]);
+        // A pair at 0.25 seconds is labelled to one decimal, rounding its tie down.
+        let first = tokenizer.encode("<0.2 seconds>");
+        assert_eq!(&prompt.ids[ids.len()..ids.len() + first.len()], &first[..]);
+        let between = prompt.picture_starts[1] - (prompt.picture_starts[0] + grid.tokens() + 1);
+        assert_eq!(between, tokenizer.encode("<1.2 seconds>").len() + 1);
+        let last = prompt.picture_starts[2] + grid.tokens() + 1;
+        assert_eq!(&prompt.ids[last..], &tokenizer.encode("Rain.")[..]);
     }
 
     #[test]

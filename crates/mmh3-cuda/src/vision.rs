@@ -12,7 +12,7 @@ use crate::{DeviceBuffer, check};
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vision::{
-    PATCH_VALUES, VisionGrid, patchify_picture, position_embeddings, rotary_angles,
+    PATCH_VALUES, VisionGrid, patchify_frames, patchify_picture, position_embeddings, rotary_angles,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -287,11 +287,26 @@ impl CudaVisionEncoder {
     /// Embeds a picture `[height, width, 3]` in [0, 1] with sides that are multiples of 32.
     pub fn encode(&self, picture: &Tensor) -> Result<VisionEmbeddings, Error> {
         let (grid, patches) = patchify_picture(picture);
+        self.embed(grid, &patches)
+    }
+
+    /// Embeds one block of a clip: two frames of the same size, which take a temporal slot each
+    /// instead of a picture repeating itself.
+    pub fn encode_frames(
+        &self,
+        first: &Tensor,
+        second: &Tensor,
+    ) -> Result<VisionEmbeddings, Error> {
+        let (grid, patches) = patchify_frames(&[first, second]);
+        self.embed(grid, &patches)
+    }
+
+    fn embed(&self, grid: VisionGrid, patches: &[f32]) -> Result<VisionEmbeddings, Error> {
         let (hidden, rows) = (self.hidden, grid.patches());
         let merged_rows = grid.tokens();
         let buffer = |values: usize| DeviceBuffer::new(values * 4);
 
-        let patches = DeviceBuffer::from_f32(&patches)?;
+        let patches = DeviceBuffer::from_f32(patches)?;
         let states = buffer(rows * hidden)?;
         self.patch_embed.apply(&patches, &states, rows, 0.0)?;
         let positions = DeviceBuffer::from_f32(&position_embeddings(&self.position_table, grid))?;
