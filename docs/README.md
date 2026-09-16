@@ -1,5 +1,7 @@
 # Documentation
 
+- [Metal on macOS](metal.md): the experimental Swift/Metal backend, build instructions and limits.
+
 - [Usage](usage.md): the options of `mmh3 generate` and prompts.
 - [FastH3](fasth3.md), [lightx2v Turbo LoRA](lightx2v-turbo.md) and [TaoMate-H3](taomate.md): the
   few-step models, where to get them and how to run them.

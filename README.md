@@ -2,12 +2,14 @@
 
 mmh3 is an inference engine dedicated to [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3),
 which generates video with a synchronized stereo soundtrack from text. It is written in Rust with
-CUDA C++ kernels and runs without PyTorch, ComfyUI or any other framework: the tokenizer, the
+CUDA C++ kernels and runs without PyTorch or ComfyUI: the tokenizer, the
 Qwen3-VL text encoder, the diffusion transformer, the sampler and both VAE decoders are implemented
 in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints from
 [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3). It saves MP4 directly with
-NVENC H.264 video and CPU-encoded AAC audio, or WebM with VP9 and Opus. Both formats work
+NVENC or VideoToolbox H.264 video and CPU-encoded AAC audio, or WebM with VP9 and Opus. Both formats work
 without an ffmpeg installation.
+
+An experimental [Metal backend for macOS](docs/metal.md) uses a Swift bridge, MPS and Metal kernels.
 
 ## Getting started
 
@@ -19,11 +21,12 @@ make download-models
 make generate
 ```
 
-`make` builds mmh3, `make download-models` downloads the models into `models`, and `make generate`
-generates a 5.2-second 1344×768 video with audio from a sample prompt and writes `out.mp4` (NVENC
-H.264 video and AAC audio).
+`make` builds mmh3 with Metal on macOS and CUDA on Linux. `make download-models` downloads the
+models into `models`, and `make generate` writes a video with audio to `out.mp4` from a sample
+prompt. On CUDA it generates a 5.2-second 1344×768 video with NVENC H.264 and AAC. On Metal it
+generates a 1.625-second 448×256 video with the four-step Turbo LoRA and VideoToolbox output.
 
-`make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT,
+On CUDA, `make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT,
 with its video sparse attention, INT8/FP8 attention and the INT8 video VAE. Compared with mmh3's
 defaults, they can change image details and the composition. mmh3 also runs two other few-step
 models with the settings on their pages. On a DGX Spark, a complete generation, including model
@@ -47,9 +50,12 @@ See [Usage](docs/usage.md) for the other settings.
   tested yet.
 - Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
-- Not yet: an HTTP server and a Metal backend for Apple Silicon.
+- Experimental Metal text-to-video support. See [Metal](docs/metal.md) for its current limits.
+- Not yet: an HTTP server.
 
 ## Requirements
+
+These requirements are for CUDA. See [Metal](docs/metal.md) for macOS.
 
 - Linux with an NVIDIA Blackwell GPU (developed on aarch64).
 - The CUDA toolkit with `nvcc` and cuBLASLt (developed with CUDA 13.0).

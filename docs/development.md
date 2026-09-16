@@ -18,7 +18,7 @@
 - The video VAE decoder with FP16 weights, or with INT8 ConvRot weights in its transformer.
 - The official per-stream Euler schedules for video and audio.
 - Weights stream from disk to the GPU with direct reads, without filling the page cache.
-- Native NVENC H.264 + AAC MP4 output, built-in VP9 + Opus WebM, or an external ffmpeg CLI.
+- Native NVENC or VideoToolbox H.264 + AAC MP4 output, built-in VP9 + Opus WebM, or an external ffmpeg CLI.
 
 ## Repository layout
 
@@ -32,10 +32,14 @@
   reference and the media writers.
 - `crates/mmh3-cuda`: the CUDA kernels (`kernels/*.cu`) and the Rust code that runs the models with
   them.
+- `crates/mmh3-metal`: the experimental Metal backend, with a Swift resource/MPS bridge and
+  `kernels/*.metal`. See [Metal](metal.md) for usage and supported options.
 - `crates/mmh3-cpu`: an FP32 CPU reference of the DiT for tests.
 - `crates/mmh3-output`: portable encoder interfaces, AAC encoding, MP4/WebM muxing and ffmpeg CLI
   output.
 - `crates/mmh3-output-nvenc`: the NVENC adapter that accepts CUDA frames for native H.264 encoding.
+- `crates/mmh3-output-videotoolbox`: native H.264 encoding on macOS, with a Swift VideoToolbox
+  bridge and Metal RGB-to-NV12 conversion into shared pixel buffers.
 - `tests/fixtures`: small random models with outputs computed by ComfyUI's implementation.
 - `tools/download-models.sh`: the model downloader that `make download-models` runs.
 - `tools/golden`: development tools that write golden data with a ComfyUI checkout.
@@ -62,7 +66,7 @@ cargo test --release --workspace --features cuda,mp4
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results
 and CPU references. The CUDA crates are empty off Linux, so `cargo test --workspace` needs no CUDA
-toolchain there.
+toolchain there. On macOS, `--features metal` takes the place of `cuda,mp4`.
 
 ## Formatting
 
@@ -70,6 +74,8 @@ toolchain there.
 make format
 ```
 
-`make format` formats the Rust code with rustfmt, the Python tools with ruff and the C++ and CUDA
-code with clang-format. ruff and clang-format run through `uvx` of [uv](https://docs.astral.sh/uv/)
-at pinned versions, so they need no separate installation.
+`make format` formats the Rust code with rustfmt, the Python tools with ruff, the Swift code with
+swiftformat and the C++, CUDA and Metal code with clang-format. ruff and clang-format run through
+`uvx` of [uv](https://docs.astral.sh/uv/) at pinned versions, so they need no separate
+installation. swiftformat only runs where it is installed, since the Swift code builds on macOS
+alone.

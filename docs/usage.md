@@ -7,14 +7,17 @@ target/release/mmh3 generate --out out.mp4 \
   --prompt "A red panda sips tea on a sunny wooden porch while birds chirp in the garden."
 ```
 
-This writes `out.mp4` with native NVENC H.264 video and AAC audio. The extension of `--out` selects
-the container, and `--ffmpeg` hands the encoding to an installed ffmpeg instead.
+This writes `out.mp4` with native H.264 video and AAC audio, using NVENC on CUDA or VideoToolbox
+on Metal. The extension of `--out` selects the container, and `--ffmpeg` hands the encoding to an
+installed ffmpeg instead.
 [Output](output.md) describes the formats and the ffmpeg path.
 
 ## make generate
 
-`make generate` runs the [FastH3](fasth3.md) settings. `PROMPT`, `SEED`, `OUT` and `MODELS` change
-the prompt, the seed, the output file and the models directory. This writes `panda.mp4`:
+`make generate` runs the [FastH3](fasth3.md) settings on CUDA and a short
+[Turbo LoRA](lightx2v-turbo.md) clip with dense attention on Metal. `PROMPT`, `SEED`, `OUT` and
+`MODELS` change the prompt, the seed, the output file and the models directory. This writes
+`panda.mp4`:
 
 ```sh
 make generate \
@@ -25,7 +28,8 @@ make generate \
 ## Options
 
 - `--out FILE` (required, `make generate` uses `out.mp4`): `.mp4` uses native NVENC H.264 + AAC in
-  an `mp4` build. `.webm` uses native VP9 + Opus in a `webm` build.
+  an `mp4` build or VideoToolbox H.264 + AAC in a `metal` build. `.webm` uses native VP9 + Opus in
+  a `webm` build.
 - `--ffmpeg [ARGS...]` (default off): Use an installed ffmpeg instead. All following arguments
   belong to ffmpeg.
 - `--prompt TEXT`, `--prompt-file FILE`: The prompt, raw text without a chat template.
@@ -85,6 +89,6 @@ non_diegetic_music: A slow, swelling orchestral string theme.
 ## Few-step models
 
 - [FastH3](fasth3.md): FastVideo's 4-step model with video sparse attention, as a patch on the base
-  DiT. `make generate` uses it.
+  DiT. `make generate` uses it on CUDA.
 - [lightx2v Turbo LoRA](lightx2v-turbo.md): a LoRA that generates in four steps.
 - [TaoMate-H3](taomate.md): a LoRA that generates in three steps with `--schedule taomate`.

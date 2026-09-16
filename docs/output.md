@@ -1,20 +1,30 @@
 # Output
 
-`mmh3 generate` writes MP4 with native NVENC H.264 and AAC, WebM with VP9 and Opus, or hands the
-encoding to an installed ffmpeg. The extension of `--out` selects the container, and `--ffmpeg`
-overrides the native output.
+`mmh3 generate` writes MP4 with native H.264 and AAC, WebM with VP9 and Opus, or hands the encoding
+to an installed ffmpeg. H.264 uses NVENC on CUDA and VideoToolbox on Metal. The extension of `--out`
+selects the container, and `--ffmpeg` overrides the native output.
 
 ## MP4
 
-An `.mp4` output uses H.264 High profile (NVENC P4, constant QP 20, no B frames, keyframes at
-most two seconds apart) and AAC-LC at 192 kb/s.
+An `.mp4` output uses H.264 High profile with no B frames and keyframes at most two seconds apart,
+plus AAC-LC at 192 kb/s. CUDA builds need the `mp4` feature and use NVENC P4 with constant QP 20.
+The `metal` feature includes VideoToolbox output with hardware encoding and quality set to 0.8.
+Neither native path needs ffmpeg.
 
-The video VAE retains RGB float32 pixels on the GPU. CUDA converts one frame at a time
+On CUDA, the video VAE retains RGB float32 pixels on the GPU. CUDA converts one frame at a time
 directly into a pitched NV12 allocation registered with NVENC. Only compressed video is
 read back to the CPU. The allocation is synchronized before submission and reused only
 after NVENC has finished reading it. This path makes no assumption about shared system
 memory and supports the same design on discrete GPUs such as RTX 5090. GB10 has been
 tested. RTX 5090 has not yet been tested on hardware.
+
+On Metal, the VAE restores pixel blocks and blends spatial tiles and temporal chunks on the GPU.
+Decoded RGB frames stay in a Metal buffer. A compute kernel converts each frame to BT.709
+limited-range NV12 by writing directly into the two planes of an IOSurface-backed CVPixelBuffer.
+VideoToolbox reads that same pixel buffer. The adapter waits for GPU conversion before encoding
+and for the encoded packet before reusing the input. Only compressed video is copied to the CPU
+for native MP4 output. Explicit ffmpeg and WebM output still read back pixels for their host-input
+encoders.
 
 Audio is encoded on the CPU using `rusty_aac`, preserving the VAE's 32 kHz sample rate.
 Audio is trimmed or silence-padded to the video duration. MP4 edit lists compensate for
@@ -87,10 +97,10 @@ and conversion of the H.264 bitstream into MP4 samples. The application selects 
 prepares output, submits video and audio, then finishes the file. WebM and ffmpeg output
 implement the host-input `OutputBackend` interface behind the same lifecycle.
 
-An Apple adapter can implement `VideoEncoder` using Metal-compatible CVPixelBuffer /
-IOSurface input and VideoToolbox, and `AudioEncoder` using AudioToolbox. It can reuse the
-same MP4 writer, sample timing, edit lists and destination publication. Apple generation
-and output adapters are not implemented.
+`mmh3-output-videotoolbox` provides a host YUV420 adapter and, with its `metal` feature, a
+GPU-buffer adapter using shared CVPixelBuffers. The application selects the GPU adapter for
+Metal generation. Both reuse the CPU AAC encoder, MP4 writer, sample timing, edit lists and
+destination publication. AudioToolbox is not required.
 
 The encoder dependencies have their own licenses. `rusty_aac` is Apache-2.0, libvpx and
 libopus are BSD-3-Clause, `shiguredo_libvpx` is Apache-2.0, the Rust Opus bindings are
@@ -106,10 +116,12 @@ See [rusty_aac](https://crates.io/crates/rusty_aac),
 ## Tests
 
 Output integration tests use ffmpeg/ffprobe as independent decoders and do not load models.
-The portable tests need no CUDA. The native output tests require NVENC:
+The portable tests need no GPU. Native output tests require the corresponding hardware encoder:
 
 ```sh
 cargo test -p mmh3-output --features mp4,webm -- --include-ignored
 # Requires an NVIDIA GPU with NVENC and also tests GPU NV12 conversion.
 cargo test -p mmh3-output-nvenc --test output -- --ignored
+# Requires a Mac with a VideoToolbox H.264 hardware encoder.
+cargo test -p mmh3-output-videotoolbox --features metal --test output -- --ignored
 ```
