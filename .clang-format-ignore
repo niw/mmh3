@@ -1,1 +1,4 @@
 crates/mmh3-output-nvenc/native/nvEncodeAPI.h
+crates/mmh3-input-nvdec/native/dynlink_cuda.h
+crates/mmh3-input-nvdec/native/dynlink_cuviddec.h
+crates/mmh3-input-nvdec/native/dynlink_nvcuvid.h
