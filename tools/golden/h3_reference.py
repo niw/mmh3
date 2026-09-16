@@ -343,9 +343,12 @@ def main():
     )
     arguments = parser.parse_args()
     if arguments.dit is None:
-        arguments.dit = (
-            REFERENCE_DIT if arguments.reference or arguments.reference_audio else DIT
+        references = (
+            arguments.reference
+            or arguments.reference_audio
+            or arguments.reference_video
         )
+        arguments.dit = REFERENCE_DIT if references else DIT
     sys.path.insert(0, arguments.comfyui)
     os.makedirs(arguments.out, exist_ok=True)
 

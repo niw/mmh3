@@ -152,9 +152,6 @@ A reference clip is right where it can be checked exactly: on a tiny model built
 own code, a forward with a picture, a clip with its soundtrack and a sound matches ComfyUI's to a
 cosine of 0.9999999, so the rows of every kind sit where the reference puts them. The frames mmh3
 demuxes and decodes itself land within one level of 255 of ComfyUI's decode of the same file, and
-the clip's latent is within 1.7e-3 of ComfyUI's encode of the same frames. The released
-checkpoint's velocity drifts further than with pictures, 1.2e-1 for video and 6.3e-1 for audio at
-448×256 against ComfyUI in FP32, where ComfyUI's own BF16 differs from its FP32 by 1.4e-2 and
-3.2e-2 on that case. Every row still agrees to a cosine of 0.94 or better after the first block,
-and this prompt carries twice as many of the massive-activation text tokens the INT8 weights
-struggle with, so the drift is worth watching rather than trusting blindly.
+the clip's latent is within 1.7e-3 of ComfyUI's encode of the same frames. With the released
+checkpoint at 448×256, the velocity is within 1.4e-2 for video and 4.3e-2 for audio of ComfyUI in
+FP32, about as far as ComfyUI's own BF16 sits from its FP32 on that case, 1.4e-2 and 3.2e-2.
