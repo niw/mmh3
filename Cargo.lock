@@ -334,6 +334,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmh3-metal"
+version = "0.1.0"
+dependencies = [
+ "mmh3-core",
+ "mmh3-cpu",
+]
+
+[[package]]
 name = "mmh3-output"
 version = "0.1.0"
 dependencies = [

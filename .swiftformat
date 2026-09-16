@@ -1,0 +1,52 @@
+# See <https://github.com/nicklockwood/SwiftFormat/blob/main/Rules.md> for each rule.
+
+--swiftversion 6.4
+
+# Use outdent "Indent code in accordance with the scope level." for #if.
+--ifdef outdent
+
+# Disable "Add or remove trailing comma from the last item in a collection literal."
+--disable trailingCommas
+
+# Enable "Mark unused function arguments with _." only for closure.
+--stripunusedargs closure-only
+
+# Disable "position let or var bindings within pattern."
+--patternlet inline
+
+# Ignore "Groups by _ delimiters to improve readability."
+--decimalgrouping ignore
+--binarygrouping ignore
+--octalgrouping ignore
+--hexgrouping ignore
+
+# Enable prev-line for "Wrap @attributes onto a separate line"
+--funcattributes prev-line
+--typeattributes prev-line
+--storedvarattrs prev-line
+--computedvarattrs prev-line
+--complexattrs prev-line
+--noncomplexattrs prev-line
+
+# Disable "Configure the placement of an extension's access control keyword."
+# Want to use `private extension` but don't want to use `public extension` or such,
+# which is not configurable in `swiftformat`.
+--disable extensionAccessControl
+
+# Use a separate let/var declaration on its own line for every property definition.
+--enable singlePropertyPerLine
+
+# Wraps the braces.
+--empty-braces linebreak
+--enable wrapEnumCases
+--enable wrapGuardStatementBodies
+--enable wrapMultilineFunctionChains
+
+# Insert blank line before and after MARK: comments.
+--enable blankLinesAroundMark
+
+# Never use semicolons.
+--semicolons never
+
+# Disable doc comments.
+--disable docComments
