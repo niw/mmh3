@@ -1,6 +1,7 @@
 //! Preparing the attention inputs in the pass that normalizes q and k must change nothing: every
 //! attention path has to match qk_norm_rope followed by the attention's own preparation in every
 //! bit.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::dit::layout::PackedLayout;
 use mmh3_core::dit::sparse::SparseSinks;

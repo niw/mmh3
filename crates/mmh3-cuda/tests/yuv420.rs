@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use mmh3_core::media::Yuv420;
 use mmh3_core::tensor::Tensor;
 use mmh3_cuda::DeviceBuffer;

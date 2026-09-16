@@ -1,5 +1,6 @@
 //! Applies a random LoRA to the tiny DiT on the GPU and compares it with the FP32 reference on
 //! merged weights.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;

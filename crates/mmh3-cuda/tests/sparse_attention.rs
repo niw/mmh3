@@ -1,5 +1,6 @@
 //! Compares the CUDA Sol-Attn with the f64 reference in mmh3-core on random BF16 heads in the DiT's
 //! qkv layout.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::dit::sparse::{SPARSE_BLOCK, SparseSinks, reference};
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};

@@ -3,6 +3,7 @@
 //! The driver's parser and decoder run behind `native/nvdec.cpp`, which hands every frame back as
 //! NV12 in host memory. The conversion to RGB happens here, with the colour matrix and range the
 //! stream declares, or the guess players make when it declares none.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::tensor::Tensor;
 use mmh3_input::mp4::Mp4File;

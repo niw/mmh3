@@ -1,5 +1,6 @@
 //! Compares the CUDA VSA with the f64 reference in mmh3-core on random BF16 heads in the DiT's qkv
 //! layout.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::dit::layout::PackedLayout;
 use mmh3_core::dit::vsa::{VsaPlan, reference};

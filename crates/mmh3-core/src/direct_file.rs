@@ -6,6 +6,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -17,8 +18,10 @@ pub const DIRECT_ALIGNMENT: usize = 4096;
 const O_DIRECT: i32 = 0o200000;
 #[cfg(all(target_os = "linux", not(target_arch = "aarch64")))]
 const O_DIRECT: i32 = 0o40000;
+#[cfg(target_os = "linux")]
 const POSIX_FADV_DONTNEED: i32 = 4;
 
+#[cfg(target_os = "linux")]
 unsafe extern "C" {
     fn posix_fadvise(descriptor: i32, offset: i64, length: i64, advice: i32) -> i32;
 }
@@ -30,7 +33,8 @@ pub struct DirectFile {
 
 impl DirectFile {
     /// Opens `path` for direct reads, or, where the file system refuses them, for buffered reads
-    /// that drop what they read from the page cache.
+    /// that drop what they read from the page cache on Linux. Other Unix platforms use ordinary
+    /// buffered reads without Linux's cache-discard advice.
     pub fn open(path: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -67,6 +71,7 @@ impl DirectFile {
             }
             filled += read;
         }
+        #[cfg(target_os = "linux")]
         if !self.direct {
             // SAFETY: plain advice on an open descriptor.
             unsafe {

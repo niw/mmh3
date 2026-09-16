@@ -61,7 +61,8 @@ cargo test --release --workspace --features cuda,mp4
 ```
 
 The tests run the CUDA kernels and models on small fixtures and compare them with ComfyUI's results
-and CPU references.
+and CPU references. The CUDA crates are empty off Linux, so `cargo test --workspace` needs no CUDA
+toolchain there.
 
 ## Formatting
 

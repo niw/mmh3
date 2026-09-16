@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use mmh3_core::numeric::f16_to_f32;
 use mmh3_cuda::DeviceBuffer;
 use mmh3_cuda::attention::{self, AttentionLayout, AttentionOffsets, Element, HEAD_DIM};

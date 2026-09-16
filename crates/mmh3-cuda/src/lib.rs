@@ -1,4 +1,5 @@
 //! CUDA backend. Kernels and their C ABI launchers live in `kernels/*.cu`.
+#![cfg(target_os = "linux")]
 
 pub mod attention;
 pub mod audio_encoder;

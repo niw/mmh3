@@ -1,4 +1,5 @@
 //! Check approximate attention against the BF16 kernel, including ragged tiles and scratch reuse.
+#![cfg(target_os = "linux")]
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
 use mmh3_cuda::attention::{self, AttentionInputs, HEAD_DIM, QuantizedWorkspace};

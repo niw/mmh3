@@ -1,4 +1,5 @@
 //! Requires NVIDIA NVENC, ffmpeg and ffprobe. No model weights are needed.
+#![cfg(target_os = "linux")]
 use mmh3_core::{media::Yuv420, tensor::Tensor};
 use mmh3_cuda::{DeviceBuffer, vae::CudaVideoFrames};
 use mmh3_output::{AacOutput, MediaSpec, mp4::Mp4Session};

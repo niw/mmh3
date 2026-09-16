@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use mmh3_core::numeric::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 use mmh3_cuda::DeviceBuffer;
 use mmh3_cuda::gemm::{self, Adapter, Output};

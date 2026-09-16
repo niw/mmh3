@@ -1,4 +1,5 @@
 //! NVENC H.264 adapter for MP4 output. GPU-specific ownership and native APIs stay in this crate.
+#![cfg(target_os = "linux")]
 use mmh3_cuda::{DeviceBuffer, vae::CudaVideoFrames};
 use mmh3_output::mp4::{H264Config, Sample, VideoEncoder, annex_b_sample};
 use mmh3_output::{MediaSpec, Result};

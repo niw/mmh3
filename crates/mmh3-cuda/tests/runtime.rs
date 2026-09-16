@@ -1,3 +1,4 @@
+#![cfg(target_os = "linux")]
 use mmh3_cuda::DeviceBuffer;
 
 #[test]

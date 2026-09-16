@@ -1,4 +1,5 @@
 //! Runs the CUDA DiT on the tiny golden fixture from tools/golden/dit_tiny.py.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::safetensors::SafeTensors;

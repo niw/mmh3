@@ -1,4 +1,5 @@
 //! Runs the CUDA video decoder on the tiny golden fixture from tools/golden/vae_tiny.py.
+#![cfg(target_os = "linux")]
 
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;

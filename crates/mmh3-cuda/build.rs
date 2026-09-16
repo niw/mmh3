@@ -4,6 +4,11 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
+        // The crate is empty off Linux, so the workspace builds without a CUDA toolchain.
+        return;
+    }
+
     let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_owned());
     let architecture = env::var("MMH3_CUDA_ARCH").unwrap_or_else(|_| "sm_120f".to_owned());
     let manifest_directory = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
