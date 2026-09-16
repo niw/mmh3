@@ -420,7 +420,9 @@ fn encode_pictures(
 ) -> Result<Vec<Tensor>, Box<dyn Error>> {
     use mmh3_core::dit::timestep::VIDEO_CONDITION_TIMESTEP;
     use mmh3_core::random::NormalSampler;
-    use mmh3_cuda::video_encoder::CudaVideoEncoder;
+    use mmh3_cuda::video_encoder::{
+        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
     use std::time::Instant;
 
     if pictures.is_empty() {
@@ -428,7 +430,12 @@ fn encode_pictures(
     }
     let started = Instant::now();
     let path = video_vae_path(options)?;
-    let encoder = CudaVideoEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+    let encoder = CudaVideoEncoder::load(
+        &SafeTensors::open(Path::new(&path))?,
+        Temporal::Frame,
+        DEFAULT_TILE_SIZE,
+        DEFAULT_TILE_OVERLAP_MIN,
+    )?;
     let mut noise = NormalSampler::new(seed ^ KEYFRAME_NOISE_STREAM);
     let latents = pictures
         .iter()

@@ -1,27 +1,36 @@
-//! The video VAE's encoder on the GPU, for pictures such as the keyframes of first and last frame
-//! generation.
+//! The video VAE's encoder on the GPU, for the keyframes of first and last frame generation and
+//! the reference pictures and clips of reference to video generation.
 //!
-//! The encoder is a causal 3D CNN of residual blocks with group norms, SiLU and 2× downsampling.
-//! For a single frame, every temporal kernel reduces to its last tap, since the earlier taps see
-//! the zero frames of the causal padding, so the encoder runs 2D convolutions with reflect padding.
-//! Like the reference, it encodes 256-pixel tiles of the picture on their own and blends the
-//! moments of the overlaps.
+//! The encoder is a causal 3D CNN of residual blocks with group norms, SiLU and 2× downsampling,
+//! whose group statistics are per frame. Its convolutions run as GEMMs over im2col rows, with
+//! reflect padding in space and two zero frames in front in time. For a single frame every
+//! temporal kernel reduces to its last tap, since the earlier taps read those zero frames, so a
+//! `Temporal::Frame` encoder keeps only that tap and runs 2D convolutions. Like the reference, it
+//! encodes 256-pixel tiles on their own and blends the moments of the overlaps, and a clip is
+//! encoded in groups of 17 frames that each give five latent frames.
 
 use crate::model::{Error, LinearKind};
 use crate::{CudaError, DeviceBuffer, check};
 use mmh3_core::numeric::f32_to_f16;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
-use mmh3_core::vae::{SPATIAL_RATIO, blend_encoded_tiles, split_tiles};
+use mmh3_core::vae::{
+    CHUNK_TOKENS, CLIP_LENGTH, SPATIAL_RATIO, TEMPORAL_RATIO, TOKEN_DROP, blend_encoded_tiles,
+    split_tiles,
+};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
 unsafe extern "C" {
     fn mmh3_video_encoder_tile_input(
         canvas: *const c_void,
+        canvas_frames: c_int,
+        height: c_int,
         width: c_int,
+        frame_offset: c_int,
         top: c_int,
         left: c_int,
+        frames: c_int,
         tile_height: c_int,
         tile_width: c_int,
         output: *mut c_void,
@@ -34,14 +43,19 @@ unsafe extern "C" {
         channels: c_int,
         stride: c_int,
         pad: c_int,
+        taps: c_int,
+        time_stride: c_int,
         output_height: c_int,
         output_width: c_int,
         columns: c_int,
+        row_offset: usize,
+        rows: usize,
         output: *mut c_void,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_video_encoder_group_norm_silu(
         input: *const c_void,
+        frames: c_int,
         pixels: c_int,
         channels: c_int,
         weight: *const c_void,
@@ -67,9 +81,15 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-const TILE_SIZE: usize = 256;
-const TILE_OVERLAP_MIN: usize = 64;
+pub const DEFAULT_TILE_SIZE: usize = 256;
+pub const DEFAULT_TILE_OVERLAP_MIN: usize = 64;
 const GROUPS: usize = 32;
+/// Temporal stride of each downsampling level of the released encoder. Their product is the
+/// latent's frames per token.
+const TIME_STRIDES: [usize; 4] = [1, 2, 2, 1];
+/// Bytes of im2col columns a convolution builds at a time, so that buffer does not grow with the
+/// frames of a clip.
+const COLUMN_SLICE_BYTES: usize = 256 << 20;
 const NORM_EPSILON: f32 = 1e-6;
 /// Latent channels. The encoder writes twice as many moments, the mean and the log variance.
 pub const LATENT_CHANNELS: usize = 24;
@@ -88,39 +108,67 @@ fn load(file: &SafeTensors, name: &str) -> Result<Tensor, Error> {
     Tensor::load(file, info).map_err(Error::Model)
 }
 
-/// A convolution as a GEMM: FP16 weights `[outputs, columns]` with the columns ordered (ky, kx,
-/// input channel) for 3 × 3 kernels and padded with zeros to a multiple of 8.
+/// What an encoder keeps of the temporal kernels, which decides what it can encode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Temporal {
+    /// A single frame, where the causal padding leaves only the last tap.
+    Frame,
+    /// A clip, with every tap and the two zero frames in front.
+    Clip,
+}
+
+impl Temporal {
+    fn taps(self) -> usize {
+        match self {
+            Temporal::Frame => 1,
+            Temporal::Clip => 3,
+        }
+    }
+}
+
+/// A convolution as a GEMM: FP16 weights `[outputs, columns]` with the columns ordered (kt, ky,
+/// kx, input channel) for 3 × 3 kernels and padded with zeros to a multiple of 8.
 struct Convolution {
     weight: DeviceBuffer,
     bias: DeviceBuffer,
     inputs: usize,
     outputs: usize,
     kernel: usize,
+    taps: usize,
     columns: usize,
 }
 
 impl Convolution {
-    /// Loads a Conv3d `[outputs, inputs, t, k, k]` and keeps its last temporal tap.
-    fn load(file: &SafeTensors, name: &str) -> Result<Self, Error> {
+    /// Loads a Conv3d `[outputs, inputs, t, k, k]` and keeps its last `taps` temporal taps.
+    fn load(file: &SafeTensors, name: &str, taps: usize) -> Result<Self, Error> {
         let weight = load(file, &format!("{name}.weight"))?;
         let bias = load(file, &format!("{name}.bias"))?;
-        let [outputs, inputs, taps, kernel, width] = weight.shape[..] else {
+        let [outputs, inputs, kernel_taps, kernel, width] = weight.shape[..] else {
             return Err(Error::Model(format!("{name} is not a Conv3d")));
         };
         if kernel != width || (kernel != 1 && kernel != 3) {
             return Err(Error::Model(format!("{name}: unsupported kernel {kernel}")));
         }
-        let columns = (inputs * kernel * kernel).next_multiple_of(8);
+        // A pointwise shortcut spans one frame however much the rest of the encoder keeps.
+        let taps = taps.min(kernel_taps);
+        let columns = (inputs * taps * kernel * kernel).next_multiple_of(8);
         let mut reordered = vec![0.0f32; outputs * columns];
         for output in 0..outputs {
             for input in 0..inputs {
-                for y in 0..kernel {
-                    for x in 0..kernel {
-                        let source = (((output * inputs + input) * taps + taps - 1) * kernel + y)
-                            * kernel
-                            + x;
-                        reordered[output * columns + (y * kernel + x) * inputs + input] =
-                            weight.data[source];
+                for tap in 0..taps {
+                    for y in 0..kernel {
+                        for x in 0..kernel {
+                            // The taps kept are the last ones, the earlier ones reading the zero
+                            // frames of the causal padding.
+                            let source_tap = kernel_taps - taps + tap;
+                            let source = (((output * inputs + input) * kernel_taps + source_tap)
+                                * kernel
+                                + y)
+                                * kernel
+                                + x;
+                            let column = ((tap * kernel + y) * kernel + x) * inputs + input;
+                            reordered[output * columns + column] = weight.data[source];
+                        }
                     }
                 }
             }
@@ -131,6 +179,7 @@ impl Convolution {
             inputs,
             outputs,
             kernel,
+            taps,
             columns,
         })
     }
@@ -166,24 +215,27 @@ struct Level {
     downsample: Option<Convolution>,
 }
 
-/// FP16 activations `[height, width, channels]`.
+/// FP16 activations `[frames, height, width, channels]`.
 struct Activation {
     buffer: DeviceBuffer,
+    frames: usize,
     height: usize,
     width: usize,
     channels: usize,
 }
 
 impl Activation {
-    fn new(height: usize, width: usize, channels: usize) -> Result<Self, CudaError> {
+    fn new(frames: usize, height: usize, width: usize, channels: usize) -> Result<Self, CudaError> {
         Ok(Activation {
-            buffer: DeviceBuffer::new(height * width * channels * 2)?,
+            buffer: DeviceBuffer::new(frames * height * width * channels * 2)?,
+            frames,
             height,
             width,
             channels,
         })
     }
 
+    /// Pixels of one frame.
     fn pixels(&self) -> usize {
         self.height * self.width
     }
@@ -196,7 +248,7 @@ struct Scratch {
     statistics: DeviceBuffer,
 }
 
-/// The diagonal Gaussian the encoder gives a picture, in the VAE's raw latent units.
+/// The diagonal Gaussian the encoder gives a picture or a clip, in the VAE's raw latent units.
 pub struct Posterior {
     pub mean: Tensor,
     pub deviation: Tensor,
@@ -244,12 +296,22 @@ pub struct CudaVideoEncoder {
     quant: Convolution,
     latents_mean: Vec<f32>,
     latents_std: Vec<f32>,
+    temporal: Temporal,
+    tile_size: usize,
+    tile_overlap_min: usize,
 }
 
 impl CudaVideoEncoder {
     /// Loads the encoder of a video VAE checkpoint: `encoder.*`, `quant_conv` and the latent
-    /// statistics.
-    pub fn load(file: &SafeTensors) -> Result<Self, Error> {
+    /// statistics. `temporal` decides whether it encodes single frames or clips, and the tile
+    /// geometry is the reference's with `DEFAULT_TILE_SIZE` and `DEFAULT_TILE_OVERLAP_MIN`.
+    pub fn load(
+        file: &SafeTensors,
+        temporal: Temporal,
+        tile_size: usize,
+        tile_overlap_min: usize,
+    ) -> Result<Self, Error> {
+        let taps = temporal.taps();
         let mut levels = Vec::new();
         for level in 0.. {
             let prefix = format!("encoder.down.{level}");
@@ -267,29 +329,32 @@ impl CudaVideoEncoder {
                 }
                 blocks.push(ResnetBlock {
                     norm1: GroupNorm::load(file, &format!("{name}.norm1"))?,
-                    conv1: Convolution::load(file, &format!("{name}.conv1"))?,
+                    conv1: Convolution::load(file, &format!("{name}.conv1"), taps)?,
                     norm2: GroupNorm::load(file, &format!("{name}.norm2"))?,
-                    conv2: Convolution::load(file, &format!("{name}.conv2"))?,
+                    conv2: Convolution::load(file, &format!("{name}.conv2"), taps)?,
                     shortcut: file
                         .get(&format!("{name}.nin_shortcut.weight"))
-                        .map(|_| Convolution::load(file, &format!("{name}.nin_shortcut")))
+                        .map(|_| Convolution::load(file, &format!("{name}.nin_shortcut"), taps))
                         .transpose()?,
                 });
             }
             let downsample = file
                 .get(&format!("{prefix}.downsample.conv.weight"))
-                .map(|_| Convolution::load(file, &format!("{prefix}.downsample.conv")))
+                .map(|_| Convolution::load(file, &format!("{prefix}.downsample.conv"), taps))
                 .transpose()?;
             levels.push(Level { blocks, downsample });
         }
         let encoder = CudaVideoEncoder {
-            input: Convolution::load(file, "encoder.conv_in")?,
+            input: Convolution::load(file, "encoder.conv_in", taps)?,
             levels,
             output_norm: GroupNorm::load(file, "encoder.norm_out")?,
-            output: Convolution::load(file, "encoder.conv_out")?,
-            quant: Convolution::load(file, "quant_conv")?,
+            output: Convolution::load(file, "encoder.conv_out", taps)?,
+            quant: Convolution::load(file, "quant_conv", taps)?,
             latents_mean: load(file, "latents_mean")?.data,
             latents_std: load(file, "latents_std")?.data,
+            temporal,
+            tile_size,
+            tile_overlap_min,
         };
         let downsamples = encoder
             .levels
@@ -297,6 +362,8 @@ impl CudaVideoEncoder {
             .filter(|level| level.downsample.is_some())
             .count();
         if 1 << downsamples != SPATIAL_RATIO
+            || downsamples != TIME_STRIDES.len()
+            || TIME_STRIDES.iter().product::<usize>() != TEMPORAL_RATIO
             || encoder.quant.outputs != 2 * LATENT_CHANNELS
             || encoder.latents_mean.len() != LATENT_CHANNELS
         {
@@ -305,54 +372,134 @@ impl CudaVideoEncoder {
         Ok(encoder)
     }
 
+    /// The temporal stride of each downsampling level, in the order the levels run.
+    fn time_strides(&self) -> impl Iterator<Item = usize> {
+        TIME_STRIDES.into_iter()
+    }
+
     /// Encodes a picture `[height, width, 3]` in [0, 1], height and width multiples of 16, into
     /// its latent posterior `[channels, 1, height / 16, width / 16]`.
     pub fn encode_picture(&self, picture: &Tensor) -> Result<Posterior, Error> {
         let [height, width, 3] = picture.shape[..] else {
             return Err(Error::Model("a picture is [height, width, 3]".to_owned()));
         };
+        if self.temporal != Temporal::Frame {
+            return Err(Error::Model(
+                "this encoder keeps the temporal taps of a clip".to_owned(),
+            ));
+        }
+        self.encode(&picture.data, 1, height, width)
+    }
+
+    /// Encodes a clip `[frames, height, width, 3]` in [0, 1], height and width multiples of 16,
+    /// into its latent posterior `[channels, latent frames, height / 16, width / 16]`.
+    pub fn encode_clip(&self, clip: &Tensor) -> Result<Posterior, Error> {
+        let [frames, height, width, 3] = clip.shape[..] else {
+            return Err(Error::Model(
+                "a clip is [frames, height, width, 3]".to_owned(),
+            ));
+        };
+        if self.temporal != Temporal::Clip {
+            return Err(Error::Model(
+                "this encoder keeps only the last temporal tap".to_owned(),
+            ));
+        }
+        self.encode(&clip.data, frames, height, width)
+    }
+
+    /// Latent frames a clip of `frames` frames gives: five per group of seventeen, less the three
+    /// the reference drops from the end of the run.
+    pub fn latent_frames(frames: usize) -> usize {
+        frames.div_ceil(CLIP_LENGTH) * CHUNK_TOKENS - TOKEN_DROP
+    }
+
+    /// The posterior of `frames` frames of pixels in [0, 1], tile by tile and clip by clip.
+    fn encode(
+        &self,
+        pixels: &[f32],
+        frames: usize,
+        height: usize,
+        width: usize,
+    ) -> Result<Posterior, Error> {
         if !height.is_multiple_of(SPATIAL_RATIO) || !width.is_multiple_of(SPATIAL_RATIO) {
             return Err(Error::Model(format!(
-                "picture {width}×{height} is not a multiple of {SPATIAL_RATIO}"
+                "{width}×{height} is not a multiple of {SPATIAL_RATIO}"
             )));
         }
-        let canvas = DeviceBuffer::from_f32(&picture.data)?;
-        let rows = split_tiles(height, TILE_SIZE, TILE_OVERLAP_MIN);
-        let columns = split_tiles(width, TILE_SIZE, TILE_OVERLAP_MIN);
-        let (tile_height, tile_width) = (rows.length, columns.length);
-        let scratch = self.scratch(tile_height, tile_width)?;
-        let mut tiles = Vec::new();
-        for &top in &rows.starts {
-            for &left in &columns.starts {
-                tiles.push(self.encode_tile(
-                    &canvas,
-                    width,
-                    top,
-                    left,
-                    tile_height,
-                    tile_width,
-                    &scratch,
-                )?);
-            }
+        if frames == 0 || pixels.len() != frames * height * width * 3 {
+            return Err(Error::Model(format!(
+                "{} values are not {frames} frames of {width}×{height} pixels",
+                pixels.len()
+            )));
         }
-        let moments = blend_encoded_tiles(&tiles, &rows, &columns, 2 * LATENT_CHANNELS);
+        let canvas = DeviceBuffer::from_f32(pixels)?;
+        let rows = split_tiles(height, self.tile_size, self.tile_overlap_min);
+        let columns = split_tiles(width, self.tile_size, self.tile_overlap_min);
+        let (tile_height, tile_width) = (rows.length, columns.length);
+        // A single frame is its own clip and keeps its one latent frame. A clip runs in groups of
+        // seventeen frames, the last padded by repeating its last frame, and drops the tokens the
+        // reference drops from the end.
+        let (clip_frames, tokens, dropped) = match self.temporal {
+            Temporal::Frame => (1, 1, 0),
+            Temporal::Clip => (CLIP_LENGTH, CHUNK_TOKENS, TOKEN_DROP),
+        };
+        let clips = frames.div_ceil(clip_frames);
+        let latent_frames = clips * tokens - dropped;
+        if latent_frames == 0 {
+            return Err(Error::Model(format!(
+                "{frames} frames give no latent frames"
+            )));
+        }
+        let scratch = self.scratch(clip_frames, tile_height, tile_width)?;
+        let tile_latent_pixels = (tile_height / SPATIAL_RATIO) * (tile_width / SPATIAL_RATIO);
         let (latent_height, latent_width) = (height / SPATIAL_RATIO, width / SPATIAL_RATIO);
         let plane = latent_height * latent_width;
-        let mut mean = vec![0.0; LATENT_CHANNELS * plane];
-        let mut deviation = vec![0.0; LATENT_CHANNELS * plane];
-        for (pixel, values) in moments
-            .as_chunks::<{ 2 * LATENT_CHANNELS }>()
-            .0
-            .iter()
-            .enumerate()
-        {
-            for channel in 0..LATENT_CHANNELS {
-                mean[channel * plane + pixel] = values[channel];
-                deviation[channel * plane + pixel] =
-                    (0.5 * values[LATENT_CHANNELS + channel].clamp(-30.0, 20.0)).exp();
+        let mut mean = vec![0.0; LATENT_CHANNELS * latent_frames * plane];
+        let mut deviation = vec![0.0; LATENT_CHANNELS * latent_frames * plane];
+        for clip in 0..clips {
+            let tiles = rows
+                .starts
+                .iter()
+                .flat_map(|&top| columns.starts.iter().map(move |&left| (top, left)))
+                .map(|(top, left)| {
+                    self.encode_tile(
+                        &canvas,
+                        [frames, height, width],
+                        [clip * clip_frames, clip_frames],
+                        [top, left, tile_height, tile_width],
+                        &scratch,
+                    )
+                })
+                .collect::<Result<Vec<_>, Error>>()?;
+            for token in 0..tokens {
+                let latent_frame = clip * tokens + token;
+                if latent_frame >= latent_frames {
+                    break;
+                }
+                let frame: Vec<&[f32]> = tiles
+                    .iter()
+                    .map(|tile| {
+                        let values = tile_latent_pixels * 2 * LATENT_CHANNELS;
+                        &tile[token * values..][..values]
+                    })
+                    .collect();
+                let moments = blend_encoded_tiles(&frame, &rows, &columns, 2 * LATENT_CHANNELS);
+                for (pixel, values) in moments
+                    .as_chunks::<{ 2 * LATENT_CHANNELS }>()
+                    .0
+                    .iter()
+                    .enumerate()
+                {
+                    for channel in 0..LATENT_CHANNELS {
+                        let index = (channel * latent_frames + latent_frame) * plane + pixel;
+                        mean[index] = values[channel];
+                        deviation[index] =
+                            (0.5 * values[LATENT_CHANNELS + channel].clamp(-30.0, 20.0)).exp();
+                    }
+                }
             }
         }
-        let shape = vec![LATENT_CHANNELS, 1, latent_height, latent_width];
+        let shape = vec![LATENT_CHANNELS, latent_frames, latent_height, latent_width];
         Ok(Posterior {
             mean: Tensor::new(shape.clone(), mean),
             deviation: Tensor::new(shape, deviation),
@@ -361,68 +508,87 @@ impl CudaVideoEncoder {
         })
     }
 
-    fn scratch(&self, height: usize, width: usize) -> Result<Scratch, CudaError> {
-        // The widest im2col rows come at full resolution or after a downsampling.
-        let mut columns = self.input.columns * height * width;
-        let (mut level_height, mut level_width) = (height, width);
+    fn scratch(&self, frames: usize, height: usize, width: usize) -> Result<Scratch, CudaError> {
+        // The widest im2col rows come at full resolution or after a downsampling, and their
+        // columns are built in slices, so that buffer does not grow with the frames.
+        let slice = |convolution: &Convolution, rows: usize| {
+            let slice_rows = (COLUMN_SLICE_BYTES / (convolution.columns * 2)).max(1);
+            slice_rows.min(rows) * convolution.columns
+        };
+        let (mut level_frames, mut level_height, mut level_width) = (frames, height, width);
+        let mut columns = slice(&self.input, level_frames * level_height * level_width);
+        let mut strides = self.time_strides();
         for level in &self.levels {
+            let rows = level_frames * level_height * level_width;
             for block in &level.blocks {
                 columns = columns
-                    .max(block.conv1.columns * level_height * level_width)
-                    .max(block.conv2.columns * level_height * level_width);
+                    .max(slice(&block.conv1, rows))
+                    .max(slice(&block.conv2, rows));
             }
             if let Some(downsample) = &level.downsample {
+                let time_stride = strides.next().unwrap_or(1);
+                level_frames = (level_frames - 1) / time_stride + 1;
                 level_height /= 2;
                 level_width /= 2;
-                columns = columns.max(downsample.columns * level_height * level_width);
+                columns = columns.max(slice(downsample, level_frames * level_height * level_width));
             }
         }
-        columns = columns.max(self.output.columns * level_height * level_width);
+        columns = columns.max(slice(
+            &self.output,
+            level_frames * level_height * level_width,
+        ));
+        let partials = frames * (height * width).div_ceil(256) * GROUPS * 2;
         Ok(Scratch {
             columns: DeviceBuffer::new(columns * 2)?,
-            partials: DeviceBuffer::new((height * width).div_ceil(256) * GROUPS * 2 * 4)?,
-            statistics: DeviceBuffer::new(GROUPS * 2 * 4)?,
+            partials: DeviceBuffer::new(partials * 4)?,
+            statistics: DeviceBuffer::new(frames * GROUPS * 2 * 4)?,
         })
     }
 
-    /// The moments `[latent pixels, 48]` of one tile.
-    #[allow(clippy::too_many_arguments)]
+    /// The moments `[latent frames, tile latent pixels, 48]` of one tile of one clip. `canvas`
+    /// gives the frames, height and width of the whole input, `clip` its first frame and its
+    /// frames, and `tile` the tile's top, left, height and width.
     fn encode_tile(
         &self,
         canvas: &DeviceBuffer,
-        width: usize,
-        top: usize,
-        left: usize,
-        tile_height: usize,
-        tile_width: usize,
+        [canvas_frames, height, width]: [usize; 3],
+        [frame_offset, frames]: [usize; 2],
+        [top, left, tile_height, tile_width]: [usize; 4],
         scratch: &Scratch,
     ) -> Result<Vec<f32>, Error> {
-        let pixels = Activation::new(tile_height, tile_width, 3)?;
-        // SAFETY: the canvas holds the tile and the activation `tile_height × tile_width × 3`.
+        let pixels = Activation::new(frames, tile_height, tile_width, 3)?;
+        // SAFETY: the canvas holds its frames of the tile and the activation
+        // `frames × tile_height × tile_width × 3`.
         check(unsafe {
             mmh3_video_encoder_tile_input(
                 canvas.pointer(),
+                canvas_frames as c_int,
+                height as c_int,
                 width as c_int,
+                frame_offset as c_int,
                 top as c_int,
                 left as c_int,
+                frames as c_int,
                 tile_height as c_int,
                 tile_width as c_int,
                 pixels.buffer.pointer(),
                 ptr::null_mut(),
             )
         })?;
-        let mut hidden = self.convolve(&self.input, &pixels, 1, None, scratch)?;
+        let mut hidden = self.convolve(&self.input, &pixels, 1, 1, None, scratch)?;
+        let mut strides = self.time_strides();
         for level in &self.levels {
             for block in &level.blocks {
                 hidden = self.resnet_block(block, &hidden, scratch)?;
             }
             if let Some(downsample) = &level.downsample {
-                hidden = self.convolve(downsample, &hidden, 2, None, scratch)?;
+                let time_stride = strides.next().unwrap_or(1);
+                hidden = self.convolve(downsample, &hidden, 2, time_stride, None, scratch)?;
             }
         }
         let normalized = self.group_norm_silu(&self.output_norm, &hidden, scratch)?;
-        let output = self.convolve(&self.output, &normalized, 1, None, scratch)?;
-        let moments = self.convolve(&self.quant, &output, 1, None, scratch)?;
+        let output = self.convolve(&self.output, &normalized, 1, 1, None, scratch)?;
+        let moments = self.convolve(&self.quant, &output, 1, 1, None, scratch)?;
         let mut bytes = vec![0u8; moments.buffer.bytes()];
         moments.buffer.copy_to_host(&mut bytes)?;
         Ok(bytes
@@ -440,13 +606,14 @@ impl CudaVideoEncoder {
         scratch: &Scratch,
     ) -> Result<Activation, Error> {
         let normalized = self.group_norm_silu(&block.norm1, input, scratch)?;
-        let hidden = self.convolve(&block.conv1, &normalized, 1, None, scratch)?;
+        let hidden = self.convolve(&block.conv1, &normalized, 1, 1, None, scratch)?;
         let normalized = self.group_norm_silu(&block.norm2, &hidden, scratch)?;
         // The second convolution adds onto the shortcut.
         let residual = match &block.shortcut {
-            Some(shortcut) => self.convolve(shortcut, input, 1, None, scratch)?,
+            Some(shortcut) => self.convolve(shortcut, input, 1, 1, None, scratch)?,
             None => {
-                let copy = Activation::new(input.height, input.width, input.channels)?;
+                let copy =
+                    Activation::new(input.frames, input.height, input.width, input.channels)?;
                 // SAFETY: both buffers hold the same number of bytes.
                 unsafe {
                     crate::copy_device(
@@ -458,7 +625,7 @@ impl CudaVideoEncoder {
                 copy
             }
         };
-        self.convolve(&block.conv2, &normalized, 1, Some(residual), scratch)
+        self.convolve(&block.conv2, &normalized, 1, 1, Some(residual), scratch)
     }
 
     fn group_norm_silu(
@@ -467,12 +634,13 @@ impl CudaVideoEncoder {
         input: &Activation,
         scratch: &Scratch,
     ) -> Result<Activation, Error> {
-        let output = Activation::new(input.height, input.width, input.channels)?;
-        // SAFETY: input and output hold `pixels × channels` values, and the scratch buffers were
-        // sized for the tile's pixels.
+        let output = Activation::new(input.frames, input.height, input.width, input.channels)?;
+        // SAFETY: input and output hold `frames × pixels × channels` values, and the scratch
+        // buffers were sized for the frames and pixels of a tile.
         check(unsafe {
             mmh3_video_encoder_group_norm_silu(
                 input.buffer.pointer(),
+                input.frames as c_int,
                 input.pixels() as c_int,
                 input.channels as c_int,
                 norm.weight.pointer(),
@@ -487,14 +655,16 @@ impl CudaVideoEncoder {
         Ok(output)
     }
 
-    /// Applies a convolution with `stride`: a 3 × 3 kernel reflect-pads one pixel on each side at
-    /// stride 1, and one pixel after the input at stride 2. With `accumulate`, the result adds onto
+    /// Applies a convolution with `stride` in space and `time_stride` in time: a 3 × 3 kernel
+    /// reflect-pads one pixel on each side at stride 1, and one pixel after the input at stride 2,
+    /// while the temporal taps read zeros before the clip. With `accumulate`, the result adds onto
     /// that activation.
     fn convolve(
         &self,
         convolution: &Convolution,
         input: &Activation,
         stride: usize,
+        time_stride: usize,
         accumulate: Option<Activation>,
         scratch: &Scratch,
     ) -> Result<Activation, Error> {
@@ -502,18 +672,53 @@ impl CudaVideoEncoder {
             return Err(Error::Model("convolution inputs do not match".to_owned()));
         }
         let (height, width) = (input.height / stride, input.width / stride);
+        // The causal padding covers the taps, so the frames only follow the temporal stride.
+        let frames = (input.frames - 1) / time_stride + 1;
         let beta = if accumulate.is_some() { 1.0 } else { 0.0 };
         let output = match accumulate {
             Some(activation) => activation,
-            None => Activation::new(height, width, convolution.outputs)?,
+            None => Activation::new(frames, height, width, convolution.outputs)?,
         };
-        let rows = height * width;
-        let operand = if convolution.kernel == 3 {
-            assert!(
-                scratch.columns.bytes() >= rows * convolution.columns * 2,
-                "the im2col buffer is too small"
+        let rows = frames * height * width;
+        let matmul = |operand: *const c_void, first: usize, count: usize| {
+            // SAFETY: the operand holds `count × columns` values, the weight `outputs × columns`
+            // and the output `count × outputs` rows from `first`.
+            check(unsafe {
+                mmh3_cublaslt_matmul(
+                    LinearKind::F16 as c_int,
+                    operand,
+                    convolution.weight.pointer(),
+                    convolution.bias.pointer(),
+                    output.buffer.pointer_at(first * convolution.outputs * 2),
+                    count as i64,
+                    convolution.outputs as i64,
+                    convolution.columns as i64,
+                    1.0,
+                    beta,
+                    ptr::null_mut(),
+                )
+            })
+        };
+        if convolution.kernel == 1 {
+            assert_eq!(
+                convolution.columns, input.channels,
+                "a 1 × 1 convolution reads the activation rows as they are"
             );
-            // SAFETY: the input holds its pixels and the scratch buffer the rows, checked above.
+            matmul(input.buffer.pointer().cast_const(), 0, rows)?;
+            return Ok(output);
+        }
+        // The columns of every row at once would be `taps × 9` times the activation, so they are
+        // built for a slice of the rows at a time.
+        let slice = (COLUMN_SLICE_BYTES / (convolution.columns * 2)).max(1);
+        assert!(
+            scratch.columns.bytes() >= slice.min(rows) * convolution.columns * 2,
+            "the im2col buffer is too small"
+        );
+        let mut first = 0;
+        while first < rows {
+            let count = slice.min(rows - first);
+            // SAFETY: the input holds its frames and pixels and the scratch buffer the slice's
+            // rows, checked above.
             check(unsafe {
                 mmh3_video_encoder_im2col(
                     input.buffer.pointer(),
@@ -522,38 +727,20 @@ impl CudaVideoEncoder {
                     input.channels as c_int,
                     stride as c_int,
                     if stride == 1 { 1 } else { 0 },
+                    convolution.taps as c_int,
+                    time_stride as c_int,
                     height as c_int,
                     width as c_int,
                     convolution.columns as c_int,
+                    first,
+                    count,
                     scratch.columns.pointer(),
                     ptr::null_mut(),
                 )
             })?;
-            scratch.columns.pointer().cast_const()
-        } else {
-            assert_eq!(
-                convolution.columns, input.channels,
-                "a 1 × 1 convolution reads the activation rows as they are"
-            );
-            input.buffer.pointer().cast_const()
-        };
-        // SAFETY: the operand holds `rows × columns` values, the weight `outputs × columns` and
-        // the output `rows × outputs`.
-        check(unsafe {
-            mmh3_cublaslt_matmul(
-                LinearKind::F16 as c_int,
-                operand,
-                convolution.weight.pointer(),
-                convolution.bias.pointer(),
-                output.buffer.pointer(),
-                rows as i64,
-                convolution.outputs as i64,
-                convolution.columns as i64,
-                1.0,
-                beta,
-                ptr::null_mut(),
-            )
-        })?;
+            matmul(scratch.columns.pointer().cast_const(), first, count)?;
+            first += count;
+        }
         Ok(output)
     }
 }

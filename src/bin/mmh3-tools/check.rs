@@ -425,7 +425,9 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 /// and compares the latents with ComfyUI's, or with those of `--reference`, a file of the same
 /// tensors.
 fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    use mmh3_cuda::video_encoder::CudaVideoEncoder;
+    use mmh3_cuda::video_encoder::{
+        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
     use std::time::Instant;
 
     let options = parse_options(
@@ -458,7 +460,12 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
 
     let started = Instant::now();
-    let encoder = CudaVideoEncoder::load(&SafeTensors::open(Path::new(&weights_path))?)?;
+    let encoder = CudaVideoEncoder::load(
+        &SafeTensors::open(Path::new(&weights_path))?,
+        Temporal::Frame,
+        DEFAULT_TILE_SIZE,
+        DEFAULT_TILE_OVERLAP_MIN,
+    )?;
     println!(
         "loaded the encoder of {weights_path} in {:.1} s",
         started.elapsed().as_secs_f64()

@@ -8,10 +8,10 @@
 pub const SPATIAL_RATIO: usize = 16;
 /// Frames per latent position along time.
 pub const TEMPORAL_RATIO: usize = 4;
-/// Frames the encoder consumed per clip.
-const CLIP_LENGTH: usize = 17;
-/// Latent frames the encoder dropped from the end.
-const TOKEN_DROP: usize = 3;
+/// Frames the encoder consumes per clip.
+pub const CLIP_LENGTH: usize = 17;
+/// Latent frames the encoder drops from the end of a run.
+pub const TOKEN_DROP: usize = 3;
 /// Latent frames that start each chunk: ceil(CLIP_LENGTH / TEMPORAL_RATIO).
 pub const CHUNK_TOKENS: usize = CLIP_LENGTH.div_ceil(TEMPORAL_RATIO);
 /// Extra latent frames each chunk decodes past its start.
@@ -70,7 +70,7 @@ pub fn split_tiles(length: usize, tile_size: usize, overlap_min: usize) -> TileA
 /// linearly with the unblended tile above over their overlap, then with the unblended tile to its
 /// left, and keeps its rows and columns up to the next tile.
 pub fn blend_encoded_tiles(
-    tiles: &[Vec<f32>],
+    tiles: &[&[f32]],
     rows: &TileAxis,
     columns: &TileAxis,
     channels: usize,
@@ -85,10 +85,10 @@ pub fn blend_encoded_tiles(
     let mut output = vec![0.0f32; height * width * channels];
     for (row, &top) in rows.starts.iter().enumerate() {
         for (column, &left) in columns.starts.iter().enumerate() {
-            let tile = &tiles[row * columns.starts.len() + column];
-            let mut blended = tile.clone();
+            let tile = tiles[row * columns.starts.len() + column];
+            let mut blended = tile.to_vec();
             if row > 0 {
-                let above = &tiles[(row - 1) * columns.starts.len() + column];
+                let above = tiles[(row - 1) * columns.starts.len() + column];
                 let extent = (rows.overlaps[row - 1] / SPATIAL_RATIO).min(tile_height);
                 for y in 0..extent {
                     let weight = y as f32 / extent as f32;
@@ -102,7 +102,7 @@ pub fn blend_encoded_tiles(
                 }
             }
             if column > 0 {
-                let left_tile = &tiles[row * columns.starts.len() + column - 1];
+                let left_tile = tiles[row * columns.starts.len() + column - 1];
                 let extent = (columns.overlaps[column - 1] / SPATIAL_RATIO).min(tile_width);
                 let vertical = blended.clone();
                 for y in 0..tile_height {
@@ -250,7 +250,8 @@ mod tests {
             (vec![0, 192], vec![64])
         );
         let tile = |value: f32| vec![value; 16 * 16];
-        let blended = blend_encoded_tiles(&[tile(1.0), tile(3.0)], &rows, &columns, 1);
+        let (first, second) = (tile(1.0), tile(3.0));
+        let blended = blend_encoded_tiles(&[&first, &second], &rows, &columns, 1);
         assert_eq!(blended.len(), 16 * 28);
         let row: Vec<f32> = blended[..28].to_vec();
         assert_eq!(&row[..12], &[1.0; 12]);
