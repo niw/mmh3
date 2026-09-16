@@ -4,12 +4,15 @@
 
 use crate::audio::load_audio;
 use crate::cli::{option_float, option_number, option_values};
+#[cfg(feature = "cuda")]
+use crate::models::{AUDIO_VAE_FILE, save_algorithm_cache, video_vae_path};
 use crate::models::{
-    AUDIO_VAE_FILE, DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path,
-    save_algorithm_cache, sparse_attention, video_vae_path,
+    DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path, sparse_attention,
 };
 use crate::pictures::load_picture;
-use crate::video::{ReferenceClip, block_frames, block_seconds, load_clip};
+use crate::video::{ReferenceClip, block_seconds};
+#[cfg(feature = "cuda")]
+use crate::video::{block_frames, load_clip};
 use mmh3_core::dit::sampler::Schedule;
 use mmh3_core::generation::GenerationShape;
 use mmh3_core::safetensors::SafeTensors;
@@ -55,9 +58,11 @@ pub const OPTIONS: &[&str] = &[
 
 /// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
 /// as the reference pipeline fixes it.
+#[cfg(feature = "cuda")]
 const KEYFRAME_POSTERIOR_SEED: u64 = 42;
 /// Mixed into the seed for the noise of keyframes and reference pictures, which comes from its own
 /// stream so that a seed keeps the target noise it has without them.
+#[cfg(feature = "cuda")]
 const KEYFRAME_NOISE_STREAM: u64 = 0x6b65_7966_7261_6d65;
 /// The most reference pictures the official pipeline takes.
 const MAX_REFERENCE_PICTURES: usize = 9;
@@ -66,6 +71,7 @@ const MAX_REFERENCE_SOUNDS: usize = 3;
 /// The most reference clips the official pipeline takes.
 const MAX_REFERENCE_CLIPS: usize = 3;
 /// Mixed into the seed for the noise of reference clips, so that they take their own stream.
+#[cfg(feature = "cuda")]
 const CLIP_NOISE_STREAM: u64 = 0x636c_6970_6e6f_6973;
 
 /// A picture that a frame of the generation starts from or reaches, fitted to the canvas.
@@ -98,6 +104,8 @@ impl Settings {
         options: &HashMap<&str, &str>,
         arguments: &[String],
     ) -> Result<Self, Box<dyn Error>> {
+        #[cfg(feature = "metal")]
+        crate::metal::validate_options(options)?;
         let shift_video = option_float(options, "shift-video", 12.0)?;
         let shift_audio = option_float(options, "shift-audio", 3.0)?;
         let schedule = match options.get("schedule").copied().unwrap_or("uniform") {
@@ -175,10 +183,13 @@ impl Settings {
         };
         let shape = GenerationShape::new(width, height, option_number(options, "frames", 124)?)?;
         // A clip is never longer than the video it is a reference for.
+        #[cfg(feature = "cuda")]
         let clips = files
             .into_iter()
             .map(|path| load_clip(Path::new(path), shape.frames))
             .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(feature = "metal")]
+        let clips: Vec<ReferenceClip> = Vec::new();
         // The first picture stretches to the canvas and the other covers it, as the reference
         // pipeline fits them.
         let keyframes = pictures
@@ -228,8 +239,11 @@ pub fn sample(
     use mmh3_core::generation::FPS;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tokenizer::Tokenizer;
-    use mmh3_core::vision::{PromptReference, VisionGrid, vision_prompt};
-    use mmh3_cuda::text_encoder::CudaTextEncoder;
+    use mmh3_core::vision::{PromptReference, VisionGrid};
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::text_encoder::CudaTextEncoder as TextEncoder;
+    #[cfg(feature = "metal")]
+    use mmh3_metal::text_encoder::MetalTextEncoder as TextEncoder;
     use std::time::Instant;
 
     let prompt = match (options.get("prompt"), options.get("prompt-file")) {
@@ -246,13 +260,15 @@ pub fn sample(
         .chain(&settings.references)
         .map(|picture| picture.to_tensor())
         .collect();
-    // The pictures come first, then the clips with their soundtracks, then the standalone
-    // sounds, the order of the official presentation.
+    #[cfg(feature = "cuda")]
     let clip_blocks: Vec<Vec<Tensor>> = settings
         .clips
         .iter()
         .map(|clip| block_frames(&clip.frames, FPS))
         .collect();
+
+    // The pictures come first, then the clips with their soundtracks, then the standalone
+    // sounds, the order of the official presentation.
     let mut prompt_references: Vec<PromptReference> = pictures
         .iter()
         .map(|picture| {
@@ -269,38 +285,46 @@ pub fn sample(
         });
     }
     prompt_references.extend(settings.sounds.iter().map(|_| PromptReference::Sound));
+
+    #[allow(unused_mut)]
     let mut context_modalities = Vec::new();
     let context = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
             let started = Instant::now();
             let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
             let file = SafeTensors::open(Path::new(&path))?;
-            let encoder = CudaTextEncoder::load(&file)?;
+            let encoder = TextEncoder::load(&file)?;
             let context = if prompt_references.is_empty() {
                 let ids = Tokenizer::h3().encode(&prompt);
                 encoder.encode(&ids, &[])?.context
             } else {
-                use mmh3_cuda::vision::CudaVisionEncoder;
+                #[cfg(feature = "metal")]
+                return Err("picture and sound prompts are not implemented on Metal yet".into());
+                #[cfg(feature = "cuda")]
+                {
+                    use mmh3_core::vision::vision_prompt;
+                    use mmh3_cuda::vision::CudaVisionEncoder;
 
-                // One embedding per vision block: the pictures, then the pairs of every clip.
-                let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
-                    Vec::new()
-                } else {
-                    let vision = CudaVisionEncoder::load(&file)?;
-                    let mut embeddings = pictures
-                        .iter()
-                        .map(|picture| vision.encode(picture))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    for blocks in &clip_blocks {
-                        for pair in blocks.chunks(2) {
-                            embeddings.push(vision.encode_frames(&pair[0], &pair[1])?);
+                    // One embedding per vision block: the pictures, then the pairs of every clip.
+                    let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
+                        Vec::new()
+                    } else {
+                        let vision = CudaVisionEncoder::load(&file)?;
+                        let mut embeddings = pictures
+                            .iter()
+                            .map(|picture| vision.encode(picture))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        for blocks in &clip_blocks {
+                            for pair in blocks.chunks(2) {
+                                embeddings.push(vision.encode_frames(&pair[0], &pair[1])?);
+                            }
                         }
-                    }
-                    embeddings
-                };
-                let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
-                context_modalities = prompt.modalities.clone();
-                encoder.encode_prompt(&prompt, &embeddings, &[])?.context
+                        embeddings
+                    };
+                    let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
+                    context_modalities = prompt.modalities.clone();
+                    encoder.encode_prompt(&prompt, &embeddings, &[])?.context
+                }
             };
             println!(
                 "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
@@ -329,7 +353,30 @@ pub fn sample(
     if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
     }
+    #[cfg(feature = "cuda")]
     let latents = encode_pictures(options, settings.seed, &pictures)?;
+    #[cfg(feature = "metal")]
+    let latents: Vec<Tensor> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let clip_latents = encode_clips(options, settings.seed, &settings.clips)?;
+    #[cfg(feature = "metal")]
+    let clip_latents: Vec<Tensor> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let sound_latents = encode_sounds(options, &settings.sounds)?;
+    #[cfg(feature = "metal")]
+    let sound_latents: Vec<Tensor> = Vec::new();
+    #[cfg(feature = "cuda")]
+    let soundtrack_latents = encode_sounds(
+        options,
+        &settings
+            .clips
+            .iter()
+            .filter_map(|clip| clip.sound.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    #[cfg(feature = "metal")]
+    let soundtrack_latents: Vec<Tensor> = Vec::new();
+
     let has_references = !(settings.references.is_empty()
         && settings.sounds.is_empty()
         && settings.clips.is_empty());
@@ -347,17 +394,7 @@ pub fn sample(
         (keyframes, Vec::new())
     } else {
         // The DiT takes the references in the order the prompt introduces them.
-        let clips = encode_clips(options, settings.seed, &settings.clips)?;
-        let sounds = encode_sounds(options, &settings.sounds)?;
-        let mut soundtracks = encode_sounds(
-            options,
-            &settings
-                .clips
-                .iter()
-                .filter_map(|clip| clip.sound.clone())
-                .collect::<Vec<_>>(),
-        )?
-        .into_iter();
+        let mut soundtracks = soundtrack_latents.into_iter();
         let references = latents
             .into_iter()
             .map(Reference::Picture)
@@ -365,13 +402,13 @@ pub fn sample(
                 settings
                     .clips
                     .iter()
-                    .zip(clips)
+                    .zip(clip_latents)
                     .map(|(clip, video)| Reference::Video {
                         video,
                         audio: clip.sound.as_ref().and_then(|_| soundtracks.next()),
                     }),
             )
-            .chain(sounds.into_iter().map(Reference::Audio))
+            .chain(sound_latents.into_iter().map(Reference::Audio))
             .collect();
         (Vec::new(), references)
     };
@@ -405,6 +442,8 @@ pub fn sample(
     let dit = load_dit(options, "dit", dit_file)?;
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
     let schedule = &settings.schedule;
+    #[cfg(feature = "metal")]
+    let prepared = dit.prepare_text(&context)?;
     for step in 0..steps {
         let started = Instant::now();
         let inputs = DitInputs {
@@ -419,7 +458,10 @@ pub fn sample(
             shift_audio: settings.shift_audio,
         };
         let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
+        #[cfg(feature = "cuda")]
         let outputs = dit.forward(&inputs, &[], step_sparse.as_ref())?;
+        #[cfg(feature = "metal")]
+        let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref())?;
         euler_step(
             &mut video.data,
             &outputs.video,
@@ -442,14 +484,14 @@ pub fn sample(
             started.elapsed().as_secs_f64()
         );
     }
+    #[cfg(feature = "cuda")]
     save_algorithm_cache();
     Ok((video, audio))
 }
 
-/// The latents of keyframes or reference pictures as the DiT sees them: a sample of the video VAE's
-/// posterior for each picture with 0.1% of noise mixed in.
 /// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
 /// They take no condition noise, as the reference pipeline leaves reference audio clean.
+#[cfg(feature = "cuda")]
 fn encode_sounds(
     options: &HashMap<&str, &str>,
     sounds: &[Tensor],
@@ -480,6 +522,7 @@ fn encode_sounds(
 
 /// The latents of the reference clips, sampled from the video VAE's posterior and mixed with the
 /// condition noise, as the reference pictures are.
+#[cfg(feature = "cuda")]
 fn encode_clips(
     options: &HashMap<&str, &str>,
     seed: u64,
@@ -527,6 +570,9 @@ fn encode_clips(
     Ok(latents)
 }
 
+/// The latents of keyframes or reference pictures as the DiT sees them: a sample of the video VAE's
+/// posterior for each picture with 0.1% of noise mixed in.
+#[cfg(feature = "cuda")]
 fn encode_pictures(
     options: &HashMap<&str, &str>,
     seed: u64,

@@ -9,6 +9,7 @@ publish = false
 [features]
 webm = ["mmh3-output/webm"]
 cuda = ["dep:mmh3-cuda", "dep:mmh3-input-nvdec"]
+metal = ["dep:mmh3-metal", "dep:mmh3-output-videotoolbox", "mmh3-output/mp4", "mmh3-output-videotoolbox/metal"]
 mp4 = ["cuda", "dep:mmh3-output-nvenc", "mmh3-output/mp4"]
 
 [dependencies]
@@ -18,12 +19,14 @@ mmh3-output = { path = "crates/mmh3-output", default-features = false }
 mmh3-cuda = { path = "crates/mmh3-cuda", optional = true }
 mmh3-input = { path = "crates/mmh3-input" }
 mmh3-input-nvdec = { path = "crates/mmh3-input-nvdec", optional = true }
+mmh3-metal = { path = "crates/mmh3-metal", optional = true }
+mmh3-output-videotoolbox = { path = "crates/mmh3-output-videotoolbox", optional = true }
 mmh3-output-nvenc = { path = "crates/mmh3-output-nvenc", optional = true }
 symphonia = { version = "0.6", features = ["all"] }
 rubato = "0.16"
 
 [workspace]
-members = ["crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-cuda", "crates/mmh3-input", "crates/mmh3-input-nvdec", "crates/mmh3-metal", "crates/mmh3-output", "crates/mmh3-output-nvenc"]
+members = ["crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-cuda", "crates/mmh3-input", "crates/mmh3-input-nvdec", "crates/mmh3-metal", "crates/mmh3-output", "crates/mmh3-output-nvenc", "crates/mmh3-output-videotoolbox"]
 default-members = [".", "crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-input", "crates/mmh3-output"]
 resolver = "3"
 

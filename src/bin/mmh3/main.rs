@@ -1,4 +1,4 @@
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod generate;
 
 use std::error::Error;
@@ -12,6 +12,8 @@ const USAGE: &str = "usage:
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
                 [--ffmpeg [FFMPEG_ARGUMENTS...]]
+
+Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
 Checkpoints default to their ComfyUI names inside a models directory laid out like ComfyUI's models folder and the
 Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
@@ -27,7 +29,8 @@ of the options, and switches the default DiT to diffusion_models/minimax_h3_ref2
 FLAC, MP3, AAC, ALAC, Ogg Vorbis, MP4 or Matroska file, resampled to the audio VAE's 32 kHz.
 --reference-video takes an H.264 MP4 the prompt refers to as <Video 1>, <Video 2> and so on. Its frames are decoded
 with NVDEC, and its soundtrack becomes the <Audio j> that precedes it.
-MP4 uses NVENC H.264 + AAC on CUDA; WebM uses built-in VP9 + Opus.
+MP4 uses NVENC on CUDA or VideoToolbox on Metal for H.264 video, with built-in AAC audio.
+WebM uses built-in VP9 + Opus.
 --ffmpeg overrides native output and consumes all remaining arguments.
 With no ffmpeg arguments it uses H.264 + AAC. Set --out to a .mp4 file.
 A one-frame trial encode checks the ffmpeg arguments before generation.
@@ -39,11 +42,11 @@ directory has it.";
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("generate") => generate::run(&arguments[1..]),
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         Some("generate") => {
-            Err("this build has no GPU backend. Rebuild with --features cuda".into())
+            Err("this build has no GPU backend. Rebuild with --features cuda on Linux or --features metal on macOS".into())
         }
         _ => {
             eprintln!("{USAGE}");

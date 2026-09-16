@@ -70,6 +70,10 @@ impl FfmpegOutput {
                         "aac",
                         "-b:a",
                         "192k",
+                        // Audio latents round to 25 ms, so their decoded duration can be a few
+                        // milliseconds shorter than the video. Keep every video frame.
+                        "-af",
+                        "apad",
                         "-shortest",
                     ]
                     .map(OsString::from),

@@ -51,7 +51,7 @@ fn tools_inspects_a_checkpoint() {
     assert!(text.contains("F32"));
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 #[test]
 fn gpu_commands_explain_the_missing_backend() {
     for (binary, command) in [
@@ -104,7 +104,7 @@ fn argument_errors_use_the_correct_binary_usage() {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[test]
 fn invalid_output_format_is_rejected_before_loading_models() {
     let output = run(
@@ -117,7 +117,7 @@ fn invalid_output_format_is_rejected_before_loading_models() {
     assert!(error.contains("--ffmpeg"), "{error}");
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[test]
 fn invalid_ffmpeg_template_is_rejected_before_loading_models() {
     let output = run(
@@ -141,10 +141,43 @@ fn mp4_feature_error_precedes_model_loading() {
     assert!(error.contains("--ffmpeg"), "{error}");
 }
 
-#[cfg(all(feature = "cuda", not(feature = "webm")))]
+#[cfg(all(any(feature = "cuda", feature = "metal"), not(feature = "webm")))]
 #[test]
 fn webm_feature_error_precedes_model_loading() {
     let output = run(MMH3, &["generate", "--prompt", "test", "--out", "out.webm"]);
     assert_eq!(output.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&output.stderr).contains("--features webm"));
+}
+
+#[cfg(feature = "metal")]
+#[test]
+fn metal_rejects_unsupported_options_before_reading_models_or_pictures() {
+    for (option, value) in [
+        ("--attention", "sol"),
+        ("--attention", "vsa"),
+        ("--attention-precision", "int8-fp8"),
+        ("--linear-precision", "nvfp4"),
+        ("--lora-mode", "merge"),
+        ("--reference", "missing.png"),
+        ("--reference-audio", "missing.wav"),
+        ("--first-frame", "missing.png"),
+        ("--patch", "missing.safetensors"),
+    ] {
+        let output = run(
+            TOOLS,
+            &[
+                "latent",
+                "--prompt",
+                "test",
+                "--out",
+                "unused.safetensors",
+                option,
+                value,
+            ],
+        );
+        assert_eq!(output.status.code(), Some(1));
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("Metal") && error.contains(option), "{error}");
+        assert!(!error.contains("No such file"), "{error}");
+    }
 }

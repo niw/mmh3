@@ -4,16 +4,23 @@
 //! reference pipeline puts a clip on, and the soundtrack comes from the same file through
 //! Symphonia, which reads MP4 audio itself.
 
+#[cfg(feature = "cuda")]
 use crate::audio::load_audio_if_any;
+#[cfg(feature = "cuda")]
 use mmh3_core::picture::{Picture, canvas_for, reference_size};
 use mmh3_core::tensor::Tensor;
+#[cfg(feature = "cuda")]
 use mmh3_input::mp4::Mp4File;
+#[cfg(feature = "cuda")]
 use std::error::Error;
+#[cfg(feature = "cuda")]
 use std::path::Path;
 
 /// Frames the video VAE consumes per clip, which a reference clip's length is snapped to.
+#[cfg(feature = "cuda")]
 const CLIP_LENGTH: usize = 17;
 /// The frames left over after the whole clips, which the latent keeps.
+#[cfg(feature = "cuda")]
 const CLIP_TAIL: usize = 5;
 
 /// A clip the prompt refers to, with the soundtrack of its file when it has one.
@@ -26,6 +33,7 @@ pub struct ReferenceClip {
 
 /// Reads at most `limit` frames of an MP4 as a clip on its own canvas, its length snapped to the
 /// 17n + 5 frames the VAE encodes, with its soundtrack.
+#[cfg(feature = "cuda")]
 pub fn load_clip(path: &Path, limit: usize) -> Result<ReferenceClip, Box<dyn Error>> {
     let mut file = Mp4File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let available = file.track().samples.len().min(limit);
@@ -71,6 +79,7 @@ pub fn load_clip(path: &Path, limit: usize) -> Result<ReferenceClip, Box<dyn Err
 }
 
 /// The largest length of at most `frames` frames that the VAE's clips cover, if there is one.
+#[cfg(feature = "cuda")]
 fn snap_frames(frames: usize) -> Option<usize> {
     if frames < CLIP_TAIL {
         return None;
@@ -81,6 +90,7 @@ fn snap_frames(frames: usize) -> Option<usize> {
 /// The canvas a clip of `width` × `height` pixels goes on: the generation canvas of its aspect
 /// ratio, or its own size on the 32-pixel grid when that is smaller, since a clip is never
 /// scaled up.
+#[cfg(feature = "cuda")]
 fn clip_canvas(width: usize, height: usize) -> (usize, usize) {
     let (canvas_width, canvas_height) = canvas_for(width, height);
     if width * height < canvas_width * canvas_height {
@@ -135,6 +145,7 @@ pub fn block_frames(clip: &Tensor, fps: usize) -> Vec<Tensor> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn snaps_a_clip_to_the_frames_the_vae_covers() {
         assert_eq!(snap_frames(4), None);
@@ -145,6 +156,7 @@ mod tests {
         assert_eq!(snap_frames(130), Some(124));
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn keeps_a_small_clip_at_its_own_size() {
         // A 16:9 clip larger than the canvas goes on the canvas.

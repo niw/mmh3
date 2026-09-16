@@ -1,13 +1,20 @@
 //! Support shared by the generation and diagnostic command-line programs.
 
+#[cfg(all(feature = "cuda", feature = "metal"))]
+compile_error!("choose one GPU backend: cuda or metal");
+#[cfg(all(feature = "metal", not(target_os = "macos")))]
+compile_error!("the metal feature requires macOS");
+
 pub mod audio;
 pub mod cli;
 pub mod output;
 pub mod pictures;
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod generation;
-#[cfg(feature = "cuda")]
+#[cfg(feature = "metal")]
+pub mod metal;
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod models;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod video;

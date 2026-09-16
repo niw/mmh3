@@ -1,0 +1,18 @@
+[package]
+name = "mmh3-output-videotoolbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+metal = ["dep:mmh3-metal"]
+
+[dependencies]
+mmh3-metal = { path = "../mmh3-metal", optional = true }
+mmh3-core = { path = "../mmh3-core" }
+mmh3-output = { path = "../mmh3-output", default-features = false, features = ["mp4"] }
+
+[dev-dependencies]
+tempfile = "3"
+serde_json = "1"

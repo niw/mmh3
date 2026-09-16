@@ -11,8 +11,18 @@ use std::path::Path;
 /// Generates video and audio, then passes the decoded media to the selected output backend.
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::generation::FPS;
-    use mmh3_cuda::audio_vae::{CudaAudioDecoder, SAMPLE_RATE};
-    use mmh3_cuda::vae::{CudaVideoDecoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::audio_vae::{CudaAudioDecoder as AudioDecoder, SAMPLE_RATE};
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::vae::{
+        CudaVideoDecoder as VideoDecoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE,
+    };
+    #[cfg(feature = "metal")]
+    use mmh3_metal::audio_vae::{MetalAudioDecoder as AudioDecoder, SAMPLE_RATE};
+    #[cfg(feature = "metal")]
+    use mmh3_metal::vae::{
+        DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, MetalVideoDecoder as VideoDecoder,
+    };
     use mmh3_output::MediaSpec;
     use std::time::Instant;
 
@@ -33,23 +43,38 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let path = video_vae_path(&options)?;
-    let decoded = CudaVideoDecoder::load(
+    let decoder = VideoDecoder::load(
         &SafeTensors::open(Path::new(&path))?,
         "",
         DEFAULT_TILE_SIZE,
         DEFAULT_TILE_OVERLAP_MIN,
-    )?
-    .decode_device(&video)?;
-    output.write_cuda_video(&decoded)?;
-    drop(decoded);
+    )?;
+    #[cfg(feature = "cuda")]
+    {
+        let decoded = decoder.decode_device(&video)?;
+        drop(decoder);
+        output.write_cuda_video(&decoded)?;
+    }
+    #[cfg(feature = "metal")]
+    if output.streams_metal_video() {
+        decoder.decode_stream(&video, |frames| {
+            output
+                .write_metal_video_chunk(frames)
+                .map_err(|e| mmh3_metal::Error(e.to_string()))
+        })?;
+        drop(decoder);
+    } else {
+        let decoded = decoder.decode_device(&video)?;
+        drop(decoder);
+        output.write_metal_video(&decoded)?;
+    }
     println!(
         "decoded and submitted the video with {path} in {:.1} s",
         started.elapsed().as_secs_f64()
     );
     let started = Instant::now();
     let path = option_path(&options, "audio-vae", AUDIO_VAE_FILE)?;
-    let waveform =
-        CudaAudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
+    let waveform = AudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
     println!(
         "decoded the audio in {:.1} s",
         started.elapsed().as_secs_f64()

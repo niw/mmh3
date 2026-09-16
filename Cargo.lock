@@ -291,8 +291,10 @@ dependencies = [
  "mmh3-cuda",
  "mmh3-input",
  "mmh3-input-nvdec",
+ "mmh3-metal",
  "mmh3-output",
  "mmh3-output-nvenc",
+ "mmh3-output-videotoolbox",
  "rubato",
  "symphonia",
  "tempfile",
@@ -361,6 +363,17 @@ dependencies = [
  "cc",
  "mmh3-core",
  "mmh3-cuda",
+ "mmh3-output",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
+name = "mmh3-output-videotoolbox"
+version = "0.1.0"
+dependencies = [
+ "mmh3-core",
+ "mmh3-metal",
  "mmh3-output",
  "serde_json",
  "tempfile",

@@ -23,7 +23,7 @@ pub struct Sample {
     pub keyframe: bool,
 }
 
-/// Implement for NVENC or a future VideoToolbox adapter. The associated input type
+/// Implemented by the NVENC and VideoToolbox adapters. The associated input type
 /// preserves native ownership. There is no untyped device pointer in this interface.
 pub trait VideoEncoder {
     type Frames;
@@ -59,6 +59,7 @@ pub struct Mp4Session<V: VideoEncoder, A: AudioEncoder> {
     audio: Option<AudioTrack>,
     video_written: bool,
     video_complete: bool,
+    video_failed: bool,
 }
 
 impl<V: VideoEncoder, A: AudioEncoder> Mp4Session<V, A> {
@@ -80,19 +81,43 @@ impl<V: VideoEncoder, A: AudioEncoder> Mp4Session<V, A> {
             audio: None,
             video_written: false,
             video_complete: false,
+            video_failed: false,
         })
     }
     pub fn write_video(&mut self, frames: &V::Frames) -> Result<()> {
         if self.video_written {
             return Err("video was already submitted".into());
         }
+        self.write_video_chunk(frames, 0..self.spec.frames)
+    }
+    /// Submit consecutive frame ranges. Encoders receive global indices, including for chunks.
+    /// Any encoding failure makes the session unusable and leaves the destination intact.
+    pub fn write_video_chunk(
+        &mut self,
+        frames: &V::Frames,
+        range: std::ops::Range<usize>,
+    ) -> Result<()> {
+        if self.video_failed
+            || self.video_complete
+            || range.is_empty()
+            || range.start != self.video.len()
+            || range.end > self.spec.frames
+        {
+            return Err(
+                "video chunks must be submitted once in order within the output range".into(),
+            );
+        }
         self.video_written = true;
-        for index in 0..self.spec.frames {
+        self.video_failed = true;
+        for index in range.clone() {
             self.video
                 .push(self.video_encoder.encode_frame(frames, index)?);
         }
-        self.video.extend(self.video_encoder.finish()?);
-        self.video_complete = true;
+        if range.end == self.spec.frames {
+            self.video.extend(self.video_encoder.finish()?);
+            self.video_complete = true;
+        }
+        self.video_failed = false;
         Ok(())
     }
     pub fn write_audio(&mut self, audio: &Tensor) -> Result<()> {

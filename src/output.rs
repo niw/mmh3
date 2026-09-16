@@ -14,6 +14,13 @@ pub struct HostSession {
 
 pub enum PreparedOutput {
     Host(HostSession),
+    #[cfg(feature = "metal")]
+    Apple(
+        mmh3_output::mp4::Mp4Session<
+            mmh3_output_videotoolbox::MetalVideoToolboxEncoder,
+            mmh3_output::AacOutput,
+        >,
+    ),
     #[cfg(feature = "mp4")]
     Nvidia(mmh3_output::mp4::Mp4Session<mmh3_output_nvenc::NvencEncoder, mmh3_output::AacOutput>),
 }
@@ -36,6 +43,17 @@ pub fn prepare(
             .to_ascii_lowercase();
         match extension.as_str() {
             "mp4" => {
+                #[cfg(feature = "metal")]
+                {
+                    return Ok(PreparedOutput::Apple(
+                        mmh3_output::mp4::Mp4Session::prepare(
+                            spec,
+                            destination,
+                            mmh3_output::AacOutput,
+                            || mmh3_output_videotoolbox::MetalVideoToolboxEncoder::new(spec),
+                        )?,
+                    ));
+                }
                 #[cfg(feature = "mp4")]
                 {
                     return Ok(PreparedOutput::Nvidia(
@@ -47,7 +65,7 @@ pub fn prepare(
                         )?,
                     ));
                 }
-                #[cfg(not(feature = "mp4"))]
+                #[cfg(not(any(feature = "mp4", feature = "metal")))]
                 return Err(
                     "native MP4 needs --features mp4. Use --out FILE.webm or --ffmpeg".into(),
                 );
@@ -80,6 +98,51 @@ pub fn prepare(
     }))
 }
 impl PreparedOutput {
+    /// CPU-readable video, including frames decoded by the Metal backend.
+    pub fn write_host_video(&mut self, frames: Yuv420) -> Result<()> {
+        match self {
+            #[cfg(feature = "metal")]
+            Self::Apple(_) => Err("VideoToolbox output requires Metal frames".into()),
+            Self::Host(session) => {
+                if session.video.is_some() {
+                    return Err("video was already submitted".into());
+                }
+                session.video = Some(frames);
+                Ok(())
+            }
+            #[cfg(feature = "mp4")]
+            Self::Nvidia(_) => {
+                Err("NVENC output requires CUDA frames. Use --ffmpeg for host frames".into())
+            }
+        }
+    }
+    #[cfg(feature = "metal")]
+    pub fn streams_metal_video(&self) -> bool {
+        matches!(self, Self::Apple(_))
+    }
+    #[cfg(feature = "metal")]
+    pub fn write_metal_video_chunk(
+        &mut self,
+        frames: &mmh3_metal::vae::MetalVideoFrames,
+    ) -> Result<()> {
+        match self {
+            Self::Apple(session) => session.write_video_chunk(frames, frames.frame_range()),
+            Self::Host(_) => Err("host output requires the complete video".into()),
+        }
+    }
+    #[cfg(feature = "metal")]
+    pub fn write_metal_video(&mut self, frames: &mmh3_metal::vae::MetalVideoFrames) -> Result<()> {
+        match self {
+            Self::Apple(session) => session.write_video(frames),
+            Self::Host(session) => {
+                if session.video.is_some() {
+                    return Err("video was already submitted".into());
+                }
+                session.video = Some(Yuv420::from_pixels(&frames.to_pixels()?)?);
+                Ok(())
+            }
+        }
+    }
     #[cfg(feature = "cuda")]
     pub fn write_cuda_video(&mut self, frames: &mmh3_cuda::vae::CudaVideoFrames) -> Result<()> {
         match self {
@@ -96,6 +159,8 @@ impl PreparedOutput {
     }
     pub fn write_audio(&mut self, audio: Tensor) -> Result<()> {
         match self {
+            #[cfg(feature = "metal")]
+            Self::Apple(session) => session.write_audio(&audio),
             Self::Host(session) => {
                 if session.audio.is_some() {
                     return Err("audio was already submitted".into());
@@ -109,6 +174,8 @@ impl PreparedOutput {
     }
     pub fn finish(self) -> Result<()> {
         match self {
+            #[cfg(feature = "metal")]
+            Self::Apple(session) => session.finish(),
             Self::Host(session) => session.backend.write(
                 &DecodedMedia {
                     spec: session.spec,

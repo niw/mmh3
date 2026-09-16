@@ -1,6 +1,9 @@
 //! Checkpoint paths and DiT settings shared by generation and golden-data checks.
 
 use crate::cli::option_float;
+#[cfg(feature = "metal")]
+pub use crate::metal::load_dit;
+#[cfg(feature = "cuda")]
 use mmh3_core::safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::error::Error;
@@ -24,6 +27,7 @@ pub const TEXT_ENCODER_FILE: &str = "text_encoders/qwen3vl_32b_minimax_h3_int8_c
 /// Loads the DiT from `--weights` or `--dit`, whichever `name` says, or `file` in the models
 /// directory, with the patch of `--patch` and the LoRA of `--lora` when given. NVFP4 layers take
 /// them into their weights, so they come before `--linear-precision`.
+#[cfg(feature = "cuda")]
 pub fn load_dit(
     options: &HashMap<&str, &str>,
     name: &str,
@@ -117,6 +121,7 @@ pub fn video_vae_path(options: &HashMap<&str, &str>) -> Result<String, Box<dyn E
 
 /// File that keeps the cuBLASLt algorithms chosen for the NVFP4 GEMMs between runs, in
 /// `$XDG_CACHE_HOME/mmh3` or `~/.cache/mmh3`.
+#[cfg(feature = "cuda")]
 fn algorithm_cache() -> Option<PathBuf> {
     let directory = std::env::var_os("XDG_CACHE_HOME")
         .filter(|directory| !directory.is_empty())
@@ -126,6 +131,7 @@ fn algorithm_cache() -> Option<PathBuf> {
 }
 
 /// Keeps the cuBLASLt algorithms this run chose for NVFP4 GEMMs for later runs.
+#[cfg(feature = "cuda")]
 pub fn save_algorithm_cache() {
     let Some(cache) = algorithm_cache() else {
         return;
@@ -205,7 +211,7 @@ fn models_directory(options: &HashMap<&str, &str>) -> Option<PathBuf> {
 
 /// The file `--name` gives: the path itself when it exists, and otherwise the first of
 /// `directories` in the models directory that has a file of that name. None without `--name`.
-fn model_file(
+pub(crate) fn model_file(
     options: &HashMap<&str, &str>,
     name: &str,
     directories: &[&str],

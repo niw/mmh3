@@ -7,7 +7,7 @@ mod bench;
 mod check;
 #[cfg(feature = "cuda")]
 mod device;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod latent;
 
 use std::error::Error;
@@ -41,6 +41,8 @@ const USAGE: &str = "usage:
                     [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X]
                     [--sparse-start X] [--vsa-sparsity X]
 
+Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
+
 Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.
 latent samples like the generate command of mmh3, with the same defaults, and writes the final video and audio
 latents without decoding them.";
@@ -51,15 +53,19 @@ fn main() -> ExitCode {
         Some("inspect") => inspect::run(&arguments[1..]),
         #[cfg(feature = "cuda")]
         Some("device") => device::run(),
+        #[cfg(feature = "metal")]
+        Some("device") => mmh3_metal::Device::new().map(|device| println!("Metal: {}", device.name())).map_err(Into::into),
         #[cfg(feature = "cuda")]
         Some("bench") => bench::run(&arguments[1..]),
         #[cfg(feature = "cuda")]
         Some("check") => check::run(&arguments[1..]),
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("latent") => latent::run(&arguments[1..]),
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(feature = "metal")]
+        Some("bench" | "check") => Err("Metal bench/check commands are not implemented yet. Run cargo test -p mmh3-metal for kernel and model checks".into()),
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         Some("device" | "bench" | "check" | "latent") => {
-            Err("this build has no GPU backend. Rebuild with --features cuda".into())
+            Err("this build has no GPU backend. Rebuild with --features cuda on Linux or --features metal on macOS".into())
         }
         _ => {
             eprintln!("{USAGE}");
