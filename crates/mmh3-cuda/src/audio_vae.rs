@@ -62,7 +62,7 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-pub const SAMPLE_RATE: usize = 32_000;
+pub use mmh3_core::audio::SAMPLE_RATE;
 /// Upsampling rate and kernel size of each transposed convolution. Their product is 800 samples per
 /// latent frame.
 const UPSAMPLE: [(usize, usize); 7] = [(5, 9), (5, 9), (2, 4), (2, 4), (2, 4), (2, 4), (2, 4)];

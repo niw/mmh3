@@ -1,3 +1,4 @@
+pub mod audio;
 pub mod direct_file;
 pub mod dit;
 pub mod generation;
