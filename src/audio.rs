@@ -29,7 +29,15 @@ struct Decoded {
 /// Symphonia reads WAV, FLAC, MP3, AAC, ALAC, Ogg Vorbis, CAF, MP4 and Matroska files. A mono file
 /// fills both channels and a file with more channels keeps the first two.
 pub fn load_audio(path: &Path) -> Result<Tensor, Box<dyn Error>> {
-    let decoded = decode(path)?;
+    load_audio_if_any(path)?
+        .ok_or_else(|| format!("{}: the file has no audio track", path.display()).into())
+}
+
+/// The waveform of a file that may carry no sound, such as the MP4 of a reference clip.
+pub fn load_audio_if_any(path: &Path) -> Result<Option<Tensor>, Box<dyn Error>> {
+    let Some(decoded) = decode(path)? else {
+        return Ok(None);
+    };
     let waveform = resample(stereo(decoded.planes), decoded.rate)?;
     let samples = waveform[0].len();
     let mut data = Vec::with_capacity(CHANNELS * samples);
@@ -37,11 +45,12 @@ pub fn load_audio(path: &Path) -> Result<Tensor, Box<dyn Error>> {
         // Float files may carry samples outside the range the VAE was trained on.
         data.extend(channel.iter().map(|value| value.clamp(-1.0, 1.0)));
     }
-    Ok(Tensor::new(vec![CHANNELS, samples], data))
+    Ok(Some(Tensor::new(vec![CHANNELS, samples], data)))
 }
 
-/// Decodes the file's default audio track into one vector per channel, with its sample rate.
-fn decode(path: &Path) -> Result<Decoded, Box<dyn Error>> {
+/// Decodes the file's default audio track into one vector per channel, with its sample rate, or
+/// nothing when the file carries no sound.
+fn decode(path: &Path) -> Result<Option<Decoded>, Box<dyn Error>> {
     let file = File::open(path).map_err(|error| format!("{}: {error}", path.display()))?;
     let stream = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
@@ -56,9 +65,19 @@ fn decode(path: &Path) -> Result<Decoded, Box<dyn Error>> {
             MetadataOptions::default(),
         )
         .map_err(|error| format!("{}: {error}", path.display()))?;
-    let track = format
-        .default_track(TrackType::Audio)
-        .ok_or_else(|| format!("{}: the file has no audio track", path.display()))?;
+    let Some(track) = format.default_track(TrackType::Audio) else {
+        return Ok(None);
+    };
+    // Symphonia reports the whole media, so the edit list of an MP4, which hides the priming a
+    // codec needs, is read separately.
+    let (mut delay, mut length) = (
+        track.delay.unwrap_or(0) as usize,
+        track.num_frames.map(|frames| frames as usize),
+    );
+    if let Ok(Some((skip, samples))) = mmh3_input::mp4::audio_trim(path) {
+        delay = delay.max(skip as usize);
+        length = Some(samples as usize);
+    }
     let track_id = track.id;
     let parameters = track
         .codec_params
@@ -118,7 +137,13 @@ fn decode(path: &Path) -> Result<Decoded, Box<dyn Error>> {
     if rate == 0 || planes.iter().all(|channel| channel.is_empty()) {
         return Err(format!("{}: the audio track has no samples", path.display()).into());
     }
-    Ok(Decoded { planes, rate })
+    for channel in &mut planes {
+        channel.drain(..delay.min(channel.len()));
+        if let Some(length) = length {
+            channel.truncate(length);
+        }
+    }
+    Ok(Some(Decoded { planes, rate }))
 }
 
 /// The latent's stereo axis holds two channels, so a mono file fills both and a file with more

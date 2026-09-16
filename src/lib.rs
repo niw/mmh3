@@ -9,3 +9,5 @@ pub mod pictures;
 pub mod generation;
 #[cfg(feature = "cuda")]
 pub mod models;
+#[cfg(feature = "cuda")]
+pub mod video;

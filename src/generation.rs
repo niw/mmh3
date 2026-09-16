@@ -9,6 +9,7 @@ use crate::models::{
     save_algorithm_cache, sparse_attention, video_vae_path,
 };
 use crate::pictures::load_picture;
+use crate::video::{ReferenceClip, block_frames, block_seconds, load_clip};
 use mmh3_core::dit::sampler::Schedule;
 use mmh3_core::generation::GenerationShape;
 use mmh3_core::safetensors::SafeTensors;
@@ -30,6 +31,7 @@ pub const OPTIONS: &[&str] = &[
     "last-frame",
     "reference",
     "reference-audio",
+    "reference-video",
     "steps",
     "schedule",
     "seed",
@@ -61,6 +63,10 @@ const KEYFRAME_NOISE_STREAM: u64 = 0x6b65_7966_7261_6d65;
 const MAX_REFERENCE_PICTURES: usize = 9;
 /// The most reference sounds the official pipeline takes.
 const MAX_REFERENCE_SOUNDS: usize = 3;
+/// The most reference clips the official pipeline takes.
+const MAX_REFERENCE_CLIPS: usize = 3;
+/// Mixed into the seed for the noise of reference clips, so that they take their own stream.
+const CLIP_NOISE_STREAM: u64 = 0x636c_6970_6e6f_6973;
 
 /// A picture that a frame of the generation starts from or reaches, fitted to the canvas.
 pub struct KeyframePicture {
@@ -76,6 +82,8 @@ pub struct Settings {
     pub references: Vec<mmh3_core::picture::Picture>,
     /// Waveforms of `--reference-audio` in their order, `[2, samples]` at the audio VAE's rate.
     pub sounds: Vec<Tensor>,
+    /// Clips of `--reference-video` in their order, each on its own canvas with its soundtrack.
+    pub clips: Vec<ReferenceClip>,
     pub schedule: Schedule,
     pub steps: usize,
     pub seed: u64,
@@ -135,13 +143,20 @@ impl Settings {
             .into_iter()
             .map(|path| load_audio(Path::new(path)))
             .collect::<Result<Vec<_>, _>>()?;
+        let files = option_values(arguments, "reference-video");
+        if files.len() > MAX_REFERENCE_CLIPS {
+            return Err(
+                format!("pass at most {MAX_REFERENCE_CLIPS} --reference-video files").into(),
+            );
+        }
         let references = references
             .into_iter()
             .map(|path| load_picture(Path::new(path)))
             .collect::<Result<Vec<_>, _>>()?;
-        if !pictures.is_empty() && !(references.is_empty() && sounds.is_empty()) {
+        if !pictures.is_empty() && !(references.is_empty() && sounds.is_empty() && files.is_empty())
+        {
             return Err(
-                "--reference and --reference-audio cannot be combined with --first-frame or --last-frame"
+                "--reference, --reference-audio and --reference-video cannot be combined with --first-frame or --last-frame"
                     .into(),
             );
         }
@@ -159,6 +174,11 @@ impl Settings {
             ),
         };
         let shape = GenerationShape::new(width, height, option_number(options, "frames", 124)?)?;
+        // A clip is never longer than the video it is a reference for.
+        let clips = files
+            .into_iter()
+            .map(|path| load_clip(Path::new(path), shape.frames))
+            .collect::<Result<Vec<_>, _>>()?;
         // The first picture stretches to the canvas and the other covers it, as the reference
         // pipeline fits them.
         let keyframes = pictures
@@ -187,6 +207,7 @@ impl Settings {
             keyframes,
             references,
             sounds,
+            clips,
             steps: schedule.steps(),
             schedule,
             seed: option_number(options, "seed", 0)? as u64,
@@ -225,14 +246,29 @@ pub fn sample(
         .chain(&settings.references)
         .map(|picture| picture.to_tensor())
         .collect();
-    // The pictures come first, then the sounds, the order of the official presentation.
-    let prompt_references: Vec<PromptReference> = pictures
+    // The pictures come first, then the clips with their soundtracks, then the standalone
+    // sounds, the order of the official presentation.
+    let clip_blocks: Vec<Vec<Tensor>> = settings
+        .clips
+        .iter()
+        .map(|clip| block_frames(&clip.frames, FPS))
+        .collect();
+    let mut prompt_references: Vec<PromptReference> = pictures
         .iter()
         .map(|picture| {
             PromptReference::Picture(VisionGrid::for_picture(picture.shape[0], picture.shape[1]))
         })
-        .chain(settings.sounds.iter().map(|_| PromptReference::Sound))
         .collect();
+    for clip in &settings.clips {
+        if clip.sound.is_some() {
+            prompt_references.push(PromptReference::Sound);
+        }
+        prompt_references.push(PromptReference::Clip {
+            grid: VisionGrid::for_picture(clip.frames.shape[1], clip.frames.shape[2]),
+            timestamps: block_seconds(clip.frames.shape[0], FPS),
+        });
+    }
+    prompt_references.extend(settings.sounds.iter().map(|_| PromptReference::Sound));
     let mut context_modalities = Vec::new();
     let context = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
@@ -246,23 +282,31 @@ pub fn sample(
             } else {
                 use mmh3_cuda::vision::CudaVisionEncoder;
 
-                let embeddings = if pictures.is_empty() {
+                // One embedding per vision block: the pictures, then the pairs of every clip.
+                let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
                     Vec::new()
                 } else {
                     let vision = CudaVisionEncoder::load(&file)?;
-                    pictures
+                    let mut embeddings = pictures
                         .iter()
                         .map(|picture| vision.encode(picture))
-                        .collect::<Result<Vec<_>, _>>()?
+                        .collect::<Result<Vec<_>, _>>()?;
+                    for blocks in &clip_blocks {
+                        for pair in blocks.chunks(2) {
+                            embeddings.push(vision.encode_frames(&pair[0], &pair[1])?);
+                        }
+                    }
+                    embeddings
                 };
                 let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
                 context_modalities = prompt.modalities.clone();
                 encoder.encode_prompt(&prompt, &embeddings, &[])?.context
             };
             println!(
-                "encoded {} prompt tokens with {} pictures and {} sounds in {:.1} s",
+                "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
                 context.shape[0],
                 pictures.len(),
+                settings.clips.len(),
                 settings.sounds.len(),
                 started.elapsed().as_secs_f64()
             );
@@ -286,7 +330,10 @@ pub fn sample(
         return Err("keyframes and references need a prompt, not --context".into());
     }
     let latents = encode_pictures(options, settings.seed, &pictures)?;
-    let (keyframes, references) = if settings.references.is_empty() && settings.sounds.is_empty() {
+    let has_references = !(settings.references.is_empty()
+        && settings.sounds.is_empty()
+        && settings.clips.is_empty());
+    let (keyframes, references) = if !has_references {
         let keyframes = settings
             .keyframes
             .iter()
@@ -299,14 +346,32 @@ pub fn sample(
             .collect();
         (keyframes, Vec::new())
     } else {
+        // The DiT takes the references in the order the prompt introduces them.
+        let clips = encode_clips(options, settings.seed, &settings.clips)?;
+        let sounds = encode_sounds(options, &settings.sounds)?;
+        let mut soundtracks = encode_sounds(
+            options,
+            &settings
+                .clips
+                .iter()
+                .filter_map(|clip| clip.sound.clone())
+                .collect::<Vec<_>>(),
+        )?
+        .into_iter();
         let references = latents
             .into_iter()
             .map(Reference::Picture)
             .chain(
-                encode_sounds(options, &settings.sounds)?
-                    .into_iter()
-                    .map(Reference::Audio),
+                settings
+                    .clips
+                    .iter()
+                    .zip(clips)
+                    .map(|(clip, video)| Reference::Video {
+                        video,
+                        audio: clip.sound.as_ref().and_then(|_| soundtracks.next()),
+                    }),
             )
+            .chain(sounds.into_iter().map(Reference::Audio))
             .collect();
         (Vec::new(), references)
     };
@@ -408,6 +473,55 @@ fn encode_sounds(
         "encoded {} sounds, {:.2} s of audio, in {:.1} s",
         latents.len(),
         frames as f64 / LATENT_RATE as f64,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(latents)
+}
+
+/// The latents of the reference clips, sampled from the video VAE's posterior and mixed with the
+/// condition noise, as the reference pictures are.
+fn encode_clips(
+    options: &HashMap<&str, &str>,
+    seed: u64,
+    clips: &[ReferenceClip],
+) -> Result<Vec<Tensor>, Box<dyn Error>> {
+    use mmh3_core::dit::timestep::VIDEO_CONDITION_TIMESTEP;
+    use mmh3_core::random::NormalSampler;
+    use mmh3_cuda::video_encoder::{
+        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
+    use std::time::Instant;
+
+    if clips.is_empty() {
+        return Ok(Vec::new());
+    }
+    let started = Instant::now();
+    let path = video_vae_path(options)?;
+    let encoder = CudaVideoEncoder::load(
+        &SafeTensors::open(Path::new(&path))?,
+        Temporal::Clip,
+        DEFAULT_TILE_SIZE,
+        DEFAULT_TILE_OVERLAP_MIN,
+    )?;
+    let mut noise = NormalSampler::new(seed ^ KEYFRAME_NOISE_STREAM ^ CLIP_NOISE_STREAM);
+    let latents = clips
+        .iter()
+        .map(|clip| {
+            let posterior = encoder.encode_clip(&clip.frames)?;
+            let count = posterior.mean.data.len();
+            let mut latent = posterior
+                .sampled_latent(&NormalSampler::new(KEYFRAME_POSTERIOR_SEED).samples(count));
+            for (value, noise) in latent.data.iter_mut().zip(noise.samples(count)) {
+                *value =
+                    VIDEO_CONDITION_TIMESTEP * *value + (1.0 - VIDEO_CONDITION_TIMESTEP) * noise;
+            }
+            Ok(latent)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let frames: usize = clips.iter().map(|clip| clip.frames.shape[0]).sum();
+    println!(
+        "encoded {} clips, {frames} frames, with {path} in {:.1} s",
+        latents.len(),
         started.elapsed().as_secs_f64()
     );
     Ok(latents)

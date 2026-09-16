@@ -7,7 +7,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
-                [--reference-audio FILE]...
+                [--reference-audio FILE]... [--reference-video FILE]...
                 [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
@@ -25,6 +25,8 @@ Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
 of the options, and switches the default DiT to diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors.
 --reference-audio does the same with a sound the prompt refers to as <Audio 1>, <Audio 2> and so on, from a WAV,
 FLAC, MP3, AAC, ALAC, Ogg Vorbis, MP4 or Matroska file, resampled to the audio VAE's 32 kHz.
+--reference-video takes an H.264 MP4 the prompt refers to as <Video 1>, <Video 2> and so on. Its frames are decoded
+with NVDEC, and its soundtrack becomes the <Audio j> that precedes it.
 MP4 uses NVENC H.264 + AAC on CUDA; WebM uses built-in VP9 + Opus.
 --ffmpeg overrides native output and consumes all remaining arguments.
 With no ffmpeg arguments it uses H.264 + AAC. Set --out to a .mp4 file.
