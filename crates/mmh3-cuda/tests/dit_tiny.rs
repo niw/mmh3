@@ -278,3 +278,43 @@ fn follows_the_cpu_reference_with_references() {
         "references change the video by only {change}"
     );
 }
+
+/// The same references ComfyUI's second pass carried: a picture on a grid of its own, a clip of
+/// the target's grid with its soundtrack, and a standalone sound.
+#[test]
+fn matches_comfyui_golden_with_references() {
+    use mmh3_core::dit::inputs::Reference;
+
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let references = vec![
+        Reference::Picture(tensor(&file, "input.reference.picture")),
+        Reference::Video {
+            video: tensor(&file, "input.reference.clip"),
+            audio: Some(tensor(&file, "input.reference.soundtrack")),
+        },
+        Reference::Audio(tensor(&file, "input.reference.sound")),
+    ];
+    let inputs = DitInputs {
+        video: unbatched(tensor(&file, "input.video")),
+        audio: unbatched(tensor(&file, "input.audio")),
+        context: unbatched(tensor(&file, "input.context")),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references,
+        sigma: metadata_number(&file, "sigma"),
+        shift_video: metadata_number(&file, "shift_video"),
+        shift_audio: metadata_number(&file, "shift_audio"),
+    };
+    let dit = CudaDit::load(&file, "weight.").unwrap();
+    let outputs = dit.forward(&inputs, &[], None).unwrap();
+    assert_close(
+        "video",
+        &outputs.video,
+        &unbatched(tensor(&file, "output.reference.video")).data,
+    );
+    assert_close(
+        "audio",
+        &outputs.audio,
+        &unbatched(tensor(&file, "output.reference.audio")).data,
+    );
+}

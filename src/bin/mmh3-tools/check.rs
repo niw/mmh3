@@ -18,6 +18,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("video-vae") => check_video_vae(&arguments[1..]),
         Some("keyframes") => check_keyframes(&arguments[1..]),
         Some("sounds") => check_sounds(&arguments[1..]),
+        Some("clips") => check_clips(&arguments[1..]),
         Some("audio-vae") => check_audio_vae(&arguments[1..]),
         Some("text-encoder") => check_text_encoder(&arguments[1..]),
         _ => Err(USAGE.into()),
@@ -114,9 +115,13 @@ impl GoldenFile {
             .collect()
     }
 
-    /// The reference pictures and sounds as the DiT sees them, the pictures with ComfyUI's
-    /// condition noise and the sounds as their posterior mean, which takes none.
-    fn references(&self) -> Result<Vec<mmh3_core::dit::inputs::Reference>, Box<dyn Error>> {
+    /// The references as the DiT sees them, in the order the prompt introduces them: the pictures
+    /// and clips with ComfyUI's condition noise, the sounds as their posterior mean, which takes
+    /// none. A clip's soundtrack comes from `soundtracks.safetensors` in the same directory.
+    fn references(
+        &self,
+        directory: &Path,
+    ) -> Result<Vec<mmh3_core::dit::inputs::Reference>, Box<dyn Error>> {
         use mmh3_core::dit::inputs::Reference;
 
         let count = |key: &str| -> Result<usize, Box<dyn Error>> {
@@ -128,17 +133,31 @@ impl GoldenFile {
                 .parse()
                 .map_err(|_| format!("bad {key}"))?)
         };
-        let pictures = (0..count("reference_pictures")?).map(|index| {
-            Ok(Reference::Picture(
+        let mut references = Vec::new();
+        for index in 0..count("reference_pictures")? {
+            references.push(Reference::Picture(
                 self.tensor(&format!("reference.{index}.augmented"))?,
-            ))
-        });
-        let sounds = (0..count("reference_sounds")?).map(|index| {
-            Ok(Reference::Audio(
+            ));
+        }
+        let clips = count("reference_clips")?;
+        let soundtracks = (clips > 0 && directory.join("soundtracks.safetensors").exists())
+            .then(|| GoldenFile::open(directory, "soundtracks.safetensors"))
+            .transpose()?;
+        for index in 0..clips {
+            references.push(Reference::Video {
+                video: self.tensor(&format!("clip.{index}.augmented"))?,
+                audio: soundtracks
+                    .as_ref()
+                    .map(|file| file.tensor(&format!("sound.{index}.latent")))
+                    .transpose()?,
+            });
+        }
+        for index in 0..count("reference_sounds")? {
+            references.push(Reference::Audio(
                 self.tensor(&format!("sound.{index}.latent"))?,
-            ))
-        });
-        pictures.chain(sounds).collect()
+            ));
+        }
+        Ok(references)
     }
 }
 
@@ -237,7 +256,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         context: text_file.tensor("context")?,
         context_modalities: text_file.context_modalities()?,
         keyframes: dit_file.keyframes()?,
-        references: dit_file.references()?,
+        references: dit_file.references(golden)?,
         sigma: sigma as f32,
         shift_video: dit_file.metadata("shift_video")?.parse()?,
         shift_audio: dit_file.metadata("shift_audio")?.parse()?,
@@ -274,6 +293,8 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some(SegmentKind::Text) => "text",
         Some(SegmentKind::Audio) => "audio",
         Some(SegmentKind::Video) => "video",
+        Some(SegmentKind::ReferenceVideo(_)) => "ref video",
+        Some(SegmentKind::ReferenceAudio(_)) => "ref audio",
         _ => "conditions",
     };
     for (index, residual) in &outputs.blocks {
@@ -285,7 +306,14 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             .copied()
             .collect();
         report(&format!("block {index}"), &sampled, &expected.data);
-        for segment in ["text", "conditions", "audio", "video"] {
+        for segment in [
+            "text",
+            "conditions",
+            "ref audio",
+            "ref video",
+            "audio",
+            "video",
+        ] {
             let (mut actual, mut reference) = (Vec::new(), Vec::new());
             for (sample, (row, expected_row)) in sampled
                 .chunks_exact(hidden)
@@ -369,7 +397,7 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let context = text_file.tensor("context")?;
     let context_modalities = text_file.context_modalities()?;
     let keyframes = dit_file.keyframes()?;
-    let references = dit_file.references()?;
+    let references = dit_file.references(golden)?;
     let dit = load_dit(&options, "weights", dit_file_for(&references))?;
     let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     println!(
@@ -496,6 +524,85 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Encodes the reference clips of a golden directory with the video VAE's clip encoder and
+/// compares the latents with ComfyUI's. With `--file`, the MP4 the clip came from is read again
+/// through mmh3's own demuxer and decoder and its pixels compared with the golden frames.
+fn check_clips(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use mmh3_cuda::video_encoder::{
+        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
+    use std::time::Instant;
+
+    let options = parse_options(arguments, &["golden", "models", "weights", "file"], USAGE)?;
+    let golden = Path::new(options.get("golden").ok_or(USAGE)?);
+    let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
+    let clips = GoldenFile::open(golden, "clips.safetensors")?;
+    let count: usize = clips
+        .metadata("reference_clips")?
+        .parse()
+        .map_err(|_| "bad reference_clips")?;
+
+    if let Some(path) = options.get("file") {
+        // The frames mmh3 decodes itself, against the frames ComfyUI decoded and resized.
+        let started = Instant::now();
+        let clip = mmh3::video::load_clip(Path::new(path), usize::MAX)?;
+        let expected = clips.tensor("clip.0.pixels")?;
+        println!(
+            "decoded {:?} from {path} in {:.1} s",
+            clip.frames.shape,
+            started.elapsed().as_secs_f64()
+        );
+        if clip.frames.shape != expected.shape {
+            return Err(format!(
+                "the frames {:?} differ from the golden {:?}",
+                clip.frames.shape, expected.shape
+            )
+            .into());
+        }
+        let (cosine, relative, worst, scale) = compare(&clip.frames.data, &expected.data);
+        println!(
+            "{:<16} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3}",
+            "frames"
+        );
+    }
+
+    let started = Instant::now();
+    let encoder = CudaVideoEncoder::load(
+        &SafeTensors::open(Path::new(&weights_path))?,
+        Temporal::Clip,
+        DEFAULT_TILE_SIZE,
+        DEFAULT_TILE_OVERLAP_MIN,
+    )?;
+    println!(
+        "loaded the encoder of {weights_path} in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    println!(
+        "{:<16} {:>11} {:>11} {:>11} {:>9}",
+        "latent", "cosine", "rel L2", "max error", "scale"
+    );
+    for index in 0..count {
+        let frames = clips.tensor(&format!("clip.{index}.pixels"))?;
+        let expected = clips.tensor(&format!("clip.{index}.latent"))?;
+        let started = Instant::now();
+        let latent = encoder.encode_clip(&frames)?.mean_latent();
+        let elapsed = started.elapsed().as_secs_f64();
+        if latent.shape != expected.shape {
+            return Err(format!(
+                "latent shape {:?} differs from the golden {:?}",
+                latent.shape, expected.shape
+            )
+            .into());
+        }
+        let (cosine, relative, worst, scale) = compare(&latent.data, &expected.data);
+        println!(
+            "{:<16} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.1} s)",
+            format!("clip {index}")
+        );
+    }
+    Ok(())
+}
+
 /// Encodes the reference sounds of a golden directory with the audio VAE's encoder and compares
 /// the posterior means with ComfyUI's.
 fn check_sounds(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -505,11 +612,18 @@ fn check_sounds(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(arguments, &["golden", "models", "weights"], USAGE)?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", AUDIO_VAE_FILE)?;
-    let sounds = GoldenFile::open(golden, "sounds.safetensors")?;
-    let count: usize = sounds
-        .metadata("reference_sounds")?
-        .parse()
-        .map_err(|_| "bad reference_sounds")?;
+    // A golden directory may hold standalone sounds, the soundtracks of its clips, or both.
+    let files: Vec<(&str, GoldenFile)> = [
+        ("sound", "sounds.safetensors"),
+        ("soundtrack", "soundtracks.safetensors"),
+    ]
+    .into_iter()
+    .filter(|(_, name)| golden.join(name).exists())
+    .map(|(label, name)| Ok((label, GoldenFile::open(golden, name)?)))
+    .collect::<Result<_, Box<dyn Error>>>()?;
+    if files.is_empty() {
+        return Err("the golden directory holds no sounds".into());
+    }
 
     let started = Instant::now();
     let encoder = CudaAudioEncoder::load(&SafeTensors::open(Path::new(&weights_path))?, "")?;
@@ -523,31 +637,37 @@ fn check_sounds(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     );
     // NOTE: ComfyUI encodes with TF32 convolutions by default. The golden script also stores a
     // strict FP32 encode.
-    for index in 0..count {
-        let waveform = sounds.tensor(&format!("sound.{index}.waveform"))?;
-        let started = Instant::now();
-        let latent = encoder.encode(&waveform)?;
-        let elapsed = started.elapsed().as_secs_f64();
-        for (label, name) in [
-            ("default", format!("sound.{index}.latent")),
-            ("FP32", format!("sound.{index}.latent_float32")),
-        ] {
-            if sounds.0.get(&name).is_none() {
-                continue;
+    for (kind, sounds) in &files {
+        let count: usize = sounds
+            .metadata("reference_sounds")?
+            .parse()
+            .map_err(|_| "bad reference_sounds")?;
+        for index in 0..count {
+            let waveform = sounds.tensor(&format!("sound.{index}.waveform"))?;
+            let started = Instant::now();
+            let latent = encoder.encode(&waveform)?;
+            let elapsed = started.elapsed().as_secs_f64();
+            for (label, name) in [
+                ("default", format!("sound.{index}.latent")),
+                ("FP32", format!("sound.{index}.latent_float32")),
+            ] {
+                if sounds.0.get(&name).is_none() {
+                    continue;
+                }
+                let expected = sounds.tensor(&name)?;
+                if latent.shape != expected.shape {
+                    return Err(format!(
+                        "latent shape {:?} differs from the golden {:?}",
+                        latent.shape, expected.shape
+                    )
+                    .into());
+                }
+                let (cosine, relative, worst, scale) = compare(&latent.data, &expected.data);
+                println!(
+                    "{:<16} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.2} s)",
+                    format!("{kind} {index} {label}")
+                );
             }
-            let expected = sounds.tensor(&name)?;
-            if latent.shape != expected.shape {
-                return Err(format!(
-                    "latent shape {:?} differs from the golden {:?}",
-                    latent.shape, expected.shape
-                )
-                .into());
-            }
-            let (cosine, relative, worst, scale) = compare(&latent.data, &expected.data);
-            println!(
-                "{:<16} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.2} s)",
-                format!("sound {index} {label}")
-            );
         }
     }
     Ok(())

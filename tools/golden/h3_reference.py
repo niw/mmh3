@@ -75,6 +75,18 @@ TEXT_ENCODER = "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VIDEO_VAE = "vae/minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "vae/minimax_h3_audio_vae_fp32.safetensors"
 AUDIO_SAMPLE_RATE = 32000
+AUDIO_SAMPLES_PER_LATENT = 800
+
+
+def trim_to_latent_frames(waveform):
+    """The samples the VAE wrapper keeps: whole latent frames, cropped from the middle as
+    vae_encode_crop_pixels crops every axis."""
+    samples = waveform.shape[1]
+    length = samples // AUDIO_SAMPLES_PER_LATENT * AUDIO_SAMPLES_PER_LATENT
+    start = (samples % AUDIO_SAMPLES_PER_LATENT) // 2
+    return waveform[:, start : start + length].contiguous()
+
+
 FPS = 24
 AUDIO_LATENTS_PER_SECOND = 40
 
@@ -312,6 +324,12 @@ def main():
         help="reference sound file, a 32 kHz WAV",
     )
     parser.add_argument(
+        "--reference-video",
+        action="append",
+        default=[],
+        help="reference clip file, an H.264 MP4 with its own soundtrack",
+    )
+    parser.add_argument(
         "--sparse-attention", choices=["off", "sol", "vsa"], default="off"
     )
     parser.add_argument("--vsa-sparsity", type=float, default=0.9)
@@ -404,6 +422,59 @@ def main():
         ]
         references.append({"image": _resize(picture, size[0], size[1], "disabled")})
     images = [item["image"] for item in keyframes + references]
+    clips = []
+    for path in arguments.reference_video:
+        import av
+        import numpy
+        from comfy_extras.nodes_minimax_h3 import CANVAS_MULTIPLE, _resize, adapt_canvas
+
+        container = av.open(path)
+        pixels = [
+            picture.to_ndarray(format="rgb24") for picture in container.decode(video=0)
+        ]
+        clip_frames = torch.from_numpy(
+            numpy.stack(pixels).astype(numpy.float32) / 255.0
+        )
+        height, width = clip_frames.shape[1], clip_frames.shape[2]
+        # MiniMaxH3ReferenceToVideo's clip sizing: the canvas of the clip's own aspect ratio,
+        # or its own size on the canvas grid when that is smaller, never scaled up.
+        canvas_width, canvas_height = adapt_canvas(width, height)
+        if width * height < canvas_width * canvas_height:
+            canvas_width, canvas_height = (
+                max(CANVAS_MULTIPLE, round(side / CANVAS_MULTIPLE) * CANVAS_MULTIPLE)
+                for side in (width, height)
+            )
+        clip_frames = _resize(clip_frames, canvas_width, canvas_height, "disabled")[
+            :frames
+        ]
+        count = clip_frames.shape[0]
+        while count % 17 != 5:
+            count -= 1
+        if count < 5:
+            raise SystemExit(f"{path} has too few frames for a reference clip")
+        clip = {"frames": clip_frames[:count].contiguous()}
+        # The clip's own soundtrack, as the node takes it next to the frames.
+        container.seek(0)
+        audio = (
+            [stream.to_ndarray() for stream in container.decode(audio=0)]
+            if container.streams.audio
+            else []
+        )
+        if audio:
+            rate = container.streams.audio[0].rate
+            if rate != AUDIO_SAMPLE_RATE:
+                raise SystemExit(
+                    f"{path} carries audio at {rate} Hz, not {AUDIO_SAMPLE_RATE}"
+                )
+            samples = numpy.concatenate(audio, axis=-1)
+            waveform = torch.from_numpy(samples.astype(numpy.float32))
+            if waveform.dtype == torch.float32 and waveform.abs().max() > 1.5:
+                waveform = waveform / 32768.0
+            if waveform.shape[0] == 1:
+                waveform = waveform.repeat(2, 1)
+            clip["waveform"] = trim_to_latent_frames(waveform[:2])
+        container.close()
+        clips.append(clip)
     sounds = []
     if arguments.reference_audio:
         import wave
@@ -421,7 +492,7 @@ def main():
         waveform = torch.from_numpy(samples.astype(numpy.float32).copy() / 32768.0).T
         if channels == 1:
             waveform = waveform.repeat(2, 1)
-        sounds.append({"waveform": waveform[:2].contiguous()})
+        sounds.append({"waveform": trim_to_latent_frames(waveform[:2])})
 
     started = time.time()
     text_path = os.path.join(arguments.out, "text.safetensors")
@@ -436,20 +507,40 @@ def main():
             ckpt_paths=[os.path.join(models, TEXT_ENCODER)],
             clip_type=comfy.sd.CLIPType.MINIMAX,
         )
-        if references or sounds:
+        if references or clips or sounds:
             items = [{"type": "image", "data": item["image"]} for item in references]
+            for item in clips:
+                if "waveform" in item:
+                    items.append({"type": "audio"})
+                sampled = item["frames"][:: FPS // 2]
+                items.append(
+                    {
+                        "type": "video",
+                        "data": sampled,
+                        "timestamps": [
+                            index / 2.0 for index in range(sampled.shape[0])
+                        ],
+                    }
+                )
             items += [{"type": "audio"} for _ in sounds]
             tokens = clip.tokenize(arguments.prompt, minimax_ref_items=items)
         else:
             tokens = clip.tokenize(arguments.prompt, images=images)
         # A vision block's embeddings count as -1, one per 32 × 32 pixels of its picture.
         token_ids = []
-        pictures = iter(images)
+        blocks = iter(
+            images
+            + [
+                item["frames"][:1]
+                for item in clips
+                for _ in range(-(-len(item["frames"][:: FPS // 2]) // 2))
+            ]
+        )
         for entry in next(iter(tokens.values()))[0]:
             if isinstance(entry[0], dict):
-                picture = next(pictures)
+                block = next(blocks)
                 token_ids.extend(
-                    [-1] * ((picture.shape[1] // 32) * (picture.shape[2] // 32))
+                    [-1] * ((block.shape[1] // 32) * (block.shape[2] // 32))
                 )
             else:
                 token_ids.append(entry[0])
@@ -475,7 +566,7 @@ def main():
         model_management.unload_all_models()
         model_management.soft_empty_cache()
 
-    if keyframes or references:
+    if keyframes or references or clips:
         started = time.time()
         with torch.inference_mode():
             video_vae = comfy.sd.VAE(
@@ -485,6 +576,10 @@ def main():
             )
             for item in keyframes + references:
                 item["latent"] = video_vae.encode(item["image"]).float()
+            for item in clips:
+                # The node hands the frames over as [T, H, W, C], which the wrapper turns into
+                # one clip. A batch axis would make its crop treat the frames as a spatial one.
+                item["latent"] = video_vae.encode(item["frames"]).float()
         for name, items, extra in (
             (
                 "keyframe",
@@ -515,11 +610,29 @@ def main():
                 f"{name}s: {len(items)} encoded with {arguments.video_vae}, {time.time() - started:.1f} s",
                 flush=True,
             )
+        if clips:
+            save_file(
+                {
+                    tensor_name: value.contiguous()
+                    for index, item in enumerate(clips)
+                    for tensor_name, value in (
+                        (f"clip.{index}.pixels", item["frames"].float()),
+                        (f"clip.{index}.latent", item["latent"][0]),
+                    )
+                },
+                os.path.join(arguments.out, "clips.safetensors"),
+                metadata={**metadata, "reference_clips": str(len(clips))},
+            )
+            print(
+                f"clips: {len(clips)} encoded with {arguments.video_vae}, "
+                f"{[tuple(item['latent'].shape) for item in clips]}",
+                flush=True,
+            )
         del video_vae
         model_management.unload_all_models()
         model_management.soft_empty_cache()
 
-    if sounds:
+    if sounds or any("waveform" in item for item in clips):
         from comfy_extras.nodes_minimax_h3 import _encode_ref_audio
 
         started = time.time()
@@ -531,34 +644,61 @@ def main():
             for key, tf32 in (("latent", allow_tf32), ("latent_float32", False)):
                 torch.backends.cudnn.allow_tf32 = tf32
                 audio_vae = comfy.sd.VAE(sd=dict(audio_weights), dtype=torch.float32)
-                for sound in sounds:
+
+                def encode_sound(waveform):
                     # The node's helper drives the VAE wrapper, which moves the samples itself.
                     latent, _ = _encode_ref_audio(
                         audio_vae,
-                        {
-                            "waveform": sound["waveform"][None],
-                            "sample_rate": AUDIO_SAMPLE_RATE,
-                        },
+                        {"waveform": waveform[None], "sample_rate": AUDIO_SAMPLE_RATE},
                     )
-                    sound[key] = latent.float().cpu()
+                    return latent.float().cpu()
+
+                for sound in sounds:
+                    sound[key] = encode_sound(sound["waveform"])
+                # A clip's own key holds its video latent, so its soundtrack takes another.
+                for item in clips:
+                    if "waveform" in item:
+                        item[f"{key.replace('latent', 'latent_audio')}"] = encode_sound(
+                            item["waveform"]
+                        )
                 del audio_vae
                 model_management.unload_all_models()
             torch.backends.cudnn.allow_tf32 = allow_tf32
-        save_file(
-            {
-                tensor_name: value.contiguous()
-                for index, sound in enumerate(sounds)
-                for tensor_name, value in (
-                    (f"sound.{index}.waveform", sound["waveform"]),
-                    (f"sound.{index}.latent", sound["latent"][0]),
-                    (f"sound.{index}.latent_float32", sound["latent_float32"][0]),
-                )
-            },
-            os.path.join(arguments.out, "sounds.safetensors"),
-            metadata={**metadata, "reference_sounds": str(len(sounds))},
-        )
+        if sounds:
+            save_file(
+                {
+                    tensor_name: value.contiguous()
+                    for index, sound in enumerate(sounds)
+                    for tensor_name, value in (
+                        (f"sound.{index}.waveform", sound["waveform"]),
+                        (f"sound.{index}.latent", sound["latent"][0]),
+                        (f"sound.{index}.latent_float32", sound["latent_float32"][0]),
+                    )
+                },
+                os.path.join(arguments.out, "sounds.safetensors"),
+                metadata={**metadata, "reference_sounds": str(len(sounds))},
+            )
+        soundtracks = [item for item in clips if "waveform" in item]
+        if soundtracks:
+            save_file(
+                {
+                    tensor_name: value.contiguous()
+                    for index, item in enumerate(soundtracks)
+                    for tensor_name, value in (
+                        (f"sound.{index}.waveform", item["waveform"]),
+                        (f"sound.{index}.latent", item["latent_audio"][0]),
+                        (
+                            f"sound.{index}.latent_float32",
+                            item["latent_audio_float32"][0],
+                        ),
+                    )
+                },
+                os.path.join(arguments.out, "soundtracks.safetensors"),
+                metadata={**metadata, "reference_sounds": str(len(soundtracks))},
+            )
         print(
-            f"sounds: {len(sounds)} encoded with {AUDIO_VAE}, {time.time() - started:.1f} s",
+            f"sounds: {len(sounds)} and {len(soundtracks)} soundtracks encoded with {AUDIO_VAE}, "
+            f"{time.time() - started:.1f} s",
             flush=True,
         )
         model_management.soft_empty_cache()
@@ -702,6 +842,47 @@ def main():
                 .contiguous()
             )
         metadata["reference_pictures"] = str(len(references))
+    if clips:
+        payload["refs"] = payload.get("refs", []) + [
+            {
+                "kind": "video_audio" if "latent_audio" in item else "video",
+                "latent_t": item["latent"].shape[2],
+                "latent_h": item["latent"].shape[3],
+                "latent_w": item["latent"].shape[4],
+                "ref_audio_t": item["latent_audio"].shape[3]
+                if "latent_audio" in item
+                else 0,
+                "latent": item["latent"],
+                "audio_latent": item.get("latent_audio"),
+            }
+            for item in clips
+        ]
+        payload["cond_video_latents"] = payload.get("cond_video_latents", []) + [
+            item["latent"] for item in clips
+        ]
+        payload["cond_audio_latents"] = payload.get("cond_audio_latents", []) + [
+            item["latent_audio"] for item in clips if "latent_audio" in item
+        ]
+        # The clip rows with ComfyUI's noise, back in each clip's latent layout. The pictures
+        # come first, so their rows are skipped.
+        rows = model._cond_video_rows(payload, device).float().cpu()
+        start = sum(
+            (reference["latent"].shape[3] // 2) * (reference["latent"].shape[4] // 2)
+            for reference in references
+        )
+        for index, item in enumerate(clips):
+            channels, latent_t, height, width = item["latent"].shape[1:]
+            count = latent_t * (height // 2) * (width // 2)
+            part = rows[start : start + count].view(
+                1, latent_t, height // 2, width // 2, channels, 1, 2, 2
+            )
+            start += count
+            tensors[f"clip.{index}.augmented"] = (
+                part.permute(4, 0, 5, 1, 2, 6, 3, 7)
+                .reshape(channels, latent_t, height, width)
+                .contiguous()
+            )
+        metadata["reference_clips"] = str(len(clips))
     if sounds:
         # The sounds follow the pictures, the order of the presentation, and reach the DiT
         # as the posterior mean, since reference audio takes no condition noise.

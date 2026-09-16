@@ -40,6 +40,12 @@ LATENT_HEIGHT = 4
 LATENT_WIDTH = 6
 AUDIO_FRAMES = 9
 SIGMA = 0.7
+# The references of the second pass.
+REFERENCE_HEIGHT = 2
+REFERENCE_WIDTH = 8
+CLIP_FRAMES = 2
+SOUNDTRACK_FRAMES = 4
+SOUND_FRAMES = 5
 
 
 def storage_dtype(name):
@@ -138,6 +144,60 @@ def main():
         video_out, audio_out = model._forward(
             [video, audio], timestep, context, transformer_options={}
         )
+    # The hooks keep firing, so the first pass is kept under its own name.
+    first_pass = dict(captured)
+
+    # A second pass with the references of reference to video generation: a picture on a grid of
+    # its own, a clip of the target's grid with a soundtrack, and a standalone sound.
+    picture = torch.randn(
+        (1, CONFIG["latents_dim"], 1, REFERENCE_HEIGHT, REFERENCE_WIDTH),
+        generator=generator,
+    )
+    clip = torch.randn(
+        (1, CONFIG["latents_dim"], CLIP_FRAMES, LATENT_HEIGHT, LATENT_WIDTH),
+        generator=generator,
+    )
+    soundtrack = torch.randn(
+        (1, CONFIG["audio_latents_dim"], 2, SOUNDTRACK_FRAMES), generator=generator
+    )
+    sound = torch.randn(
+        (1, CONFIG["audio_latents_dim"], 2, SOUND_FRAMES), generator=generator
+    )
+    payload = {
+        "seed": 0,
+        "refs": [
+            {
+                "kind": "image",
+                "latent_h": REFERENCE_HEIGHT,
+                "latent_w": REFERENCE_WIDTH,
+                "latent": picture,
+            },
+            {
+                "kind": "video_audio",
+                "latent_t": CLIP_FRAMES,
+                "latent_h": LATENT_HEIGHT,
+                "latent_w": LATENT_WIDTH,
+                "ref_audio_t": SOUNDTRACK_FRAMES,
+                "latent": clip,
+                "audio_latent": soundtrack,
+            },
+            {"kind": "audio", "ref_audio_t": SOUND_FRAMES, "audio_latent": sound},
+        ],
+        "cond_video_latents": [picture, clip],
+        "cond_audio_latents": [soundtrack, sound],
+    }
+    with torch.inference_mode():
+        reference_video, reference_audio = model._forward(
+            [video, audio],
+            timestep,
+            context,
+            transformer_options={},
+            minimax_payload=payload,
+        )
+        # The rows the DiT saw, with the condition noise it mixed in, back in latent layout.
+        rows = model._cond_video_rows(payload, torch.device("cpu")).float()
+    picture_rows = rows[: (REFERENCE_HEIGHT // 2) * (REFERENCE_WIDTH // 2)]
+    clip_rows = rows[(REFERENCE_HEIGHT // 2) * (REFERENCE_WIDTH // 2) :]
 
     tensors = {f"weight.{name}": value.contiguous() for name, value in weights.items()}
     tensors.update(
@@ -146,13 +206,39 @@ def main():
             "input.audio": audio.contiguous(),
             "input.context": context.contiguous(),
             "input.timestep": timestep,
-            "intermediate.text_states": captured["text_states"].contiguous(),
+            "intermediate.text_states": first_pass["text_states"].contiguous(),
             "output.video": video_out.contiguous(),
             "output.audio": audio_out.contiguous(),
         }
     )
     for index in range(CONFIG["num_layers"]):
-        tensors[f"intermediate.block.{index}"] = captured[f"block.{index}"].contiguous()
+        tensors[f"intermediate.block.{index}"] = first_pass[
+            f"block.{index}"
+        ].contiguous()
+
+    def unpatchify(part, frames, height, width):
+        channels = CONFIG["latents_dim"]
+        part = part.view(1, frames, height // 2, width // 2, channels, 1, 2, 2)
+        return (
+            part.permute(4, 0, 5, 1, 2, 6, 3, 7)
+            .reshape(channels, frames, height, width)
+            .contiguous()
+        )
+
+    tensors.update(
+        {
+            "input.reference.picture": unpatchify(
+                picture_rows, 1, REFERENCE_HEIGHT, REFERENCE_WIDTH
+            ),
+            "input.reference.clip": unpatchify(
+                clip_rows, CLIP_FRAMES, LATENT_HEIGHT, LATENT_WIDTH
+            ),
+            "input.reference.soundtrack": soundtrack[0].contiguous(),
+            "input.reference.sound": sound[0].contiguous(),
+            "output.reference.video": reference_video.contiguous(),
+            "output.reference.audio": reference_audio.contiguous(),
+        }
+    )
     metadata = {
         "config": json.dumps(CONFIG),
         "sigma": str(SIGMA),

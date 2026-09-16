@@ -29,6 +29,7 @@ const USAGE: &str = "usage:
   mmh3-tools check video-vae --golden <directory> [--models DIR] [--weights FILE] [--reference FILE]
   mmh3-tools check keyframes --golden <directory> [--models DIR] [--weights FILE] [--reference FILE]
   mmh3-tools check sounds --golden <directory> [--models DIR] [--weights FILE]
+  mmh3-tools check clips --golden <directory> [--models DIR] [--weights FILE] [--file clip.mp4]
   mmh3-tools check audio-vae --golden <directory> [--models DIR] [--weights FILE]
   mmh3-tools check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
   mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
