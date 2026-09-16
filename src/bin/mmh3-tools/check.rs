@@ -17,6 +17,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("sample") => check_sample(&arguments[1..]),
         Some("video-vae") => check_video_vae(&arguments[1..]),
         Some("keyframes") => check_keyframes(&arguments[1..]),
+        Some("sounds") => check_sounds(&arguments[1..]),
         Some("audio-vae") => check_audio_vae(&arguments[1..]),
         Some("text-encoder") => check_text_encoder(&arguments[1..]),
         _ => Err(USAGE.into()),
@@ -113,22 +114,31 @@ impl GoldenFile {
             .collect()
     }
 
-    /// The reference pictures as the DiT sees them, with ComfyUI's condition noise.
+    /// The reference pictures and sounds as the DiT sees them, the pictures with ComfyUI's
+    /// condition noise and the sounds as their posterior mean, which takes none.
     fn references(&self) -> Result<Vec<mmh3_core::dit::inputs::Reference>, Box<dyn Error>> {
-        if !self.has_metadata("reference_pictures") {
-            return Ok(Vec::new());
-        }
-        let count: usize = self
-            .metadata("reference_pictures")?
-            .parse()
-            .map_err(|_| "bad reference_pictures")?;
-        (0..count)
-            .map(|index| {
-                Ok(mmh3_core::dit::inputs::Reference::Picture(
-                    self.tensor(&format!("reference.{index}.augmented"))?,
-                ))
-            })
-            .collect()
+        use mmh3_core::dit::inputs::Reference;
+
+        let count = |key: &str| -> Result<usize, Box<dyn Error>> {
+            if !self.has_metadata(key) {
+                return Ok(0);
+            }
+            Ok(self
+                .metadata(key)?
+                .parse()
+                .map_err(|_| format!("bad {key}"))?)
+        };
+        let pictures = (0..count("reference_pictures")?).map(|index| {
+            Ok(Reference::Picture(
+                self.tensor(&format!("reference.{index}.augmented"))?,
+            ))
+        });
+        let sounds = (0..count("reference_sounds")?).map(|index| {
+            Ok(Reference::Audio(
+                self.tensor(&format!("sound.{index}.latent"))?,
+            ))
+        });
+        pictures.chain(sounds).collect()
     }
 }
 
@@ -475,6 +485,63 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "{:<12} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.2} s)",
             format!("{name} {index}")
         );
+    }
+    Ok(())
+}
+
+/// Encodes the reference sounds of a golden directory with the audio VAE's encoder and compares
+/// the posterior means with ComfyUI's.
+fn check_sounds(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use mmh3_cuda::audio_encoder::CudaAudioEncoder;
+    use std::time::Instant;
+
+    let options = parse_options(arguments, &["golden", "models", "weights"], USAGE)?;
+    let golden = Path::new(options.get("golden").ok_or(USAGE)?);
+    let weights_path = option_path(&options, "weights", AUDIO_VAE_FILE)?;
+    let sounds = GoldenFile::open(golden, "sounds.safetensors")?;
+    let count: usize = sounds
+        .metadata("reference_sounds")?
+        .parse()
+        .map_err(|_| "bad reference_sounds")?;
+
+    let started = Instant::now();
+    let encoder = CudaAudioEncoder::load(&SafeTensors::open(Path::new(&weights_path))?, "")?;
+    println!(
+        "loaded the encoder of {weights_path} in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    println!(
+        "{:<16} {:>11} {:>11} {:>11} {:>9}",
+        "against", "cosine", "rel L2", "max error", "scale"
+    );
+    // NOTE: ComfyUI encodes with TF32 convolutions by default. The golden script also stores a
+    // strict FP32 encode.
+    for index in 0..count {
+        let waveform = sounds.tensor(&format!("sound.{index}.waveform"))?;
+        let started = Instant::now();
+        let latent = encoder.encode(&waveform)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        for (label, name) in [
+            ("default", format!("sound.{index}.latent")),
+            ("FP32", format!("sound.{index}.latent_float32")),
+        ] {
+            if sounds.0.get(&name).is_none() {
+                continue;
+            }
+            let expected = sounds.tensor(&name)?;
+            if latent.shape != expected.shape {
+                return Err(format!(
+                    "latent shape {:?} differs from the golden {:?}",
+                    latent.shape, expected.shape
+                )
+                .into());
+            }
+            let (cosine, relative, worst, scale) = compare(&latent.data, &expected.data);
+            println!(
+                "{:<16} {cosine:>11.7} {relative:>11.3e} {worst:>11.3e} {scale:>9.3} ({elapsed:.2} s)",
+                format!("sound {index} {label}")
+            );
+        }
     }
     Ok(())
 }

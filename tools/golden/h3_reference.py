@@ -13,7 +13,8 @@ runs the DiT with an FP32 residual stream and FP32 activations instead of ComfyU
 default BF16, as a tighter reference. --reference, repeatable, adds a reference picture
 the way ComfyUI's MiniMaxH3ReferenceToVideo does with its default sizing (scaled down to
 the canvas area at its own aspect ratio, never up), and switches the default DiT to the
-ref2va one. --lora applies a LoRA from models/loras to the
+ref2va one. --reference-audio, repeatable, adds a reference sound from a 32 kHz WAV file,
+the rate of the audio VAE, so that no resampling enters the comparison. --lora applies a LoRA from models/loras to the
 DiT, for example the 768p Turbo LoRA with --steps 4 --shift-video 6. ComfyUI merges a
 LoRA into quantized weights and requantizes them with stochastic rounding, and
 --lora-rounding nearest rounds to nearest instead. --sparse-attention sol patches in
@@ -44,6 +45,11 @@ It writes up to four files into the output directory:
   sizes and their normalized latents. The pictures also go to the text encoder as
   <Picture i>, and dit.safetensors then holds their latents with the condition noise
   ComfyUI mixes in, as the DiT sees them.
+- sounds.safetensors, with --reference-audio: the stereo waveforms at 32 kHz and their
+  normalized posterior means from the audio VAE's encoder, from ComfyUI's default setup as
+  "latent" and from strict FP32, with TF32 convolutions turned off, as "latent_float32". The sounds also go to the text
+  encoder as <Audio j>, after the pictures, and dit.safetensors holds their latents as the
+  DiT sees them, which is unchanged since reference audio takes no condition noise.
 - decode.safetensors: video pixels in [0, 1] and the stereo waveform decoded from the
   final latents, before ComfyUI's audio loudness normalization. The waveform comes from
   ComfyUI's default audio VAE setup as "audio" and from strict FP32, with PyTorch's TF32
@@ -68,6 +74,7 @@ REFERENCE_DIT = "diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetens
 TEXT_ENCODER = "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
 VIDEO_VAE = "vae/minimax_h3_video_vae_fp16.safetensors"
 AUDIO_VAE = "vae/minimax_h3_audio_vae_fp32.safetensors"
+AUDIO_SAMPLE_RATE = 32000
 FPS = 24
 AUDIO_LATENTS_PER_SECOND = 40
 
@@ -299,6 +306,12 @@ def main():
         "--reference", action="append", default=[], help="reference picture file"
     )
     parser.add_argument(
+        "--reference-audio",
+        action="append",
+        default=[],
+        help="reference sound file, a 32 kHz WAV",
+    )
+    parser.add_argument(
         "--sparse-attention", choices=["off", "sol", "vsa"], default="off"
     )
     parser.add_argument("--vsa-sparsity", type=float, default=0.9)
@@ -312,7 +325,9 @@ def main():
     )
     arguments = parser.parse_args()
     if arguments.dit is None:
-        arguments.dit = REFERENCE_DIT if arguments.reference else DIT
+        arguments.dit = (
+            REFERENCE_DIT if arguments.reference or arguments.reference_audio else DIT
+        )
     sys.path.insert(0, arguments.comfyui)
     os.makedirs(arguments.out, exist_ok=True)
 
@@ -389,6 +404,24 @@ def main():
         ]
         references.append({"image": _resize(picture, size[0], size[1], "disabled")})
     images = [item["image"] for item in keyframes + references]
+    sounds = []
+    if arguments.reference_audio:
+        import wave
+
+        import numpy
+    for path in arguments.reference_audio:
+        # The image has no torchaudio backend, and a 16-bit WAV at the VAE's rate needs none.
+        with wave.open(path, "rb") as file:
+            if file.getsampwidth() != 2 or file.getframerate() != AUDIO_SAMPLE_RATE:
+                raise SystemExit(f"{path} is not 16-bit PCM at {AUDIO_SAMPLE_RATE} Hz")
+            channels = file.getnchannels()
+            samples = numpy.frombuffer(
+                file.readframes(file.getnframes()), dtype="<i2"
+            ).reshape(-1, channels)
+        waveform = torch.from_numpy(samples.astype(numpy.float32).copy() / 32768.0).T
+        if channels == 1:
+            waveform = waveform.repeat(2, 1)
+        sounds.append({"waveform": waveform[:2].contiguous()})
 
     started = time.time()
     text_path = os.path.join(arguments.out, "text.safetensors")
@@ -403,8 +436,9 @@ def main():
             ckpt_paths=[os.path.join(models, TEXT_ENCODER)],
             clip_type=comfy.sd.CLIPType.MINIMAX,
         )
-        if references:
+        if references or sounds:
             items = [{"type": "image", "data": item["image"]} for item in references]
+            items += [{"type": "audio"} for _ in sounds]
             tokens = clip.tokenize(arguments.prompt, minimax_ref_items=items)
         else:
             tokens = clip.tokenize(arguments.prompt, images=images)
@@ -483,6 +517,50 @@ def main():
             )
         del video_vae
         model_management.unload_all_models()
+        model_management.soft_empty_cache()
+
+    if sounds:
+        from comfy_extras.nodes_minimax_h3 import _encode_ref_audio
+
+        started = time.time()
+        audio_weights = comfy.utils.load_torch_file(os.path.join(models, AUDIO_VAE))
+        allow_tf32 = torch.backends.cudnn.allow_tf32
+        with torch.inference_mode():
+            # ComfyUI's default setup uses TF32 convolutions, so a strict FP32 encode comes
+            # along as the tighter reference, as for the audio decode.
+            for key, tf32 in (("latent", allow_tf32), ("latent_float32", False)):
+                torch.backends.cudnn.allow_tf32 = tf32
+                audio_vae = comfy.sd.VAE(sd=dict(audio_weights), dtype=torch.float32)
+                for sound in sounds:
+                    # The node's helper drives the VAE wrapper, which moves the samples itself.
+                    latent, _ = _encode_ref_audio(
+                        audio_vae,
+                        {
+                            "waveform": sound["waveform"][None],
+                            "sample_rate": AUDIO_SAMPLE_RATE,
+                        },
+                    )
+                    sound[key] = latent.float().cpu()
+                del audio_vae
+                model_management.unload_all_models()
+            torch.backends.cudnn.allow_tf32 = allow_tf32
+        save_file(
+            {
+                tensor_name: value.contiguous()
+                for index, sound in enumerate(sounds)
+                for tensor_name, value in (
+                    (f"sound.{index}.waveform", sound["waveform"]),
+                    (f"sound.{index}.latent", sound["latent"][0]),
+                    (f"sound.{index}.latent_float32", sound["latent_float32"][0]),
+                )
+            },
+            os.path.join(arguments.out, "sounds.safetensors"),
+            metadata={**metadata, "reference_sounds": str(len(sounds))},
+        )
+        print(
+            f"sounds: {len(sounds)} encoded with {AUDIO_VAE}, {time.time() - started:.1f} s",
+            flush=True,
+        )
         model_management.soft_empty_cache()
 
     started = time.time()
@@ -624,6 +702,17 @@ def main():
                 .contiguous()
             )
         metadata["reference_pictures"] = str(len(references))
+    if sounds:
+        # The sounds follow the pictures, the order of the presentation, and reach the DiT
+        # as the posterior mean, since reference audio takes no condition noise.
+        payload["refs"] = payload.get("refs", []) + [
+            {"kind": "audio", "ref_audio_t": sound["latent"].shape[3]}
+            for sound in sounds
+        ]
+        payload["cond_audio_latents"] = [sound["latent"] for sound in sounds]
+        for index, sound in enumerate(sounds):
+            tensors[f"sound.{index}.latent"] = sound["latent"][0].contiguous()
+        metadata["reference_sounds"] = str(len(sounds))
     with torch.inference_mode():
         for step in range(arguments.steps):
             timestep = torch.tensor([sigmas_video[step] * 1000.0], device=device)
