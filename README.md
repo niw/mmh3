@@ -45,8 +45,9 @@ See [Usage](docs/usage.md) for the other settings.
 - NVIDIA Blackwell GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for
   `sm_120f`, so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been
   tested yet.
-- Videos from reference pictures and sounds ([Ref2VA](docs/ref2va.md)) work with the ref2va DiT.
-- Not yet: reference videos, an HTTP server, and a Metal backend for Apple Silicon.
+- Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
+  DiT, reading reference clips from MP4 files.
+- Not yet: an HTTP server and a Metal backend for Apple Silicon.
 
 ## Requirements
 

@@ -42,6 +42,9 @@ make generate \
   `<Audio 2>` and so on, in the order of the options, from a WAV, FLAC, MP3, AAC, ALAC, Ogg Vorbis,
   MP4 or Matroska file, resampled to the audio VAE's 32 kHz. Switches the default DiT to the ref2va
   one as well.
+- `--reference-video FILE` (default none, repeatable): An H.264 MP4 the prompt refers to as
+  `<Video 1>`, `<Video 2>` and so on, its frames decoded with NVDEC and its soundtrack taken as the
+  `<Audio j>` before it. Switches the default DiT to the ref2va one as well.
 - `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
   there is no CFG.
 - `--schedule uniform|taomate` (default `uniform`): `taomate` runs the three steps the TaoMate-H3

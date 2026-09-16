@@ -5,8 +5,9 @@
   few-step models, where to get them and how to run them.
 - [First and last frames](fl2va.md): generating from pictures with `--first-frame` and
   `--last-frame`.
-- [Reference pictures and sounds](ref2va.md): generating with the ref2va DiT from pictures and
-  sounds the prompt refers to, with `--reference` and `--reference-audio`.
+- [Reference pictures, sounds and clips](ref2va.md): generating with the ref2va DiT from pictures,
+  sounds and clips the prompt refers to, with `--reference`, `--reference-audio` and
+  `--reference-video`.
 - [NVFP4 linear layers](nvfp4.md): the experimental `--linear-precision nvfp4`, its speed and
   accuracy.
 - [Models](models.md): the models directory and what `make download-models` downloads.
