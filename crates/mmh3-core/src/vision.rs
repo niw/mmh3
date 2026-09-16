@@ -202,12 +202,25 @@ pub struct VisionPrompt {
     pub positions: Vec<[usize; 3]>,
 }
 
-/// H3's presentation of a prompt with pictures, without a chat template: for each picture
-/// `"<Picture i>: "`, `<|vision_start|>`, its vision embeddings and `<|vision_end|>`, then the
-/// prompt. Text tokens take consecutive positions on all three axes, and a picture's embeddings
+/// A reference the prompt introduces: a picture, which the vision tower embeds, or a sound, which
+/// only gets a label since H3 has no audio tower.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromptReference {
+    Picture(VisionGrid),
+    Sound,
+}
+
+/// H3's presentation of a prompt with references, without a chat template: for each picture
+/// `"<Picture i>: "`, `<|vision_start|>`, its vision embeddings and `<|vision_end|>`, for each
+/// sound `"<Audio j>: "`, and then the prompt. Both kinds are numbered from one within their own
+/// kind. Text tokens take consecutive positions on all three axes, and a picture's embeddings
 /// share the time position of their first one and spread over its rows and columns, after which
 /// the text continues past the picture's largest position.
-pub fn vision_prompt(tokenizer: &Tokenizer, prompt: &str, pictures: &[VisionGrid]) -> VisionPrompt {
+pub fn vision_prompt(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    references: &[PromptReference],
+) -> VisionPrompt {
     fn push_text(prompt: &mut VisionPrompt, next: &mut usize, ids: &[u32], modality: Modality) {
         for &id in ids {
             prompt.ids.push(id);
@@ -224,9 +237,22 @@ pub fn vision_prompt(tokenizer: &Tokenizer, prompt: &str, pictures: &[VisionGrid
         positions: Vec::new(),
     };
     let mut next = 0;
-    for (index, grid) in pictures.iter().enumerate() {
-        let label = tokenizer.encode(&format!("<Picture {}>: ", index + 1));
-        push_text(&mut result, &mut next, &label, Modality::Text);
+    let (mut pictures, mut sounds) = (0, 0);
+    for reference in references {
+        let grid = match reference {
+            PromptReference::Picture(grid) => {
+                pictures += 1;
+                let label = tokenizer.encode(&format!("<Picture {pictures}>: "));
+                push_text(&mut result, &mut next, &label, Modality::Text);
+                grid
+            }
+            PromptReference::Sound => {
+                sounds += 1;
+                let label = tokenizer.encode(&format!("<Audio {sounds}>: "));
+                push_text(&mut result, &mut next, &label, Modality::Text);
+                continue;
+            }
+        };
         push_text(&mut result, &mut next, &[VISION_START], Modality::Video);
         result.picture_starts.push(result.ids.len());
         let (rows, columns) = (grid.height / MERGE, grid.width / MERGE);
@@ -268,7 +294,8 @@ mod tests {
     fn places_two_pictures_in_the_prompt() {
         let grid = VisionGrid::for_picture(768, 1344);
         assert_eq!((grid.height, grid.width, grid.tokens()), (48, 84, 1008));
-        let prompt = vision_prompt(&Tokenizer::h3(), "Rain.", &[grid, grid]);
+        let picture = PromptReference::Picture(grid);
+        let prompt = vision_prompt(&Tokenizer::h3(), "Rain.", &[picture, picture]);
         assert_eq!(&prompt.ids[..6], &[21604, 3826, 220, 16, 26818, 220]);
         assert_eq!(prompt.ids[6], VISION_START);
         assert_eq!(prompt.picture_starts, vec![7, 7 + 1008 + 1 + 6 + 1]);
@@ -285,6 +312,47 @@ mod tests {
         assert_eq!(prompt.modalities[6], Modality::Video);
         assert_eq!(prompt.modalities[first + 1008], Modality::Video);
         assert_eq!(*prompt.modalities.last().unwrap(), Modality::Text);
+    }
+
+    #[test]
+    fn labels_sounds_after_the_pictures() {
+        let tokenizer = Tokenizer::h3();
+        let grid = VisionGrid {
+            height: 4,
+            width: 4,
+        };
+        let prompt = vision_prompt(
+            &tokenizer,
+            "Rain.",
+            &[
+                PromptReference::Picture(grid),
+                PromptReference::Sound,
+                PromptReference::Sound,
+            ],
+        );
+        // One vision block, then the two labels and the prompt as plain text.
+        assert_eq!(prompt.picture_starts.len(), 1);
+        let after = prompt.picture_starts[0] + grid.tokens() + 1;
+        let labels = tokenizer.encode("<Audio 1>: ");
+        assert_eq!(&prompt.ids[after..after + labels.len()], &labels[..]);
+        let second = after + labels.len();
+        // The label and the prompt are tokenized on their own, so no merge spans their boundary.
+        let expected: Vec<u32> = tokenizer
+            .encode("<Audio 2>: ")
+            .into_iter()
+            .chain(tokenizer.encode("Rain."))
+            .collect();
+        assert_eq!(&prompt.ids[second..], &expected[..]);
+        assert!(
+            prompt.modalities[after..]
+                .iter()
+                .all(|modality| *modality == Modality::Text)
+        );
+        // Text positions stay consecutive across the labels.
+        for (offset, position) in prompt.positions[after..].iter().enumerate() {
+            let first = prompt.positions[after][0];
+            assert_eq!(*position, [first + offset; 3]);
+        }
     }
 
     #[test]

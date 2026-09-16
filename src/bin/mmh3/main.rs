@@ -7,6 +7,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
+                [--reference-audio FILE]...
                 [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
@@ -22,6 +23,8 @@ Comfy-Org/MiniMax-H3 repository, given by --models or MMH3_MODELS:
 --height the first picture sets the canvas's aspect ratio.
 --reference takes a PNG or JPEG picture the prompt refers to as <Picture 1>, <Picture 2> and so on, in the order
 of the options, and switches the default DiT to diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors.
+--reference-audio does the same with a sound the prompt refers to as <Audio 1>, <Audio 2> and so on, from a WAV,
+FLAC, MP3, AAC, ALAC, Ogg Vorbis, MP4 or Matroska file, resampled to the audio VAE's 32 kHz.
 MP4 uses NVENC H.264 + AAC on CUDA; WebM uses built-in VP9 + Opus.
 --ffmpeg overrides native output and consumes all remaining arguments.
 With no ffmpeg arguments it uses H.264 + AAC. Set --out to a .mp4 file.

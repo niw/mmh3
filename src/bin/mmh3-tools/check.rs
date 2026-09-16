@@ -662,13 +662,16 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let pictures: Vec<mmh3_core::tensor::Tensor> = (0..)
         .map_while(|index| golden.tensor(&format!("picture.{index}.pixels")).ok())
         .collect();
-    let grids: Vec<mmh3_core::vision::VisionGrid> = pictures
+    let references: Vec<mmh3_core::vision::PromptReference> = pictures
         .iter()
         .map(|picture| {
-            mmh3_core::vision::VisionGrid::for_picture(picture.shape[0], picture.shape[1])
+            mmh3_core::vision::PromptReference::Picture(mmh3_core::vision::VisionGrid::for_picture(
+                picture.shape[0],
+                picture.shape[1],
+            ))
         })
         .collect();
-    let prompt = mmh3_core::vision::vision_prompt(&Tokenizer::h3(), &prompt, &grids);
+    let prompt = mmh3_core::vision::vision_prompt(&Tokenizer::h3(), &prompt, &references);
     let ids = prompt.ids.clone();
     if ids != expected_ids {
         return Err(

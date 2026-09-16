@@ -2,10 +2,11 @@
 //! prompt's text states and the DiT's Euler steps from the seed's noise, with the keyframes of
 //! first and last frame generation or the reference pictures of reference to video generation.
 
+use crate::audio::load_audio;
 use crate::cli::{option_float, option_number, option_values};
 use crate::models::{
-    DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path, save_algorithm_cache,
-    sparse_attention, video_vae_path,
+    AUDIO_VAE_FILE, DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path,
+    save_algorithm_cache, sparse_attention, video_vae_path,
 };
 use crate::pictures::load_picture;
 use mmh3_core::dit::sampler::Schedule;
@@ -28,6 +29,7 @@ pub const OPTIONS: &[&str] = &[
     "first-frame",
     "last-frame",
     "reference",
+    "reference-audio",
     "steps",
     "schedule",
     "seed",
@@ -36,6 +38,7 @@ pub const OPTIONS: &[&str] = &[
     "dit",
     "text-encoder",
     "video-vae",
+    "audio-vae",
     "patch",
     "lora",
     "lora-strength",
@@ -56,6 +59,8 @@ const KEYFRAME_POSTERIOR_SEED: u64 = 42;
 const KEYFRAME_NOISE_STREAM: u64 = 0x6b65_7966_7261_6d65;
 /// The most reference pictures the official pipeline takes.
 const MAX_REFERENCE_PICTURES: usize = 9;
+/// The most reference sounds the official pipeline takes.
+const MAX_REFERENCE_SOUNDS: usize = 3;
 
 /// A picture that a frame of the generation starts from or reaches, fitted to the canvas.
 pub struct KeyframePicture {
@@ -69,6 +74,8 @@ pub struct Settings {
     pub keyframes: Vec<KeyframePicture>,
     /// Pictures of `--reference` in their order, each scaled to its size for the DiT.
     pub references: Vec<mmh3_core::picture::Picture>,
+    /// Waveforms of `--reference-audio` in their order, `[2, samples]` at the audio VAE's rate.
+    pub sounds: Vec<Tensor>,
     pub schedule: Schedule,
     pub steps: usize,
     pub seed: u64,
@@ -118,12 +125,25 @@ impl Settings {
                 format!("pass at most {MAX_REFERENCE_PICTURES} --reference pictures").into(),
             );
         }
+        let files = option_values(arguments, "reference-audio");
+        if files.len() > MAX_REFERENCE_SOUNDS {
+            return Err(
+                format!("pass at most {MAX_REFERENCE_SOUNDS} --reference-audio files").into(),
+            );
+        }
+        let sounds = files
+            .into_iter()
+            .map(|path| load_audio(Path::new(path)))
+            .collect::<Result<Vec<_>, _>>()?;
         let references = references
             .into_iter()
             .map(|path| load_picture(Path::new(path)))
             .collect::<Result<Vec<_>, _>>()?;
-        if !pictures.is_empty() && !references.is_empty() {
-            return Err("--reference cannot be combined with --first-frame or --last-frame".into());
+        if !pictures.is_empty() && !(references.is_empty() && sounds.is_empty()) {
+            return Err(
+                "--reference and --reference-audio cannot be combined with --first-frame or --last-frame"
+                    .into(),
+            );
         }
         // Without a canvas size, the first keyframe gives the aspect ratio.
         let (width, height) = match (
@@ -166,6 +186,7 @@ impl Settings {
             shape,
             keyframes,
             references,
+            sounds,
             steps: schedule.steps(),
             schedule,
             seed: option_number(options, "seed", 0)? as u64,
@@ -186,6 +207,7 @@ pub fn sample(
     use mmh3_core::generation::FPS;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tokenizer::Tokenizer;
+    use mmh3_core::vision::{PromptReference, VisionGrid, vision_prompt};
     use mmh3_cuda::text_encoder::CudaTextEncoder;
     use std::time::Instant;
 
@@ -203,6 +225,14 @@ pub fn sample(
         .chain(&settings.references)
         .map(|picture| picture.to_tensor())
         .collect();
+    // The pictures come first, then the sounds, the order of the official presentation.
+    let prompt_references: Vec<PromptReference> = pictures
+        .iter()
+        .map(|picture| {
+            PromptReference::Picture(VisionGrid::for_picture(picture.shape[0], picture.shape[1]))
+        })
+        .chain(settings.sounds.iter().map(|_| PromptReference::Sound))
+        .collect();
     let mut context_modalities = Vec::new();
     let context = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
@@ -210,31 +240,30 @@ pub fn sample(
             let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
             let file = SafeTensors::open(Path::new(&path))?;
             let encoder = CudaTextEncoder::load(&file)?;
-            let context = if pictures.is_empty() {
+            let context = if prompt_references.is_empty() {
                 let ids = Tokenizer::h3().encode(&prompt);
                 encoder.encode(&ids, &[])?.context
             } else {
-                use mmh3_core::vision::{VisionGrid, vision_prompt};
                 use mmh3_cuda::vision::CudaVisionEncoder;
 
-                let vision = CudaVisionEncoder::load(&file)?;
-                let embeddings = pictures
-                    .iter()
-                    .map(|picture| vision.encode(picture))
-                    .collect::<Result<Vec<_>, _>>()?;
-                drop(vision);
-                let grids: Vec<VisionGrid> = pictures
-                    .iter()
-                    .map(|picture| VisionGrid::for_picture(picture.shape[0], picture.shape[1]))
-                    .collect();
-                let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &grids);
+                let embeddings = if pictures.is_empty() {
+                    Vec::new()
+                } else {
+                    let vision = CudaVisionEncoder::load(&file)?;
+                    pictures
+                        .iter()
+                        .map(|picture| vision.encode(picture))
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
                 context_modalities = prompt.modalities.clone();
                 encoder.encode_prompt(&prompt, &embeddings, &[])?.context
             };
             println!(
-                "encoded {} prompt tokens with {} pictures in {:.1} s",
+                "encoded {} prompt tokens with {} pictures and {} sounds in {:.1} s",
                 context.shape[0],
                 pictures.len(),
+                settings.sounds.len(),
                 started.elapsed().as_secs_f64()
             );
             context
@@ -253,11 +282,11 @@ pub fn sample(
         }
         _ => return Err("pass a prompt or --context, not both".into()),
     };
-    if options.contains_key("context") && !pictures.is_empty() {
+    if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
     }
     let latents = encode_pictures(options, settings.seed, &pictures)?;
-    let (keyframes, references) = if settings.references.is_empty() {
+    let (keyframes, references) = if settings.references.is_empty() && settings.sounds.is_empty() {
         let keyframes = settings
             .keyframes
             .iter()
@@ -270,10 +299,16 @@ pub fn sample(
             .collect();
         (keyframes, Vec::new())
     } else {
-        (
-            Vec::new(),
-            latents.into_iter().map(Reference::Picture).collect(),
-        )
+        let references = latents
+            .into_iter()
+            .map(Reference::Picture)
+            .chain(
+                encode_sounds(options, &settings.sounds)?
+                    .into_iter()
+                    .map(Reference::Audio),
+            )
+            .collect();
+        (Vec::new(), references)
     };
     // NOTE: the video noise is drawn before the audio noise, the order of the official pipeline.
     let shape = &settings.shape;
@@ -348,6 +383,36 @@ pub fn sample(
 
 /// The latents of keyframes or reference pictures as the DiT sees them: a sample of the video VAE's
 /// posterior for each picture with 0.1% of noise mixed in.
+/// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
+/// They take no condition noise, as the reference pipeline leaves reference audio clean.
+fn encode_sounds(
+    options: &HashMap<&str, &str>,
+    sounds: &[Tensor],
+) -> Result<Vec<Tensor>, Box<dyn Error>> {
+    use mmh3_core::audio::LATENT_RATE;
+    use mmh3_cuda::audio_encoder::CudaAudioEncoder;
+    use std::time::Instant;
+
+    if sounds.is_empty() {
+        return Ok(Vec::new());
+    }
+    let started = Instant::now();
+    let path = option_path(options, "audio-vae", AUDIO_VAE_FILE)?;
+    let encoder = CudaAudioEncoder::load(&SafeTensors::open(Path::new(&path))?, "")?;
+    let latents = sounds
+        .iter()
+        .map(|waveform| encoder.encode(waveform))
+        .collect::<Result<Vec<Tensor>, _>>()?;
+    let frames: usize = latents.iter().map(|latent| latent.shape[2]).sum();
+    println!(
+        "encoded {} sounds, {:.2} s of audio, in {:.1} s",
+        latents.len(),
+        frames as f64 / LATENT_RATE as f64,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(latents)
+}
+
 fn encode_pictures(
     options: &HashMap<&str, &str>,
     seed: u64,
