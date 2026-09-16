@@ -316,6 +316,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mmh3-input"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "mmh3-output"
 version = "0.1.0"
 dependencies = [

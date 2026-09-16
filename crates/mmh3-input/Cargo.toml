@@ -1,0 +1,11 @@
+[package]
+name = "mmh3-input"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+
+[dev-dependencies]
+tempfile = "3"

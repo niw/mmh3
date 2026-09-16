@@ -21,8 +21,8 @@ symphonia = { version = "0.6", features = ["all"] }
 rubato = "0.16"
 
 [workspace]
-members = ["crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-cuda", "crates/mmh3-output", "crates/mmh3-output-nvenc"]
-default-members = [".", "crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-output"]
+members = ["crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-cuda", "crates/mmh3-input", "crates/mmh3-output", "crates/mmh3-output-nvenc"]
+default-members = [".", "crates/mmh3-core", "crates/mmh3-cpu", "crates/mmh3-input", "crates/mmh3-output"]
 resolver = "3"
 
 [workspace.package]
