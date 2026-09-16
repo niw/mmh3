@@ -196,9 +196,12 @@ constexpr int CONV_TILE_ROWS = 8;
 constexpr int CONV_TILE_PIXELS = 16;
 constexpr int CONV_BLOCK_N = 128;
 constexpr int CONV_CHUNK = 32;
-/// Rows one warp keeps, which share every weight fragment it reads from shared memory.
-constexpr int CONV_WARP_ROWS = 1;
-constexpr int CONV_WARPS = CONV_TILE_ROWS / CONV_WARP_ROWS * (CONV_TILE_PIXELS / 16);
+/// A warp keeps a square of the tile: four rows of pixels by sixty-four outputs. Reading one
+// weight fragment for four rows, rather than for one, is what keeps the shared memory traffic
+// under the rate the tensor cores consume it.
+constexpr int CONV_WARP_ROWS = 4;
+constexpr int CONV_WARP_OUTPUTS = 64;
+constexpr int CONV_WARPS = CONV_TILE_ROWS / CONV_WARP_ROWS * (CONV_BLOCK_N / CONV_WARP_OUTPUTS);
 constexpr int CONV_THREADS = CONV_WARPS * 32;
 constexpr int CONV_ROW_BYTES = CONV_CHUNK * 2;
 constexpr int CONV_ROW_CHUNKS = CONV_CHUNK / 8;
@@ -236,7 +239,8 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
     const int warp = threadIdx.x / 32;
     const int matrix = lane / 8;
     const int matrix_row = lane % 8;
-    const int warp_row = warp * CONV_WARP_ROWS;
+    const int warp_row = warp / (CONV_BLOCK_N / CONV_WARP_OUTPUTS) * CONV_WARP_ROWS;
+    const int warp_output = warp % (CONV_BLOCK_N / CONV_WARP_OUTPUTS) * CONV_WARP_OUTPUTS;
 
     const int first_pixel = blockIdx.x * CONV_TILE_PIXELS;
     const int first_row = blockIdx.y * CONV_TILE_ROWS;
@@ -331,8 +335,8 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
         }
     };
 
-    // Two accumulator groups per sixteen outputs a weight stage holds, for each row.
-    float accumulators[CONV_WARP_ROWS][CONV_BLOCK_N / 8][4] = {};
+    // Two accumulator groups per sixteen outputs of the warp's square, for each of its rows.
+    float accumulators[CONV_WARP_ROWS][CONV_WARP_OUTPUTS / 8][4] = {};
     for (int slice = 0; slice < CONV_COMBINATIONS; slice++) {
         load_slab_slice(0, slice);
     }
@@ -390,9 +394,9 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
                                                step * 2 + matrix / 2));
             }
             #pragma unroll
-            for (int pair = 0; pair < CONV_BLOCK_N / 16; pair++) {
+            for (int pair = 0; pair < CONV_WARP_OUTPUTS / 16; pair++) {
                 uint32_t lines[4];
-                const int line = pair * 16 + (matrix / 2) * 8 + matrix_row;
+                const int line = warp_output + pair * 16 + (matrix / 2) * 8 + matrix_row;
                 load_matrix_x4(lines, stage + conv_offset(line, step * 2 + matrix % 2));
                 #pragma unroll
                 for (int row = 0; row < CONV_WARP_ROWS; row++) {
@@ -410,19 +414,18 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
     // which writes four bytes at a time. The staging buffers are free by now, so the tile passes
     // through them in the order the output holds it and leaves in whole vectors.
     __half *tile = reinterpret_cast<__half *>(shared_memory);
-    const int stride = CONV_WARP_ROWS * CONV_TILE_PIXELS * CONV_BLOCK_N;
     #pragma unroll
     for (int line = 0; line < CONV_WARP_ROWS; line++) {
         #pragma unroll
-        for (int pair = 0; pair < CONV_BLOCK_N / 8; pair++) {
+        for (int pair = 0; pair < CONV_WARP_OUTPUTS / 8; pair++) {
             #pragma unroll
             for (int half = 0; half < 2; half++) {
                 const int pixel = lane / 4 + half * 8;
-                const int out = (pair / 2) * 16 + (pair % 2) * 8 + (lane % 4) * 2;
+                const int out = warp_output + (pair / 2) * 16 + (pair % 2) * 8 + (lane % 4) * 2;
                 #pragma unroll
                 for (int index = 0; index < 2; index++) {
                     const int position =
-                        warp * stride + (line * CONV_TILE_PIXELS + pixel) * CONV_BLOCK_N + out;
+                        ((warp_row + line) * CONV_TILE_PIXELS + pixel) * CONV_BLOCK_N + out;
                     tile[position + index] = __float2half_rn(
                         accumulators[line][pair][half * 2 + index] +
                         __half2float(bias[min(first_output + out + index, outputs - 1)]));
@@ -432,7 +435,8 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
     }
     __syncthreads();
     // Eight halves per thread of the rows this block wrote, in the output's own order.
-    for (int index = threadIdx.x * 8; index < CONV_WARPS * stride; index += CONV_THREADS * 8) {
+    const int tile_halves = CONV_TILE_ROWS * CONV_TILE_PIXELS * CONV_BLOCK_N;
+    for (int index = threadIdx.x * 8; index < tile_halves; index += CONV_THREADS * 8) {
         const int out = index % CONV_BLOCK_N;
         const int pixel = index / CONV_BLOCK_N % CONV_TILE_PIXELS;
         const int row = index / (CONV_BLOCK_N * CONV_TILE_PIXELS);
