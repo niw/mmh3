@@ -68,7 +68,20 @@ unsafe extern "C" {
         bias: *const c_void,
         outputs: c_int,
         accumulate: c_int,
+        statistics: *const c_void,
+        norm_weight: *const c_void,
+        norm_bias: *const c_void,
         output: *mut c_void,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn mmh3_video_encoder_group_norm_statistics(
+        input: *const c_void,
+        frames: c_int,
+        pixels: c_int,
+        channels: c_int,
+        epsilon: f32,
+        partials: *mut c_void,
+        statistics: *mut c_void,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_video_encoder_group_norm_silu(
@@ -648,7 +661,7 @@ impl CudaVideoEncoder {
                 ptr::null_mut(),
             )
         })?;
-        let mut hidden = self.convolve(&self.input, &pixels, 1, 1, None, scratch)?;
+        let mut hidden = self.convolve(&self.input, &pixels, 1, 1, None, None, scratch)?;
         let mut strides = self.time_strides();
         for level in &self.levels {
             for block in &level.blocks {
@@ -656,12 +669,12 @@ impl CudaVideoEncoder {
             }
             if let Some(downsample) = &level.downsample {
                 let time_stride = strides.next().unwrap_or(1);
-                hidden = self.convolve(downsample, &hidden, 2, time_stride, None, scratch)?;
+                hidden = self.convolve(downsample, &hidden, 2, time_stride, None, None, scratch)?;
             }
         }
-        let normalized = self.group_norm_silu(&self.output_norm, &hidden, scratch)?;
-        let output = self.convolve(&self.output, &normalized, 1, 1, None, scratch)?;
-        let moments = self.convolve(&self.quant, &output, 1, 1, None, scratch)?;
+        let output =
+            self.normalized_convolve(&self.output_norm, &self.output, &hidden, None, scratch)?;
+        let moments = self.convolve(&self.quant, &output, 1, 1, None, None, scratch)?;
         let mut bytes = vec![0u8; moments.buffer.bytes()];
         moments.buffer.copy_to_host(&mut bytes)?;
         Ok(bytes
@@ -678,12 +691,10 @@ impl CudaVideoEncoder {
         input: &Activation,
         scratch: &'a Scratch,
     ) -> Result<Activation<'a>, Error> {
-        let normalized = self.group_norm_silu(&block.norm1, input, scratch)?;
-        let hidden = self.convolve(&block.conv1, &normalized, 1, 1, None, scratch)?;
-        let normalized = self.group_norm_silu(&block.norm2, &hidden, scratch)?;
+        let hidden = self.normalized_convolve(&block.norm1, &block.conv1, input, None, scratch)?;
         // The second convolution adds onto the shortcut.
         let residual = match &block.shortcut {
-            Some(shortcut) => self.convolve(shortcut, input, 1, 1, None, scratch)?,
+            Some(shortcut) => self.convolve(shortcut, input, 1, 1, None, None, scratch)?,
             None => {
                 let copy = Activation::new(
                     &scratch.activations,
@@ -703,7 +714,56 @@ impl CudaVideoEncoder {
                 copy
             }
         };
-        self.convolve(&block.conv2, &normalized, 1, 1, Some(residual), scratch)
+        self.normalized_convolve(&block.norm2, &block.conv2, &hidden, Some(residual), scratch)
+    }
+
+    /// SiLU(GroupNorm(input)) and then the convolution. A 3 x 3 kernel at stride one applies the
+    /// norm as it stages its input, so the normalized activation never reaches memory.
+    fn normalized_convolve<'a>(
+        &self,
+        norm: &GroupNorm,
+        convolution: &Convolution,
+        input: &Activation,
+        accumulate: Option<Activation<'a>>,
+        scratch: &'a Scratch,
+    ) -> Result<Activation<'a>, Error> {
+        if self.fuses(convolution, input, 1, 1) && input.channels.is_multiple_of(GROUPS) {
+            return self.convolve(convolution, input, 1, 1, accumulate, Some(norm), scratch);
+        }
+        let normalized = self.group_norm_silu(norm, input, scratch)?;
+        self.convolve(convolution, &normalized, 1, 1, accumulate, None, scratch)
+    }
+
+    /// Whether the fused convolution takes this kernel and input.
+    fn fuses(
+        &self,
+        convolution: &Convolution,
+        input: &Activation,
+        stride: usize,
+        time_stride: usize,
+    ) -> bool {
+        convolution.kernel == 3
+            && stride == 1
+            && time_stride == 1
+            && input.channels.is_multiple_of(CONV_CHANNEL_CHUNK)
+    }
+
+    fn group_norm_statistics(&self, input: &Activation, scratch: &Scratch) -> Result<(), Error> {
+        // SAFETY: the input holds `frames × pixels × channels` values, and the scratch buffers were
+        // sized for the frames and pixels of a tile.
+        check(unsafe {
+            mmh3_video_encoder_group_norm_statistics(
+                input.buffer.pointer(),
+                input.frames as c_int,
+                input.pixels() as c_int,
+                input.channels as c_int,
+                NORM_EPSILON,
+                scratch.partials.pointer(),
+                scratch.statistics.pointer(),
+                ptr::null_mut(),
+            )
+        })?;
+        Ok(())
     }
 
     fn group_norm_silu<'a>(
@@ -750,6 +810,7 @@ impl CudaVideoEncoder {
         stride: usize,
         time_stride: usize,
         accumulate: Option<Activation<'a>>,
+        normalize: Option<&GroupNorm>,
         scratch: &'a Scratch,
     ) -> Result<Activation<'a>, Error> {
         if input.channels != convolution.inputs {
@@ -773,13 +834,24 @@ impl CudaVideoEncoder {
         // A 3 x 3 kernel at stride one runs as one pass over the input, which keeps its columns out
         // of memory. The channels of the first convolution and the strided downsamplings do not fit
         // the kernel, and take the columns.
-        if convolution.kernel == 3
-            && stride == 1
-            && time_stride == 1
-            && input.channels.is_multiple_of(CONV_CHANNEL_CHUNK)
-        {
+        if self.fuses(convolution, input, stride, time_stride) {
+            let statistics = match normalize {
+                Some(_) => {
+                    self.group_norm_statistics(input, scratch)?;
+                    scratch.statistics.pointer().cast_const()
+                }
+                None => ptr::null(),
+            };
+            let (norm_weight, norm_bias) = match normalize {
+                Some(norm) => (
+                    norm.weight.pointer().cast_const(),
+                    norm.bias.pointer().cast_const(),
+                ),
+                None => (ptr::null(), ptr::null()),
+            };
             // SAFETY: the input holds its frames and pixels of channels, the weight `outputs ×
-            // columns` and the output the same frames and pixels of `convolution.outputs`.
+            // columns` and the output the same frames and pixels of `convolution.outputs`. The
+            // statistics hold two floats per group of every frame.
             check(unsafe {
                 mmh3_video_encoder_conv3d(
                     input.buffer.pointer(),
@@ -793,11 +865,19 @@ impl CudaVideoEncoder {
                     convolution.bias.pointer(),
                     convolution.outputs as c_int,
                     c_int::from(beta != 0.0),
+                    statistics,
+                    norm_weight,
+                    norm_bias,
                     output.buffer.pointer(),
                     ptr::null_mut(),
                 )
             })?;
             return Ok(output);
+        }
+        if normalize.is_some() {
+            return Err(Error::Model(
+                "this convolution cannot normalize its input".to_owned(),
+            ));
         }
         let matmul = |operand: *const c_void, first: usize, count: usize| {
             // SAFETY: the operand holds `count × columns` values, the weight `outputs × columns`
