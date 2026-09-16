@@ -1163,11 +1163,9 @@ impl CudaDit {
             if let Some(weight) = nvfp4_fc1 {
                 return self.nvfp4_mlp(prefix, weight, workspace, tokens, head, modulation);
             }
-        } else if self.tensors.is_int8(&fc1) {
-            return Err(Error::Model(format!(
-                "{fc1}: an INT8 MLP needs the block modulation"
-            )));
         } else {
+            // NOTE: without modulation, as in the text refiner, an INT8 fc1 runs as a plain GEMM
+            // followed by `mmh3_swiglu`, since only the blocks' fc1 rows are interleaved.
             self.add_residual(workspace, tokens, gate(2))?;
             self.normalize(
                 &format!("{prefix}.norm2.weight"),
