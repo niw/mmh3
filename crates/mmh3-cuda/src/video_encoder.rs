@@ -2,12 +2,13 @@
 //! the reference pictures and clips of reference to video generation.
 //!
 //! The encoder is a causal 3D CNN of residual blocks with group norms, SiLU and 2× downsampling,
-//! whose group statistics are per frame. Its convolutions run as GEMMs over im2col rows, with
-//! reflect padding in space and two zero frames in front in time. For a single frame every
-//! temporal kernel reduces to its last tap, since the earlier taps read those zero frames, so a
-//! `Temporal::Frame` encoder keeps only that tap and runs 2D convolutions. Like the reference, it
-//! encodes 256-pixel tiles on their own and blends the moments of the overlaps, and a clip is
-//! encoded in groups of 17 frames that each give five latent frames.
+//! whose group statistics are per frame. Its 3 x 3 convolutions at stride one run as one fused
+//! pass over the input, and the rest as GEMMs over im2col rows, with reflect padding in space and
+//! two zero frames in front in time. For a single frame every temporal kernel reduces to its last
+//! tap, since the earlier taps read those zero frames, so a `Temporal::Frame` encoder keeps only
+//! that tap and runs 2D convolutions. Like the reference, it encodes 256-pixel tiles on their own
+//! and blends the moments of the overlaps, and a clip is encoded in groups of 17 frames that each
+//! give five latent frames.
 
 use crate::model::{Error, LinearKind};
 use crate::{CudaError, DeviceBuffer, check};
@@ -18,7 +19,9 @@ use mmh3_core::vae::{
     CHUNK_TOKENS, CLIP_LENGTH, SPATIAL_RATIO, TEMPORAL_RATIO, TOKEN_DROP, blend_encoded_tiles,
     split_tiles,
 };
+use std::cell::RefCell;
 use std::ffi::{c_int, c_void};
+use std::mem::ManuallyDrop;
 use std::ptr;
 
 unsafe extern "C" {
@@ -50,6 +53,21 @@ unsafe extern "C" {
         columns: c_int,
         row_offset: usize,
         rows: usize,
+        output: *mut c_void,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn mmh3_video_encoder_conv3d(
+        input: *const c_void,
+        frames: c_int,
+        height: c_int,
+        width: c_int,
+        channels: c_int,
+        taps: c_int,
+        weight: *const c_void,
+        columns: c_int,
+        bias: *const c_void,
+        outputs: c_int,
+        accumulate: c_int,
         output: *mut c_void,
         stream: *mut c_void,
     ) -> c_int;
@@ -98,6 +116,8 @@ fn column_slice_bytes() -> usize {
         (cache / 3 * 2).clamp(16 << 20, 256 << 20)
     })
 }
+/// Channels the fused convolution stages at a time, which its inputs must be a multiple of.
+const CONV_CHANNEL_CHUNK: usize = 32;
 const NORM_EPSILON: f32 = 1e-6;
 /// Latent channels. The encoder writes twice as many moments, the mean and the log variance.
 pub const LATENT_CHANNELS: usize = 24;
@@ -223,24 +243,67 @@ struct Level {
     downsample: Option<Convolution>,
 }
 
-/// FP16 activations `[frames, height, width, channels]`.
-struct Activation {
-    buffer: DeviceBuffer,
+/// Device buffers an encode reuses. Allocating one costs a few hundred microseconds on an
+/// integrated GPU, and freeing one waits for the work that reads it, so the activations of a tile
+/// are handed back here rather than released.
+#[derive(Default)]
+struct Buffers {
+    free: RefCell<Vec<(usize, DeviceBuffer)>>,
+}
+
+impl Buffers {
+    fn take(&self, bytes: usize) -> Result<DeviceBuffer, CudaError> {
+        let mut free = self.free.borrow_mut();
+        match free.iter().position(|&(size, _)| size == bytes) {
+            Some(index) => Ok(free.swap_remove(index).1),
+            None => DeviceBuffer::new(bytes),
+        }
+    }
+
+    fn give(&self, bytes: usize, buffer: DeviceBuffer) {
+        self.free.borrow_mut().push((bytes, buffer));
+    }
+}
+
+/// FP16 activations `[frames, height, width, channels]`, from a pool of buffers.
+struct Activation<'a> {
+    buffer: ManuallyDrop<DeviceBuffer>,
+    pool: &'a Buffers,
     frames: usize,
     height: usize,
     width: usize,
     channels: usize,
 }
 
-impl Activation {
-    fn new(frames: usize, height: usize, width: usize, channels: usize) -> Result<Self, CudaError> {
+impl Drop for Activation<'_> {
+    fn drop(&mut self) {
+        // SAFETY: the buffer is taken once, in this the only owner's drop.
+        let buffer = unsafe { ManuallyDrop::take(&mut self.buffer) };
+        self.pool.give(self.bytes(), buffer);
+    }
+}
+
+impl<'a> Activation<'a> {
+    fn new(
+        pool: &'a Buffers,
+        frames: usize,
+        height: usize,
+        width: usize,
+        channels: usize,
+    ) -> Result<Self, CudaError> {
+        let bytes = frames * height * width * channels * 2;
         Ok(Activation {
-            buffer: DeviceBuffer::new(frames * height * width * channels * 2)?,
+            buffer: ManuallyDrop::new(pool.take(bytes)?),
+            pool,
             frames,
             height,
             width,
             channels,
         })
+    }
+
+    fn bytes(&self) -> usize {
+        self.frames * self.height * self.width * self.channels * 2
     }
 
     /// Pixels of one frame.
@@ -249,11 +312,12 @@ impl Activation {
     }
 }
 
-/// Scratch buffers of one tile.
+/// Scratch buffers of one tile, and the pool its activations come from.
 struct Scratch {
     columns: DeviceBuffer,
     partials: DeviceBuffer,
     statistics: DeviceBuffer,
+    activations: Buffers,
 }
 
 /// The diagonal Gaussian the encoder gives a picture or a clip, in the VAE's raw latent units.
@@ -550,6 +614,7 @@ impl CudaVideoEncoder {
             columns: DeviceBuffer::new(columns * 2)?,
             partials: DeviceBuffer::new(partials * 4)?,
             statistics: DeviceBuffer::new(frames * GROUPS * 2 * 4)?,
+            activations: Buffers::default(),
         })
     }
 
@@ -564,7 +629,7 @@ impl CudaVideoEncoder {
         [top, left, tile_height, tile_width]: [usize; 4],
         scratch: &Scratch,
     ) -> Result<Vec<f32>, Error> {
-        let pixels = Activation::new(frames, tile_height, tile_width, 3)?;
+        let pixels = Activation::new(&scratch.activations, frames, tile_height, tile_width, 3)?;
         // SAFETY: the canvas holds its frames of the tile and the activation
         // `frames × tile_height × tile_width × 3`.
         check(unsafe {
@@ -607,12 +672,12 @@ impl CudaVideoEncoder {
             .collect())
     }
 
-    fn resnet_block(
+    fn resnet_block<'a>(
         &self,
         block: &ResnetBlock,
         input: &Activation,
-        scratch: &Scratch,
-    ) -> Result<Activation, Error> {
+        scratch: &'a Scratch,
+    ) -> Result<Activation<'a>, Error> {
         let normalized = self.group_norm_silu(&block.norm1, input, scratch)?;
         let hidden = self.convolve(&block.conv1, &normalized, 1, 1, None, scratch)?;
         let normalized = self.group_norm_silu(&block.norm2, &hidden, scratch)?;
@@ -620,8 +685,13 @@ impl CudaVideoEncoder {
         let residual = match &block.shortcut {
             Some(shortcut) => self.convolve(shortcut, input, 1, 1, None, scratch)?,
             None => {
-                let copy =
-                    Activation::new(input.frames, input.height, input.width, input.channels)?;
+                let copy = Activation::new(
+                    &scratch.activations,
+                    input.frames,
+                    input.height,
+                    input.width,
+                    input.channels,
+                )?;
                 // SAFETY: both buffers hold the same number of bytes.
                 unsafe {
                     crate::copy_device(
@@ -636,13 +706,19 @@ impl CudaVideoEncoder {
         self.convolve(&block.conv2, &normalized, 1, 1, Some(residual), scratch)
     }
 
-    fn group_norm_silu(
+    fn group_norm_silu<'a>(
         &self,
         norm: &GroupNorm,
         input: &Activation,
-        scratch: &Scratch,
-    ) -> Result<Activation, Error> {
-        let output = Activation::new(input.frames, input.height, input.width, input.channels)?;
+        scratch: &'a Scratch,
+    ) -> Result<Activation<'a>, Error> {
+        let output = Activation::new(
+            &scratch.activations,
+            input.frames,
+            input.height,
+            input.width,
+            input.channels,
+        )?;
         // SAFETY: input and output hold `frames × pixels × channels` values, and the scratch
         // buffers were sized for the frames and pixels of a tile.
         check(unsafe {
@@ -667,15 +743,15 @@ impl CudaVideoEncoder {
     /// reflect-pads one pixel on each side at stride 1, and one pixel after the input at stride 2,
     /// while the temporal taps read zeros before the clip. With `accumulate`, the result adds onto
     /// that activation.
-    fn convolve(
+    fn convolve<'a>(
         &self,
         convolution: &Convolution,
         input: &Activation,
         stride: usize,
         time_stride: usize,
-        accumulate: Option<Activation>,
-        scratch: &Scratch,
-    ) -> Result<Activation, Error> {
+        accumulate: Option<Activation<'a>>,
+        scratch: &'a Scratch,
+    ) -> Result<Activation<'a>, Error> {
         if input.channels != convolution.inputs {
             return Err(Error::Model("convolution inputs do not match".to_owned()));
         }
@@ -685,9 +761,44 @@ impl CudaVideoEncoder {
         let beta = if accumulate.is_some() { 1.0 } else { 0.0 };
         let output = match accumulate {
             Some(activation) => activation,
-            None => Activation::new(frames, height, width, convolution.outputs)?,
+            None => Activation::new(
+                &scratch.activations,
+                frames,
+                height,
+                width,
+                convolution.outputs,
+            )?,
         };
         let rows = frames * height * width;
+        // A 3 x 3 kernel at stride one runs as one pass over the input, which keeps its columns out
+        // of memory. The channels of the first convolution and the strided downsamplings do not fit
+        // the kernel, and take the columns.
+        if convolution.kernel == 3
+            && stride == 1
+            && time_stride == 1
+            && input.channels.is_multiple_of(CONV_CHANNEL_CHUNK)
+        {
+            // SAFETY: the input holds its frames and pixels of channels, the weight `outputs ×
+            // columns` and the output the same frames and pixels of `convolution.outputs`.
+            check(unsafe {
+                mmh3_video_encoder_conv3d(
+                    input.buffer.pointer(),
+                    input.frames as c_int,
+                    input.height as c_int,
+                    input.width as c_int,
+                    input.channels as c_int,
+                    convolution.taps as c_int,
+                    convolution.weight.pointer(),
+                    convolution.columns as c_int,
+                    convolution.bias.pointer(),
+                    convolution.outputs as c_int,
+                    c_int::from(beta != 0.0),
+                    output.buffer.pointer(),
+                    ptr::null_mut(),
+                )
+            })?;
+            return Ok(output);
+        }
         let matmul = |operand: *const c_void, first: usize, count: usize| {
             // SAFETY: the operand holds `count × columns` values, the weight `outputs × columns`
             // and the output `count × outputs` rows from `first`.

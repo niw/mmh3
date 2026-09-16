@@ -135,11 +135,12 @@ rows, two per latent frame at 40 frames per second, against about 2,300 rows for
 Encoding it takes 0.2 s, and a run with one 448×256 reference picture and a two-second sound at
 1344×768 and 124 frames takes 14.4 s per step, the same as without the sound.
 
-A clip costs what its own size and length ask for. A 22-frame clip of 448×256 encodes in 4.2 s and
+A clip costs what its own size and length ask for. A 22-frame clip of 448×256 encodes in 0.8 s and
 adds 784 video rows, 74 audio rows and one vision block, and a 1344×768 video of 124 frames still
 runs at 15.1 s per step with it, about two and a half minutes for the eight steps. The same 22
-frames at 1344×768 take 47.8 s to encode instead and bring about 37,000 rows, as many as the
-target itself, so a long reference at full size is expensive on both counts.
+frames at 1344×768 take 10.8 s to encode instead and bring about 37,000 rows, as many as the
+target itself, and 124 frames of 1344×768 take 42 s, so a long reference at full size is expensive
+on both counts.
 
 Against ComfyUI in FP32 at 448×256 with two reference pictures, one of them 128×256, the DiT's
 velocity is within 1.1e-2 for video and 1.9e-2 for audio, as close as with keyframes. With one

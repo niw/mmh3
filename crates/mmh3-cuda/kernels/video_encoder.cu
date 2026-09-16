@@ -1,3 +1,4 @@
+#include "tensor_core.cuh"
 #include <cstddef>
 #include <cstdint>
 #include <cuda_fp16.h>
@@ -183,6 +184,161 @@ __global__ void group_norm_silu_kernel(const __half *__restrict__ input, int pix
     }
 }
 
+// A 3 x 3 x taps convolution at stride one as one pass over the input: a block keeps a patch of
+// output pixels in registers and stages the input its taps read, so the twenty-seven columns of
+// every output pixel never reach memory. Pixel rows in shared memory hold a chunk of channels
+// padded to 80 bytes, which spreads the eight addresses of every ldmatrix phase over eight bank
+// groups. A wide patch reads the weight fewer times per output, and its input rows are shared by
+// the three vertical taps.
+constexpr int CONV_TILE_ROWS = 16;
+constexpr int CONV_TILE_PIXELS = 16;
+constexpr int CONV_BLOCK_N = 128;
+constexpr int CONV_CHUNK = 32;
+constexpr int CONV_WARPS = CONV_TILE_ROWS * (CONV_TILE_PIXELS / 16);
+constexpr int CONV_THREADS = CONV_WARPS * 32;
+constexpr int CONV_ROW_BYTES = (CONV_CHUNK + 8) * 2;
+constexpr int CONV_ROW_CHUNKS = CONV_CHUNK / 8;
+constexpr int CONV_PATCH_PIXELS = CONV_TILE_PIXELS + 2;
+constexpr int CONV_PATCH_ROWS = CONV_TILE_ROWS + 2;
+
+__device__ __forceinline__ int conv_offset(int row, int chunk) {
+    return row * CONV_ROW_BYTES + chunk * 16;
+}
+
+constexpr int CONV_PATCH_LINES = 3 * CONV_PATCH_ROWS * CONV_PATCH_PIXELS;
+constexpr int CONV_PATCH_BYTES = CONV_PATCH_LINES * CONV_ROW_BYTES;
+constexpr int CONV_WEIGHT_BYTES = CONV_BLOCK_N * CONV_ROW_BYTES;
+constexpr int CONV_SHARED_BYTES = CONV_PATCH_BYTES + 2 * CONV_WEIGHT_BYTES;
+
+template <int TAPS>
+__global__ void __launch_bounds__(CONV_THREADS, 1)
+    conv3d_kernel(const __half *__restrict__ input, int frames, int height, int width, int channels,
+                  const __half *__restrict__ weight, int columns, const __half *__restrict__ bias,
+                  int outputs, int accumulate, __half *__restrict__ output) {
+    extern __shared__ __align__(128) uint8_t shared_memory[];
+    const uint32_t patch = shared_address(shared_memory);
+    const uint32_t weights = patch + CONV_PATCH_BYTES;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int matrix = lane / 8;
+    const int matrix_row = lane % 8;
+    const int warp_row = warp / (CONV_TILE_PIXELS / 16);
+    const int warp_pixel = (warp % (CONV_TILE_PIXELS / 16)) * 16;
+
+    const int first_pixel = blockIdx.x * CONV_TILE_PIXELS;
+    const int first_row = blockIdx.y * CONV_TILE_ROWS;
+    const int frame = blockIdx.z % frames;
+    const int first_output = (blockIdx.z / frames) * CONV_BLOCK_N;
+    const size_t pixels = static_cast<size_t>(height) * width;
+
+    // Pixel `pixel` of row `ky` of temporal tap `tap` of the patch, for a chunk of channels. Rows
+    // and pixels past the input have nothing to mirror and only feed dropped accumulators.
+    auto load_patch = [&](int channel_base) {
+        for (int index = threadIdx.x;
+             index < TAPS * CONV_PATCH_ROWS * CONV_PATCH_PIXELS * CONV_ROW_CHUNKS;
+             index += CONV_THREADS) {
+            const int chunk = index % CONV_ROW_CHUNKS;
+            const int line = index / CONV_ROW_CHUNKS;
+            const int pixel = line % CONV_PATCH_PIXELS;
+            const int ky = line / CONV_PATCH_PIXELS % CONV_PATCH_ROWS;
+            const int tap = line / (CONV_PATCH_PIXELS * CONV_PATCH_ROWS);
+            const int source_frame = frame + tap - (TAPS - 1);
+            const int source_row = first_row + ky - 1;
+            const int source_pixel = first_pixel + pixel - 1;
+            const bool valid = source_frame >= 0 && source_row <= height && source_pixel <= width;
+            const __half *source =
+                input +
+                (valid ? (static_cast<size_t>(source_frame) * pixels +
+                          reflect(source_row, height) * width + reflect(source_pixel, width)) *
+                             channels
+                       : 0) +
+                channel_base + chunk * 8;
+            copy_async_16(patch + conv_offset(line, chunk), source, valid);
+        }
+    };
+    // The weight rows of one spatial and temporal tap, for a chunk of channels.
+    auto load_weight = [&](uint32_t destination, int tap, int channel_base) {
+        for (int index = threadIdx.x; index < CONV_BLOCK_N * CONV_ROW_CHUNKS;
+             index += CONV_THREADS) {
+            const int chunk = index % CONV_ROW_CHUNKS;
+            const int line = index / CONV_ROW_CHUNKS;
+            const int out = first_output + line;
+            const bool valid = out < outputs;
+            const __half *source = weight + (valid ? static_cast<size_t>(out) * columns : 0) +
+                                   tap * channels + channel_base + chunk * 8;
+            copy_async_16(destination + conv_offset(line, chunk), source, valid);
+        }
+    };
+
+    // Two accumulator groups per sixteen outputs the weight stage holds.
+    float accumulators[CONV_BLOCK_N / 8][4] = {};
+    for (int channel_base = 0; channel_base < channels; channel_base += CONV_CHUNK) {
+        load_patch(channel_base);
+        load_weight(weights, 0, channel_base);
+        copy_async_commit();
+        for (int tap = 0; tap < TAPS * 9; tap++) {
+            if (tap + 1 < TAPS * 9) {
+                load_weight(weights + ((tap + 1) % 2) * CONV_WEIGHT_BYTES, tap + 1, channel_base);
+            }
+            copy_async_commit();
+            copy_async_wait<1>();
+            __syncthreads();
+
+            const uint32_t stage = weights + (tap % 2) * CONV_WEIGHT_BYTES;
+            const int patch_line =
+                ((tap / 9) * CONV_PATCH_ROWS + warp_row + (tap / 3) % 3) * CONV_PATCH_PIXELS;
+            const int kx = tap % 3;
+            #pragma unroll
+            for (int step = 0; step < CONV_CHUNK / 16; step++) {
+                uint32_t rows[4];
+                const int pixel = warp_pixel + (matrix % 2) * 8 + matrix_row + kx;
+                load_matrix_x4(rows,
+                               patch + conv_offset(patch_line + pixel, step * 2 + matrix / 2));
+                #pragma unroll
+                for (int pair = 0; pair < CONV_BLOCK_N / 16; pair++) {
+                    uint32_t lines[4];
+                    const int line = pair * 16 + (matrix / 2) * 8 + matrix_row;
+                    load_matrix_x4(lines, stage + conv_offset(line, step * 2 + matrix % 2));
+                    Numeric<__half>::mma(accumulators[pair * 2], rows, lines[0], lines[1]);
+                    Numeric<__half>::mma(accumulators[pair * 2 + 1], rows, lines[2], lines[3]);
+                }
+            }
+            __syncthreads();
+        }
+    }
+
+    // Thread `lane` holds pixels lane / 4 and lane / 4 + 8 of each pair, at two adjacent outputs.
+    const int row = first_row + warp_row;
+    if (row >= height) {
+        return;
+    }
+    __half *tile = output + (static_cast<size_t>(frame) * pixels + row * width) * outputs;
+    #pragma unroll
+    for (int pair = 0; pair < CONV_BLOCK_N / 8; pair++) {
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            const int pixel = first_pixel + warp_pixel + lane / 4 + half * 8;
+            const int out = first_output + (pair / 2) * 16 + (pair % 2) * 8 + (lane % 4) * 2;
+            if (pixel >= width) {
+                continue;
+            }
+            #pragma unroll
+            for (int index = 0; index < 2; index++) {
+                if (out + index >= outputs) {
+                    continue;
+                }
+                const size_t position = static_cast<size_t>(pixel) * outputs + out + index;
+                float value =
+                    accumulators[pair][half * 2 + index] + __half2float(bias[out + index]);
+                if (accumulate != 0) {
+                    value += __half2float(tile[position]);
+                }
+                tile[position] = __float2half_rn(value);
+            }
+        }
+    }
+}
+
 } // namespace
 
 // Normalizes `frames` frames of the tile at (top, left) of a canvas [canvas_frames, height, width,
@@ -196,6 +352,36 @@ extern "C" int mmh3_video_encoder_tile_input(const float *canvas, int canvas_fra
     tile_input_kernel<<<grid_for(count), THREADS, 0, stream>>>(canvas, canvas_frames, height, width,
                                                                frame_offset, top, left, frames,
                                                                tile_height, tile_width, output);
+    return static_cast<int>(cudaGetLastError());
+}
+
+// A 3 x 3 x `taps` convolution at stride one, with reflect padding in space and zeros before the
+// clip: output[t, y, x, o] = bias[o] + sum over the taps and channels, added onto the output when
+// `accumulate` is set. The weight holds `columns` per output, the taps ordered (kt, ky, kx,
+// channel). `channels` must be a multiple of 32 and `taps` one or three.
+extern "C" int mmh3_video_encoder_conv3d(const __half *input, int frames, int height, int width,
+                                         int channels, int taps, const __half *weight, int columns,
+                                         const __half *bias, int outputs, int accumulate,
+                                         __half *output, cudaStream_t stream) {
+    if (channels % CONV_CHUNK != 0 || columns < taps * 9 * channels || (taps != 1 && taps != 3) ||
+        height < 2 || width < 2 || frames <= 0 || outputs <= 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const int output_blocks = (outputs + CONV_BLOCK_N - 1) / CONV_BLOCK_N;
+    const dim3 grid((width + CONV_TILE_PIXELS - 1) / CONV_TILE_PIXELS,
+                    (height + CONV_TILE_ROWS - 1) / CONV_TILE_ROWS, frames * output_blocks);
+    auto launch = [&](auto kernel) {
+        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             CONV_SHARED_BYTES);
+        kernel<<<grid, CONV_THREADS, CONV_SHARED_BYTES, stream>>>(input, frames, height, width,
+                                                                  channels, weight, columns, bias,
+                                                                  outputs, accumulate, output);
+    };
+    if (taps == 3) {
+        launch(conv3d_kernel<3>);
+    } else {
+        launch(conv3d_kernel<1>);
+    }
     return static_cast<int>(cudaGetLastError());
 }
 
