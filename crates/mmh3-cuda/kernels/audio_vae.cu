@@ -19,20 +19,22 @@ unsigned grid_for(size_t count) {
     return static_cast<unsigned>(blocks < 65535 ? blocks : 65535);
 }
 
-// columns[(s, t), j, c] = input[s, t + j · dilation − padding, c], zero outside the sequence.
+// columns[r, j, c] = input[s, t · step + j · dilation − padding, c], zero outside the sequence,
+// for the `rows` output rows that start at `row_offset`. A row is sequence s = row / output_length
+// and time t = row % output_length, and `step` of 1 leaves `output_length` equal to `length`.
 __global__ void im2col_kernel(const float *__restrict__ input, float *__restrict__ columns,
-                              int sequences, int length, int channels, int kernel, int dilation,
-                              int padding) {
-    const size_t count = static_cast<size_t>(sequences) * length * kernel * channels;
+                              int length, int output_length, int channels, int kernel, int dilation,
+                              int step, int padding, size_t row_offset, size_t rows) {
+    const size_t count = rows * kernel * channels;
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
          index += stride) {
         const int channel = static_cast<int>(index % channels);
         const int tap = static_cast<int>((index / channels) % kernel);
-        const size_t row = index / (static_cast<size_t>(channels) * kernel);
-        const int time = static_cast<int>(row % length);
-        const size_t sequence = row / length;
-        const int source = time + tap * dilation - padding;
+        const size_t row = row_offset + index / (static_cast<size_t>(channels) * kernel);
+        const int time = static_cast<int>(row % output_length);
+        const size_t sequence = row / output_length;
+        const int source = time * step + tap * dilation - padding;
         columns[index] = source >= 0 && source < length
                              ? input[(sequence * length + source) * channels + channel]
                              : 0.0f;
@@ -142,12 +144,13 @@ __global__ void clamp_kernel(float *values, size_t count, float limit) {
 
 } // namespace
 
-extern "C" int mmh3_audio_im2col(const float *input, float *columns, int sequences, int length,
-                                 int channels, int kernel, int dilation, int padding,
-                                 cudaStream_t stream) {
-    const size_t count = static_cast<size_t>(sequences) * length * kernel * channels;
-    im2col_kernel<<<grid_for(count), THREADS, 0, stream>>>(input, columns, sequences, length,
-                                                           channels, kernel, dilation, padding);
+extern "C" int mmh3_audio_im2col(const float *input, float *columns, int length, int output_length,
+                                 int channels, int kernel, int dilation, int step, int padding,
+                                 size_t row_offset, size_t rows, cudaStream_t stream) {
+    const size_t count = rows * kernel * channels;
+    im2col_kernel<<<grid_for(count), THREADS, 0, stream>>>(input, columns, length, output_length,
+                                                           channels, kernel, dilation, step,
+                                                           padding, row_offset, rows);
     return static_cast<int>(cudaGetLastError());
 }
 

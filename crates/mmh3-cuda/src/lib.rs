@@ -1,6 +1,7 @@
 //! CUDA backend. Kernels and their C ABI launchers live in `kernels/*.cu`.
 
 pub mod attention;
+pub mod audio_encoder;
 pub mod audio_vae;
 pub mod bench;
 pub mod dit;

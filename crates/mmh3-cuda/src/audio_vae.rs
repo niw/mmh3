@@ -14,12 +14,15 @@ unsafe extern "C" {
     fn mmh3_audio_im2col(
         input: *const c_void,
         columns: *mut c_void,
-        sequences: c_int,
         length: c_int,
+        output_length: c_int,
         channels: c_int,
         kernel: c_int,
         dilation: c_int,
+        step: c_int,
         padding: c_int,
+        row_offset: usize,
+        rows: usize,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_audio_conv_transpose_gather(
@@ -86,16 +89,16 @@ impl AudioDecoderConfig {
 
 /// A convolution with its weight laid out for im2col rows: `[outputs, kernel, inputs]`, or
 /// `[kernel, outputs, inputs]` for a transposed convolution.
-struct Convolution {
+pub(crate) struct Convolution {
     weight: DeviceBuffer,
     bias: Option<DeviceBuffer>,
-    outputs: usize,
-    inputs: usize,
-    kernel: usize,
+    pub(crate) outputs: usize,
+    pub(crate) inputs: usize,
+    pub(crate) kernel: usize,
 }
 
 impl Convolution {
-    fn load(file: &SafeTensors, name: &str, has_bias: bool) -> Result<Self, Error> {
+    pub(crate) fn load(file: &SafeTensors, name: &str, has_bias: bool) -> Result<Self, Error> {
         let weight = host_tensor(file, &format!("{name}.weight"))?;
         let &[outputs, inputs, kernel] = weight.shape.as_slice() else {
             return Err(Error::Model(format!(
@@ -154,6 +157,176 @@ impl Convolution {
             kernel,
         })
     }
+}
+
+/// `output[sequences × length, outputs]` from `input[sequences × length, inputs]`, through im2col
+/// for kernels wider than one sample. Zero padding keeps the length.
+pub(crate) fn convolve(
+    convolution: &Convolution,
+    dilation: usize,
+    input: &DeviceBuffer,
+    output: &DeviceBuffer,
+    columns: &DeviceBuffer,
+    sequences: usize,
+    length: usize,
+) -> Result<(), Error> {
+    let padding = dilation * (convolution.kernel - 1) / 2;
+    let output_length = convolve_with(
+        convolution,
+        Walk {
+            dilation,
+            step: 1,
+            padding,
+        },
+        input,
+        output,
+        columns,
+        sequences,
+        length,
+    )?;
+    assert_eq!(
+        output_length, length,
+        "zero padding did not keep the length"
+    );
+    Ok(())
+}
+
+/// Bytes of im2col columns a convolution builds at a time. At 64 MiB the GEMM of a slice still
+/// has tens of thousands of rows, and the buffer no longer grows with the length of the signal.
+const COLUMN_SLICE_BYTES: usize = 64 << 20;
+
+/// Output rows whose columns fit the slice budget.
+fn column_rows(features: usize) -> usize {
+    (COLUMN_SLICE_BYTES / (features * 4)).max(1)
+}
+
+/// Values the columns buffer needs for a convolution of `features` values over `rows` output rows.
+pub(crate) fn column_values(rows: usize, features: usize) -> usize {
+    column_rows(features).min(rows) * features
+}
+
+/// How a convolution walks the signal. A `step` above one shortens the output.
+#[derive(Clone, Copy)]
+pub(crate) struct Walk {
+    pub(crate) dilation: usize,
+    pub(crate) step: usize,
+    pub(crate) padding: usize,
+}
+
+/// `output[sequences × output length, outputs]` from `input[sequences × length, inputs]`, returning
+/// the output length.
+pub(crate) fn convolve_with(
+    convolution: &Convolution,
+    walk: Walk,
+    input: &DeviceBuffer,
+    output: &DeviceBuffer,
+    columns: &DeviceBuffer,
+    sequences: usize,
+    length: usize,
+) -> Result<usize, Error> {
+    let span = walk.dilation * (convolution.kernel - 1) + 1;
+    if length + 2 * walk.padding < span {
+        return Err(Error::Model(format!(
+            "a signal of {length} samples is shorter than a kernel spanning {span}"
+        )));
+    }
+    let output_length = (length + 2 * walk.padding - span) / walk.step + 1;
+    let rows = sequences * output_length;
+    let features = convolution.kernel * convolution.inputs;
+    assert!(
+        input.bytes() >= sequences * length * convolution.inputs * 4
+            && output.bytes() >= rows * convolution.outputs * 4,
+        "signal buffers are too small"
+    );
+    let bias = convolution
+        .bias
+        .as_ref()
+        .map_or(ptr::null(), |bias| bias.pointer().cast_const());
+    if convolution.kernel == 1 && walk.step == 1 {
+        // SAFETY: the input holds `rows × features` values, the weight `outputs × features` and
+        // the output `rows × outputs`, checked above.
+        unsafe {
+            cublaslt_linear(
+                LinearKind::F32,
+                input.pointer(),
+                convolution.weight.pointer(),
+                bias,
+                output.pointer(),
+                rows,
+                convolution.outputs,
+                features,
+            )?
+        };
+        return Ok(output_length);
+    }
+    // The columns of the whole signal would be `kernel` times its size, so they are built for a
+    // slice of the output rows at a time. Every slice is still large enough for the GEMM.
+    let slice = column_rows(features);
+    assert!(
+        columns.bytes() >= slice.min(rows) * features * 4,
+        "the im2col buffer is too small"
+    );
+    let mut first = 0;
+    while first < rows {
+        let count = slice.min(rows - first);
+        // SAFETY: the input holds `sequences × length × inputs` values, the columns
+        // `count × kernel × inputs` and the output rows `count × outputs` from `first`, checked
+        // above.
+        unsafe {
+            check(mmh3_audio_im2col(
+                input.pointer(),
+                columns.pointer(),
+                length as c_int,
+                output_length as c_int,
+                convolution.inputs as c_int,
+                convolution.kernel as c_int,
+                walk.dilation as c_int,
+                walk.step as c_int,
+                walk.padding as c_int,
+                first,
+                count,
+                ptr::null_mut(),
+            ))?;
+            cublaslt_linear(
+                LinearKind::F32,
+                columns.pointer(),
+                convolution.weight.pointer(),
+                bias,
+                output.pointer_at(first * convolution.outputs * 4),
+                count,
+                convolution.outputs,
+                features,
+            )?;
+        }
+        first += count;
+    }
+    Ok(output_length)
+}
+
+/// `output = (first + second) / divisor`, in place when the output aliases an input.
+pub(crate) fn add(
+    output: &DeviceBuffer,
+    first: &DeviceBuffer,
+    second: &DeviceBuffer,
+    count: usize,
+    divisor: f32,
+) -> Result<(), Error> {
+    assert!(
+        output.bytes().min(first.bytes()).min(second.bytes()) >= count * 4,
+        "signal buffers are too small"
+    );
+    // SAFETY: every buffer holds `count` values, checked above.
+    check(unsafe {
+        mmh3_audio_add(
+            output.pointer(),
+            first.pointer(),
+            second.pointer(),
+            count,
+            divisor,
+            ptr::null_mut(),
+        )
+    })?;
+    Ok(())
 }
 
 /// Anti-aliased SnakeBeta: α and 1 / (β + 1e-9) per channel, and the upsample and downsample
@@ -294,71 +467,6 @@ impl CudaAudioDecoder {
         &self.config
     }
 
-    /// `output[sequences × length, outputs]` from `input[sequences × length, inputs]`, through
-    /// im2col for kernels wider than one sample. Zero padding keeps the length.
-    #[allow(clippy::too_many_arguments)]
-    fn convolve(
-        &self,
-        convolution: &Convolution,
-        dilation: usize,
-        input: &DeviceBuffer,
-        output: &DeviceBuffer,
-        workspace: &Workspace,
-        sequences: usize,
-        length: usize,
-    ) -> Result<(), Error> {
-        let rows = sequences * length;
-        let features = convolution.kernel * convolution.inputs;
-        assert!(
-            input.bytes() >= rows * convolution.inputs * 4
-                && output.bytes() >= rows * convolution.outputs * 4,
-            "signal buffers are too small"
-        );
-        let columns = if convolution.kernel == 1 {
-            input
-        } else {
-            assert!(
-                workspace.columns.bytes() >= rows * features * 4,
-                "the im2col buffer is too small"
-            );
-            // SAFETY: the input holds `rows × inputs` values and the columns
-            // `rows × kernel × inputs`, checked above.
-            check(unsafe {
-                mmh3_audio_im2col(
-                    input.pointer(),
-                    workspace.columns.pointer(),
-                    sequences as c_int,
-                    length as c_int,
-                    convolution.inputs as c_int,
-                    convolution.kernel as c_int,
-                    dilation as c_int,
-                    (dilation * (convolution.kernel - 1) / 2) as c_int,
-                    ptr::null_mut(),
-                )
-            })?;
-            &workspace.columns
-        };
-        let bias = convolution
-            .bias
-            .as_ref()
-            .map_or(ptr::null(), |bias| bias.pointer().cast_const());
-        // SAFETY: the columns hold `rows × features` values, the weight `outputs × features` and
-        // the output `rows × outputs`, checked above.
-        unsafe {
-            cublaslt_linear(
-                LinearKind::F32,
-                columns.pointer(),
-                convolution.weight.pointer(),
-                bias,
-                output.pointer(),
-                rows,
-                convolution.outputs,
-                features,
-            )?
-        };
-        Ok(())
-    }
-
     fn activate(
         &self,
         activation: &Activation,
@@ -383,31 +491,6 @@ impl CudaAudioDecoder {
                 sequences as c_int,
                 length as c_int,
                 activation.channels as c_int,
-                ptr::null_mut(),
-            )
-        })?;
-        Ok(())
-    }
-
-    fn add(
-        output: &DeviceBuffer,
-        first: &DeviceBuffer,
-        second: &DeviceBuffer,
-        count: usize,
-        divisor: f32,
-    ) -> Result<(), Error> {
-        assert!(
-            output.bytes().min(first.bytes()).min(second.bytes()) >= count * 4,
-            "signal buffers are too small"
-        );
-        // SAFETY: every buffer holds `count` values, checked above.
-        check(unsafe {
-            mmh3_audio_add(
-                output.pointer(),
-                first.pointer(),
-                second.pointer(),
-                count,
-                divisor,
                 ptr::null_mut(),
             )
         })?;
@@ -501,12 +584,12 @@ impl CudaAudioDecoder {
                     sequences,
                     length,
                 )?;
-                self.convolve(
+                convolve(
                     &block.dilated[unit],
                     dilation,
                     &workspace.first,
                     &workspace.second,
-                    workspace,
+                    &workspace.columns,
                     sequences,
                     length,
                 )?;
@@ -517,16 +600,16 @@ impl CudaAudioDecoder {
                     sequences,
                     length,
                 )?;
-                self.convolve(
+                convolve(
                     &block.plain[unit],
                     1,
                     &workspace.first,
                     &workspace.second,
-                    workspace,
+                    &workspace.columns,
                     sequences,
                     length,
                 )?;
-                Self::add(running, &workspace.second, source, count, 1.0)?;
+                add(running, &workspace.second, source, count, 1.0)?;
             }
             if index > 0 {
                 let divisor = if index + 1 == block_count {
@@ -534,7 +617,7 @@ impl CudaAudioDecoder {
                 } else {
                     1.0
                 };
-                Self::add(&workspace.sum, &workspace.sum, running, count, divisor)?;
+                add(&workspace.sum, &workspace.sum, running, count, divisor)?;
             }
         }
         Ok(())
@@ -567,44 +650,49 @@ impl CudaAudioDecoder {
             }
         }
 
-        let (mut signal_size, mut columns_size) = (
-            frames * config.latent_features.max(config.initial_channels),
-            frames * EDGE_KERNEL * config.latent_features,
-        );
+        // The im2col convolutions build their columns in slices, so their share of the buffer
+        // does not grow with the signal. The transposed convolutions write all their products at
+        // once and need the whole extent.
+        let mut signal_size = frames * config.latent_features.max(config.initial_channels);
+        let mut columns_values =
+            column_values(sequences * frames, EDGE_KERNEL * config.latent_features);
         let (mut length, mut width) = (frames, config.initial_channels);
         for (&(rate, _), upsample) in UPSAMPLE.iter().zip(&self.upsamples) {
-            columns_size = columns_size.max(length * upsample.kernel * upsample.outputs);
+            columns_values =
+                columns_values.max(sequences * length * upsample.kernel * upsample.outputs);
             (length, width) = (length * rate, upsample.outputs);
             signal_size = signal_size.max(length * width);
-            columns_size =
-                columns_size.max(length * RESBLOCK_KERNELS.iter().max().unwrap() * width);
+            columns_values = columns_values.max(column_values(
+                sequences * length,
+                RESBLOCK_KERNELS.iter().max().unwrap() * width,
+            ));
         }
-        columns_size = columns_size.max(length * EDGE_KERNEL * width);
+        columns_values = columns_values.max(column_values(sequences * length, EDGE_KERNEL * width));
         let mut workspace = Workspace {
             signal: DeviceBuffer::new(sequences * signal_size * 4)?,
             sum: DeviceBuffer::new(sequences * signal_size * 4)?,
             running: DeviceBuffer::new(sequences * signal_size * 4)?,
             first: DeviceBuffer::new(sequences * signal_size * 4)?,
             second: DeviceBuffer::new(sequences * signal_size * 4)?,
-            columns: DeviceBuffer::new(sequences * columns_size * 4)?,
+            columns: DeviceBuffer::new(columns_values * 4)?,
         };
 
         let latent_rows = DeviceBuffer::from_f32(&rows)?;
-        self.convolve(
+        convolve(
             &self.input_projection,
             1,
             &latent_rows,
             &workspace.first,
-            &workspace,
+            &workspace.columns,
             sequences,
             frames,
         )?;
-        self.convolve(
+        convolve(
             &self.pre,
             1,
             &workspace.first,
             &workspace.signal,
-            &workspace,
+            &workspace.columns,
             sequences,
             frames,
         )?;
@@ -624,12 +712,12 @@ impl CudaAudioDecoder {
             length,
         )?;
         let output = DeviceBuffer::new(sequences * length * 4)?;
-        self.convolve(
+        convolve(
             &self.post,
             1,
             &workspace.first,
             &output,
-            &workspace,
+            &workspace.columns,
             sequences,
             length,
         )?;
