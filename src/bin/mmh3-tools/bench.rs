@@ -11,6 +11,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("mma") => bench_mma(&arguments[1..]),
         Some("attention") => bench_attention(&arguments[1..]),
         Some("vsa") => bench_vsa(&arguments[1..]),
+        Some("encoder") => bench_encoder(&arguments[1..]),
         _ => Err(USAGE.into()),
     }
 }
@@ -287,5 +288,79 @@ fn bench_vsa(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "  {:.2} s per DiT forward ({DIT_BLOCK_COUNT} blocks)",
         milliseconds * DIT_BLOCK_COUNT as f64 / 1e3
     );
+    Ok(())
+}
+
+fn bench_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use mmh3::models::{VIDEO_VAE_FILE, option_path};
+    use mmh3_core::safetensors::SafeTensors;
+    use mmh3_core::tensor::Tensor;
+    use mmh3_cuda::video_encoder::{
+        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
+    use std::path::Path;
+    use std::time::Instant;
+
+    let options = parse_options(
+        arguments,
+        &[
+            "models",
+            "weights",
+            "width",
+            "height",
+            "frames",
+            "tile-size",
+            "iterations",
+        ],
+        USAGE,
+    )?;
+    let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
+    let width = option_number(&options, "width", 1344)?;
+    let height = option_number(&options, "height", 768)?;
+    let frames = option_number(&options, "frames", 124)?;
+    let tile_size = option_number(&options, "tile-size", DEFAULT_TILE_SIZE)?;
+    let iterations = option_number(&options, "iterations", 1)?;
+
+    let started = Instant::now();
+    let encoder = CudaVideoEncoder::load(
+        &SafeTensors::open(Path::new(&weights_path))?,
+        Temporal::Clip,
+        tile_size,
+        DEFAULT_TILE_OVERLAP_MIN,
+    )?;
+    println!(
+        "loaded the encoder of {weights_path} in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+
+    // A smooth gradient with a moving band stands in for a clip: the cost is the shape's, not the
+    // content's.
+    let values = (0..frames * height * width * 3)
+        .map(|index| {
+            let pixel = index / 3;
+            let (row, column) = (pixel / width % height, pixel % width);
+            let frame = pixel / (height * width);
+            ((row + column + 4 * frame) % 255) as f32 / 255.0
+        })
+        .collect();
+    let clip = Tensor::new(vec![frames, height, width, 3], values);
+    println!(
+        "{width}×{height}, {frames} frames in {}×{} tiles, {} latent frames, {iterations} runs",
+        tile_size,
+        tile_size,
+        CudaVideoEncoder::latent_frames(frames)
+    );
+    let mut best = f64::INFINITY;
+    for _ in 0..iterations {
+        let started = Instant::now();
+        let posterior = encoder.encode_clip(&clip)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        best = best.min(elapsed);
+        println!(
+            "  {elapsed:.2} s for the moments {:?}",
+            posterior.mean.shape
+        );
+    }
+    println!("{best:.2} s per clip at best");
     Ok(())
 }

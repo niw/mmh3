@@ -87,6 +87,16 @@ using Shape = std::tuple<int64_t, int64_t, int64_t>;
 std::mutex nvfp4_algorithms_mutex;
 std::map<Shape, cublasLtMatmulAlgo_t> nvfp4_algorithms;
 
+// The same for the plain GEMMs, keyed by kind, shape and whether a bias is added.
+using MatmulKey = std::tuple<int, int64_t, int64_t, int64_t, bool>;
+std::mutex matmul_algorithms_mutex;
+std::map<MatmulKey, cublasLtMatmulAlgo_t> matmul_algorithms;
+
+// How many heuristic candidates a new shape times against each other. cuBLASLt offers only a few
+// for the convolution shapes of the VAE encoder, so the list is as long as it will fill.
+constexpr int MATMUL_CANDIDATES = 32;
+constexpr int NVFP4_CANDIDATES = 8;
+
 } // namespace
 
 // An algorithm chosen for an NVFP4 GEMM shape, see mmh3_cublaslt_nvfp4_algorithms.
@@ -146,19 +156,68 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     cublasLtMatmulPreferenceSetAttribute(descriptors.preference,
                                          CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &workspace_bytes,
                                          sizeof(workspace_bytes));
-    cublasLtMatmulHeuristicResult_t result;
+    auto run = [&](const cublasLtMatmulAlgo_t *algorithm) {
+        return cublasLtMatmul(state.handle, descriptors.operation, &alpha, weight,
+                              descriptors.weight, input, descriptors.input, &beta, output,
+                              descriptors.output, output, descriptors.output, algorithm,
+                              state.workspace, WORKSPACE_BYTES, stream);
+    };
+    // NOTE: the first heuristic result is often a small-tile kernel that runs at a fraction of the
+    // bandwidth the shape allows, so the first call of each shape times the candidates on its own
+    // operands and keeps the fastest. A call that accumulates cannot be repeated, so it takes the
+    // algorithm of the same shape without one, or the heuristic's first result.
+    const MatmulKey key = std::make_tuple(kind, m, n, k, bias != nullptr);
+    const std::lock_guard<std::mutex> lock(matmul_algorithms_mutex);
+    const auto found = matmul_algorithms.find(key);
+    if (found != matmul_algorithms.end()) {
+        status = run(&found->second);
+        if (status == CUBLAS_STATUS_SUCCESS) {
+            return 0;
+        }
+        matmul_algorithms.erase(found);
+    }
+    cublasLtMatmulHeuristicResult_t results[MATMUL_CANDIDATES];
     int returned = 0;
-    status = cublasLtMatmulAlgoGetHeuristic(
-        state.handle, descriptors.operation, descriptors.weight, descriptors.input,
-        descriptors.output, descriptors.output, descriptors.preference, 1, &result, &returned);
+    status = cublasLtMatmulAlgoGetHeuristic(state.handle, descriptors.operation, descriptors.weight,
+                                            descriptors.input, descriptors.output,
+                                            descriptors.output, descriptors.preference,
+                                            MATMUL_CANDIDATES, results, &returned);
     if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
         return status_code(status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED : status);
     }
-    status =
-        cublasLtMatmul(state.handle, descriptors.operation, &alpha, weight, descriptors.weight,
-                       input, descriptors.input, &beta, output, descriptors.output, output,
-                       descriptors.output, &result.algo, state.workspace, WORKSPACE_BYTES, stream);
-    return status_code(status);
+    if (beta != 0.0f) {
+        return status_code(run(&results[0].algo));
+    }
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float best = 0.0f;
+    int best_index = -1;
+    for (int index = 0; index < returned; index++) {
+        // The first run of a candidate loads its kernel, which costs more than the call itself.
+        if (run(&results[index].algo) != CUBLAS_STATUS_SUCCESS) {
+            continue;
+        }
+        cudaEventRecord(start, stream);
+        const cublasStatus_t timed = run(&results[index].algo);
+        cudaEventRecord(stop, stream);
+        float elapsed = 0.0f;
+        if (timed != CUBLAS_STATUS_SUCCESS || cudaEventSynchronize(stop) != cudaSuccess ||
+            cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
+            continue;
+        }
+        if (best_index < 0 || elapsed < best) {
+            best = elapsed;
+            best_index = index;
+        }
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    if (best_index < 0) {
+        return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
+    }
+    matmul_algorithms[key] = results[best_index].algo;
+    return status_code(run(&results[best_index].algo));
 }
 
 extern "C" int mmh3_cublaslt_linear(int kind, const void *input, const void *weight,
@@ -237,13 +296,12 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
         // An algorithm taken over from an earlier process may not run here.
         nvfp4_algorithms.erase(found);
     }
-    constexpr int CANDIDATES = 8;
-    cublasLtMatmulHeuristicResult_t results[CANDIDATES];
+    cublasLtMatmulHeuristicResult_t results[NVFP4_CANDIDATES];
     int returned = 0;
-    status =
-        cublasLtMatmulAlgoGetHeuristic(state.handle, descriptors.operation, descriptors.weight,
-                                       descriptors.input, descriptors.output, descriptors.output,
-                                       descriptors.preference, CANDIDATES, results, &returned);
+    status = cublasLtMatmulAlgoGetHeuristic(state.handle, descriptors.operation, descriptors.weight,
+                                            descriptors.input, descriptors.output,
+                                            descriptors.output, descriptors.preference,
+                                            NVFP4_CANDIDATES, results, &returned);
     if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
         return status_code(status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED : status);
     }

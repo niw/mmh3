@@ -87,9 +87,17 @@ const GROUPS: usize = 32;
 /// Temporal stride of each downsampling level of the released encoder. Their product is the
 /// latent's frames per token.
 const TIME_STRIDES: [usize; 4] = [1, 2, 2, 1];
-/// Bytes of im2col columns a convolution builds at a time, so that buffer does not grow with the
-/// frames of a clip.
-const COLUMN_SLICE_BYTES: usize = 256 << 20;
+/// Bytes of im2col columns a convolution builds at a time. A slice that stays inside the L2 cache
+/// is handed to the GEMM without a round trip through memory, which the 3 x 3 kernels' twenty-seven
+/// columns per channel would otherwise dominate: two thirds of the L2 takes 448 x 256 from 3.4 to
+/// 2.3 seconds on a GB10.
+fn column_slice_bytes() -> usize {
+    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *BYTES.get_or_init(|| {
+        let cache = crate::device_info(0).map_or(0, |info| info.l2_cache_bytes.max(0) as usize);
+        (cache / 3 * 2).clamp(16 << 20, 256 << 20)
+    })
+}
 const NORM_EPSILON: f32 = 1e-6;
 /// Latent channels. The encoder writes twice as many moments, the mean and the log variance.
 pub const LATENT_CHANNELS: usize = 24;
@@ -512,7 +520,7 @@ impl CudaVideoEncoder {
         // The widest im2col rows come at full resolution or after a downsampling, and their
         // columns are built in slices, so that buffer does not grow with the frames.
         let slice = |convolution: &Convolution, rows: usize| {
-            let slice_rows = (COLUMN_SLICE_BYTES / (convolution.columns * 2)).max(1);
+            let slice_rows = (column_slice_bytes() / (convolution.columns * 2)).max(1);
             slice_rows.min(rows) * convolution.columns
         };
         let (mut level_frames, mut level_height, mut level_width) = (frames, height, width);
@@ -709,7 +717,7 @@ impl CudaVideoEncoder {
         }
         // The columns of every row at once would be `taps × 9` times the activation, so they are
         // built for a slice of the rows at a time.
-        let slice = (COLUMN_SLICE_BYTES / (convolution.columns * 2)).max(1);
+        let slice = (column_slice_bytes() / (convolution.columns * 2)).max(1);
         assert!(
             scratch.columns.bytes() >= slice.min(rows) * convolution.columns * 2,
             "the im2col buffer is too small"
