@@ -232,6 +232,23 @@ unsafe extern "C" {
         scale: f32,
         stream: *mut c_void,
     ) -> c_int;
+    fn mmh3_attention_roped(
+        element_type: c_int,
+        head_dim: c_int,
+        query: *const c_void,
+        key: *const c_void,
+        value: *const c_void,
+        output: *mut c_void,
+        tokens: c_int,
+        heads: c_int,
+        batch: c_int,
+        layout: *const AttentionLayout,
+        scale: f32,
+        angles: *const c_void,
+        pairs: c_int,
+        epsilon: f32,
+        stream: *mut c_void,
+    ) -> c_int;
     fn mmh3_attention_bf16(
         query: *const c_void,
         key: *const c_void,
@@ -281,6 +298,51 @@ pub(crate) unsafe fn attention_pointers(
             batch as c_int,
             layout,
             scale,
+            ptr::null_mut(),
+        )
+    })
+}
+
+/// `attention_pointers` with the normalization and the rotation that the video VAE's decoder puts
+/// between its projection and its attention: as each tile of q and k reaches shared memory, its
+/// rows take an RMS norm over the head dimension and a RoPE from `angles`, [tokens, pairs].
+///
+/// # Safety
+/// As `attention_pointers`, and `angles` must hold `tokens × pairs` floats.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn attention_roped_pointers(
+    element: Element,
+    head_dim: usize,
+    query: *const c_void,
+    key: *const c_void,
+    value: *const c_void,
+    output: *mut c_void,
+    tokens: usize,
+    heads: usize,
+    batch: usize,
+    layout: &AttentionLayout,
+    scale: f32,
+    angles: *const c_void,
+    pairs: usize,
+    epsilon: f32,
+) -> Result<(), CudaError> {
+    // SAFETY: the caller guarantees the extents.
+    check(unsafe {
+        mmh3_attention_roped(
+            element as c_int,
+            head_dim as c_int,
+            query,
+            key,
+            value,
+            output,
+            tokens as c_int,
+            heads as c_int,
+            batch as c_int,
+            layout,
+            scale,
+            angles,
+            pairs as c_int,
+            epsilon,
             ptr::null_mut(),
         )
     })

@@ -62,22 +62,22 @@ __global__ void __launch_bounds__(ROW_THREADS)
     }
 }
 
-// Per-head RMSNorm without weight of q and k in the [tokens, heads, 3, 64] qkv buffer, then the
+// Per-head RMSNorm without weight of k in the [tokens, heads, 3, 64] qkv buffer, then the
 // split-half rotary embedding on the first 2 × pairs dimensions. Angles are per token within a
 // tile.
-__global__ void qk_norm_rope_kernel(__half *qkv, const float *__restrict__ angles, int pairs,
-                                    int tile_tokens, int tokens, int heads, float epsilon) {
+__global__ void key_norm_rope_kernel(__half *qkv, const float *__restrict__ angles, int pairs,
+                                     int tile_tokens, int tokens, int heads, float epsilon) {
     __shared__ float values[ROW_THREADS / 32][VAE_HEAD_DIM];
     const int warp_in_block = threadIdx.x / 32;
     const int lane = threadIdx.x % 32;
     const int64_t item = static_cast<int64_t>(blockIdx.x) * (blockDim.x / 32) + warp_in_block;
-    if (item >= static_cast<int64_t>(tokens) * heads * 2) {
+    if (item >= static_cast<int64_t>(tokens) * heads) {
         return;
     }
-    const int is_key = static_cast<int>(item % 2);
-    const int head = static_cast<int>((item / 2) % heads);
-    const int64_t token = item / 2 / heads;
-    __half *vector = qkv + (token * heads + head) * 3 * VAE_HEAD_DIM + is_key * VAE_HEAD_DIM;
+    const int head = static_cast<int>(item % heads);
+    const int64_t token = item / heads;
+    // The key of the head, since the attention kernel normalizes and rotates the query itself.
+    __half *vector = qkv + (token * heads + head) * 3 * VAE_HEAD_DIM + VAE_HEAD_DIM;
     float *shared = values[warp_in_block];
 
     float squares = 0.0f;
@@ -430,13 +430,13 @@ extern "C" int mmh3_vae_norm(const float *input, const __half *weight, const __h
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int mmh3_vae_qk_norm_rope(__half *qkv, const float *angles, int pairs, int tile_tokens,
-                                     int tokens, int heads, float epsilon, cudaStream_t stream) {
-    const int64_t items = static_cast<int64_t>(tokens) * heads * 2;
+extern "C" int mmh3_vae_key_norm_rope(__half *qkv, const float *angles, int pairs, int tile_tokens,
+                                      int tokens, int heads, float epsilon, cudaStream_t stream) {
+    const int64_t items = static_cast<int64_t>(tokens) * heads;
     const int warps_per_block = ROW_THREADS / 32;
     const unsigned blocks = static_cast<unsigned>((items + warps_per_block - 1) / warps_per_block);
-    qk_norm_rope_kernel<<<blocks, ROW_THREADS, 0, stream>>>(qkv, angles, pairs, tile_tokens, tokens,
-                                                            heads, epsilon);
+    key_norm_rope_kernel<<<blocks, ROW_THREADS, 0, stream>>>(qkv, angles, pairs, tile_tokens,
+                                                             tokens, heads, epsilon);
     return static_cast<int>(cudaGetLastError());
 }
 

@@ -71,6 +71,12 @@ template <> struct Numeric<__nv_bfloat16> {
         __nv_bfloat162 value = __floats2bfloat162_rn(low, high);
         return *reinterpret_cast<uint32_t *>(&value);
     }
+    __device__ static float to_float(uint16_t bits) {
+        return __bfloat162float(__ushort_as_bfloat16(bits));
+    }
+    __device__ static uint16_t from_float(float value) {
+        return __bfloat16_as_ushort(__float2bfloat16_rn(value));
+    }
 };
 
 template <> struct Numeric<__half> {
@@ -87,7 +93,21 @@ template <> struct Numeric<__half> {
         __half2 value = __floats2half2_rn(low, high);
         return *reinterpret_cast<uint32_t *>(&value);
     }
+    __device__ static float to_float(uint16_t bits) { return __half2float(__ushort_as_half(bits)); }
+    __device__ static uint16_t from_float(float value) {
+        return __half_as_ushort(__float2half_rn(value));
+    }
 };
+
+__device__ __forceinline__ uint16_t load_shared_16(uint32_t address) {
+    uint16_t value;
+    asm volatile("ld.shared.b16 %0, [%1];\n" : "=h"(value) : "r"(address));
+    return value;
+}
+
+__device__ __forceinline__ void store_shared_16(uint32_t address, uint16_t value) {
+    asm volatile("st.shared.b16 [%0], %1;\n" ::"r"(address), "h"(value) : "memory");
+}
 
 template <int HEAD_DIM> struct Tiles {
     static constexpr int row_bytes = HEAD_DIM * 2;

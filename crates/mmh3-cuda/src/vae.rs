@@ -5,7 +5,7 @@
 //! cuBLASLt, and the INT8 ConvRot weights of the quantized checkpoint through the INT8 GEMM. Tiles
 //! and chunks are blended in FP32 into pixels in [0, 1].
 
-use crate::attention::{AttentionLayout, Element, attention_pointers};
+use crate::attention::{AttentionLayout, Element, attention_roped_pointers};
 use crate::gemm::{Int8Output, int8_pointers, rotate_quantize_pointers};
 use crate::loader::Uploader;
 use crate::model::{
@@ -35,7 +35,7 @@ unsafe extern "C" {
         epsilon: f32,
         stream: *mut c_void,
     ) -> c_int;
-    fn mmh3_vae_qk_norm_rope(
+    fn mmh3_vae_key_norm_rope(
         qkv: *mut c_void,
         angles: *const c_void,
         pairs: c_int,
@@ -843,7 +843,7 @@ impl CudaVideoDecoder {
             // SAFETY: qkv holds `tokens × heads × 3 × 64` values, the angles cover a tile and the
             // layout stays within the `tiles × tile_tokens` rows of qkv and attention.
             unsafe {
-                check(mmh3_vae_qk_norm_rope(
+                check(mmh3_vae_key_norm_rope(
                     qkv.cast(),
                     angles.pointer(),
                     (3 * ROPE_FREQUENCIES) as c_int,
@@ -853,7 +853,7 @@ impl CudaVideoDecoder {
                     NORM_EPSILON,
                     ptr::null_mut(),
                 ))?;
-                attention_pointers(
+                attention_roped_pointers(
                     Element::F16,
                     HEAD_DIM,
                     qkv.cast(),
@@ -865,6 +865,9 @@ impl CudaVideoDecoder {
                     tiles,
                     &layout,
                     1.0 / (HEAD_DIM as f32).sqrt(),
+                    angles.pointer(),
+                    3 * ROPE_FREQUENCIES,
+                    NORM_EPSILON,
                 )?;
             }
             self.linear(

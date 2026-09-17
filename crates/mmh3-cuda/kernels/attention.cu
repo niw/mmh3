@@ -44,6 +44,70 @@ __device__ __forceinline__ int tile_offset(int row, int chunk) {
     }
 }
 
+// What the VAE decoder's query takes between its projection and the attention: an RMS norm over the
+// head dimension and a RoPE from prepared angles, [tokens, pairs]. Null angles leave the tile as it
+// arrives, which is what the DiT and the text encoder want, since they normalize their own.
+//
+// NOTE: only the query, which belongs to one block. Every block reads all of the keys, so a key
+// normalized here would be normalized once per block of queries, and the separate pass over the
+// keys costs less than that.
+struct AttentionRope {
+    const float *angles;
+    int pairs;
+    float epsilon;
+};
+
+// Normalizes and rotates `rows` rows of a tile in place, one warp per row, in the order and the
+// precision of the separate pass it replaces. Rows past the last token stay as the copy left them.
+template <typename Element, int HEAD_DIM, int ROWS, bool TMA, int WARP_COUNT>
+__device__ void normalize_rotate(uint32_t tile, int first_token, int rows, int tokens,
+                                 const AttentionRope &rope, float *scratch) {
+    using N = Numeric<Element>;
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    for (int row = warp; row < rows; row += WARP_COUNT) {
+        if (first_token + row >= tokens) {
+            continue;
+        }
+        float *values = scratch + warp * HEAD_DIM;
+        uint32_t addresses[HEAD_DIM / 32];
+        float squares = 0.0f;
+        #pragma unroll
+        for (int slot = 0; slot < HEAD_DIM / 32; slot++) {
+            const int index = slot * 32 + lane;
+            addresses[slot] =
+                tile + tile_offset<HEAD_DIM, ROWS, TMA>(row, index / 8) + (index % 8) * 2;
+            const float value = N::to_float(load_shared_16(addresses[slot]));
+            values[index] = value;
+            squares += value * value;
+        }
+        #pragma unroll
+        for (int offset = 16; offset > 0; offset /= 2) {
+            squares += __shfl_xor_sync(0xffffffff, squares, offset);
+        }
+        const float inverse = rsqrtf(squares / HEAD_DIM + rope.epsilon);
+        #pragma unroll
+        for (int slot = 0; slot < HEAD_DIM / 32; slot++) {
+            values[slot * 32 + lane] *= inverse;
+        }
+        __syncwarp();
+        const float *angles = rope.angles + static_cast<int64_t>(first_token + row) * rope.pairs;
+        for (int pair = lane; pair < rope.pairs; pair += 32) {
+            float sine, cosine;
+            sincosf(angles[pair], &sine, &cosine);
+            const float first = values[pair];
+            const float second = values[pair + rope.pairs];
+            values[pair] = first * cosine - second * sine;
+            values[pair + rope.pairs] = first * sine + second * cosine;
+        }
+        __syncwarp();
+        #pragma unroll
+        for (int slot = 0; slot < HEAD_DIM / 32; slot++) {
+            store_shared_16(addresses[slot], N::from_float(values[slot * 32 + lane]));
+        }
+    }
+}
+
 // The query, key and value tensors as TMA sees them: [head dimension, tokens, heads, batch].
 struct AttentionMaps {
     CUtensorMap query;
@@ -53,12 +117,13 @@ struct AttentionMaps {
 
 // Head dimension 64 asks for two blocks per SM: its stages are half the size, so two fit in shared
 // memory and one block's MMAs cover the other's copies.
-template <typename Element, int HEAD_DIM, bool TMA>
+template <typename Element, int HEAD_DIM, bool TMA, bool ROPE>
 __global__ void __launch_bounds__(THREADS, HEAD_DIM == 64 ? 2 : 1)
     attention_kernel(const Element *__restrict__ query, const Element *__restrict__ key,
                      const Element *__restrict__ value, Element *__restrict__ output, int tokens,
                      Mmh3AttentionLayout layout, float scale_log2,
-                     const __grid_constant__ AttentionMaps maps) {
+                     const __grid_constant__ AttentionMaps maps, AttentionRope rope) {
+    __shared__ float rope_scratch[ROPE ? WARPS * HEAD_DIM : 1];
     using T = Tiles<HEAD_DIM>;
     using N = Numeric<Element>;
     constexpr int SLABS = HEAD_DIM * sizeof(Element) / 128;
@@ -136,6 +201,12 @@ __global__ void __launch_bounds__(THREADS, HEAD_DIM == 64 ? 2 : 1)
         load_key_value_block(0, 0);
         copy_async_commit();
         copy_async_wait<1>();
+        __syncthreads();
+    }
+
+    if constexpr (ROPE) {
+        normalize_rotate<Element, HEAD_DIM, BLOCK_M, TMA, WARPS>(
+            stage_address(1), first_query, BLOCK_M, tokens, rope, rope_scratch);
         __syncthreads();
     }
 
@@ -336,11 +407,12 @@ template <> CUtensorMapDataType map_type<__nv_bfloat16>() {
 }
 template <> CUtensorMapDataType map_type<__half>() { return CU_TENSOR_MAP_DATA_TYPE_FLOAT16; }
 
-template <typename Element, int HEAD_DIM, bool TMA>
+template <typename Element, int HEAD_DIM, bool TMA, bool ROPE>
 int launch_kernel(const Element *query, const Element *key, const Element *value, Element *output,
                   int tokens, int heads, int batch, const Mmh3AttentionLayout &layout,
-                  const AttentionMaps &maps, float scale_log2, cudaStream_t stream) {
-    auto kernel = attention_kernel<Element, HEAD_DIM, TMA>;
+                  const AttentionMaps &maps, const AttentionRope &rope, float scale_log2,
+                  cudaStream_t stream) {
+    auto kernel = attention_kernel<Element, HEAD_DIM, TMA, ROPE>;
     // The TMA path adds its barriers and the alignment its boxes need.
     constexpr int shared_bytes = Tiles<HEAD_DIM>::shared_bytes + (TMA ? 256 : 0);
     static const cudaError_t configured =
@@ -350,14 +422,28 @@ int launch_kernel(const Element *query, const Element *key, const Element *value
     }
     dim3 grid((tokens + BLOCK_M - 1) / BLOCK_M, heads, batch);
     kernel<<<grid, THREADS, shared_bytes, stream>>>(query, key, value, output, tokens, layout,
-                                                    scale_log2, maps);
+                                                    scale_log2, maps, rope);
     return static_cast<int>(cudaGetLastError());
+}
+
+template <typename Element, int HEAD_DIM, bool TMA>
+int launch_roped(const Element *query, const Element *key, const Element *value, Element *output,
+                 int tokens, int heads, int batch, const Mmh3AttentionLayout &layout,
+                 const AttentionMaps &maps, const AttentionRope &rope, float scale_log2,
+                 cudaStream_t stream) {
+    if (rope.angles != nullptr) {
+        return launch_kernel<Element, HEAD_DIM, TMA, true>(query, key, value, output, tokens, heads,
+                                                           batch, layout, maps, rope, scale_log2,
+                                                           stream);
+    }
+    return launch_kernel<Element, HEAD_DIM, TMA, false>(
+        query, key, value, output, tokens, heads, batch, layout, maps, rope, scale_log2, stream);
 }
 
 template <typename Element, int HEAD_DIM>
 int launch(const void *query, const void *key, const void *value, void *output, int tokens,
-           int heads, int batch, const Mmh3AttentionLayout &layout, float scale,
-           cudaStream_t stream) {
+           int heads, int batch, const Mmh3AttentionLayout &layout, const AttentionRope &rope,
+           float scale, cudaStream_t stream) {
     Mmh3AttentionLayout normalized = layout;
     normalized.heads_per_key_value =
         layout.heads_per_key_value > 0 ? layout.heads_per_key_value : 1;
@@ -381,42 +467,54 @@ int launch(const void *query, const void *key, const void *value, void *output, 
                              key_value_heads, batch, BLOCK_N, normalized.token_stride[VALUE],
                              normalized.head_stride[VALUE], normalized.batch_stride[VALUE]);
     if (mapped) {
-        return launch_kernel<Element, HEAD_DIM, true>(query_base, key_base, value_base, output_base,
-                                                      tokens, heads, batch, normalized, maps,
-                                                      scale_log2, stream);
+        return launch_roped<Element, HEAD_DIM, true>(query_base, key_base, value_base, output_base,
+                                                     tokens, heads, batch, normalized, maps, rope,
+                                                     scale_log2, stream);
     }
-    return launch_kernel<Element, HEAD_DIM, false>(query_base, key_base, value_base, output_base,
-                                                   tokens, heads, batch, normalized, maps,
-                                                   scale_log2, stream);
+    return launch_roped<Element, HEAD_DIM, false>(query_base, key_base, value_base, output_base,
+                                                  tokens, heads, batch, normalized, maps, rope,
+                                                  scale_log2, stream);
 }
 
 } // namespace
 
 // element_type 0 is BF16 and 1 is FP16. head_dim is 64 or 128.
-extern "C" int mmh3_attention(int element_type, int head_dim, const void *query, const void *key,
-                              const void *value, void *output, int tokens, int heads, int batch,
-                              const Mmh3AttentionLayout *layout, float scale, cudaStream_t stream) {
+// With `angles`, q and k are normalized over the head dimension and rotated by `pairs` angle pairs
+// per token as they reach shared memory, which is what the video VAE's decoder needs.
+extern "C" int mmh3_attention_roped(int element_type, int head_dim, const void *query,
+                                    const void *key, const void *value, void *output, int tokens,
+                                    int heads, int batch, const Mmh3AttentionLayout *layout,
+                                    float scale, const float *angles, int pairs, float epsilon,
+                                    cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0 || batch <= 0 ||
         (layout->heads_per_key_value > 0 && heads % layout->heads_per_key_value != 0)) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
+    const AttentionRope rope = {angles, pairs, epsilon};
     if (element_type == 0 && head_dim == 128) {
         return launch<__nv_bfloat16, 128>(query, key, value, output, tokens, heads, batch, *layout,
-                                          scale, stream);
+                                          rope, scale, stream);
     }
     if (element_type == 1 && head_dim == 64) {
-        return launch<__half, 64>(query, key, value, output, tokens, heads, batch, *layout, scale,
-                                  stream);
+        return launch<__half, 64>(query, key, value, output, tokens, heads, batch, *layout, rope,
+                                  scale, stream);
     }
     if (element_type == 0 && head_dim == 64) {
         return launch<__nv_bfloat16, 64>(query, key, value, output, tokens, heads, batch, *layout,
-                                         scale, stream);
+                                         rope, scale, stream);
     }
     if (element_type == 1 && head_dim == 128) {
-        return launch<__half, 128>(query, key, value, output, tokens, heads, batch, *layout, scale,
-                                   stream);
+        return launch<__half, 128>(query, key, value, output, tokens, heads, batch, *layout, rope,
+                                   scale, stream);
     }
     return static_cast<int>(cudaErrorInvalidValue);
+}
+
+extern "C" int mmh3_attention(int element_type, int head_dim, const void *query, const void *key,
+                              const void *value, void *output, int tokens, int heads, int batch,
+                              const Mmh3AttentionLayout *layout, float scale, cudaStream_t stream) {
+    return mmh3_attention_roped(element_type, head_dim, query, key, value, output, tokens, heads,
+                                batch, layout, scale, nullptr, 0, 0.0f, stream);
 }
 
 // The DiT's layout: q, k and v with their own token strides and heads of 128 packed contiguously.
