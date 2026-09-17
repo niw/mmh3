@@ -145,7 +145,10 @@ unsafe extern "C" {
 }
 
 pub const DEFAULT_TILE_SIZE: usize = 256;
-pub const DEFAULT_TILE_OVERLAP_MIN: usize = 64;
+// NOTE: the grid a tile size and this minimum produce, not the minimum itself, sets the decode
+// cost: 32 gives 6 x 4 tiles at 1344 x 768 where 48 and above give 7 x 4, for the same distance
+// from a finer grid.
+pub const DEFAULT_TILE_OVERLAP_MIN: usize = 32;
 
 const HEAD_DIM: usize = 64;
 const NORM_EPSILON: f32 = 1e-5;

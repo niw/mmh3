@@ -1,7 +1,7 @@
 //! Model checks against golden data captured from the reference implementation.
 
 use crate::USAGE;
-use mmh3::cli::parse_options;
+use mmh3::cli::{option_number, parse_options};
 use mmh3::models::{
     AUDIO_VAE_FILE, DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, VIDEO_VAE_FILE, load_dit,
     option_path, sparse_attention,
@@ -681,19 +681,31 @@ fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let options = parse_options(
         arguments,
-        &["golden", "models", "weights", "reference"],
+        &[
+            "golden",
+            "models",
+            "weights",
+            "reference",
+            "tile-size",
+            "tile-overlap",
+            "reference-tile-size",
+            "reference-tile-overlap",
+        ],
         USAGE,
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
+    let tile_size = option_number(&options, "tile-size", DEFAULT_TILE_SIZE)?;
+    let tile_overlap = option_number(&options, "tile-overlap", DEFAULT_TILE_OVERLAP_MIN)?;
+    let reference_tile_size = option_number(&options, "reference-tile-size", tile_size)?;
+    let reference_tile_overlap = option_number(&options, "reference-tile-overlap", tile_overlap)?;
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
     let steps: usize = dit_file.metadata("steps")?.parse()?;
     let latent = dit_file.unbatched(&format!("step{}.latent.video", steps - 1))?;
 
     let started = Instant::now();
     let weights = SafeTensors::open(Path::new(&weights_path))?;
-    let decoder =
-        CudaVideoDecoder::load(&weights, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?;
+    let decoder = CudaVideoDecoder::load(&weights, "", tile_size, tile_overlap)?;
     println!(
         "loaded {weights_path} in {:.1} s",
         started.elapsed().as_secs_f64()
@@ -709,7 +721,7 @@ fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     drop(decoder);
     let expected = if let Some(reference) = options.get("reference") {
         let weights = SafeTensors::open(Path::new(reference))?;
-        CudaVideoDecoder::load(&weights, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?
+        CudaVideoDecoder::load(&weights, "", reference_tile_size, reference_tile_overlap)?
             .decode(&latent, false)?
             .pixels
     } else if golden.join("decode.safetensors").exists() {

@@ -28,6 +28,8 @@ const USAGE: &str = "usage:
   mmh3-tools check sample --golden <directory> [--models DIR] [--weights FILE] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
                     [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
   mmh3-tools check video-vae --golden <directory> [--models DIR] [--weights FILE] [--reference FILE]
+                             [--tile-size N] [--tile-overlap N]
+                             [--reference-tile-size N] [--reference-tile-overlap N]
   mmh3-tools check keyframes --golden <directory> [--models DIR] [--weights FILE] [--reference FILE]
   mmh3-tools check sounds --golden <directory> [--models DIR] [--weights FILE]
   mmh3-tools check clips --golden <directory> [--models DIR] [--weights FILE] [--file clip.mp4]
