@@ -51,8 +51,10 @@ struct AttentionMaps {
     CUtensorMap value;
 };
 
+// Head dimension 64 asks for two blocks per SM: its stages are half the size, so two fit in shared
+// memory and one block's MMAs cover the other's copies.
 template <typename Element, int HEAD_DIM, bool TMA>
-__global__ void __launch_bounds__(THREADS, 1)
+__global__ void __launch_bounds__(THREADS, HEAD_DIM == 64 ? 2 : 1)
     attention_kernel(const Element *__restrict__ query, const Element *__restrict__ key,
                      const Element *__restrict__ value, Element *__restrict__ output, int tokens,
                      Mmh3AttentionLayout layout, float scale_log2,
