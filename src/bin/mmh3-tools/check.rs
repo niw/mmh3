@@ -273,6 +273,15 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "forward at sigma {sigma:.4} in {:.1} s{routing}",
         started.elapsed().as_secs_f64()
     );
+    if let Some(overlap) = dit.vsa_route_overlap()? {
+        println!(
+            "VSA neighbouring query tiles: {:.1} tiles loaded separately, {:.1} distinct \
+             ({:.1}% of the loads would go)",
+            overlap.separate,
+            overlap.merged,
+            100.0 * (1.0 - overlap.merged / overlap.separate)
+        );
+    }
 
     println!(
         "{:<12} {:>11} {:>11} {:>11} {:>9}",

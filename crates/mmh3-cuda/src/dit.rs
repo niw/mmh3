@@ -5,7 +5,7 @@
 
 use crate::attention::{
     AttentionInputs, AttentionLayout, AttentionPrecision, HEAD_DIM, PreparedAttention,
-    QuantizedWorkspace, SparseWorkspace, VsaWorkspace, dense_bf16_pointers,
+    QuantizedWorkspace, RouteOverlap, SparseWorkspace, VsaWorkspace, dense_bf16_pointers,
     dense_quantized_pointers, prepare_inputs_pointers, sparse_pointers, vsa_pointers,
 };
 use crate::gemm::interleave_swiglu_rows;
@@ -355,6 +355,16 @@ impl CudaDit {
     /// Selects quantized attention for the main DiT blocks. The text refiner stays in BF16.
     pub fn set_attention_precision(&mut self, precision: AttentionPrecision) {
         self.attention_precision = precision;
+    }
+
+    /// How much neighbouring query tiles shared in the last VSA call, or `None` when no call has
+    /// used VSA yet.
+    pub fn vsa_route_overlap(&self) -> Result<Option<RouteOverlap>, Error> {
+        let buffers = self.buffers.borrow();
+        let Some((_, _, workspace)) = buffers.vsa.as_ref() else {
+            return Ok(None);
+        };
+        Ok(Some(workspace.route_overlap()?))
     }
 
     pub fn config(&self) -> &DitConfig {

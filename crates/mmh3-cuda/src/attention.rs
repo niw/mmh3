@@ -903,7 +903,65 @@ pub struct VsaWorkspace {
     coarse: DeviceBuffer,
 }
 
+/// What two neighbouring query tiles select, as a block covering both would see it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RouteOverlap {
+    /// Neighbouring pairs counted, over every head.
+    pub pairs: usize,
+    /// Mean tiles the two blocks load between them today.
+    pub separate: f64,
+    /// Mean distinct tiles, which is what one block covering both rows would load.
+    pub merged: f64,
+}
+
 impl VsaWorkspace {
+    /// Downloads the selections and measures how much neighbouring query tiles share, which is the
+    /// key and value traffic a block over two query tiles would save. Diagnostic, not a hot path.
+    pub fn route_overlap(&self) -> Result<RouteOverlap, CudaError> {
+        let tiles = self.tiles;
+        let mut counts = vec![0u8; self.route_counts.bytes()];
+        self.route_counts.copy_to_host(&mut counts)?;
+        let mut routes = vec![0u8; self.routes.bytes()];
+        self.routes.copy_to_host(&mut routes)?;
+        let count = |head: usize, tile: usize| -> usize {
+            let offset = (head * tiles + tile) * 4;
+            i32::from_le_bytes(counts[offset..offset + 4].try_into().unwrap()).max(0) as usize
+        };
+        let route = |head: usize, tile: usize, entry: usize| -> usize {
+            let offset = ((head * tiles + tile) * tiles + entry) * 2;
+            u16::from_le_bytes(routes[offset..offset + 2].try_into().unwrap()) as usize
+        };
+        let mut overlap = RouteOverlap::default();
+        let mut selected = vec![false; tiles];
+        for head in 0..self.heads {
+            for tile in (0..tiles.saturating_sub(1)).step_by(2) {
+                let (first, second) = (count(head, tile), count(head, tile + 1));
+                if first == 0 && second == 0 {
+                    continue;
+                }
+                selected.iter_mut().for_each(|value| *value = false);
+                let mut distinct = 0;
+                for (other, length) in [(tile, first), (tile + 1, second)] {
+                    for entry in 0..length {
+                        let target = route(head, other, entry);
+                        if target < tiles && !selected[target] {
+                            selected[target] = true;
+                            distinct += 1;
+                        }
+                    }
+                }
+                overlap.pairs += 1;
+                overlap.separate += (first + second) as f64;
+                overlap.merged += distinct as f64;
+            }
+        }
+        if overlap.pairs > 0 {
+            overlap.separate /= overlap.pairs as f64;
+            overlap.merged /= overlap.pairs as f64;
+        }
+        Ok(overlap)
+    }
+
     pub fn new(plan: &VsaPlan, tokens: usize, heads: usize) -> Result<Self, CudaError> {
         Self::with_precision(plan, tokens, heads, AttentionPrecision::Bf16)
     }
