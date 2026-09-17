@@ -6,6 +6,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "tma.cuh"
+
 // Scaled INT8 GEMM for the DiT, text encoder and video VAE linear layers:
 //   output[m, n] = round(sum_k activations[m, k] * weights[n, k] * activation_scales[m] *
 //   weight_scales[n]
@@ -34,35 +36,6 @@ __device__ __forceinline__ uint32_t shared_address(const void *pointer) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
 }
 
-__device__ __forceinline__ void barrier_init(uint32_t barrier, uint32_t count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(barrier), "r"(count));
-}
-
-__device__ __forceinline__ void barrier_expect_bytes(uint32_t barrier, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(barrier),
-                 "r"(bytes)
-                 : "memory");
-}
-
-__device__ __forceinline__ void barrier_wait(uint32_t barrier, uint32_t parity) {
-    asm volatile("{\n"
-                 ".reg .pred done;\n"
-                 "WAIT:\n"
-                 "mbarrier.try_wait.parity.shared::cta.b64 done, [%0], %1;\n"
-                 "@!done bra WAIT;\n"
-                 "}\n" ::"r"(barrier),
-                 "r"(parity)
-                 : "memory");
-}
-
-__device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMap *map,
-                                          uint32_t barrier, int column, int row) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes "
-                 "[%0], [%1, {%2, %3}], [%4];\n" ::"r"(destination),
-                 "l"(reinterpret_cast<uint64_t>(map)), "r"(column), "r"(row), "r"(barrier)
-                 : "memory");
-}
-
 __device__ __forceinline__ void load_matrix_x4(uint32_t (&registers)[4], uint32_t address) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
                  : "=r"(registers[0]), "=r"(registers[1]), "=r"(registers[2]), "=r"(registers[3])
@@ -77,12 +50,6 @@ __device__ __forceinline__ void mma_s8(int32_t (&accumulator)[4], const uint32_t
                  : "+r"(accumulator[0]), "+r"(accumulator[1]), "+r"(accumulator[2]),
                    "+r"(accumulator[3])
                  : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
-}
-
-// The TMA 128B swizzle stores 16-byte chunk c of a 128-byte row r at chunk c ^ (r % 8), so every
-// ldmatrix phase touches eight distinct bank groups.
-__device__ __forceinline__ uint32_t swizzled_offset(int row, int chunk) {
-    return row * BLOCK_K + ((chunk ^ (row & 7)) << 4);
 }
 
 template <int BLOCK_M, int BLOCK_N, int WARPS_M> struct Int8GemmConfig {
@@ -315,7 +282,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             __threadfence_block();
             if (atomicAdd(release_counts + ring.stage, 1) == WARPS - 1) {
                 release_counts[ring.stage] = 0;
-                asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+                async_proxy_fence();
                 fill_stage<Config>(grid, ring.sequence + STAGES, stage_a, barrier, maps);
             }
         }
@@ -478,20 +445,6 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
 
 using TallTile = Int8GemmConfig<256, 128, 4>;
 using WideTile = Int8GemmConfig<128, 256, 4>;
-
-PFN_cuTensorMapEncodeTiled_v12000 tensor_map_encoder() {
-    static const PFN_cuTensorMapEncodeTiled_v12000 encoder = [] {
-        void *function = nullptr;
-        cudaDriverEntryPointQueryResult result;
-        if (cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &function, 12000,
-                                             cudaEnableDefault, &result) != cudaSuccess ||
-            result != cudaDriverEntryPointSuccess) {
-            return static_cast<PFN_cuTensorMapEncodeTiled_v12000>(nullptr);
-        }
-        return reinterpret_cast<PFN_cuTensorMapEncodeTiled_v12000>(function);
-    }();
-    return encoder;
-}
 
 // Describes `rows` rows of `columns` elements to TMA in boxes of `box_rows` rows by 128 bytes,
 // zero-filling rows past the end.
