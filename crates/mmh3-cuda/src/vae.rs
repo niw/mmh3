@@ -680,6 +680,7 @@ impl CudaVideoDecoder {
                 f16: true,
                 bias,
                 swiglu,
+                stride: 0,
             };
             int8_pointers(
                 workspace.quantized.pointer(),

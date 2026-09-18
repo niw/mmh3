@@ -28,6 +28,7 @@ unsafe extern "C" {
         m: c_int,
         n: c_int,
         k: c_int,
+        output_stride: c_int,
         adapter_down: *const c_void,
         adapter_up: *const c_void,
         rank: c_int,
@@ -148,6 +149,9 @@ pub(crate) struct Int8Output {
     pub(crate) f16: bool,
     pub(crate) bias: *const c_void,
     pub(crate) swiglu: bool,
+    /// Elements between the rows of the output, or zero for rows side by side. A shared-out step
+    /// writes one rank's heads into a row that holds every rank's.
+    pub(crate) stride: usize,
 }
 
 impl Int8Output {
@@ -157,6 +161,7 @@ impl Int8Output {
             f16: false,
             bias: ptr::null(),
             swiglu: false,
+            stride: 0,
         }
     }
 }
@@ -303,6 +308,7 @@ unsafe fn int8_config(
             m as c_int,
             n as c_int,
             k as c_int,
+            output.stride as c_int,
             adapter.down,
             adapter.up,
             adapter.rank as c_int,
@@ -387,6 +393,7 @@ pub fn int8(
             .bias
             .map_or(ptr::null(), |bias| bias.pointer().cast_const()),
         swiglu: output.swiglu,
+        stride: 0,
     };
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
     unsafe {

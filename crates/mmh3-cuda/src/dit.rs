@@ -925,10 +925,10 @@ impl CudaDit {
         Ok(())
     }
 
-    /// A block's attention when the step is shared out: exchange the inputs, attend to this rank's
-    /// heads over the whole sequence, and exchange the output back. VSA only, since its entry point
-    /// is the one that takes the exchanged layout.
-    #[allow(clippy::too_many_arguments)]
+    /// A block when the step is shared out. The exchange is of what the projections consume, not of
+    /// what they produce: a rank sends its rows of the quantized block input, an eighth of the
+    /// bytes q, k, v and the gate would take, and then runs its own heads' columns over the whole
+    /// sequence. The arithmetic is the same and nothing is quantized twice.
     fn sharded_attention(
         &self,
         prefix: &str,
@@ -946,11 +946,56 @@ impl CudaDit {
         else {
             return Err(Error::Model("a sharded block needs VSA".to_owned()));
         };
+        let (normalized, scales) = self.exchange_inputs(workspace, context, tokens)?;
+
+        let started = Instant::now();
+        let (shard, hidden) = (&context.shard, config.hidden);
+        let own = shard.own_heads();
+        let (inner, whole) = (own.len() * HEAD_DIM, config.inner());
+        let inputs = context
+            .exchange
+            .region(Region::Inputs, tokens * 3 * inner * 2)?;
+        let gated = self
+            .tensors
+            .optional(&format!("{prefix}.attn.to_gate_compress.weight"))
+            .is_some();
+        let gate = if gated {
+            context.exchange.region(Region::Gate, tokens * inner * 2)?
+        } else {
+            ptr::null_mut()
+        };
+        // The three tensors of one token sit side by side, so each projection writes a column range
+        // of a row that is three times as wide as its own result.
+        for tensor in 0..3 {
+            let columns =
+                (tensor * whole + own.start * HEAD_DIM)..(tensor * whole + own.end * HEAD_DIM);
+            // SAFETY: the region holds `tokens × 3 × inner` values.
+            let into = unsafe { inputs.byte_add(tensor * inner * 2) };
+            self.tensors.linear_quantized_range(
+                &format!("{prefix}.attn.qkv_proj"),
+                into,
+                tokens,
+                columns,
+                3 * inner,
+                normalized,
+                scales,
+            )?;
+        }
+        if gated {
+            self.tensors.linear_quantized_range(
+                &format!("{prefix}.attn.to_gate_compress"),
+                gate,
+                tokens,
+                (own.start * HEAD_DIM)..(own.end * HEAD_DIM),
+                0,
+                normalized,
+                scales,
+            )?;
+        }
+        let _ = hidden;
+
         let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
         let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
-        let (inputs, gate) = self.exchange_inputs(workspace, context, tokens)?;
-        let started = Instant::now();
-        let inner = context.shard.own_heads().len() * HEAD_DIM;
         let attended = context
             .exchange
             .region(Region::Attended, tokens * inner * 2)?;
@@ -964,7 +1009,7 @@ impl CudaDit {
             head_stride: [HEAD_DIM as i64; 4],
             ..AttentionLayout::default()
         };
-        // SAFETY: the exchanged inputs hold `tokens × 3 × own heads × 128` values in the layout the
+        // SAFETY: the projections filled `tokens × 3 × own heads × 128` values in the layout the
         // preparation and VSA already read, the gate holds one tensor of the same rows, and the
         // angles cover every token because attention sees the whole sequence.
         unsafe {
@@ -975,7 +1020,7 @@ impl CudaDit {
                 angles,
                 3 * config.rope_frequencies,
                 tokens,
-                context.shard.own_heads().len(),
+                own.len(),
                 config.norm_eps,
                 PreparedAttention::Vsa(vsa_workspace),
             )?;
@@ -1000,87 +1045,48 @@ impl CudaDit {
         self.exchange_outputs(workspace, context, tokens)
     }
 
-    /// Turns "my tokens, every head" into "every token, my heads". Each rank gathers its own share
-    /// straight into place and one share per peer into memory that peer reads, and comes back with
-    /// the whole sequence for the heads it attends with.
+    /// Gives every rank the whole sequence's block input, which is what the projections consume.
+    /// A rank writes its own rows and reads the others', and the result is the same INT8 values
+    /// every rank would have produced on its own.
     fn exchange_inputs(
         &self,
         workspace: &Workspace,
         context: &mut ShardContext<'_>,
         tokens: usize,
-    ) -> Result<(*mut c_void, *mut c_void), Error> {
-        let (shard, heads) = (&context.shard, self.config.heads);
-        let (rows, own) = (shard.own_tokens(), shard.own_heads());
-        let (own_inner, gated) = (own.len() * HEAD_DIM, workspace.gate.is_some());
-        let inputs_bytes = tokens * 3 * own_inner * 2;
-        let gate_bytes = tokens * own_inner * 2;
-        let inputs = context.exchange.region(Region::Inputs, inputs_bytes)?;
-        let gate = if gated {
-            context.exchange.region(Region::Gate, gate_bytes)?
-        } else {
-            ptr::null_mut()
-        };
+    ) -> Result<(*const c_void, *const c_void), Error> {
         let started = Instant::now();
-        let source = workspace.qkv.pointer();
-        let gate_source = workspace
-            .gate
-            .as_ref()
-            .map_or(ptr::null_mut(), |gate| gate.pointer());
-        for peer in 0..shard.ranks() {
-            let span = shard.heads[peer].clone();
-            let inner = span.len() * HEAD_DIM;
-            let (into_inputs, into_gate) = if peer == shard.rank {
-                // SAFETY: this rank's share sits at its own token offset in the whole sequence.
-                unsafe {
-                    (
-                        inputs.byte_add(rows.start * 3 * own_inner * 2),
-                        if gated {
-                            gate.byte_add(rows.start * own_inner * 2)
-                        } else {
-                            gate
-                        },
-                    )
-                }
-            } else {
-                (
-                    context
-                        .exchange
-                        .region(Region::SendInputs(peer), rows.len() * 3 * inner * 2)?,
-                    if gated {
-                        context
-                            .exchange
-                            .region(Region::SendGate(peer), rows.len() * inner * 2)?
-                    } else {
-                        ptr::null_mut()
-                    },
-                )
-            };
-            // SAFETY: qkv holds this rank's rows of every head, and the destinations were sized for
-            // the span above.
-            unsafe {
-                shard::pack(
-                    source,
-                    into_inputs,
-                    rows.len(),
-                    3,
-                    heads,
-                    HEAD_DIM,
-                    span.clone(),
-                )?;
-                if gated {
-                    shard::pack(gate_source, into_gate, rows.len(), 1, heads, HEAD_DIM, span)?;
-                }
-            }
+        let hidden = self.config.hidden;
+        let rows = context.shard.own_tokens();
+        let normalized = context
+            .exchange
+            .region(Region::Normalized, tokens * hidden)?;
+        let scales = context.exchange.region(Region::Scales, tokens * 4)?;
+        // SAFETY: the regions hold every token's rows and this rank wrote its own.
+        unsafe {
+            copy_device(
+                normalized.byte_add(rows.start * hidden),
+                workspace.quantized.pointer().cast_const(),
+                rows.len() * hidden,
+            )?;
+            copy_device(
+                scales.byte_add(rows.start * 4),
+                workspace.scales.pointer().cast_const(),
+                rows.len() * 4,
+            )?;
         }
-        // NOTE: the gathers are launched on a stream and the barrier is a socket message, so the
-        // device has to finish before a peer is told the memory is ready. Without this it reads
-        // whatever was there last.
+        // NOTE: the copies are on a stream and the barrier is a socket message, so the device has
+        // to finish before a peer is told the memory is ready.
         crate::synchronize()?;
+        context
+            .exchange
+            .publish(Region::Normalized, tokens * hidden)?;
+        context.exchange.publish(Region::Scales, tokens * 4)?;
         context.timing.gather += started.elapsed();
         let started = Instant::now();
         context.exchange.barrier()?;
         context.timing.barrier += started.elapsed();
         let started = Instant::now();
+        let shard = &context.shard;
         for peer in 0..shard.ranks() {
             if peer == shard.rank {
                 continue;
@@ -1088,28 +1094,26 @@ impl CudaDit {
             let taken = shard.tokens[peer].clone();
             context.exchange.read(
                 peer,
-                Region::SendInputs(shard.rank),
-                0,
-                Region::Inputs,
-                taken.start * 3 * own_inner * 2,
-                taken.len() * 3 * own_inner * 2,
+                Region::Normalized,
+                taken.start * hidden,
+                Region::Normalized,
+                taken.start * hidden,
+                taken.len() * hidden,
             )?;
-            if gated {
-                context.exchange.read(
-                    peer,
-                    Region::SendGate(shard.rank),
-                    0,
-                    Region::Gate,
-                    taken.start * own_inner * 2,
-                    taken.len() * own_inner * 2,
-                )?;
-            }
+            context.exchange.read(
+                peer,
+                Region::Scales,
+                taken.start * 4,
+                Region::Scales,
+                taken.start * 4,
+                taken.len() * 4,
+            )?;
         }
         context.timing.read += started.elapsed();
         let started = Instant::now();
         context.exchange.barrier()?;
         context.timing.barrier += started.elapsed();
-        Ok((inputs, gate))
+        Ok((normalized.cast_const(), scales.cast_const()))
     }
 
     /// Turns "every token, my heads" back into "my tokens, every head", leaving a block's attention
@@ -1234,15 +1238,19 @@ impl CudaDit {
                     0,
                     1,
                 )?;
-                self.tensors.linear_quantized(
-                    &qkv,
-                    workspace.qkv.pointer(),
-                    int8_rows,
-                    &workspace.quantized,
-                    &workspace.scales,
-                    adapter(&qkv),
-                    false,
-                )?;
+                // A shared-out block exchanges what this just quantized and projects afterwards,
+                // over the whole sequence and its own heads.
+                if shard.is_none() {
+                    self.tensors.linear_quantized(
+                        &qkv,
+                        workspace.qkv.pointer(),
+                        int8_rows,
+                        &workspace.quantized,
+                        &workspace.scales,
+                        adapter(&qkv),
+                        false,
+                    )?;
+                }
             }
             if let Some(weight) = nvfp4_qkv {
                 self.add_norm_quantize_nvfp4(
@@ -1288,7 +1296,8 @@ impl CudaDit {
             )?;
         }
         let vsa_gate = match sparse {
-            Some(SparsePass::Vsa { .. }) => {
+            // A shared-out block's gate comes out of the same exchanged input as its projections.
+            Some(SparsePass::Vsa { .. }) if shard.is_none() => {
                 let fused = modulation.is_some() && self.tensors.is_int8(&qkv);
                 self.vsa_gate(prefix, workspace, tokens, head, fused)?
             }

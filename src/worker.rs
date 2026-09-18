@@ -1063,6 +1063,7 @@ impl<'a> Exchanger<'a> {
     pub fn open(
         shard: &Shard,
         tokens: usize,
+        hidden: usize,
         gated: bool,
         reader: &'a mut BufReader<TcpStream>,
         writer: &'a mut BufWriter<TcpStream>,
@@ -1071,7 +1072,7 @@ impl<'a> Exchanger<'a> {
         let mut regions = HashMap::new();
         let mut computed = HashMap::new();
         let mut table = Vec::new();
-        for (region, bytes) in shard::regions(shard, tokens, gated) {
+        for (region, bytes) in shard::regions(shard, tokens, hidden, gated) {
             // Everything gets registered memory, since a peer may read any of it. A region a block
             // computes in gets a device buffer beside it, and the two are kept in step by `publish`
             // on the way out and by the copy that follows a read on the way in.
@@ -1359,7 +1360,15 @@ fn serve_shard(
         1,
     );
     let gated = dit.has_vsa_gates();
-    let mut exchanger = Exchanger::open(&shard, tokens, gated, reader, writer, connection)?;
+    let mut exchanger = Exchanger::open(
+        &shard,
+        tokens,
+        dit.config().hidden,
+        gated,
+        reader,
+        writer,
+        connection,
+    )?;
     println!(
         "rank {} of {} takes tokens {:?} and heads {:?}",
         shard.rank,
@@ -1428,6 +1437,7 @@ impl Worker {
         &'a mut self,
         shard: &Shard,
         tokens: usize,
+        hidden: usize,
         gated: bool,
         open: &OpenSession,
         payload: &[u8],
@@ -1442,7 +1452,7 @@ impl Worker {
             .as_ref()
             .ok_or("a shared-out step needs a reliable connection")?;
         worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
-        Exchanger::open(shard, tokens, gated, reader, writer, connection)
+        Exchanger::open(shard, tokens, hidden, gated, reader, writer, connection)
     }
 }
 

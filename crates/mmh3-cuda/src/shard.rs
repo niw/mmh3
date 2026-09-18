@@ -103,7 +103,14 @@ impl Shard {
 /// wire when a session opens.
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum Region {
-    /// `[all tokens][q, k, v][own heads][128]`, this rank's attention inputs once exchanged.
+    /// `[all tokens][hidden]` INT8, the block's input as the projections consume it. Exchanging
+    /// this rather than what the projections produce carries an eighth of the bytes and changes
+    /// nothing: a rank runs its own heads' columns over the whole sequence instead of every
+    /// column over its own rows.
+    Normalized,
+    /// `[all tokens]` FP32, one scale a row beside `Normalized`.
+    Scales,
+    /// `[all tokens][q, k, v][own heads][128]`, this rank's attention inputs.
     Inputs,
     /// `[all tokens][own heads][128]`, VSA's compressed query beside them.
     Gate,
@@ -122,7 +129,10 @@ impl Region {
     /// has to live. Attention reads its inputs once per query tile, and where the wire cannot
     /// reach device memory that difference is sevenfold: 24.8 s a step against 3.4 s.
     pub fn is_computed_in(self) -> bool {
-        matches!(self, Region::Inputs | Region::Gate | Region::Attended)
+        matches!(
+            self,
+            Region::Normalized | Region::Scales | Region::Inputs | Region::Gate | Region::Attended
+        )
     }
 
     /// A stable name for the wire: both sides list what they made, and a peer looks an entry up
@@ -135,6 +145,8 @@ impl Region {
             Region::SendInputs(peer) => (3, peer as u32),
             Region::SendGate(peer) => (4, peer as u32),
             Region::Received(peer) => (5, peer as u32),
+            Region::Normalized => (6, 0),
+            Region::Scales => (7, 0),
         }
     }
 
@@ -146,6 +158,8 @@ impl Region {
             3 => Region::SendInputs(peer as usize),
             4 => Region::SendGate(peer as usize),
             5 => Region::Received(peer as usize),
+            6 => Region::Normalized,
+            7 => Region::Scales,
             _ => return None,
         })
     }
@@ -153,10 +167,12 @@ impl Region {
 
 /// Every region a shared-out block needs and how long it is, so that a transport can make them all
 /// before the first block instead of growing them under the addresses a peer already holds.
-pub fn regions(shard: &Shard, tokens: usize, gated: bool) -> Vec<(Region, usize)> {
+pub fn regions(shard: &Shard, tokens: usize, hidden: usize, gated: bool) -> Vec<(Region, usize)> {
     let own = shard.own_heads().len() * HEAD_DIM;
     let rows = shard.own_tokens().len();
     let mut list = vec![
+        (Region::Normalized, tokens * hidden),
+        (Region::Scales, tokens * 4),
         (Region::Inputs, tokens * 3 * own * 2),
         (Region::Attended, tokens * own * 2),
     ];
@@ -168,10 +184,6 @@ pub fn regions(shard: &Shard, tokens: usize, gated: bool) -> Vec<(Region, usize)
             continue;
         }
         let inner = shard.heads[peer].len() * HEAD_DIM;
-        list.push((Region::SendInputs(peer), rows * 3 * inner * 2));
-        if gated {
-            list.push((Region::SendGate(peer), rows * inner * 2));
-        }
         list.push((Region::Received(peer), rows * inner * 2));
     }
     list

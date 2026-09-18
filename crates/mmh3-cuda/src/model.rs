@@ -220,6 +220,55 @@ impl DeviceTensors {
         )
     }
 
+    /// `linear_quantized` over a range of the output columns, with the rows of the result `stride`
+    /// elements apart. The weight is `[outputs, features]` and its scales `[outputs]`, so a range of
+    /// the columns is a range of both, and no adapter comes along: a shared-out step is the only
+    /// caller and it refuses LoRA.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_quantized_range(
+        &self,
+        name: &str,
+        output: *mut c_void,
+        rows: usize,
+        columns: std::ops::Range<usize>,
+        stride: usize,
+        quantized: *const c_void,
+        activation_scales: *const c_void,
+    ) -> Result<(), Error> {
+        let weight = self.get(&format!("{name}.weight"))?;
+        let (outputs, features) = (weight.shape[0], weight.shape[1]);
+        let weight_scales = self.get(&format!("{name}.weight_scale"))?;
+        if weight.dtype != DType::I8
+            || features % CONVROT_GROUP != 0
+            || self.optional(&format!("{name}.bias")).is_some()
+        {
+            return Err(Error::Model(format!("{name}: unsupported INT8 layer")));
+        }
+        if columns.end > outputs {
+            return Err(Error::Model(format!(
+                "{name}: columns {columns:?} of {outputs}"
+            )));
+        }
+        let mut output = Int8Output::bf16(output);
+        output.stride = stride;
+        // SAFETY: the caller keeps `rows × features` quantized values and `rows` scales, and a
+        // range of the columns is the matching range of the weight's rows and of its scales.
+        unsafe {
+            int8_pointers(
+                quantized,
+                weight.buffer.pointer_at(columns.start * features),
+                activation_scales,
+                weight_scales.buffer.pointer_at(columns.start * 4),
+                output,
+                rows,
+                columns.len(),
+                features,
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
     /// The INT8 ConvRot path of `linear`: quantizes the BF16 input unless `input_quantized`, and
     /// runs the INT8 GEMM with the adapter inside it. The adapter's down projection runs on the
     /// quantized input.

@@ -495,6 +495,7 @@ pub fn sample(
             match target.worker.open_shard(
                 &shard,
                 target.tokens,
+                dit.config().hidden,
                 target.gated,
                 &target.open,
                 &target.payload,
@@ -775,15 +776,19 @@ fn shard_target(
     use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
     use mmh3_cuda::shard::Shard;
 
-    // NOTE: sharing the DiT is slower than keeping it here over this link, so it waits to be
-    // asked for. A 768p step exchanges 34 GB, which takes 4 s at the 8.3 GB/s two machines reach
-    // at once, against the 7 s of arithmetic it saves, and the barriers cost the rest.
-    let ranks = crate::cli::option_number(options, "shard-dit", 1).ok()?;
+    // A worker that only encodes the prompt and decodes some chunks is worth 9% of a run, which is
+    // not worth a second machine. Sharing every step is worth 35%, so it is what `--worker` does
+    // unless `--shard-dit 0` says otherwise.
+    let asked = options.contains_key("shard-dit");
+    let ranks = crate::cli::option_number(options, "shard-dit", 2).ok()?;
     if ranks < 2 {
+        // Zero keeps the DiT here. One shares a step with nobody, which `alone_shard` handles.
         return None;
     }
     if settings.workers.is_empty() {
-        println!("sharing a step needs a worker, so the DiT stays here");
+        if asked {
+            println!("sharing a step needs a worker, so the DiT stays here");
+        }
         return None;
     }
     if ranks > 2 {
