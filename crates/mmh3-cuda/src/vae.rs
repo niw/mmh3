@@ -1099,10 +1099,11 @@ impl CudaVideoDecoder {
         })
     }
 
-    /// One chunk's canvas, `[3, canvas frames, height, width]` FP32, before any blending with its
-    /// neighbours. The arithmetic is the decode's own, so a canvas computed here and one computed
-    /// on another machine of the same backend are the same bytes.
-    pub fn decode_chunk(&self, latent: &Tensor, chunk: usize) -> Result<Vec<f32>, Error> {
+    /// One chunk's canvas, `[3, canvas frames, height, width]` FP32 as little-endian bytes, before
+    /// any blending with its neighbours. Bytes rather than values because they travel to another
+    /// machine and go straight onto its device. The arithmetic is the decode's own, so a canvas
+    /// computed here and one computed elsewhere on the same backend are the same bytes.
+    pub fn decode_chunk(&self, latent: &Tensor, chunk: usize) -> Result<Vec<u8>, Error> {
         let mut decode = self.context(latent)?;
         if chunk >= decode.chunks {
             return Err(Error::Model(format!(
@@ -1111,7 +1112,9 @@ impl CudaVideoDecoder {
             )));
         }
         self.fill_canvas(&mut decode, chunk, false)?;
-        Ok(decode.canvas.to_f32()?)
+        let mut bytes = vec![0u8; decode.canvas.bytes()];
+        decode.canvas.copy_to_host(&mut bytes)?;
+        Ok(bytes)
     }
 
     pub fn decode(
@@ -1141,7 +1144,7 @@ impl CudaVideoDecoder {
     pub fn decode_device_with(
         &self,
         latent: &Tensor,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<f32>>,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
     ) -> Result<CudaVideoFrames, Error> {
         let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false, remote)?;
         CudaVideoFrames::from_rgb(pixels, frames, height, width)
@@ -1300,7 +1303,7 @@ impl CudaVideoDecoder {
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<f32>>,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
     ) -> Result<(DeviceBuffer, [usize; 3], Option<Tensor>), Error> {
         let mut decode = self.context(latent)?;
         let (plane, canvas_frames) = (decode.plane, decode.canvas_frames);
@@ -1345,19 +1348,15 @@ impl CudaVideoDecoder {
         for chunk in 0..chunks {
             match remote(chunk) {
                 // A canvas another machine decoded, in the bytes this one would have produced.
-                Some(ref values) => {
-                    let expected = OUTPUT_CHANNELS * canvas_frames * plane;
-                    if values.len() != expected {
+                Some(ref bytes) => {
+                    let expected = OUTPUT_CHANNELS * canvas_frames * plane * size_of::<f32>();
+                    if bytes.len() != expected {
                         return Err(Error::Model(format!(
-                            "chunk {chunk} arrived with {} values, not {expected}",
-                            values.len()
+                            "chunk {chunk} arrived with {} bytes, not {expected}",
+                            bytes.len()
                         )));
                     }
-                    let bytes: Vec<u8> = values
-                        .iter()
-                        .flat_map(|value| value.to_le_bytes())
-                        .collect();
-                    decode.canvas.copy_from_host(&bytes)?;
+                    decode.canvas.copy_from_host(bytes)?;
                 }
                 None => {
                     let captured =

@@ -295,6 +295,7 @@ dependencies = [
  "mmh3-output",
  "mmh3-output-nvenc",
  "mmh3-output-videotoolbox",
+ "mmh3-rdma",
  "rubato",
  "symphonia",
  "tempfile",
@@ -378,6 +379,10 @@ dependencies = [
  "serde_json",
  "tempfile",
 ]
+
+[[package]]
+name = "mmh3-rdma"
+version = "0.1.0"
 
 [[package]]
 name = "moxcms"

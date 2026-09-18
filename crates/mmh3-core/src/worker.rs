@@ -33,6 +33,7 @@ pub enum Kind {
     Error = 9,
     DecodeVideo = 10,
     Canvas = 11,
+    Release = 12,
 }
 
 impl Kind {
@@ -49,6 +50,7 @@ impl Kind {
             9 => Kind::Error,
             10 => Kind::DecodeVideo,
             11 => Kind::Canvas,
+            12 => Kind::Release,
             _ => return None,
         })
     }
@@ -217,10 +219,15 @@ pub struct Speed {
     pub bandwidth_gbytes: f32,
 }
 
+/// A machine's RoCE address, opaque here: `mmh3_rdma::Address` gives it meaning.
+pub const RDMA_ADDRESS_BYTES: usize = 26;
+
 #[derive(Clone, Debug)]
 pub struct Hello {
     pub leader: String,
     pub token: String,
+    /// Where this side's reliable connection waits, when it has one.
+    pub rdma: Option<[u8; RDMA_ADDRESS_BYTES]>,
 }
 
 #[derive(Clone, Debug)]
@@ -232,6 +239,8 @@ pub struct Welcome {
     pub transports: u32,
     pub speed: Option<Speed>,
     pub checkpoints: Vec<Checkpoint>,
+    /// Answered when the leader offered one and this side has one too.
+    pub rdma: Option<[u8; RDMA_ADDRESS_BYTES]>,
 }
 
 /// Token identifiers of a prompt, to be encoded by whichever machine holds the text encoder.
@@ -253,11 +262,16 @@ pub struct DecodeVideo {
     pub shape: [u32; 4],
 }
 
-/// A chunk's canvas before any blending, `[3, canvas frames, height, width]` FP32.
+/// A chunk's canvas before any blending, `[3, canvas frames, height, width]` FP32, counted in
+/// bytes because that is how it travels and how a decoder hands it over. With a remote key the
+/// bytes are not in the payload: they wait in the worker's memory for the leader to read, and the
+/// worker holds them until a `Release` says it may let go.
 #[derive(Clone, Debug)]
 pub struct Canvas {
     pub chunk: u32,
-    pub values: u64,
+    pub bytes: u64,
+    pub remote_address: u64,
+    pub remote_key: u32,
 }
 
 /// `[tokens, hidden]` FP32, as the encoders already return it.
@@ -267,10 +281,35 @@ pub struct TextStates {
     pub hidden: usize,
 }
 
+fn encode_rdma(encoder: &mut Encoder, address: &Option<[u8; RDMA_ADDRESS_BYTES]>) {
+    match address {
+        Some(bytes) => {
+            encoder.u8(1).bytes(bytes);
+        }
+        None => {
+            encoder.u8(0);
+        }
+    }
+}
+
+fn decode_rdma(decoder: &mut Decoder<'_>) -> io::Result<Option<[u8; RDMA_ADDRESS_BYTES]>> {
+    Ok(match decoder.u8()? {
+        0 => None,
+        _ => {
+            let mut address = [0u8; RDMA_ADDRESS_BYTES];
+            for byte in address.iter_mut() {
+                *byte = decoder.u8()?;
+            }
+            Some(address)
+        }
+    })
+}
+
 impl Hello {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
         encoder.string(&self.leader).string(&self.token);
+        encode_rdma(&mut encoder, &self.rdma);
         encoder.finish()
     }
 
@@ -279,6 +318,7 @@ impl Hello {
         Ok(Hello {
             leader: decoder.string()?,
             token: decoder.string()?,
+            rdma: decode_rdma(&mut decoder)?,
         })
     }
 }
@@ -307,6 +347,7 @@ impl Welcome {
         for checkpoint in &self.checkpoints {
             encoder.string(&checkpoint.role).u64(checkpoint.digest);
         }
+        encode_rdma(&mut encoder, &self.rdma);
         encoder.finish()
     }
 
@@ -332,6 +373,7 @@ impl Welcome {
                 digest: decoder.u64()?,
             });
         }
+        let rdma = decode_rdma(&mut decoder)?;
         Ok(Welcome {
             backend,
             device,
@@ -340,6 +382,7 @@ impl Welcome {
             transports,
             speed,
             checkpoints,
+            rdma,
         })
     }
 }
@@ -432,11 +475,15 @@ impl DecodeVideo {
 }
 
 impl Canvas {
-    pub const BYTES: usize = 16;
+    pub const BYTES: usize = 28;
 
     pub fn encode(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
-        encoder.u64(self.chunk as u64).u64(self.values);
+        encoder
+            .u64(self.chunk as u64)
+            .u64(self.bytes)
+            .u64(self.remote_address)
+            .u32(self.remote_key);
         encoder.finish()
     }
 
@@ -444,7 +491,9 @@ impl Canvas {
         let mut decoder = Decoder::new(bytes);
         Ok(Canvas {
             chunk: decoder.u64()? as u32,
-            values: decoder.u64()?,
+            bytes: decoder.u64()?,
+            remote_address: decoder.u64()?,
+            remote_key: decoder.u32()?,
         })
     }
 }
@@ -521,6 +570,7 @@ mod tests {
             memory_bytes: 128 << 30,
             capabilities: CAPABILITY_ENCODE_TEXT | CAPABILITY_DECODE_VIDEO,
             transports: TRANSPORT_TCP,
+            rdma: None,
             speed: Some(Speed {
                 gemm_tops: 181.6,
                 bandwidth_gbytes: 227.7,

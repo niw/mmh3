@@ -147,6 +147,46 @@ fn resolve(models: &Path, role: &str) -> Option<PathBuf> {
     file.exists().then_some(file)
 }
 
+/// The reliable connection to one peer, when both sides have RoCE. Bulk payloads go this way and
+/// the socket carries only what asks for them.
+#[cfg(feature = "cuda")]
+type Rdma = mmh3_rdma::Connection;
+#[cfg(feature = "cuda")]
+type Region = mmh3_rdma::Region;
+#[cfg(not(feature = "cuda"))]
+type Rdma = ();
+#[cfg(not(feature = "cuda"))]
+type Region = ();
+
+/// Opens this machine's side of a reliable connection, or nothing when it has no RoCE port.
+fn open_rdma() -> Option<(Rdma, [u8; worker::RDMA_ADDRESS_BYTES])> {
+    #[cfg(feature = "cuda")]
+    {
+        let connection = mmh3_rdma::Connection::open("", mmh3_rdma::DEFAULT_GLOBAL_ID).ok()?;
+        let address = connection.address().ok()?;
+        Some((connection, address.to_bytes()))
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        None
+    }
+}
+
+/// Finishes the connection once the peer's address has arrived over the socket.
+fn join_rdma(connection: Rdma, peer: &[u8; worker::RDMA_ADDRESS_BYTES]) -> Option<Rdma> {
+    #[cfg(feature = "cuda")]
+    {
+        let address = mmh3_rdma::Address::from_bytes(peer)?;
+        connection.connect(&address).ok()?;
+        Some(connection)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = (connection, peer);
+        None
+    }
+}
+
 /// One worker as the leader sees it.
 pub struct Worker {
     pub address: String,
@@ -154,6 +194,8 @@ pub struct Worker {
     reader: BufReader<TcpStream>,
     writer: BufWriter<TcpStream>,
     request: u64,
+    rdma: Option<Rdma>,
+    staging: Option<Region>,
 }
 
 impl Worker {
@@ -178,17 +220,31 @@ impl Worker {
                 transports: 0,
                 speed: None,
                 checkpoints: Vec::new(),
+                rdma: None,
             },
             request: 0,
+            rdma: None,
+            staging: None,
             address,
         };
+        let offered = open_rdma();
         let hello = Hello {
             leader: hostname(),
             token: token.to_owned(),
+            rdma: offered.as_ref().map(|(_, address)| *address),
         };
         let body = worker.call(Kind::Hello, &hello.encode(), &[])?;
         worker.welcome = Welcome::decode(&body.1)?;
+        worker.rdma = match (offered, worker.welcome.rdma) {
+            (Some((connection, _)), Some(peer)) => join_rdma(connection, &peer),
+            _ => None,
+        };
         Ok(worker)
+    }
+
+    /// Whether the bulk of a reply comes over RoCE rather than the socket.
+    pub fn reads_remotely(&self) -> bool {
+        self.rdma.is_some()
     }
 
     pub fn serves(&self, capability: u32) -> bool {
@@ -209,13 +265,35 @@ impl Worker {
         Ok(started.elapsed())
     }
 
-    /// Sends and reads back `bytes`, and returns the round trip in gigabytes a second.
-    pub fn bandwidth(&mut self, bytes: usize) -> Result<f64, Box<dyn Error>> {
+    /// Moves `bytes` and returns the rate in gigabytes a second: over the socket it goes there and
+    /// back, over a reliable connection it is read once, which is how the payloads travel.
+    pub fn bandwidth(&mut self, bytes: usize) -> Result<(f64, bool), Box<dyn Error>> {
+        if self.reads_remotely() {
+            let request = worker::Canvas {
+                chunk: 0,
+                bytes: bytes as u64,
+                remote_address: 0,
+                remote_key: 0,
+            };
+            let started = Instant::now();
+            let (header, body) = self.call(Kind::Bandwidth, &request.encode(), &[])?;
+            if header.kind != Kind::Canvas {
+                return Err(format!(
+                    "{} answered a measurement with {:?}",
+                    self.address, header.kind
+                )
+                .into());
+            }
+            let offer = worker::Canvas::decode(&body)?;
+            self.read_into_staging(&offer)?;
+            let seconds = started.elapsed().as_secs_f64();
+            return Ok(((bytes as f64 / seconds) / 1e9, true));
+        }
         let payload = vec![0u8; bytes];
         let started = Instant::now();
         self.call(Kind::Bandwidth, &[], &payload)?;
         let seconds = started.elapsed().as_secs_f64();
-        Ok((2.0 * bytes as f64 / seconds) / 1e9)
+        Ok(((2.0 * bytes as f64 / seconds) / 1e9, false))
     }
 
     /// The prompt's text states, encoded wherever the text encoder lives.
@@ -256,7 +334,7 @@ impl Worker {
         chunk: usize,
         tile_size: usize,
         tile_overlap: usize,
-    ) -> Result<Vec<f32>, Box<dyn Error>> {
+    ) -> Result<Vec<u8>, Box<dyn Error>> {
         let checkpoint = self
             .checkpoint(role)
             .ok_or_else(|| format!("{} has no {role}", self.address))?
@@ -281,14 +359,60 @@ impl Worker {
             return Err(format!("{} answered a chunk with {:?}", self.address, header.kind).into());
         }
         let canvas = Canvas::decode(&body)?;
-        let values = &body[Canvas::BYTES..];
-        if values.len() as u64 != canvas.values * 4 {
-            return Err(format!("{} sent {} bytes of canvas", self.address, values.len()).into());
+        if canvas.remote_key != 0 {
+            return self.read_canvas(&canvas);
         }
-        Ok(values
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect())
+        let payload = &body[Canvas::BYTES..];
+        if payload.len() as u64 != canvas.bytes {
+            return Err(format!("{} sent {} bytes of canvas", self.address, payload.len()).into());
+        }
+        Ok(payload.to_vec())
+    }
+
+    /// Reads the worker's memory into this side's, and tells it the memory is free. The bytes stay
+    /// in the registered buffer, which the caller copies out of if it needs them.
+    #[cfg(feature = "cuda")]
+    fn read_into_staging(&mut self, canvas: &Canvas) -> Result<(), Box<dyn Error>> {
+        let connection = self
+            .rdma
+            .as_ref()
+            .ok_or_else(|| format!("{} pointed at memory with no connection", self.address))?;
+        let bytes = canvas.bytes as usize;
+        // One registered buffer serves every transfer of a run, since registering it costs tens of
+        // milliseconds for every hundred megabytes. It only ever grows: a smaller payload reads
+        // into the front of it.
+        if self.staging.as_ref().map(Region::bytes).unwrap_or(0) < bytes {
+            self.staging = None;
+            self.staging = Some(connection.register(vec![0u8; bytes])?);
+        }
+        let region = self.staging.as_mut().expect("just registered");
+        region.read_from(
+            connection,
+            canvas.remote_address,
+            canvas.remote_key,
+            bytes,
+            30_000,
+        )?;
+        self.request += 1;
+        worker::send(&mut self.writer, Kind::Release, self.request, &[], &[])?;
+        Ok(())
+    }
+
+    /// A canvas read out of the worker's memory.
+    #[cfg(feature = "cuda")]
+    fn read_canvas(&mut self, canvas: &Canvas) -> Result<Vec<u8>, Box<dyn Error>> {
+        self.read_into_staging(canvas)?;
+        Ok(self
+            .staging
+            .as_ref()
+            .expect("read into it")
+            .as_slice()
+            .to_vec())
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn read_canvas(&mut self, _canvas: &Canvas) -> Result<Vec<u8>, Box<dyn Error>> {
+        Err("this build reads canvases over the socket only".into())
     }
 
     fn call(
@@ -365,18 +489,52 @@ fn probe(address: &str, token: &str) -> Result<(), Box<dyn Error>> {
     }
     println!("round trip {:.3} ms", round_trip.as_secs_f64() * 1e3);
     for megabytes in [1usize, 64, 512] {
-        let gigabytes = worker.bandwidth(megabytes << 20)?;
-        println!("{megabytes} MiB there and back at {gigabytes:.2} GB/s");
+        // The first call of a size registers the memory, which a run pays once and a measurement
+        // should not count at all.
+        worker.bandwidth(megabytes << 20)?;
+        let (gigabytes, remote) = worker.bandwidth(megabytes << 20)?;
+        let how = if remote { "read" } else { "there and back" };
+        println!("{megabytes} MiB {how} at {gigabytes:.2} GB/s");
     }
+    exchange(&mut worker)?;
+    Ok(())
+}
+
+/// One DiT step's worth of Ulysses traffic, to see whether the link carries a shard before anything
+/// is built on it. Each layer exchanges twice, and the rendezvous happens as often as the payload,
+/// which a single large read does not show.
+fn exchange(worker: &mut Worker) -> Result<(), Box<dyn Error>> {
+    // A 768p step: 31k tokens of 56 heads by 128 in bf16, halved by token and by head. The first
+    // leg carries q, k and v, the second carries the attention output.
+    const LAYERS: usize = 50;
+    const LEGS: [usize; 2] = [336 << 20, 112 << 20];
+
+    for bytes in LEGS {
+        worker.bandwidth(bytes)?;
+    }
+    let started = Instant::now();
+    for _ in 0..LAYERS {
+        for bytes in LEGS {
+            worker.bandwidth(bytes)?;
+        }
+    }
+    let seconds = started.elapsed().as_secs_f64();
+    let moved = (LAYERS * LEGS.iter().sum::<usize>()) as f64;
+    println!(
+        "a step's exchange, {} transfers of {:.1} GB, in {seconds:.2} s at {:.2} GB/s",
+        LAYERS * LEGS.len(),
+        moved / 1e9,
+        (moved / seconds) / 1e9
+    );
     Ok(())
 }
 
 /// Chunks of a decode that other machines are working on. The leader asks for one when its own
 /// walk reaches it, and decodes it here if the machine that had it failed.
 pub struct RemoteCanvases {
-    receiver: Receiver<(usize, Result<Vec<f32>, String>)>,
+    receiver: Receiver<(usize, Result<Vec<u8>, String>)>,
     delegated: Vec<usize>,
-    arrived: HashMap<usize, Vec<f32>>,
+    arrived: HashMap<usize, Vec<u8>>,
 }
 
 impl RemoteCanvases {
@@ -448,7 +606,7 @@ impl RemoteCanvases {
 
     /// The canvas of `chunk` when another machine has it, waiting for it if it is still coming, and
     /// `None` when this machine should decode it after all.
-    pub fn take(&mut self, chunk: usize) -> Option<Vec<f32>> {
+    pub fn take(&mut self, chunk: usize) -> Option<Vec<u8>> {
         if !self.delegated.contains(&chunk) {
             return None;
         }
@@ -557,6 +715,8 @@ fn session(
     // The text encoder and the video decoder load on their first request and stay for the session.
     let mut encoder: Resident = None;
     let mut decoder: ResidentDecoder = None;
+    let mut rdma: Option<Rdma> = None;
+    let mut staging: Option<Region> = None;
 
     loop {
         let (header, body) = match worker::receive(&mut reader, BODY_LIMIT) {
@@ -576,22 +736,64 @@ fn session(
                     reply(&mut writer, Kind::Error, message, &[])?;
                     return Err("a leader offered the wrong token".into());
                 }
+                // A leader that offers a reliable connection gets this side's, and the bulk of
+                // every later reply goes that way instead of down the socket.
+                let offered = hello.rdma.and_then(|_| open_rdma());
                 let welcome = Welcome {
                     backend: BACKEND,
                     device: device_name(),
                     memory_bytes: memory_bytes(),
                     capabilities: CAPABILITY_ENCODE_TEXT | CAPABILITY_DECODE_VIDEO,
-                    transports: TRANSPORT_TCP,
+                    transports: TRANSPORT_TCP
+                        | if offered.is_some() {
+                            worker::TRANSPORT_RDMA
+                        } else {
+                            0
+                        },
                     speed: None,
                     checkpoints: checkpoints
                         .iter()
                         .map(|(checkpoint, _)| checkpoint.clone())
                         .collect(),
+                    rdma: offered.as_ref().map(|(_, address)| *address),
                 };
                 reply(&mut writer, Kind::Welcome, &welcome.encode(), &[])?;
+                rdma = match (offered, hello.rdma) {
+                    (Some((connection, _)), Some(peer)) => join_rdma(connection, &peer),
+                    _ => None,
+                };
             }
             Kind::Ping => reply(&mut writer, Kind::Pong, &[], &[])?,
-            Kind::Bandwidth => reply(&mut writer, Kind::BandwidthDone, &[], &body)?,
+            // A measurement moves the same way a payload would: read out of this side's memory
+            // when there is a reliable connection, echoed down the socket when there is not.
+            Kind::Bandwidth => match (rdma.as_ref(), worker::Canvas::decode(&body)) {
+                (Some(connection), Ok(request)) if !body.is_empty() => {
+                    let bytes = request.bytes as usize;
+                    if staging.as_ref().map(Region::bytes).unwrap_or(0) < bytes {
+                        // NOTE: the old region unregisters before the new one registers, so the
+                        // two never hold the same memory at once.
+                        drop(staging.take());
+                        staging = Some(connection.register(vec![0u8; bytes])?);
+                    }
+                    let region = staging.as_ref().expect("just registered");
+                    let offer = worker::Canvas {
+                        chunk: 0,
+                        bytes: request.bytes,
+                        remote_address: region.address(),
+                        remote_key: region.remote_key(),
+                    };
+                    reply(&mut writer, Kind::Canvas, &offer.encode(), &[])?;
+                    let (release, _) = worker::receive(&mut reader, BODY_LIMIT)?;
+                    if release.kind != Kind::Release {
+                        return Err(format!(
+                            "a leader sent {:?} while memory waited",
+                            release.kind
+                        )
+                        .into());
+                    }
+                }
+                _ => reply(&mut writer, Kind::BandwidthDone, &[], &body)?,
+            },
             Kind::EncodeText => {
                 let request = EncodeText::decode(&body)?;
                 match encode_text(checkpoints, &request, &mut encoder) {
@@ -615,21 +817,55 @@ fn session(
             Kind::DecodeVideo => {
                 let started = Instant::now();
                 match decode_video(checkpoints, &body, &mut decoder) {
-                    Ok((chunk, values)) => {
-                        let canvas = Canvas {
+                    Ok((chunk, payload)) => {
+                        let megabytes = payload.len() >> 20;
+                        let mut canvas = Canvas {
                             chunk,
-                            values: values.len() as u64,
+                            bytes: payload.len() as u64,
+                            remote_address: 0,
+                            remote_key: 0,
                         };
-                        let payload: Vec<u8> = values
-                            .iter()
-                            .flat_map(|value| value.to_le_bytes())
-                            .collect();
+                        // Without a reliable connection the canvas goes down the socket.
+                        let Some(connection) = rdma.as_ref() else {
+                            println!(
+                                "decoded chunk {chunk} in {:.1} s, {megabytes} MiB back",
+                                started.elapsed().as_secs_f64()
+                            );
+                            reply(&mut writer, Kind::Canvas, &canvas.encode(), &payload)?;
+                            continue;
+                        };
+                        // One registered canvas serves the session. Registering hundreds of
+                        // megabytes costs seconds, so every chunk copies into the same memory,
+                        // which only ever grows.
+                        if staging.as_ref().map(Region::bytes).unwrap_or(0) < payload.len() {
+                            staging = None;
+                            match connection.register(vec![0u8; payload.len()]) {
+                                Ok(region) => staging = Some(region),
+                                Err(error) => {
+                                    let message = format!("registering a canvas: {error}");
+                                    reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
+                                    continue;
+                                }
+                            }
+                        }
+                        let region = staging.as_mut().expect("just registered");
+                        region.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
+                        canvas.remote_address = region.address();
+                        canvas.remote_key = region.remote_key();
                         println!(
-                            "decoded chunk {chunk} in {:.1} s, {} MiB back",
-                            started.elapsed().as_secs_f64(),
-                            payload.len() >> 20
+                            "decoded chunk {chunk} in {:.1} s, {megabytes} MiB to read",
+                            started.elapsed().as_secs_f64()
                         );
-                        reply(&mut writer, Kind::Canvas, &canvas.encode(), &payload)?;
+                        reply(&mut writer, Kind::Canvas, &canvas.encode(), &[])?;
+                        // The memory holds this canvas until the leader says it has read it.
+                        let (release, _) = worker::receive(&mut reader, BODY_LIMIT)?;
+                        if release.kind != Kind::Release {
+                            return Err(format!(
+                                "a leader sent {:?} while a canvas waited",
+                                release.kind
+                            )
+                            .into());
+                        }
                     }
                     Err(error) => {
                         reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
@@ -690,7 +926,7 @@ fn decode_video(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
     resident: &mut ResidentDecoder,
-) -> Result<(u32, Vec<f32>), Box<dyn Error>> {
+) -> Result<(u32, Vec<u8>), Box<dyn Error>> {
     let (request, descriptor_bytes) = DecodeVideo::decode(body)?;
     let (checkpoint, path) = checkpoints
         .iter()
