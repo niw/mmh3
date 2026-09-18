@@ -242,15 +242,20 @@ pub struct Speed {
     pub bandwidth_gbytes: f32,
 }
 
-/// A machine's RoCE address, opaque here: `mmh3_rdma::Address` gives it meaning.
+/// A machine's RoCE address, opaque here: `mmh3_rdma::Address` gives it meaning. A machine offers
+/// one per path, since a Spark's NIC answers over two PCIe links and a payload goes over both.
 pub const RDMA_ADDRESS_BYTES: usize = 26;
+/// The most paths a machine may offer, as `mmh3_rdma` splits a payload over them.
+pub const RDMA_PATHS: usize = 4;
+/// One address per path, or nothing when the machine has no RoCE.
+pub type RdmaAddresses = Option<Vec<[u8; RDMA_ADDRESS_BYTES]>>;
 
 #[derive(Clone, Debug)]
 pub struct Hello {
     pub leader: String,
     pub token: String,
     /// Where this side's reliable connection waits, when it has one.
-    pub rdma: Option<[u8; RDMA_ADDRESS_BYTES]>,
+    pub rdma: RdmaAddresses,
 }
 
 #[derive(Clone, Debug)]
@@ -263,7 +268,7 @@ pub struct Welcome {
     pub speed: Option<Speed>,
     pub checkpoints: Vec<Checkpoint>,
     /// Answered when the leader offered one and this side has one too.
-    pub rdma: Option<[u8; RDMA_ADDRESS_BYTES]>,
+    pub rdma: RdmaAddresses,
 }
 
 /// Token identifiers of a prompt, to be encoded by whichever machine holds the text encoder.
@@ -294,7 +299,7 @@ pub struct Canvas {
     pub chunk: u32,
     pub bytes: u64,
     pub remote_address: u64,
-    pub remote_key: u32,
+    pub remote_keys: Vec<u32>,
 }
 
 /// Which block-sparse attention a session runs, and on which of its steps. The whole schedule
@@ -399,7 +404,7 @@ pub struct OpenSession {
 
 /// Where one rank's memory sits, so the others can read it. One entry per region a step uses, in
 /// the order every rank makes them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RemoteRegion {
     /// The rank whose memory this is.
     pub owner: u32,
@@ -409,17 +414,17 @@ pub struct RemoteRegion {
     pub peer: u32,
     pub address: u64,
     pub bytes: u64,
-    pub key: u32,
+    pub keys: Vec<u32>,
 }
 
 /// One rank's end of a connection to another, which the leader passes on so that two workers can
 /// reach each other without a socket between them.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerLink {
     /// The rank at the other end.
     pub peer: u32,
-    /// The RoCE address, as `mmh3_rdma::Address` lays it out.
-    pub address: [u8; RDMA_ADDRESS_BYTES],
+    /// The RoCE addresses, one per path, as `mmh3_rdma::Address` lays them out.
+    pub addresses: Vec<[u8; RDMA_ADDRESS_BYTES]>,
 }
 
 impl PeerLink {
@@ -427,7 +432,10 @@ impl PeerLink {
         let mut encoder = Encoder::default();
         encoder.u32(links.len() as u32);
         for link in links {
-            encoder.u32(link.peer).bytes(&link.address);
+            encoder.u32(link.peer).u8(link.addresses.len() as u8);
+            for address in &link.addresses {
+                encoder.bytes(address);
+            }
         }
         encoder.finish()
     }
@@ -438,9 +446,14 @@ impl PeerLink {
         let mut links = Vec::with_capacity(count.min(64));
         for _ in 0..count {
             let peer = decoder.u32()?;
-            let mut address = [0u8; RDMA_ADDRESS_BYTES];
-            address.copy_from_slice(decoder.take(RDMA_ADDRESS_BYTES)?);
-            links.push(PeerLink { peer, address });
+            let paths = decoder.u8()? as usize;
+            let mut addresses = Vec::with_capacity(paths.min(RDMA_PATHS));
+            for _ in 0..paths.min(RDMA_PATHS) {
+                let mut address = [0u8; RDMA_ADDRESS_BYTES];
+                address.copy_from_slice(decoder.take(RDMA_ADDRESS_BYTES)?);
+                addresses.push(address);
+            }
+            links.push(PeerLink { peer, addresses });
         }
         Ok(links)
     }
@@ -598,8 +611,8 @@ impl RemoteRegion {
                 .u32(region.kind)
                 .u32(region.peer)
                 .u64(region.address)
-                .u64(region.bytes)
-                .u32(region.key);
+                .u64(region.bytes);
+            encode_keys(&mut encoder, &region.keys);
         }
         encoder.finish()
     }
@@ -615,7 +628,7 @@ impl RemoteRegion {
                     peer: decoder.u32()?,
                     address: decoder.u64()?,
                     bytes: decoder.u64()?,
-                    key: decoder.u32()?,
+                    keys: decode_keys(&mut decoder)?,
                 })
             })
             .collect()
@@ -671,10 +684,13 @@ pub struct TextStates {
     pub hidden: usize,
 }
 
-fn encode_rdma(encoder: &mut Encoder, address: &Option<[u8; RDMA_ADDRESS_BYTES]>) {
-    match address {
-        Some(bytes) => {
-            encoder.u8(1).bytes(bytes);
+fn encode_rdma(encoder: &mut Encoder, addresses: &RdmaAddresses) {
+    match addresses {
+        Some(addresses) => {
+            encoder.u8(addresses.len().min(RDMA_PATHS) as u8);
+            for address in addresses.iter().take(RDMA_PATHS) {
+                encoder.bytes(address);
+            }
         }
         None => {
             encoder.u8(0);
@@ -682,17 +698,35 @@ fn encode_rdma(encoder: &mut Encoder, address: &Option<[u8; RDMA_ADDRESS_BYTES]>
     }
 }
 
-fn decode_rdma(decoder: &mut Decoder<'_>) -> io::Result<Option<[u8; RDMA_ADDRESS_BYTES]>> {
-    Ok(match decoder.u8()? {
-        0 => None,
-        _ => {
-            let mut address = [0u8; RDMA_ADDRESS_BYTES];
-            for byte in address.iter_mut() {
-                *byte = decoder.u8()?;
-            }
-            Some(address)
-        }
-    })
+fn decode_rdma(decoder: &mut Decoder<'_>) -> io::Result<RdmaAddresses> {
+    let count = decoder.u8()? as usize;
+    if count == 0 {
+        return Ok(None);
+    }
+    let mut addresses = Vec::with_capacity(count.min(RDMA_PATHS));
+    for _ in 0..count.min(RDMA_PATHS) {
+        let mut address = [0u8; RDMA_ADDRESS_BYTES];
+        address.copy_from_slice(decoder.take(RDMA_ADDRESS_BYTES)?);
+        addresses.push(address);
+    }
+    Ok(Some(addresses))
+}
+
+/// One key per path, which a peer needs all of to reach a region.
+fn encode_keys(encoder: &mut Encoder, keys: &[u32]) {
+    encoder.u8(keys.len().min(RDMA_PATHS) as u8);
+    for key in keys.iter().take(RDMA_PATHS) {
+        encoder.u32(*key);
+    }
+}
+
+fn decode_keys(decoder: &mut Decoder<'_>) -> io::Result<Vec<u32>> {
+    let count = decoder.u8()? as usize;
+    let mut keys = Vec::with_capacity(count.min(RDMA_PATHS));
+    for _ in 0..count.min(RDMA_PATHS) {
+        keys.push(decoder.u32()?);
+    }
+    Ok(keys)
 }
 
 impl Hello {
@@ -872,8 +906,8 @@ impl Canvas {
         encoder
             .u64(self.chunk as u64)
             .u64(self.bytes)
-            .u64(self.remote_address)
-            .u32(self.remote_key);
+            .u64(self.remote_address);
+        encode_keys(&mut encoder, &self.remote_keys);
         encoder.finish()
     }
 
@@ -883,7 +917,7 @@ impl Canvas {
             chunk: decoder.u64()? as u32,
             bytes: decoder.u64()?,
             remote_address: decoder.u64()?,
-            remote_key: decoder.u32()?,
+            remote_keys: decode_keys(&mut decoder)?,
         })
     }
 }

@@ -930,6 +930,86 @@ impl CudaDit {
         Ok(())
     }
 
+    /// The attention projections over one range of the sequence's rows. A shared-out block runs
+    /// them in two goes, its own rows and then the peers', and the arithmetic is the same either
+    /// way: a row of the result depends on that row of the input alone.
+    #[allow(clippy::too_many_arguments)]
+    fn project_inputs(
+        &self,
+        prefix: &str,
+        workspace: &Workspace,
+        heads: &Range<usize>,
+        rows: Range<usize>,
+        normalized: *const c_void,
+        scales: *const c_void,
+        inputs: *mut c_void,
+        gate: *mut c_void,
+    ) -> Result<(), Error> {
+        let (hidden, whole) = (self.config.hidden, self.config.inner());
+        let inner = heads.len() * HEAD_DIM;
+        let count = rows.len();
+        if count == 0 {
+            return Ok(());
+        }
+        // SAFETY: the regions hold every token's rows, and this range lies inside them.
+        let (normalized, scales) = unsafe {
+            (
+                normalized.byte_add(rows.start * hidden),
+                scales.byte_add(rows.start * 4),
+            )
+        };
+        // An adapter's down projection depends on the block's input alone, so the three tensors of
+        // a range share one.
+        let down = |name: &str| -> Result<Option<AdapterPointers>, Error> {
+            let adapter = self
+                .adapters
+                .get(name)
+                .map(|adapter| (adapter, &workspace.adapter));
+            // SAFETY: the range holds `count` rows of the input and its scales.
+            unsafe {
+                self.tensors
+                    .adapter_down(adapter, name, count, normalized, scales)
+            }
+        };
+        // The three tensors of one token sit side by side, so each projection writes a column range
+        // of a row that is three times as wide as its own result.
+        let qkv = format!("{prefix}.attn.qkv_proj");
+        let qkv_adapter = down(&qkv)?;
+        for tensor in 0..3 {
+            let columns =
+                (tensor * whole + heads.start * HEAD_DIM)..(tensor * whole + heads.end * HEAD_DIM);
+            // SAFETY: the region holds `tokens × 3 × inner` values.
+            let into = unsafe { inputs.byte_add((rows.start * 3 * inner + tensor * inner) * 2) };
+            self.tensors.linear_quantized_range(
+                &qkv,
+                into,
+                count,
+                columns,
+                3 * inner,
+                normalized,
+                scales,
+                qkv_adapter,
+            )?;
+        }
+        if !gate.is_null() {
+            let name = format!("{prefix}.attn.to_gate_compress");
+            let adapter = down(&name)?;
+            // SAFETY: the gate holds `tokens × inner` values.
+            let into = unsafe { gate.byte_add(rows.start * inner * 2) };
+            self.tensors.linear_quantized_range(
+                &name,
+                into,
+                count,
+                (heads.start * HEAD_DIM)..(heads.end * HEAD_DIM),
+                0,
+                normalized,
+                scales,
+                adapter,
+            )?;
+        }
+        Ok(())
+    }
+
     /// A block when the step is shared out. The exchange is of what the projections consume, not of
     /// what they produce: a rank sends its rows of the quantized block input, an eighth of the
     /// bytes q, k, v and the gate would take, and then runs its own heads' columns over the whole
@@ -944,12 +1024,12 @@ impl CudaDit {
         sparse: Option<&SparsePass>,
     ) -> Result<(), Error> {
         let config = &self.config;
-        let (normalized, scales) = self.exchange_inputs(workspace, context, tokens)?;
+        let (normalized, scales) = self.publish_inputs(workspace, context, tokens)?;
 
         let started = Instant::now();
-        let (shard, hidden) = (&context.shard, config.hidden);
+        let shard = context.shard.clone();
         let own = shard.own_heads();
-        let (inner, whole) = (own.len() * HEAD_DIM, config.inner());
+        let inner = own.len() * HEAD_DIM;
         let inputs = context
             .exchange
             .region(Region::Inputs, tokens * 3 * inner * 2)?;
@@ -965,54 +1045,38 @@ impl CudaDit {
         } else {
             ptr::null_mut()
         };
-        // An adapter's down projection depends on the block's input alone, so the three tensors
-        // share one. The scratch covers the whole sequence here, not just this rank's rows.
-        let down = |name: &str| -> Result<Option<AdapterPointers>, Error> {
-            let adapter = self
-                .adapters
-                .get(name)
-                .map(|adapter| (adapter, &workspace.adapter));
-            // SAFETY: the exchanged input holds every token's rows and its scales.
-            unsafe {
-                self.tensors
-                    .adapter_down(adapter, name, tokens, normalized, scales)
+        // This rank's own rows are already here, so they go through the projections while the
+        // peers' rows are still crossing the wire: the read below blocks this thread and the
+        // device has a third of a second of work queued behind it.
+        self.project_inputs(
+            prefix,
+            workspace,
+            &own,
+            shard.own_tokens(),
+            normalized,
+            scales,
+            inputs,
+            gate,
+        )?;
+        context.timing.attend += started.elapsed();
+        self.send_inputs(context)?;
+        self.fetch_inputs(context)?;
+        let started = Instant::now();
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
             }
-        };
-        // The three tensors of one token sit side by side, so each projection writes a column range
-        // of a row that is three times as wide as its own result.
-        let qkv = format!("{prefix}.attn.qkv_proj");
-        let qkv_adapter = down(&qkv)?;
-        for tensor in 0..3 {
-            let columns =
-                (tensor * whole + own.start * HEAD_DIM)..(tensor * whole + own.end * HEAD_DIM);
-            // SAFETY: the region holds `tokens × 3 × inner` values.
-            let into = unsafe { inputs.byte_add(tensor * inner * 2) };
-            self.tensors.linear_quantized_range(
-                &qkv,
-                into,
-                tokens,
-                columns,
-                3 * inner,
+            self.project_inputs(
+                prefix,
+                workspace,
+                &own,
+                shard.tokens[peer].clone(),
                 normalized,
                 scales,
-                qkv_adapter,
-            )?;
-        }
-        if gated {
-            let name = format!("{prefix}.attn.to_gate_compress");
-            let adapter = down(&name)?;
-            self.tensors.linear_quantized_range(
-                &name,
+                inputs,
                 gate,
-                tokens,
-                (own.start * HEAD_DIM)..(own.end * HEAD_DIM),
-                0,
-                normalized,
-                scales,
-                adapter,
             )?;
         }
-        let _ = hidden;
 
         let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
         let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
@@ -1126,10 +1190,10 @@ impl CudaDit {
         self.exchange_outputs(workspace, context, tokens)
     }
 
-    /// Gives every rank the whole sequence's block input, which is what the projections consume.
-    /// A rank writes its own rows and reads the others', and the result is the same INT8 values
-    /// every rank would have produced on its own.
-    fn exchange_inputs(
+    /// Puts this rank's rows of the block input where the peers can read them, and says so. The
+    /// rows of the others arrive in `fetch_inputs`, and between the two a rank projects what it
+    /// already holds.
+    fn publish_inputs(
         &self,
         workspace: &Workspace,
         context: &mut ShardContext<'_>,
@@ -1155,46 +1219,80 @@ impl CudaDit {
                 rows.len() * 4,
             )?;
         }
-        // NOTE: the copies are on a stream and the barrier is a socket message, so the device has
-        // to finish before a peer is told the memory is ready.
+        // NOTE: the copies are on a stream and the wire is not, so the device has to finish
+        // before the rows go out. Only this rank's rows do, which is half of a two-rank region.
         crate::synchronize()?;
         context
             .exchange
-            .publish(Region::Normalized, tokens * hidden)?;
-        context.exchange.publish(Region::Scales, tokens * 4)?;
+            .publish(Region::Normalized, rows.start * hidden, rows.len() * hidden)?;
+        context
+            .exchange
+            .publish(Region::Scales, rows.start * 4, rows.len() * 4)?;
         context.timing.gather += started.elapsed();
+        Ok((normalized.cast_const(), scales.cast_const()))
+    }
+
+    /// Pushes this rank's rows of the block input to every peer. It runs after the projections of
+    /// those same rows are queued, so the device works through them while this thread is on the
+    /// wire.
+    fn send_inputs(&self, context: &mut ShardContext<'_>) -> Result<(), Error> {
+        let hidden = self.config.hidden;
+        let started = Instant::now();
+        let shard = context.shard.clone();
+        let rows = shard.own_tokens();
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            context.exchange.write(
+                peer,
+                Region::Normalized,
+                rows.start * hidden,
+                Region::Normalized,
+                rows.start * hidden,
+                rows.len() * hidden,
+            )?;
+            context.exchange.write(
+                peer,
+                Region::Scales,
+                rows.start * 4,
+                Region::Scales,
+                rows.start * 4,
+                rows.len() * 4,
+            )?;
+        }
+        context.timing.read += started.elapsed();
+        Ok(())
+    }
+
+    /// Waits for every rank's rows of the block input to have landed and takes them to the device,
+    /// then waits again so that nothing overwrites them before every rank has read them.
+    fn fetch_inputs(&self, context: &mut ShardContext<'_>) -> Result<(), Error> {
+        let hidden = self.config.hidden;
         let started = Instant::now();
         context.exchange.barrier()?;
         context.timing.barrier += started.elapsed();
         let started = Instant::now();
-        let shard = &context.shard;
+        let shard = context.shard.clone();
         for peer in 0..shard.ranks() {
             if peer == shard.rank {
                 continue;
             }
             let taken = shard.tokens[peer].clone();
-            context.exchange.read(
-                peer,
-                Region::Normalized,
-                taken.start * hidden,
+            context.exchange.receive(
                 Region::Normalized,
                 taken.start * hidden,
                 taken.len() * hidden,
             )?;
-            context.exchange.read(
-                peer,
-                Region::Scales,
-                taken.start * 4,
-                Region::Scales,
-                taken.start * 4,
-                taken.len() * 4,
-            )?;
+            context
+                .exchange
+                .receive(Region::Scales, taken.start * 4, taken.len() * 4)?;
         }
         context.timing.read += started.elapsed();
         let started = Instant::now();
         context.exchange.barrier()?;
         context.timing.barrier += started.elapsed();
-        Ok((normalized.cast_const(), scales.cast_const()))
+        Ok(())
     }
 
     /// Turns "every token, my heads" back into "my tokens, every head", leaving a block's attention
@@ -1205,17 +1303,36 @@ impl CudaDit {
         context: &mut ShardContext<'_>,
         tokens: usize,
     ) -> Result<(), Error> {
-        let (shard, heads) = (&context.shard, self.config.heads);
+        let shard = context.shard.clone();
+        let heads = self.config.heads;
         let (rows, own) = (shard.own_tokens(), shard.own_heads());
         let own_inner = own.len() * HEAD_DIM;
         let attended = context
             .exchange
             .region(Region::Attended, tokens * own_inner * 2)?;
-        // The peers read what attention just wrote, which on a machine whose wire cannot reach
-        // device memory means a copy into memory it can register.
-        context
-            .exchange
-            .publish(Region::Attended, tokens * own_inner * 2)?;
+        // Each peer takes its own rows of what attention just wrote, so only those leave the
+        // device, which on a two-rank run is half of the region.
+        let started = Instant::now();
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            let taken = shard.tokens[peer].clone();
+            context.exchange.publish(
+                Region::Attended,
+                taken.start * own_inner * 2,
+                taken.len() * own_inner * 2,
+            )?;
+            context.exchange.write(
+                peer,
+                Region::Attended,
+                taken.start * own_inner * 2,
+                Region::Received(shard.rank),
+                0,
+                taken.len() * own_inner * 2,
+            )?;
+        }
+        context.timing.read += started.elapsed();
         let started = Instant::now();
         context.exchange.barrier()?;
         context.timing.barrier += started.elapsed();
@@ -1225,14 +1342,9 @@ impl CudaDit {
                 continue;
             }
             let inner = shard.heads[peer].len() * HEAD_DIM;
-            context.exchange.read(
-                peer,
-                Region::Attended,
-                rows.start * inner * 2,
-                Region::Received(peer),
-                0,
-                rows.len() * inner * 2,
-            )?;
+            context
+                .exchange
+                .receive(Region::Received(peer), 0, rows.len() * inner * 2)?;
         }
         context.timing.read += started.elapsed();
         let started = Instant::now();

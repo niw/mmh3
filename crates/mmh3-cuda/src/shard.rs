@@ -201,22 +201,27 @@ pub trait Exchange {
     /// This rank's `region`, at least `bytes` long, made on the first call and kept afterwards.
     fn region(&mut self, region: Region, bytes: usize) -> Result<*mut c_void, Error>;
 
-    /// Reads `bytes` of `peer`'s `from` region, `peer_offset` bytes in, into this rank's `into`
-    /// region `offset` bytes in.
-    fn read(
+    /// Writes `bytes` of this rank's `from` region, `offset` bytes in, into `peer`'s `into` region
+    /// `peer_offset` bytes in. The ranks push rather than pull because the link carries a write at
+    /// 13.0 GB/s and a read at 9.6.
+    fn write(
         &mut self,
         peer: usize,
         from: Region,
-        peer_offset: usize,
-        into: Region,
         offset: usize,
+        into: Region,
+        peer_offset: usize,
         bytes: usize,
     ) -> Result<(), Error>;
 
-    /// Puts `bytes` of `region` where the peers can read it. A transport whose wire cannot reach
-    /// device memory keeps a copy in memory it can register, and this is where it refreshes it.
-    /// Called before the barrier that tells the peers to read.
-    fn publish(&mut self, region: Region, bytes: usize) -> Result<(), Error>;
+    /// Puts `bytes` of `region`, `offset` bytes in, where the wire can reach it. A transport whose
+    /// wire cannot reach device memory keeps a copy in memory it can register, and this is where it
+    /// refreshes it. Called before the writes that send it.
+    fn publish(&mut self, region: Region, offset: usize, bytes: usize) -> Result<(), Error>;
+
+    /// Takes `bytes` of `region`, `offset` bytes in, from where the wire left it to where the
+    /// kernels read it. Called after the barrier that says every peer's writes have landed.
+    fn receive(&mut self, region: Region, offset: usize, bytes: usize) -> Result<(), Error>;
 
     /// Every rank has reached this point, so what they wrote may be read and what they read may be
     /// written again.
@@ -282,19 +287,25 @@ impl Exchange for WholeExchange {
         Ok(self.regions[&region].pointer())
     }
 
-    fn read(
+    fn write(
         &mut self,
         peer: usize,
         _from: Region,
-        _peer_offset: usize,
-        _into: Region,
         _offset: usize,
+        _into: Region,
+        _peer_offset: usize,
         _bytes: usize,
     ) -> Result<(), Error> {
-        Err(Error::Model(format!("one rank cannot read rank {peer}")))
+        Err(Error::Model(format!(
+            "one rank cannot write to rank {peer}"
+        )))
     }
 
-    fn publish(&mut self, _region: Region, _bytes: usize) -> Result<(), Error> {
+    fn publish(&mut self, _region: Region, _offset: usize, _bytes: usize) -> Result<(), Error> {
+        Ok(())
+    }
+
+    fn receive(&mut self, _region: Region, _offset: usize, _bytes: usize) -> Result<(), Error> {
         Ok(())
     }
 

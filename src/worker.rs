@@ -176,13 +176,19 @@ fn rdma_device() -> Option<&'static mmh3_rdma::Device> {
         .as_ref()
 }
 
-/// Opens this machine's side of a connection, or nothing when it has no RoCE port.
-fn open_rdma() -> Option<(Rdma, [u8; worker::RDMA_ADDRESS_BYTES])> {
+/// Opens this machine's side of a connection, with one path per RoCE port, or nothing when it has
+/// none.
+fn open_rdma() -> Option<(Rdma, Vec<[u8; worker::RDMA_ADDRESS_BYTES]>)> {
     #[cfg(feature = "cuda")]
     {
         let link = rdma_device()?.link().ok()?;
-        let address = link.address().ok()?;
-        Some((link, address.to_bytes()))
+        let addresses = link
+            .addresses()
+            .ok()?
+            .into_iter()
+            .map(|address| address.to_bytes())
+            .collect();
+        Some((link, addresses))
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -190,12 +196,15 @@ fn open_rdma() -> Option<(Rdma, [u8; worker::RDMA_ADDRESS_BYTES])> {
     }
 }
 
-/// Finishes a connection once the peer's address has arrived over a socket.
-fn join_rdma(link: Rdma, peer: &[u8; worker::RDMA_ADDRESS_BYTES]) -> Option<Rdma> {
+/// Finishes a connection once the peer's addresses have arrived over a socket.
+fn join_rdma(link: Rdma, peer: &[[u8; worker::RDMA_ADDRESS_BYTES]]) -> Option<Rdma> {
     #[cfg(feature = "cuda")]
     {
-        let address = mmh3_rdma::Address::from_bytes(peer)?;
-        link.connect(&address).ok()?;
+        let addresses: Option<Vec<mmh3_rdma::Address>> = peer
+            .iter()
+            .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
+            .collect();
+        link.connect(&addresses?).ok()?;
         Some(link)
     }
     #[cfg(not(feature = "cuda"))]
@@ -249,11 +258,11 @@ impl Worker {
         let hello = Hello {
             leader: hostname(),
             token: token.to_owned(),
-            rdma: offered.as_ref().map(|(_, address)| *address),
+            rdma: offered.as_ref().map(|(_, addresses)| addresses.clone()),
         };
         let body = worker.call(Kind::Hello, &hello.encode(), &[])?;
         worker.welcome = Welcome::decode(&body.1)?;
-        worker.rdma = match (offered, worker.welcome.rdma) {
+        worker.rdma = match (offered, worker.welcome.rdma.clone()) {
             (Some((connection, _)), Some(peer)) => join_rdma(connection, &peer),
             _ => None,
         };
@@ -291,7 +300,7 @@ impl Worker {
                 chunk: 0,
                 bytes: bytes as u64,
                 remote_address: 0,
-                remote_key: 0,
+                remote_keys: Vec::new(),
             };
             let started = Instant::now();
             let (header, body) = self.call(Kind::Bandwidth, &request.encode(), &[])?;
@@ -303,7 +312,7 @@ impl Worker {
                 .into());
             }
             let offer = worker::Canvas::decode(&body)?;
-            self.read_into_staging(&offer)?;
+            self.write_from_staging(&offer)?;
             let seconds = started.elapsed().as_secs_f64();
             return Ok(((bytes as f64 / seconds) / 1e9, true));
         }
@@ -377,7 +386,7 @@ impl Worker {
             return Err(format!("{} answered a chunk with {:?}", self.address, header.kind).into());
         }
         let canvas = Canvas::decode(&body)?;
-        if canvas.remote_key != 0 {
+        if !canvas.remote_keys.is_empty() {
             return self.read_canvas(&canvas);
         }
         let payload = &body[Canvas::BYTES..];
@@ -385,6 +394,34 @@ impl Worker {
             return Err(format!("{} sent {} bytes of canvas", self.address, payload.len()).into());
         }
         Ok(payload.to_vec())
+    }
+
+    /// Writes this side's memory into the worker's and tells it the memory is free, which is the
+    /// way a shared-out step moves a payload.
+    #[cfg(feature = "cuda")]
+    fn write_from_staging(&mut self, canvas: &Canvas) -> Result<(), Box<dyn Error>> {
+        let link = self
+            .rdma
+            .as_ref()
+            .ok_or_else(|| format!("{} pointed at memory with no connection", self.address))?;
+        let device = rdma_device().ok_or("this machine has no RoCE port")?;
+        let bytes = canvas.bytes as usize;
+        if self.staging.as_ref().map(Region::bytes).unwrap_or(0) < bytes {
+            self.staging = None;
+            self.staging = Some(device.register(vec![0u8; bytes])?);
+        }
+        let region = self.staging.as_ref().expect("just registered");
+        region.write_out(
+            link,
+            0,
+            canvas.remote_address,
+            &canvas.remote_keys,
+            bytes,
+            30_000,
+        )?;
+        self.request += 1;
+        worker::send(&mut self.writer, Kind::Release, self.request, &[], &[])?;
+        Ok(())
     }
 
     /// Reads the worker's memory into this side's, and tells it the memory is free. The bytes stay
@@ -408,7 +445,7 @@ impl Worker {
         region.read_from(
             link,
             canvas.remote_address,
-            canvas.remote_key,
+            &canvas.remote_keys,
             bytes,
             30_000,
         )?;
@@ -512,7 +549,7 @@ fn probe(address: &str, token: &str) -> Result<(), Box<dyn Error>> {
         // should not count at all.
         worker.bandwidth(megabytes << 20)?;
         let (gigabytes, remote) = worker.bandwidth(megabytes << 20)?;
-        let how = if remote { "read" } else { "there and back" };
+        let how = if remote { "written" } else { "there and back" };
         println!("{megabytes} MiB {how} at {gigabytes:.2} GB/s");
     }
     exchange(&mut worker)?;
@@ -759,7 +796,7 @@ fn session(
                 }
                 // A leader that offers a reliable connection gets this side's, and the bulk of
                 // every later reply goes that way instead of down the socket.
-                let offered = hello.rdma.and_then(|_| open_rdma());
+                let offered = hello.rdma.as_ref().and_then(|_| open_rdma());
                 let welcome = Welcome {
                     backend: BACKEND,
                     device: device_name(),
@@ -784,7 +821,7 @@ fn session(
                         .iter()
                         .map(|(checkpoint, _)| checkpoint.clone())
                         .collect(),
-                    rdma: offered.as_ref().map(|(_, address)| *address),
+                    rdma: offered.as_ref().map(|(_, addresses)| addresses.clone()),
                 };
                 reply(&mut writer, Kind::Welcome, &welcome.encode(), &[])?;
                 rdma = match (offered, hello.rdma) {
@@ -810,7 +847,7 @@ fn session(
                         chunk: 0,
                         bytes: request.bytes,
                         remote_address: region.address(),
-                        remote_key: region.remote_key(),
+                        remote_keys: region.remote_keys().to_vec(),
                     };
                     reply(&mut writer, Kind::Canvas, &offer.encode(), &[])?;
                     let (release, _) = worker::receive(&mut reader, BODY_LIMIT)?;
@@ -875,7 +912,7 @@ fn session(
                             chunk,
                             bytes: payload.len() as u64,
                             remote_address: 0,
-                            remote_key: 0,
+                            remote_keys: Vec::new(),
                         };
                         // Without a reliable connection the canvas goes down the socket.
                         let Some(link) = rdma.as_ref() else {
@@ -912,7 +949,7 @@ fn session(
                         let region = staging.as_mut().expect("just registered");
                         region.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
                         canvas.remote_address = region.address();
-                        canvas.remote_key = region.remote_key();
+                        canvas.remote_keys = region.remote_keys().to_vec();
                         println!(
                             "decoded chunk {chunk} in {:.1} s, {megabytes} MiB to read",
                             started.elapsed().as_secs_f64()
@@ -1174,7 +1211,11 @@ impl<'a> Exchanger<'a> {
             let link = device.link()?;
             mine.push(worker::PeerLink {
                 peer: peer as u32,
-                address: link.address()?.to_bytes(),
+                addresses: link
+                    .addresses()?
+                    .into_iter()
+                    .map(|address| address.to_bytes())
+                    .collect(),
             });
             opened.push((peer, link));
         }
@@ -1191,12 +1232,19 @@ impl<'a> Exchanger<'a> {
             self.expect(header, Kind::SessionLinks, &body)?;
             let theirs = worker::PeerLink::decode_all(&body)?;
             for (peer, link) in opened {
-                let address = theirs
+                let addresses: Option<Vec<mmh3_rdma::Address>> = theirs
                     .iter()
                     .find(|entry| entry.peer as usize == peer)
-                    .and_then(|entry| mmh3_rdma::Address::from_bytes(&entry.address))
-                    .ok_or_else(|| format!("rank {peer} offered no connection"))?;
-                link.connect(&address)?;
+                    .and_then(|entry| {
+                        entry
+                            .addresses
+                            .iter()
+                            .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
+                            .collect()
+                    });
+                let addresses =
+                    addresses.ok_or_else(|| format!("rank {peer} offered no connection"))?;
+                link.connect(&addresses)?;
                 self.links.insert(peer, LinkOf::Opened(link));
             }
             return Ok(());
@@ -1219,7 +1267,7 @@ impl<'a> Exchanger<'a> {
                         .find(|entry| entry.peer as usize == peer)
                         .map(|entry| worker::PeerLink {
                             peer: *owner as u32,
-                            address: entry.address,
+                            addresses: entry.addresses.clone(),
                         })
                 })
                 .collect();
@@ -1255,7 +1303,7 @@ impl<'a> Exchanger<'a> {
                 peer,
                 address: held.address(),
                 bytes: bytes as u64,
-                key: held.remote_key(),
+                keys: held.remote_keys().to_vec(),
             });
             self.regions.insert(region, held);
             if region.is_computed_in() {
@@ -1387,6 +1435,7 @@ impl shard::Exchange for Exchanger<'_> {
     fn publish(
         &mut self,
         region: shard::Region,
+        offset: usize,
         bytes: usize,
     ) -> Result<(), mmh3_cuda::model::Error> {
         let Some(device) = self.computed.get(&region) else {
@@ -1396,27 +1445,68 @@ impl shard::Exchange for Exchanger<'_> {
             .regions
             .get_mut(&region)
             .ok_or_else(|| exchange_error(format!("no {region:?} was registered")))?;
-        // SAFETY: both hold at least `bytes`, checked when they were made.
-        unsafe { mmh3_cuda::download(&mut held.as_mut_slice()[..bytes], device.pointer())? };
+        if offset + bytes > held.bytes() {
+            return Err(exchange_error(format!(
+                "{bytes} bytes at {offset} of a {} byte {region:?}",
+                held.bytes()
+            )));
+        }
+        // SAFETY: the device buffer is as long as the registered one, so the same range fits.
+        unsafe {
+            mmh3_cuda::download(
+                &mut held.as_mut_slice()[offset..offset + bytes],
+                device.pointer().byte_add(offset),
+            )?
+        };
         Ok(())
     }
 
-    fn read(
+    fn receive(
         &mut self,
-        peer: usize,
-        from: shard::Region,
-        peer_offset: usize,
-        into: shard::Region,
+        region: shard::Region,
         offset: usize,
         bytes: usize,
     ) -> Result<(), mmh3_cuda::model::Error> {
-        if peer == self.rank {
-            return Err(exchange_error("a rank cannot read itself".to_owned()));
+        let Some(device) = self.computed.get(&region) else {
+            return Ok(());
+        };
+        let held = self
+            .regions
+            .get(&region)
+            .ok_or_else(|| exchange_error(format!("no {region:?} was registered")))?;
+        if offset + bytes > held.bytes() {
+            return Err(exchange_error(format!(
+                "{bytes} bytes at {offset} of a {} byte {region:?}",
+                held.bytes()
+            )));
         }
-        let remote = *self
+        // SAFETY: the device buffer is as long as the registered one, so the same range fits.
+        unsafe {
+            mmh3_cuda::upload(
+                device.pointer().byte_add(offset),
+                &held.as_slice()[offset..offset + bytes],
+            )?
+        };
+        Ok(())
+    }
+
+    fn write(
+        &mut self,
+        peer: usize,
+        from: shard::Region,
+        offset: usize,
+        into: shard::Region,
+        peer_offset: usize,
+        bytes: usize,
+    ) -> Result<(), mmh3_cuda::model::Error> {
+        if peer == self.rank {
+            return Err(exchange_error("a rank cannot write to itself".to_owned()));
+        }
+        let remote = self
             .peers
-            .get(&(peer, from))
-            .ok_or_else(|| exchange_error(format!("rank {peer} offered no {from:?}")))?;
+            .get(&(peer, into))
+            .cloned()
+            .ok_or_else(|| exchange_error(format!("rank {peer} offered no {into:?}")))?;
         let link = self
             .links
             .get(&peer)
@@ -1424,35 +1514,26 @@ impl shard::Exchange for Exchanger<'_> {
             .link();
         if peer_offset + bytes > remote.bytes as usize {
             return Err(exchange_error(format!(
-                "{bytes} bytes at {peer_offset} of a {} byte {from:?}",
+                "{bytes} bytes at {peer_offset} of a {} byte {into:?}",
                 remote.bytes
             )));
         }
         let held = self
             .regions
-            .get_mut(&into)
-            .ok_or_else(|| exchange_error(format!("no {into:?} was registered")))?;
-        held.read_into(
+            .get(&from)
+            .ok_or_else(|| exchange_error(format!("no {from:?} was registered")))?;
+        held.write_out(
             link,
             offset,
             remote.address + peer_offset as u64,
-            remote.key,
+            &remote.keys,
             bytes,
             EXCHANGE_TIMEOUT,
         )
-        .map_err(|error| exchange_error(format!("reading {from:?} of rank {peer}: {error}")))?;
-        // What the wire could reach now has to reach the kernels.
-        if let Some(device) = self.computed.get(&into) {
-            let landed = &held.as_slice()[offset..offset + bytes];
-            // SAFETY: the device buffer is as long as the registered one, so the same range fits.
-            unsafe { mmh3_cuda::upload(device.pointer().byte_add(offset), landed)? };
-        }
+        .map_err(|error| exchange_error(format!("writing {into:?} of rank {peer}: {error}")))?;
         Ok(())
     }
 
-    /// Through the leader, since the workers have no sockets to each other: each of them says it
-    /// has arrived and waits, and the leader answers once they all have. That is one hop more than
-    /// a direct message and nothing beside the 0.2 s a step spends here.
     fn barrier(&mut self) -> Result<(), mmh3_cuda::model::Error> {
         let arrive = |exchanger: &mut Self, peer: usize| -> Result<(), mmh3_cuda::model::Error> {
             exchanger

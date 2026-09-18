@@ -62,7 +62,24 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// One connection's share of a payload, as `rdma.c` lays it out.
+#[repr(C)]
+struct Part {
+    link: *mut c_void,
+    region: *mut c_void,
+    local: *mut u8,
+    bytes: usize,
+    remote_address: u64,
+    remote_key: u32,
+}
+
+/// How many paths a payload may be split over, and how long a device name may be, as `rdma.c`
+/// defines them.
+const PARTS: usize = 4;
+const NAME_BYTES: usize = 64;
+
 unsafe extern "C" {
+    fn mmh3_rdma_device_names(names: *mut c_char, capacity: c_int) -> c_int;
     fn mmh3_rdma_open(device: *const c_char, global_id_index: c_int) -> *mut c_void;
     fn mmh3_rdma_close(rdma: *mut c_void);
     fn mmh3_rdma_link_open(rdma: *mut c_void) -> *mut c_void;
@@ -76,23 +93,18 @@ unsafe extern "C" {
         remote_key: *mut u32,
     ) -> *mut c_void;
     fn mmh3_rdma_unregister(region: *mut c_void);
-    fn mmh3_rdma_read_all(
-        link: *mut c_void,
-        region: *mut c_void,
-        local: *mut c_void,
-        bytes: usize,
-        remote_address: u64,
-        remote_key: u32,
-        milliseconds: c_int,
-    ) -> c_int;
+    fn mmh3_rdma_read_all(parts: *const Part, count: c_int, milliseconds: c_int) -> c_int;
+    fn mmh3_rdma_write_all(parts: *const Part, count: c_int, milliseconds: c_int) -> c_int;
 }
 
 /// The RoCEv2 entry of a port's table, which is what these machines use.
 pub const DEFAULT_GLOBAL_ID: i32 = 3;
 
-/// The RoCE device and its protection domain, which the memory regions belong to.
+/// The RoCE paths of this machine and their protection domains, which the memory regions belong
+/// to. A Spark's one NIC hangs off two PCIe Gen5 x4 links and answers to both for the one cable,
+/// and a payload split over the two carries 22.2 GB/s against the 13.0 of either.
 pub struct Device {
-    handle: *mut c_void,
+    handles: Vec<*mut c_void>,
 }
 
 // The handle moves and is shared between threads: one device serves every connection of a process,
@@ -101,12 +113,40 @@ unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
-    /// Opens the first active port of `device`, or of any device when it is empty.
+    /// Opens `device`, or every device with an active port when it is empty.
     pub fn open(device: &str, global_id_index: i32) -> Result<Self, Error> {
-        let name = CString::new(device).map_err(|_| Error("a device name has a nul".to_owned()))?;
-        // SAFETY: the name outlives the call, which copies what it needs.
-        let handle = unsafe { mmh3_rdma_open(name.as_ptr(), global_id_index) };
-        if handle.is_null() {
+        let names: Vec<String> = if device.is_empty() {
+            let mut bytes = vec![0u8; PARTS * NAME_BYTES];
+            // SAFETY: the buffer holds `PARTS` names of `NAME_BYTES` each.
+            let found =
+                unsafe { mmh3_rdma_device_names(bytes.as_mut_ptr().cast(), PARTS as c_int) };
+            (0..found.max(0) as usize)
+                .map(|index| {
+                    let start = index * NAME_BYTES;
+                    let end = bytes[start..start + NAME_BYTES]
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(NAME_BYTES);
+                    String::from_utf8_lossy(&bytes[start..start + end]).into_owned()
+                })
+                .collect()
+        } else {
+            vec![device.to_owned()]
+        };
+        // Both ends pair their paths by the order of this list, so it has to be one both agree on.
+        let mut names = names;
+        names.sort();
+        let mut handles = Vec::with_capacity(names.len());
+        for name in &names {
+            let name = CString::new(name.as_str())
+                .map_err(|_| Error("a device name has a nul".to_owned()))?;
+            // SAFETY: the name outlives the call, which copies what it needs.
+            let handle = unsafe { mmh3_rdma_open(name.as_ptr(), global_id_index) };
+            if !handle.is_null() {
+                handles.push(handle);
+            }
+        }
+        if handles.is_empty() {
             return Err(Error(format!(
                 "no RoCE port to open{}",
                 if device.is_empty() {
@@ -116,17 +156,26 @@ impl Device {
                 }
             )));
         }
-        Ok(Device { handle })
+        Ok(Device { handles })
     }
 
-    /// One connection of this device, for one peer.
+    /// How many paths a payload is split over.
+    pub fn paths(&self) -> usize {
+        self.handles.len()
+    }
+
+    /// One connection of this device, for one peer: a queue pair on each of its paths.
     pub fn link(&self) -> Result<Link, Error> {
-        // SAFETY: the handle is live, and the link keeps the device alive through the borrow.
-        let handle = unsafe { mmh3_rdma_link_open(self.handle) };
-        if handle.is_null() {
-            return Err(Error("opening a connection".to_owned()));
+        let mut handles = Vec::with_capacity(self.handles.len());
+        for device in &self.handles {
+            // SAFETY: the handle is live, and the link keeps the device alive through the borrow.
+            let handle = unsafe { mmh3_rdma_link_open(*device) };
+            if handle.is_null() {
+                return Err(Error("opening a connection".to_owned()));
+            }
+            handles.push(handle);
         }
-        Ok(Link { handle })
+        Ok(Link { handles })
     }
 
     /// Takes `buffer` and registers it on this device, which every connection of it may then
@@ -134,25 +183,28 @@ impl Device {
     /// of megabytes costs seconds, and every transfer of a run reuses the same region.
     pub fn register(&self, buffer: Vec<u8>) -> Result<Region, Error> {
         let mut buffer = buffer;
-        let mut remote_key = 0u32;
         let (address, bytes) = (buffer.as_ptr() as u64, buffer.len());
-        // SAFETY: the buffer moves into the region, which keeps it at this address until it
-        // unregisters in `Drop`.
-        let handle = unsafe {
-            mmh3_rdma_register(
-                self.handle,
-                buffer.as_mut_ptr().cast(),
-                bytes,
-                &mut remote_key,
-            )
-        };
-        if handle.is_null() {
-            return Err(Error(format!("registering {bytes} bytes")));
+        let mut handles = Vec::with_capacity(self.handles.len());
+        let mut keys = Vec::with_capacity(self.handles.len());
+        // The paths have a protection domain each, so the same memory takes a registration and a
+        // key on every one of them. The address is the buffer's either way.
+        for device in &self.handles {
+            let mut remote_key = 0u32;
+            // SAFETY: the buffer moves into the region, which keeps it at this address until it
+            // unregisters in `Drop`.
+            let handle = unsafe {
+                mmh3_rdma_register(*device, buffer.as_mut_ptr().cast(), bytes, &mut remote_key)
+            };
+            if handle.is_null() {
+                return Err(Error(format!("registering {bytes} bytes")));
+            }
+            handles.push(handle);
+            keys.push(remote_key);
         }
         Ok(Region {
-            handle,
+            handles,
             address,
-            remote_key,
+            keys,
             buffer,
         })
     }
@@ -160,14 +212,16 @@ impl Device {
 
 impl Drop for Device {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `open` and is dropped once, after every link of it.
-        unsafe { mmh3_rdma_close(self.handle) };
+        for handle in &self.handles {
+            // SAFETY: the handles came from `open` and are dropped once, after every link of them.
+            unsafe { mmh3_rdma_close(*handle) };
+        }
     }
 }
 
-/// One reliable connection to one peer.
+/// One reliable connection to one peer: a queue pair on each of the device's paths.
 pub struct Link {
-    handle: *mut c_void,
+    handles: Vec<*mut c_void>,
 }
 
 // The handle is only ever used from the thread that owns the link, so it moves between threads but
@@ -175,23 +229,41 @@ pub struct Link {
 unsafe impl Send for Link {}
 
 impl Link {
-    /// This side's address, for the other side to connect to.
-    pub fn address(&self) -> Result<Address, Error> {
-        let mut address = Address::default();
-        // SAFETY: the handle is live and the address is this call's to fill.
-        let status = unsafe { mmh3_rdma_link_address(self.handle, &mut address) };
-        if status != 0 {
-            return Err(Error(format!("reading the local address: {status}")));
-        }
-        Ok(address)
+    pub fn paths(&self) -> usize {
+        self.handles.len()
     }
 
-    /// Moves the connection to ready. Both sides call this with the other's address.
-    pub fn connect(&self, peer: &Address) -> Result<(), Error> {
-        // SAFETY: the handle is live and the peer outlives the call.
-        let status = unsafe { mmh3_rdma_link_connect(self.handle, peer) };
-        if status != 0 {
-            return Err(Error(format!("connecting: {status}")));
+    /// This side's addresses, one per path, for the other side to connect to.
+    pub fn addresses(&self) -> Result<Vec<Address>, Error> {
+        let mut addresses = Vec::with_capacity(self.handles.len());
+        for handle in &self.handles {
+            let mut address = Address::default();
+            // SAFETY: the handle is live and the address is this call's to fill.
+            let status = unsafe { mmh3_rdma_link_address(*handle, &mut address) };
+            if status != 0 {
+                return Err(Error(format!("reading the local address: {status}")));
+            }
+            addresses.push(address);
+        }
+        Ok(addresses)
+    }
+
+    /// Moves every path to ready. Both sides call this with the other's addresses, which the two
+    /// take in the same order, so a path talks to the one the peer opened beside it.
+    pub fn connect(&self, peers: &[Address]) -> Result<(), Error> {
+        if peers.len() != self.handles.len() {
+            return Err(Error(format!(
+                "{} addresses for {} paths",
+                peers.len(),
+                self.handles.len()
+            )));
+        }
+        for (handle, peer) in self.handles.iter().zip(peers) {
+            // SAFETY: the handle is live and the peer outlives the call.
+            let status = unsafe { mmh3_rdma_link_connect(*handle, peer) };
+            if status != 0 {
+                return Err(Error(format!("connecting: {status}")));
+            }
         }
         Ok(())
     }
@@ -199,16 +271,18 @@ impl Link {
 
 impl Drop for Link {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `Device::link` and is dropped once.
-        unsafe { mmh3_rdma_link_close(self.handle) };
+        for handle in &self.handles {
+            // SAFETY: the handles came from `Device::link` and are dropped once.
+            unsafe { mmh3_rdma_link_close(*handle) };
+        }
     }
 }
 
 /// Memory the device's connections may read and write, and what the other side needs to reach it.
 pub struct Region {
-    handle: *mut c_void,
+    handles: Vec<*mut c_void>,
     address: u64,
-    remote_key: u32,
+    keys: Vec<u32>,
     buffer: Vec<u8>,
 }
 
@@ -221,8 +295,9 @@ impl Region {
         self.address
     }
 
-    pub fn remote_key(&self) -> u32 {
-        self.remote_key
+    /// One key per path, which the peer needs all of to reach this memory.
+    pub fn remote_keys(&self) -> &[u32] {
+        &self.keys
     }
 
     pub fn bytes(&self) -> usize {
@@ -237,49 +312,121 @@ impl Region {
         &mut self.buffer
     }
 
-    /// Reads the peer's memory into this one, splitting what one work request cannot carry.
-    pub fn read_from(
-        &mut self,
+    /// Splits `bytes` of this region, `offset` bytes in, over the connection's paths and writes
+    /// them into the peer's memory. Over the link between two Sparks one path runs at 13.0 GB/s
+    /// and the two together at 22.2, so a rank pushes its rows to the peers rather than letting
+    /// them pull, and splits them.
+    pub fn write_out(
+        &self,
         link: &Link,
+        offset: usize,
         remote_address: u64,
-        remote_key: u32,
+        remote_keys: &[u32],
         bytes: usize,
         milliseconds: i32,
     ) -> Result<(), Error> {
-        self.read_into(link, 0, remote_address, remote_key, bytes, milliseconds)
+        self.parted(
+            link,
+            offset,
+            remote_address,
+            remote_keys,
+            bytes,
+            true,
+            milliseconds,
+        )
     }
 
-    /// `read_from` landing `offset` bytes into this region, which is how a rank collects the peers'
-    /// shares of one sequence side by side.
+    /// `write_out` the other way round, which is how a canvas comes back from a worker.
     pub fn read_into(
         &mut self,
         link: &Link,
         offset: usize,
         remote_address: u64,
-        remote_key: u32,
+        remote_keys: &[u32],
         bytes: usize,
+        milliseconds: i32,
+    ) -> Result<(), Error> {
+        self.parted(
+            link,
+            offset,
+            remote_address,
+            remote_keys,
+            bytes,
+            false,
+            milliseconds,
+        )
+    }
+
+    /// `read_into` from the start of the region.
+    pub fn read_from(
+        &mut self,
+        link: &Link,
+        remote_address: u64,
+        remote_keys: &[u32],
+        bytes: usize,
+        milliseconds: i32,
+    ) -> Result<(), Error> {
+        self.read_into(link, 0, remote_address, remote_keys, bytes, milliseconds)
+    }
+
+    /// One transfer, cut into a piece per path. The cut is by whole 4 KiB pages so that neither
+    /// side straddles one, and the last path takes the remainder.
+    #[allow(clippy::too_many_arguments)]
+    fn parted(
+        &self,
+        link: &Link,
+        offset: usize,
+        remote_address: u64,
+        remote_keys: &[u32],
+        bytes: usize,
+        writing: bool,
         milliseconds: i32,
     ) -> Result<(), Error> {
         if offset + bytes > self.buffer.len() {
             return Err(Error(format!(
-                "a read of {bytes} bytes at {offset} into {} of memory",
+                "{bytes} bytes at {offset} of {} of memory",
                 self.buffer.len()
             )));
         }
-        // SAFETY: the region and its buffer are live, and the peer's range is its own to check.
+        let paths = self
+            .handles
+            .len()
+            .min(link.handles.len())
+            .min(remote_keys.len());
+        if paths == 0 {
+            return Err(Error("a connection with no path".to_owned()));
+        }
+        const PAGE: usize = 4096;
+        let each = (bytes / paths / PAGE) * PAGE;
+        let mut parts = Vec::with_capacity(paths);
+        for (path, key) in remote_keys.iter().enumerate().take(paths) {
+            let start = path * each;
+            let length = if path + 1 == paths {
+                bytes - start
+            } else {
+                each
+            };
+            parts.push(Part {
+                link: link.handles[path],
+                region: self.handles[path],
+                // SAFETY: the range lies inside the buffer, checked above.
+                local: unsafe { self.buffer.as_ptr().add(offset + start).cast_mut() },
+                bytes: length,
+                remote_address: remote_address + start as u64,
+                remote_key: *key,
+            });
+        }
+        // SAFETY: every part points inside this region's buffer and names a live connection.
         let status = unsafe {
-            mmh3_rdma_read_all(
-                link.handle,
-                self.handle,
-                self.buffer.as_mut_ptr().add(offset).cast(),
-                bytes,
-                remote_address,
-                remote_key,
-                milliseconds,
-            )
+            if writing {
+                mmh3_rdma_write_all(parts.as_ptr(), parts.len() as c_int, milliseconds)
+            } else {
+                mmh3_rdma_read_all(parts.as_ptr(), parts.len() as c_int, milliseconds)
+            }
         };
         if status != 0 {
-            return Err(Error(format!("reading {bytes} bytes: {status}")));
+            let what = if writing { "writing" } else { "reading" };
+            return Err(Error(format!("{what} {bytes} bytes: {status}")));
         }
         Ok(())
     }
@@ -287,8 +434,10 @@ impl Region {
 
 impl Drop for Region {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `register` and is dropped once, before the buffer.
-        unsafe { mmh3_rdma_unregister(self.handle) };
+        for handle in &self.handles {
+            // SAFETY: the handles came from `register` and are dropped once, before the buffer.
+            unsafe { mmh3_rdma_unregister(*handle) };
+        }
     }
 }
 
