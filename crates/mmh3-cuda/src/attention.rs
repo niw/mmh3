@@ -105,6 +105,14 @@ impl QuantizedWorkspace {
         })
     }
 
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
     fn raw(&self) -> RawQuantizedWorkspace {
         RawQuantizedWorkspace {
             query: self.query.pointer(),
@@ -790,6 +798,10 @@ impl SparseWorkspace {
 
     pub fn tokens(&self) -> usize {
         self.tokens
+    }
+
+    pub fn heads(&self) -> usize {
+        self.heads
     }
 
     fn raw(&self) -> RawSparseWorkspace {

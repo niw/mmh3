@@ -39,10 +39,10 @@ Arguments normally go after the generated inputs and before the output path.
 For a full invocation, use whole-argument {video}, {audio}, and {out} placeholders. No shell is invoked.
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
 directory has it.
---shard-dit N splits every DiT step across N machines, Ulysses style, this one and N-1 workers. It is what a
-worker is for: over the 200 GbE between two DGX Sparks a 768p step goes from 13.4 s to 9.0 and a run from 78.8 s
-to 58.3, where a worker that only encodes the prompt and decodes chunks saves 9%. Two machines so far, and
---shard-dit 0 keeps the DiT here.
+--shard-dit N splits every DiT step across at most N machines, Ulysses style, this one and N-1 workers. Without
+it every worker that can take a share does, which is what naming one asks for. Sharing a step is what a worker is
+for: over the 200 GbE between two DGX Sparks a 768p step goes from 13.4 s to 9.0 and a run from 78.8 s to 58.3,
+where a worker that only encodes the prompt and decodes chunks saves 9%. --shard-dit 0 keeps the DiT here.
 --worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
 encoder encodes the prompt, so this machine never loads it. Anything a worker cannot do, or fails at, this
 machine does itself.";

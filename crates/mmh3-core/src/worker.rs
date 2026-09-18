@@ -7,7 +7,7 @@
 use std::io::{self, Read, Write};
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"MH3W");
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// What a worker announces it can serve, and what a leader asks for.
 pub const CAPABILITY_ENCODE_TEXT: u32 = 1 << 0;
 pub const CAPABILITY_DECODE_VIDEO: u32 = 1 << 1;
@@ -40,6 +40,7 @@ pub enum Kind {
     VelocityPart = 16,
     Ready = 17,
     CloseSession = 18,
+    SessionLinks = 19,
 }
 
 impl Kind {
@@ -63,6 +64,7 @@ impl Kind {
             16 => Kind::VelocityPart,
             17 => Kind::Ready,
             18 => Kind::CloseSession,
+            19 => Kind::SessionLinks,
             _ => return None,
         })
     }
@@ -143,6 +145,11 @@ impl Encoder {
         self
     }
 
+    pub fn f64(&mut self, value: f64) -> &mut Self {
+        self.0.extend_from_slice(&value.to_le_bytes());
+        self
+    }
+
     /// A length-prefixed UTF-8 string.
     pub fn string(&mut self, value: &str) -> &mut Self {
         self.u32(value.len() as u32);
@@ -172,7 +179,7 @@ impl<'a> Decoder<'a> {
         Decoder { bytes, position: 0 }
     }
 
-    fn take(&mut self, count: usize) -> io::Result<&'a [u8]> {
+    pub fn take(&mut self, count: usize) -> io::Result<&'a [u8]> {
         let end = self.position.checked_add(count).ok_or_else(short)?;
         if end > self.bytes.len() {
             return Err(short());
@@ -196,6 +203,10 @@ impl<'a> Decoder<'a> {
 
     pub fn f32(&mut self) -> io::Result<f32> {
         Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    pub fn f64(&mut self) -> io::Result<f64> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
 
     pub fn string(&mut self) -> io::Result<String> {
@@ -286,11 +297,82 @@ pub struct Canvas {
     pub remote_key: u32,
 }
 
+/// Which block-sparse attention a session runs, and on which of its steps. The whole schedule
+/// crosses the wire rather than one step's decision, because every rank has to make the same choice
+/// on every step and a rank that disagrees attends a different sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct SparseSettings {
+    /// 0 dense, 1 Sol-Attn, 2 VSA.
+    pub method: u8,
+    /// Sol-Attn's routing threshold in standard deviations.
+    pub tau: f32,
+    /// The fraction of video tiles VSA drops. FP64, because the kept tile count rounds and two
+    /// ranks that keep different tiles attend different sequences: 0.9 through FP32 keeps 101 of
+    /// 1000 tiles where FP64 keeps 100.
+    pub vsa_sparsity: f64,
+    /// The fraction of the steps that run dense first.
+    pub start_fraction: f32,
+    /// Sequences shorter than this stay dense.
+    pub min_tokens: u32,
+}
+
+impl SparseSettings {
+    pub const DENSE: u8 = 0;
+    pub const SOL: u8 = 1;
+    pub const VSA: u8 = 2;
+}
+
+/// A clean condition the run never denoises: a keyframe of first and last frame generation, or a
+/// reference of reference to video generation. Its latents follow the context in the payload, in
+/// this order, FP32. A shape of zeroes means the condition has no rows of that kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Condition {
+    pub kind: u8,
+    /// The frame of the target a keyframe anchors at, unused by a reference.
+    pub frame_index: u32,
+    /// `[channels, frames, height, width]` of the video latent.
+    pub video_shape: [u32; 4],
+    /// `[channels, 2, frames]` of the audio latent.
+    pub audio_shape: [u32; 3],
+}
+
+impl Condition {
+    pub const KEYFRAME: u8 = 0;
+    pub const REFERENCE_PICTURE: u8 = 1;
+    pub const REFERENCE_VIDEO: u8 = 2;
+    pub const REFERENCE_AUDIO: u8 = 3;
+
+    /// FP32 values the condition carries, video then audio.
+    pub fn values(&self) -> usize {
+        let count = |shape: &[u32]| -> usize {
+            if shape.contains(&0) {
+                0
+            } else {
+                shape.iter().map(|&extent| extent as usize).product()
+            }
+        };
+        count(&self.video_shape) + count(&self.audio_shape)
+    }
+}
+
+/// A LoRA or a patch the leader added to its DiT, which every rank has to add the same way. The
+/// file carries no role, so the digest of its header is what the two machines agree on.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Adapter {
+    pub digest: u64,
+    pub strength: f32,
+    /// 0 for an adapter kept beside the weights, 1 for a merge into them.
+    pub mode: u8,
+}
+
+impl Adapter {
+    pub const ADAPTER: u8 = 0;
+    pub const MERGE: u8 = 1;
+}
+
 /// Opening a shared-out step: everything a rank needs to stand up the same layout the leader has,
 /// except the latents, which change every step. Both sides work the shard out of `ranks`, so only
 /// which rank this worker takes crosses the wire.
-///
-/// Keyframes and references are not carried yet, so a run that has any keeps the DiT to itself.
 #[derive(Clone, Debug)]
 pub struct OpenSession {
     pub checkpoint: Checkpoint,
@@ -304,15 +386,23 @@ pub struct OpenSession {
     pub context_shape: [u32; 2],
     pub shift_video: f32,
     pub shift_audio: f32,
-    pub vsa_sparsity: f32,
+    /// How many steps the run takes, which is what decides when sparse attention starts.
+    pub steps: u32,
+    pub sparse: SparseSettings,
+    /// The keyframes and references, in the order their latents follow the context.
+    pub conditions: Vec<Condition>,
+    /// The LoRAs and patches, in the order they were added.
+    pub adapters: Vec<Adapter>,
     /// 0 for bf16 attention, 1 for INT8 QK with FP8 PV.
     pub precision: u8,
 }
 
-/// Where one rank's memory sits, so the other can read it. One entry per region a step uses, in the
-/// order both sides make them.
+/// Where one rank's memory sits, so the others can read it. One entry per region a step uses, in
+/// the order every rank makes them.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RemoteRegion {
+    /// The rank whose memory this is.
+    pub owner: u32,
     /// What the region is for, as the backend names it.
     pub kind: u32,
     /// Which peer it belongs to, for the regions that are made one per peer.
@@ -322,8 +412,42 @@ pub struct RemoteRegion {
     pub key: u32,
 }
 
+/// One rank's end of a connection to another, which the leader passes on so that two workers can
+/// reach each other without a socket between them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PeerLink {
+    /// The rank at the other end.
+    pub peer: u32,
+    /// The RoCE address, as `mmh3_rdma::Address` lays it out.
+    pub address: [u8; RDMA_ADDRESS_BYTES],
+}
+
+impl PeerLink {
+    pub fn encode_all(links: &[PeerLink]) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(links.len() as u32);
+        for link in links {
+            encoder.u32(link.peer).bytes(&link.address);
+        }
+        encoder.finish()
+    }
+
+    pub fn decode_all(bytes: &[u8]) -> io::Result<Vec<PeerLink>> {
+        let mut decoder = Decoder::new(bytes);
+        let count = decoder.u32()? as usize;
+        let mut links = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let peer = decoder.u32()?;
+            let mut address = [0u8; RDMA_ADDRESS_BYTES];
+            address.copy_from_slice(decoder.take(RDMA_ADDRESS_BYTES)?);
+            links.push(PeerLink { peer, address });
+        }
+        Ok(links)
+    }
+}
+
 impl RemoteRegion {
-    pub const BYTES: usize = 28;
+    pub const BYTES: usize = 32;
 }
 
 /// One step of a shared-out run: the sigma and the latents, which every rank embeds for itself.
@@ -362,8 +486,30 @@ impl OpenSession {
         encoder
             .f32(self.shift_video)
             .f32(self.shift_audio)
-            .f32(self.vsa_sparsity)
-            .u8(self.precision);
+            .u32(self.steps)
+            .u8(self.sparse.method)
+            .f32(self.sparse.tau)
+            .f64(self.sparse.vsa_sparsity)
+            .f32(self.sparse.start_fraction)
+            .u32(self.sparse.min_tokens)
+            .u8(self.precision)
+            .u32(self.conditions.len() as u32);
+        for condition in &self.conditions {
+            encoder.u8(condition.kind).u32(condition.frame_index);
+            for value in condition.video_shape {
+                encoder.u32(value);
+            }
+            for value in condition.audio_shape {
+                encoder.u32(value);
+            }
+        }
+        encoder.u32(self.adapters.len() as u32);
+        for adapter in &self.adapters {
+            encoder
+                .u64(adapter.digest)
+                .f32(adapter.strength)
+                .u8(adapter.mode);
+        }
         encoder.finish()
     }
 
@@ -396,8 +542,47 @@ impl OpenSession {
             context_shape,
             shift_video: decoder.f32()?,
             shift_audio: decoder.f32()?,
-            vsa_sparsity: decoder.f32()?,
+            steps: decoder.u32()?,
+            sparse: SparseSettings {
+                method: decoder.u8()?,
+                tau: decoder.f32()?,
+                vsa_sparsity: decoder.f64()?,
+                start_fraction: decoder.f32()?,
+                min_tokens: decoder.u32()?,
+            },
             precision: decoder.u8()?,
+            conditions: Vec::new(),
+            adapters: Vec::new(),
+        };
+        let count = decoder.u32()? as usize;
+        let mut conditions = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            let mut condition = Condition {
+                kind: decoder.u8()?,
+                frame_index: decoder.u32()?,
+                ..Condition::default()
+            };
+            for value in &mut condition.video_shape {
+                *value = decoder.u32()?;
+            }
+            for value in &mut condition.audio_shape {
+                *value = decoder.u32()?;
+            }
+            conditions.push(condition);
+        }
+        let count = decoder.u32()? as usize;
+        let mut adapters = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            adapters.push(Adapter {
+                digest: decoder.u64()?,
+                strength: decoder.f32()?,
+                mode: decoder.u8()?,
+            });
+        }
+        let session = OpenSession {
+            conditions,
+            adapters,
+            ..session
         };
         Ok((session, decoder.position))
     }
@@ -409,6 +594,7 @@ impl RemoteRegion {
         encoder.u32(regions.len() as u32);
         for region in regions {
             encoder
+                .u32(region.owner)
                 .u32(region.kind)
                 .u32(region.peer)
                 .u64(region.address)
@@ -424,6 +610,7 @@ impl RemoteRegion {
         (0..count)
             .map(|_| {
                 Ok(RemoteRegion {
+                    owner: decoder.u32()?,
                     kind: decoder.u32()?,
                     peer: decoder.u32()?,
                     address: decoder.u64()?,

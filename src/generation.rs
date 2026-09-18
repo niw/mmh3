@@ -486,21 +486,23 @@ pub fn sample(
         &context_modalities,
         &video,
         &audio,
-        keyframes.is_empty() && references.is_empty(),
+        &keyframes,
+        &references,
     );
     #[cfg(feature = "cuda")]
     let mut sharing = match &mut target {
         Some(target) => {
             let shard = target.shard.clone();
-            match target.worker.open_shard(
+            match crate::worker::open_shard(
+                &mut target.workers,
+                &target.open,
+                &target.payload,
                 &shard,
                 target.tokens,
                 dit.config().hidden,
                 target.gated,
-                &target.open,
-                &target.payload,
             ) {
-                Ok(exchanger) => Some(Sharing::With(exchanger, shard)),
+                Ok(exchanger) => Some(Sharing::With(Box::new(exchanger), shard)),
                 Err(error) => {
                     eprintln!("warning: opening a shared run: {error}");
                     None
@@ -509,8 +511,17 @@ pub fn sample(
         }
         // `--shard-dit 1` runs the same path with nothing to carry anywhere, which tells the cost
         // of the machinery apart from the cost of the link.
-        None => alone_shard(options, &dit, &context, &video, &audio, settings)
-            .map(|shard| Sharing::Alone(mmh3_cuda::shard::WholeExchange::new(), shard)),
+        None => alone_shard(
+            options,
+            &dit,
+            &context,
+            &video,
+            &audio,
+            &keyframes,
+            &references,
+            settings,
+        )
+        .map(|shard| Sharing::Alone(mmh3_cuda::shard::WholeExchange::new(), shard)),
     };
     #[cfg(feature = "metal")]
     let prepared = dit.prepare_text(&context)?;
@@ -746,16 +757,15 @@ fn encode_pictures(
 /// because the exchange borrows it for the whole run.
 #[cfg(feature = "cuda")]
 struct ShardTarget {
-    worker: crate::worker::Worker,
+    workers: Vec<crate::worker::Worker>,
     shard: mmh3_cuda::shard::Shard,
     tokens: usize,
     gated: bool,
-    open: mmh3_core::worker::OpenSession,
+    open: Vec<mmh3_core::worker::OpenSession>,
     payload: Vec<u8>,
 }
 
-/// The first worker that can take a share of the DiT, or `None` to keep the whole step here. A run
-/// with conditions keeps it: the session carries no keyframes or references yet.
+/// The first worker that can take a share of the DiT, or `None` to keep the whole step here.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn shard_target(
@@ -767,12 +777,12 @@ fn shard_target(
     context_modalities: &[mmh3_core::dit::timestep::Modality],
     video: &Tensor,
     audio: &Tensor,
-    plain: bool,
+    keyframes: &[mmh3_core::dit::inputs::Keyframe],
+    references: &[mmh3_core::dit::inputs::Reference],
 ) -> Option<ShardTarget> {
-    use crate::worker::{Worker, digest, session_payload};
+    use crate::worker::{Worker, digest, session_conditions, session_payload};
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
-    use mmh3_core::dit::sparse::SparseMethod;
     use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
     use mmh3_cuda::shard::Shard;
 
@@ -780,7 +790,9 @@ fn shard_target(
     // not worth a second machine. Sharing every step is worth 35%, so it is what `--worker` does
     // unless `--shard-dit 0` says otherwise.
     let asked = options.contains_key("shard-dit");
-    let ranks = crate::cli::option_number(options, "shard-dit", 2).ok()?;
+    // Without `--shard-dit`, every worker that can take a share does: naming a machine is what
+    // asks for it. With it, the number is a cap on the ranks rather than a promise of them.
+    let ranks = crate::cli::option_number(options, "shard-dit", settings.workers.len() + 1).ok()?;
     if ranks < 2 {
         // Zero keeps the DiT here. One shares a step with nobody, which `alone_shard` handles.
         return None;
@@ -791,19 +803,21 @@ fn shard_target(
         }
         return None;
     }
-    if ranks > 2 {
-        println!("only two machines can share a step so far, so the DiT stays here");
-        return None;
-    }
-    if !plain {
-        println!("a run with conditions keeps the DiT here");
-        return None;
-    }
-    let Some(SparseMethod::Vsa { sparsity }) = sparse.map(|settings| settings.method) else {
-        println!("sharing a step needs VSA, so the DiT stays here");
-        return None;
+    let file = if references.is_empty() {
+        crate::models::DIT_FILE
+    } else {
+        crate::models::REFERENCE_DIT_FILE
     };
-    let path = crate::models::option_path(options, "dit", crate::models::DIT_FILE).ok()?;
+    let path = crate::models::option_path(options, "dit", file).ok()?;
+    // The LoRAs and patches this run added, in the order `load_dit` adds them. A worker that
+    // cannot find one refuses the session rather than running a different DiT.
+    let adapters = match session_adapters(options) {
+        Ok(adapters) => adapters,
+        Err(error) => {
+            eprintln!("warning: naming the adapters for a worker: {error}");
+            return None;
+        }
+    };
     let file = mmh3_core::safetensors::SafeTensors::open(std::path::Path::new(&path)).ok()?;
     let checkpoint = Checkpoint {
         role: "dit.h3".to_owned(),
@@ -811,7 +825,12 @@ fn shard_target(
     };
     drop(file);
 
+    // The workers that can take a share, in the order they were given, up to the rank count.
+    let mut workers = Vec::new();
     for address in &settings.workers {
+        if workers.len() + 1 >= ranks {
+            break;
+        }
         let worker = match Worker::connect(address, &settings.token) {
             Ok(worker) => worker,
             Err(error) => {
@@ -822,69 +841,132 @@ fn shard_target(
         if !worker.serves(CAPABILITY_DIT_SHARD) || !worker.reads_remotely() {
             continue;
         }
-        let inputs = DitInputs {
-            video: video.clone(),
-            audio: audio.clone(),
-            context: context.clone(),
-            context_modalities: context_modalities.to_vec(),
-            keyframes: Vec::new(),
-            references: Vec::new(),
-            sigma: 1.0,
-            shift_video: settings.shift_video,
-            shift_audio: settings.shift_audio,
-        };
-        let tokens = PackedLayout::for_inputs(&inputs).len();
-        let shape = |dimensions: &[usize]| -> Vec<u32> {
-            dimensions.iter().map(|value| *value as u32).collect()
-        };
-        let open = OpenSession {
+        workers.push(worker);
+    }
+    if workers.is_empty() {
+        if asked {
+            println!("no worker can take a share of a step, so the DiT stays here");
+        }
+        return None;
+    }
+    // A rank that cannot be filled is one the run does without: the ranks are what the machines
+    // that answered add up to, not what `--shard-dit` asked for.
+    let ranks = workers.len() + 1;
+    let inputs = DitInputs {
+        video: video.clone(),
+        audio: audio.clone(),
+        context: context.clone(),
+        context_modalities: context_modalities.to_vec(),
+        keyframes: keyframes.to_vec(),
+        references: references.to_vec(),
+        sigma: 1.0,
+        shift_video: settings.shift_video,
+        shift_audio: settings.shift_audio,
+    };
+    let tokens = PackedLayout::for_inputs(&inputs).len();
+    let shape = |dimensions: &[usize]| -> Vec<u32> {
+        dimensions.iter().map(|value| *value as u32).collect()
+    };
+    let open = |rank: usize| -> Option<OpenSession> {
+        Some(OpenSession {
             checkpoint: checkpoint.clone(),
-            ranks: 2,
-            rank: 1,
+            ranks: ranks as u32,
+            rank: rank as u32,
             video_shape: shape(&video.shape).try_into().ok()?,
             audio_shape: shape(&audio.shape).try_into().ok()?,
             context_shape: shape(&context.shape).try_into().ok()?,
             shift_video: settings.shift_video,
             shift_audio: settings.shift_audio,
-            vsa_sparsity: sparsity as f32,
+            steps: settings.steps as u32,
+            sparse: crate::worker::sparse_settings(sparse),
+            conditions: session_conditions(keyframes, references),
+            adapters: adapters.clone(),
             precision: match dit.attention_precision() {
                 mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => 1,
                 _ => 0,
             },
+        })
+    };
+    let open: Option<Vec<OpenSession>> = (1..ranks).map(open).collect();
+    let open = open?;
+    println!(
+        "{} takes a share of every step, {tokens} tokens split {ranks} ways",
+        workers
+            .iter()
+            .map(|worker| worker.address.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Some(ShardTarget {
+        shard: Shard::even(0, ranks, tokens, dit.config().heads, 1),
+        workers,
+        tokens,
+        gated: dit.has_vsa_gates(),
+        open,
+        payload: session_payload(context, context_modalities, keyframes, references),
+    })
+}
+
+/// The LoRAs and patches of `--patch` and `--lora`, as a session names them: by the digest of the
+/// file, since the machines name the files differently.
+#[cfg(feature = "cuda")]
+fn session_adapters(
+    options: &HashMap<&str, &str>,
+) -> Result<Vec<mmh3_core::worker::Adapter>, Box<dyn Error>> {
+    use crate::models::model_file;
+    use mmh3_core::worker::Adapter;
+
+    let mut adapters = Vec::new();
+    // A patch applies as adapters at full strength, before the LoRA.
+    let wanted = [
+        (
+            model_file(options, "patch", &["patches", "loras"])?,
+            1.0,
+            "adapter",
+        ),
+        (
+            model_file(options, "lora", &["loras"])?,
+            option_float(options, "lora-strength", 1.0)?,
+            options.get("lora-mode").copied().unwrap_or("adapter"),
+        ),
+    ];
+    for (path, strength, mode) in wanted {
+        let Some(path) = path else {
+            continue;
         };
-        println!(
-            "worker {} takes a share of every step, {tokens} tokens split in two",
-            worker.address
-        );
-        return Some(ShardTarget {
-            shard: Shard::even(0, 2, tokens, dit.config().heads, 1),
-            worker,
-            tokens,
-            gated: dit.has_vsa_gates(),
-            open,
-            payload: session_payload(context, context_modalities),
+        adapters.push(Adapter {
+            digest: crate::worker::digest(&SafeTensors::open(Path::new(&path))?),
+            strength,
+            mode: if mode == "merge" {
+                Adapter::MERGE
+            } else {
+                Adapter::ADAPTER
+            },
         });
     }
-    None
+    Ok(adapters)
 }
 
 /// How a step is shared out, which is either with another machine or, for `--shard-dit 1`, with
 /// nobody at all so that the machinery can be timed on its own.
 #[cfg(feature = "cuda")]
 enum Sharing<'a> {
-    With(crate::worker::Exchanger<'a>, mmh3_cuda::shard::Shard),
+    With(Box<crate::worker::Exchanger<'a>>, mmh3_cuda::shard::Shard),
     Alone(mmh3_cuda::shard::WholeExchange, mmh3_cuda::shard::Shard),
 }
 
 /// The shard of a run that shares a step with nobody. One rank covers the whole sequence and every
 /// head, so the result is the whole step's, and what is left is the gathers and the waits.
 #[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
 fn alone_shard(
     options: &HashMap<&str, &str>,
     dit: &mmh3_cuda::dit::CudaDit,
     context: &Tensor,
     video: &Tensor,
     audio: &Tensor,
+    keyframes: &[mmh3_core::dit::inputs::Keyframe],
+    references: &[mmh3_core::dit::inputs::Reference],
     settings: &Settings,
 ) -> Option<mmh3_cuda::shard::Shard> {
     use mmh3_core::dit::inputs::DitInputs;
@@ -898,8 +980,8 @@ fn alone_shard(
         audio: audio.clone(),
         context: context.clone(),
         context_modalities: Vec::new(),
-        keyframes: Vec::new(),
-        references: Vec::new(),
+        keyframes: keyframes.to_vec(),
+        references: references.to_vec(),
         sigma: 1.0,
         shift_video: settings.shift_video,
         shift_audio: settings.shift_audio,

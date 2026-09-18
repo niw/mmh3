@@ -220,10 +220,37 @@ impl DeviceTensors {
         )
     }
 
+    /// The down projection of `name`'s adapter over `rows` of a quantized input, which the column
+    /// ranges of `linear_quantized_range` then share: it depends on the input alone, and a block
+    /// runs three of them over the same rows.
+    ///
+    /// # Safety
+    /// `quantized` must hold `rows × inputs` values and `activation_scales` `rows`.
+    pub(crate) unsafe fn adapter_down(
+        &self,
+        adapter: Option<(&LowRank, &DeviceBuffer)>,
+        name: &str,
+        rows: usize,
+        quantized: *const c_void,
+        activation_scales: *const c_void,
+    ) -> Result<Option<AdapterPointers>, Error> {
+        match adapter {
+            Some((low_rank, scratch)) if low_rank.rank % ADAPTER_RANK_MULTIPLE == 0 => {
+                // SAFETY: the caller guarantees the input extents.
+                Ok(Some(unsafe {
+                    low_rank.project_down_quantized(quantized, activation_scales, rows, scratch)?
+                }))
+            }
+            Some(_) => Err(Error::Model(format!(
+                "{name}: the adapter rank must be a multiple of {ADAPTER_RANK_MULTIPLE}"
+            ))),
+            None => Ok(None),
+        }
+    }
+
     /// `linear_quantized` over a range of the output columns, with the rows of the result `stride`
     /// elements apart. The weight is `[outputs, features]` and its scales `[outputs]`, so a range of
-    /// the columns is a range of both, and no adapter comes along: a shared-out step is the only
-    /// caller and it refuses LoRA.
+    /// the columns is a range of both, and so is the adapter's up projection, `[outputs, rank]`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn linear_quantized_range(
         &self,
@@ -234,6 +261,7 @@ impl DeviceTensors {
         stride: usize,
         quantized: *const c_void,
         activation_scales: *const c_void,
+        adapter: Option<AdapterPointers>,
     ) -> Result<(), Error> {
         let weight = self.get(&format!("{name}.weight"))?;
         let (outputs, features) = (weight.shape[0], weight.shape[1]);
@@ -251,6 +279,12 @@ impl DeviceTensors {
         }
         let mut output = Int8Output::bf16(output);
         output.stride = stride;
+        let adapter = adapter.map(|mut adapter| {
+            // SAFETY: the up projection holds `outputs × rank` BF16 values and the range lies
+            // inside it, checked above.
+            adapter.up = unsafe { adapter.up.byte_add(columns.start * adapter.rank * 2) };
+            adapter
+        });
         // SAFETY: the caller keeps `rows × features` quantized values and `rows` scales, and a
         // range of the columns is the matching range of the weight's rows and of its scales.
         unsafe {
@@ -263,7 +297,7 @@ impl DeviceTensors {
                 rows,
                 columns.len(),
                 features,
-                None,
+                adapter,
             )?;
         }
         Ok(())

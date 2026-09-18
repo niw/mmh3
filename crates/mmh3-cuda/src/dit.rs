@@ -8,6 +8,7 @@ use crate::attention::{
     QuantizedWorkspace, RouteOverlap, SparseWorkspace, VsaWorkspace, dense_bf16_pointers,
     dense_quantized_pointers, prepare_inputs_pointers, sparse_pointers, vsa_pointers,
 };
+use crate::gemm::AdapterPointers;
 use crate::gemm::interleave_swiglu_rows;
 use crate::loader::Uploader;
 use crate::model::{
@@ -160,6 +161,9 @@ struct WorkspaceShape {
     /// write SwiGLU directly.
     expanded_rows: usize,
     adapter_rank: usize,
+    /// Rows the adapters' down projections cover, which a shared-out block runs over the whole
+    /// sequence rather than over this rank's rows.
+    adapter_rows: usize,
     /// Whether the blocks have VSA gates.
     gated: bool,
     /// Values per row of the NVFP4 layers' activations, or 0 without NVFP4 layers.
@@ -197,6 +201,7 @@ impl Workspace {
             tokens,
             expanded_rows,
             adapter_rank,
+            adapter_rows,
             gated,
             nvfp4_columns,
             nvfp4_adapter_rank,
@@ -214,7 +219,7 @@ impl Workspace {
             activated: DeviceBuffer::new(tokens * ffn * 2)?,
             quantized: DeviceBuffer::new(tokens * hidden.max(inner).max(ffn))?,
             scales: DeviceBuffer::new(tokens * 4)?,
-            adapter: DeviceBuffer::new(tokens * adapter_rank.max(1) * 2)?,
+            adapter: DeviceBuffer::new(adapter_rows.max(tokens) * adapter_rank.max(1) * 2)?,
             gate: if gated {
                 Some(DeviceBuffer::new(tokens * inner * 2)?)
             } else {
@@ -939,13 +944,6 @@ impl CudaDit {
         sparse: Option<&SparsePass>,
     ) -> Result<(), Error> {
         let config = &self.config;
-        let Some(SparsePass::Vsa {
-            workspace: vsa_workspace,
-            kept,
-        }) = sparse
-        else {
-            return Err(Error::Model("a sharded block needs VSA".to_owned()));
-        };
         let (normalized, scales) = self.exchange_inputs(workspace, context, tokens)?;
 
         let started = Instant::now();
@@ -955,41 +953,63 @@ impl CudaDit {
         let inputs = context
             .exchange
             .region(Region::Inputs, tokens * 3 * inner * 2)?;
-        let gated = self
-            .tensors
-            .optional(&format!("{prefix}.attn.to_gate_compress.weight"))
-            .is_some();
+        // Only VSA reads a gate. The region is there on every step of a gated checkpoint, since a
+        // schedule may turn VSA on partway through a run, and the dense steps leave it alone.
+        let gated = matches!(sparse, Some(SparsePass::Vsa { .. }))
+            && self
+                .tensors
+                .optional(&format!("{prefix}.attn.to_gate_compress.weight"))
+                .is_some();
         let gate = if gated {
             context.exchange.region(Region::Gate, tokens * inner * 2)?
         } else {
             ptr::null_mut()
         };
+        // An adapter's down projection depends on the block's input alone, so the three tensors
+        // share one. The scratch covers the whole sequence here, not just this rank's rows.
+        let down = |name: &str| -> Result<Option<AdapterPointers>, Error> {
+            let adapter = self
+                .adapters
+                .get(name)
+                .map(|adapter| (adapter, &workspace.adapter));
+            // SAFETY: the exchanged input holds every token's rows and its scales.
+            unsafe {
+                self.tensors
+                    .adapter_down(adapter, name, tokens, normalized, scales)
+            }
+        };
         // The three tensors of one token sit side by side, so each projection writes a column range
         // of a row that is three times as wide as its own result.
+        let qkv = format!("{prefix}.attn.qkv_proj");
+        let qkv_adapter = down(&qkv)?;
         for tensor in 0..3 {
             let columns =
                 (tensor * whole + own.start * HEAD_DIM)..(tensor * whole + own.end * HEAD_DIM);
             // SAFETY: the region holds `tokens × 3 × inner` values.
             let into = unsafe { inputs.byte_add(tensor * inner * 2) };
             self.tensors.linear_quantized_range(
-                &format!("{prefix}.attn.qkv_proj"),
+                &qkv,
                 into,
                 tokens,
                 columns,
                 3 * inner,
                 normalized,
                 scales,
+                qkv_adapter,
             )?;
         }
         if gated {
+            let name = format!("{prefix}.attn.to_gate_compress");
+            let adapter = down(&name)?;
             self.tensors.linear_quantized_range(
-                &format!("{prefix}.attn.to_gate_compress"),
+                &name,
                 gate,
                 tokens,
                 (own.start * HEAD_DIM)..(own.end * HEAD_DIM),
                 0,
                 normalized,
                 scales,
+                adapter,
             )?;
         }
         let _ = hidden;
@@ -1009,35 +1029,96 @@ impl CudaDit {
             head_stride: [HEAD_DIM as i64; 4],
             ..AttentionLayout::default()
         };
+        // Every workspace here is made for this rank's heads over the whole sequence, which is what
+        // the region holds, so the attention runs exactly as it does on one machine.
+        let quantized = workspace.attention_quantized.as_ref();
+        let prepared = match (sparse, quantized) {
+            (Some(SparsePass::Sol { workspace, .. }), _) => {
+                Some(PreparedAttention::Sparse(workspace))
+            }
+            (Some(SparsePass::Vsa { workspace, .. }), _) => Some(PreparedAttention::Vsa(workspace)),
+            (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
+            (None, None) => None,
+        };
+        let ready = if prepared.is_some() {
+            AttentionInputs::Prepared
+        } else {
+            AttentionInputs::Raw
+        };
+        let scale = 1.0 / (config.head_dim as f32).sqrt();
         // SAFETY: the projections filled `tokens × 3 × own heads × 128` values in the layout the
-        // preparation and VSA already read, the gate holds one tensor of the same rows, and the
+        // preparation and the attention read, the gate holds one tensor of the same rows, and the
         // angles cover every token because attention sees the whole sequence.
         unsafe {
-            prepare_inputs_pointers(
-                inputs,
-                query_norm,
-                key_norm,
-                angles,
-                3 * config.rope_frequencies,
-                tokens,
-                own.len(),
-                config.norm_eps,
-                PreparedAttention::Vsa(vsa_workspace),
-            )?;
+            let pairs = 3 * config.rope_frequencies;
+            match prepared {
+                Some(attention) => prepare_inputs_pointers(
+                    inputs,
+                    query_norm,
+                    key_norm,
+                    angles,
+                    pairs,
+                    tokens,
+                    own.len(),
+                    config.norm_eps,
+                    attention,
+                )?,
+                None => check(mmh3_qk_norm_rope(
+                    inputs,
+                    query_norm,
+                    key_norm,
+                    angles,
+                    pairs as c_int,
+                    tokens as c_int,
+                    own.len() as c_int,
+                    own.len() as c_int,
+                    config.norm_eps,
+                    ptr::null_mut(),
+                ))?,
+            }
             let base = inputs.cast::<u16>();
-            vsa_pointers(
-                base.cast(),
-                base.add(inner).cast(),
-                base.add(2 * inner).cast(),
-                gate.cast_const(),
-                inner,
-                attended,
-                &layout,
-                1.0 / (config.head_dim as f32).sqrt(),
-                *kept,
-                vsa_workspace,
-                AttentionInputs::Prepared,
-            )?;
+            match sparse {
+                None => match quantized {
+                    Some(quantized) => {
+                        dense_quantized_pointers(inputs, attended, scale, quantized, ready)?
+                    }
+                    None => dense_bf16_pointers(inputs, attended, tokens, own.len(), scale)?,
+                },
+                Some(SparsePass::Sol {
+                    workspace: sparse_workspace,
+                    tau,
+                    sinks,
+                }) => sparse_pointers(
+                    base.cast(),
+                    base.add(inner).cast(),
+                    base.add(2 * inner).cast(),
+                    attended,
+                    tokens,
+                    own.len(),
+                    &layout,
+                    scale,
+                    *tau,
+                    *sinks,
+                    sparse_workspace,
+                    ready,
+                )?,
+                Some(SparsePass::Vsa {
+                    workspace: vsa_workspace,
+                    kept,
+                }) => vsa_pointers(
+                    base.cast(),
+                    base.add(inner).cast(),
+                    base.add(2 * inner).cast(),
+                    gate.cast_const(),
+                    inner,
+                    attended,
+                    &layout,
+                    scale,
+                    *kept,
+                    vsa_workspace,
+                    ready,
+                )?,
+            }
         }
         // The attention is on the stream too, and the peers are about to read what it wrote.
         crate::synchronize()?;
@@ -1783,6 +1864,18 @@ impl CudaDit {
                     "a sharded step cannot run NVFP4 layers".to_owned(),
                 ));
             }
+            // A rank exchanges the quantized block input, which only the fused normalize and
+            // quantize pass of an INT8 qkv projection writes. Without it the peers would read
+            // memory no block filled.
+            if let Some(layer) = (0..config.layers).find(|layer| {
+                !self
+                    .tensors
+                    .is_int8(&format!("blocks.{layer}.attn.qkv_proj"))
+            }) {
+                return Err(Error::Model(format!(
+                    "a sharded step needs INT8 attention projections, and block {layer} has none"
+                )));
+            }
             if context.shard.rank > 0 && rows.start < text_tokens {
                 return Err(Error::Model(
                     "the text rows must fall to rank 0 alone".to_owned(),
@@ -1821,11 +1914,6 @@ impl CudaDit {
         let plan = vsa_sparsity.map(|_| VsaPlan::for_layout(&layout));
         let quantized_dense =
             self.attention_precision == AttentionPrecision::Int8Fp8 && method.is_none();
-        if context.is_some() && plan.is_none() {
-            return Err(Error::Model(
-                "a sharded step needs VSA, whose attention takes the exchanged layout".to_owned(),
-            ));
-        }
 
         let mut buffers = self.buffers.borrow_mut();
         let ForwardBuffers {
@@ -1842,6 +1930,7 @@ impl CudaDit {
                 rows.len()
             },
             adapter_rank,
+            adapter_rows: tokens,
             gated: plan.is_some() && self.has_vsa_gates(),
             nvfp4_columns: self
                 .nvfp4
@@ -1864,28 +1953,32 @@ impl CudaDit {
             _ => Workspace::new(config, shape)?,
         };
         let workspace = cached_workspace.insert(workspace);
-        match (quantized_dense, workspace.attention_quantized.is_some()) {
-            (true, false) => {
-                workspace.attention_quantized = Some(QuantizedWorkspace::new(tokens, config.heads)?)
-            }
-            (false, true) => workspace.attention_quantized = None,
-            _ => {}
+        let wanted = quantized_dense.then(|| (tokens, heads.len()));
+        if workspace
+            .attention_quantized
+            .as_ref()
+            .map(|quantized| (quantized.tokens(), quantized.heads()))
+            != wanted
+        {
+            workspace.attention_quantized = None;
+            workspace.attention_quantized = wanted
+                .map(|(tokens, heads)| QuantizedWorkspace::new(tokens, heads))
+                .transpose()?;
         }
         let workspace = &*workspace;
         match sparse_tau {
             Some(_)
                 if cached_sparse.as_ref().is_some_and(|(precision, sparse)| {
-                    *precision == self.attention_precision && sparse.tokens() == tokens
+                    *precision == self.attention_precision
+                        && sparse.tokens() == tokens
+                        && sparse.heads() == heads.len()
                 }) => {}
             Some(_) => {
                 *cached_sparse = None;
                 *cached_sparse = Some((
                     self.attention_precision,
-                    SparseWorkspace::with_precision(
-                        tokens,
-                        config.heads,
-                        self.attention_precision,
-                    )?,
+                    // A sharded step attends with its own heads over the whole sequence.
+                    SparseWorkspace::with_precision(tokens, heads.len(), self.attention_precision)?,
                 ));
             }
             None => *cached_sparse = None,

@@ -1,8 +1,12 @@
-//! One reliable connection to another machine over RoCE, and reads of its memory.
+//! A RoCE device with memory registered on it, reliable connections to other machines, and reads
+//! of their memory.
 //!
 //! The bulk of a distributed decode or a sharded step is too large for a socket: over the link
 //! between two DGX Sparks, `ib_write_bw` reaches 13.3 GB/s where TCP reaches 1.5. Control stays on
 //! the socket, which every machine has, and only the payloads come this way.
+//!
+//! The registrations belong to the device rather than to one connection, so a rank that shares a
+//! step with several peers registers its regions once and offers them all one remote key.
 //!
 //! The verbs calls live in `src/rdma.c`, since their structures belong to the installed headers.
 
@@ -61,8 +65,10 @@ impl std::error::Error for Error {}
 unsafe extern "C" {
     fn mmh3_rdma_open(device: *const c_char, global_id_index: c_int) -> *mut c_void;
     fn mmh3_rdma_close(rdma: *mut c_void);
-    fn mmh3_rdma_address(rdma: *mut c_void, address: *mut Address) -> c_int;
-    fn mmh3_rdma_connect(rdma: *mut c_void, peer: *const Address) -> c_int;
+    fn mmh3_rdma_link_open(rdma: *mut c_void) -> *mut c_void;
+    fn mmh3_rdma_link_close(link: *mut c_void);
+    fn mmh3_rdma_link_address(link: *mut c_void, address: *mut Address) -> c_int;
+    fn mmh3_rdma_link_connect(link: *mut c_void, peer: *const Address) -> c_int;
     fn mmh3_rdma_register(
         rdma: *mut c_void,
         buffer: *mut c_void,
@@ -71,7 +77,7 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn mmh3_rdma_unregister(region: *mut c_void);
     fn mmh3_rdma_read_all(
-        rdma: *mut c_void,
+        link: *mut c_void,
         region: *mut c_void,
         local: *mut c_void,
         bytes: usize,
@@ -84,15 +90,17 @@ unsafe extern "C" {
 /// The RoCEv2 entry of a port's table, which is what these machines use.
 pub const DEFAULT_GLOBAL_ID: i32 = 3;
 
-pub struct Connection {
+/// The RoCE device and its protection domain, which the memory regions belong to.
+pub struct Device {
     handle: *mut c_void,
 }
 
-// The handle is only ever used from the thread that owns the connection, and one connection serves
-// one peer, so it moves between threads but is never shared.
-unsafe impl Send for Connection {}
+// The handle moves and is shared between threads: one device serves every connection of a process,
+// and libibverbs allows concurrent calls on a context, a protection domain and its registrations.
+unsafe impl Send for Device {}
+unsafe impl Sync for Device {}
 
-impl Connection {
+impl Device {
     /// Opens the first active port of `device`, or of any device when it is empty.
     pub fn open(device: &str, global_id_index: i32) -> Result<Self, Error> {
         let name = CString::new(device).map_err(|_| Error("a device name has a nul".to_owned()))?;
@@ -108,33 +116,22 @@ impl Connection {
                 }
             )));
         }
-        Ok(Connection { handle })
+        Ok(Device { handle })
     }
 
-    /// This side's address, for the other side to connect to.
-    pub fn address(&self) -> Result<Address, Error> {
-        let mut address = Address::default();
-        // SAFETY: the handle is live and the address is this call's to fill.
-        let status = unsafe { mmh3_rdma_address(self.handle, &mut address) };
-        if status != 0 {
-            return Err(Error(format!("reading the local address: {status}")));
+    /// One connection of this device, for one peer.
+    pub fn link(&self) -> Result<Link, Error> {
+        // SAFETY: the handle is live, and the link keeps the device alive through the borrow.
+        let handle = unsafe { mmh3_rdma_link_open(self.handle) };
+        if handle.is_null() {
+            return Err(Error("opening a connection".to_owned()));
         }
-        Ok(address)
+        Ok(Link { handle })
     }
 
-    /// Moves the connection to ready. Both sides call this with the other's address.
-    pub fn connect(&self, peer: &Address) -> Result<(), Error> {
-        // SAFETY: the handle is live and the peer outlives the call.
-        let status = unsafe { mmh3_rdma_connect(self.handle, peer) };
-        if status != 0 {
-            return Err(Error(format!("connecting: {status}")));
-        }
-        Ok(())
-    }
-
-    /// Takes `buffer` and registers it for this connection. The region owns the memory so that it
-    /// can outlive one transfer: registering hundreds of megabytes costs seconds, and every
-    /// transfer of a run reuses the same region.
+    /// Takes `buffer` and registers it on this device, which every connection of it may then
+    /// serve. The region owns the memory so that it can outlive one transfer: registering hundreds
+    /// of megabytes costs seconds, and every transfer of a run reuses the same region.
     pub fn register(&self, buffer: Vec<u8>) -> Result<Region, Error> {
         let mut buffer = buffer;
         let mut remote_key = 0u32;
@@ -161,14 +158,53 @@ impl Connection {
     }
 }
 
-impl Drop for Connection {
+impl Drop for Device {
     fn drop(&mut self) {
-        // SAFETY: the handle came from `open` and is dropped once.
+        // SAFETY: the handle came from `open` and is dropped once, after every link of it.
         unsafe { mmh3_rdma_close(self.handle) };
     }
 }
 
-/// Memory this connection may read and write, and what the other side needs to reach it.
+/// One reliable connection to one peer.
+pub struct Link {
+    handle: *mut c_void,
+}
+
+// The handle is only ever used from the thread that owns the link, so it moves between threads but
+// is never shared.
+unsafe impl Send for Link {}
+
+impl Link {
+    /// This side's address, for the other side to connect to.
+    pub fn address(&self) -> Result<Address, Error> {
+        let mut address = Address::default();
+        // SAFETY: the handle is live and the address is this call's to fill.
+        let status = unsafe { mmh3_rdma_link_address(self.handle, &mut address) };
+        if status != 0 {
+            return Err(Error(format!("reading the local address: {status}")));
+        }
+        Ok(address)
+    }
+
+    /// Moves the connection to ready. Both sides call this with the other's address.
+    pub fn connect(&self, peer: &Address) -> Result<(), Error> {
+        // SAFETY: the handle is live and the peer outlives the call.
+        let status = unsafe { mmh3_rdma_link_connect(self.handle, peer) };
+        if status != 0 {
+            return Err(Error(format!("connecting: {status}")));
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Link {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from `Device::link` and is dropped once.
+        unsafe { mmh3_rdma_link_close(self.handle) };
+    }
+}
+
+/// Memory the device's connections may read and write, and what the other side needs to reach it.
 pub struct Region {
     handle: *mut c_void,
     address: u64,
@@ -204,27 +240,20 @@ impl Region {
     /// Reads the peer's memory into this one, splitting what one work request cannot carry.
     pub fn read_from(
         &mut self,
-        connection: &Connection,
+        link: &Link,
         remote_address: u64,
         remote_key: u32,
         bytes: usize,
         milliseconds: i32,
     ) -> Result<(), Error> {
-        self.read_into(
-            connection,
-            0,
-            remote_address,
-            remote_key,
-            bytes,
-            milliseconds,
-        )
+        self.read_into(link, 0, remote_address, remote_key, bytes, milliseconds)
     }
 
     /// `read_from` landing `offset` bytes into this region, which is how a rank collects the peers'
     /// shares of one sequence side by side.
     pub fn read_into(
         &mut self,
-        connection: &Connection,
+        link: &Link,
         offset: usize,
         remote_address: u64,
         remote_key: u32,
@@ -240,7 +269,7 @@ impl Region {
         // SAFETY: the region and its buffer are live, and the peer's range is its own to check.
         let status = unsafe {
             mmh3_rdma_read_all(
-                connection.handle,
+                link.handle,
                 self.handle,
                 self.buffer.as_mut_ptr().add(offset).cast(),
                 bytes,
