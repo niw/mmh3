@@ -227,6 +227,44 @@ impl Workspace {
     }
 }
 
+/// How a latent divides across machines: the chunks and the canvas each one leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodePlan {
+    pub chunks: usize,
+    pub canvas_frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub tiles: usize,
+}
+
+impl DecodePlan {
+    /// Values in one chunk's canvas, `[3, canvas frames, height, width]`.
+    pub fn canvas_values(&self) -> usize {
+        OUTPUT_CHANNELS * self.canvas_frames * self.height * self.width
+    }
+}
+
+/// One decode's buffers and geometry, shared by a whole video and by a single chunk.
+struct Decode {
+    workspace: Workspace,
+    angles: DeviceBuffer,
+    canvas: DeviceBuffer,
+    denormalized: Tensor,
+    grid: TileGrid,
+    tiles: usize,
+    chunks: usize,
+    chunk_frames: usize,
+    padded_frames: usize,
+    output_frames: usize,
+    canvas_frames: usize,
+    patches: usize,
+    tile_tokens: usize,
+    height: usize,
+    width: usize,
+    plane: usize,
+    single_frame: bool,
+}
+
 /// The tile grid of one decode call, with the geometry on the device for the blend kernel.
 struct TileGrid {
     rows: TileAxis,
@@ -1038,13 +1076,51 @@ impl CudaVideoDecoder {
     /// Decodes a normalized latent `[channels, frames, height, width]` into pixels
     /// `[3, frames, height, width]` in [0, 1]. A latent of `f > 1` frames decodes in overlapping
     /// chunks of 7 latent frames.
+    /// How a latent divides: the chunks a decode runs and the canvas each one leaves, which is what
+    /// a leader hands to another machine.
+    pub fn plan(&self, latent: &Tensor) -> Result<DecodePlan, Error> {
+        let [_, latent_frames, latent_height, latent_width] = self.latent_extents(latent)?;
+        let (height, width) = (latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
+        let grid = TileGrid::new(height, width, self.tile_size, self.tile_overlap_min)?;
+        let (chunks, chunk_frames) = if latent_frames == 1 {
+            (1, 1)
+        } else {
+            (
+                TemporalPlan::new(latent_frames).chunks,
+                CHUNK_TOKENS + CHUNK_OVERLAP_TOKENS,
+            )
+        };
+        Ok(DecodePlan {
+            chunks,
+            canvas_frames: chunk_frames * TEMPORAL_RATIO,
+            height,
+            width,
+            tiles: grid.count(),
+        })
+    }
+
+    /// One chunk's canvas, `[3, canvas frames, height, width]` FP32, before any blending with its
+    /// neighbours. The arithmetic is the decode's own, so a canvas computed here and one computed
+    /// on another machine of the same backend are the same bytes.
+    pub fn decode_chunk(&self, latent: &Tensor, chunk: usize) -> Result<Vec<f32>, Error> {
+        let mut decode = self.context(latent)?;
+        if chunk >= decode.chunks {
+            return Err(Error::Model(format!(
+                "chunk {chunk} of a latent with {} chunks",
+                decode.chunks
+            )));
+        }
+        self.fill_canvas(&mut decode, chunk, false)?;
+        Ok(decode.canvas.to_f32()?)
+    }
+
     pub fn decode(
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
     ) -> Result<VideoDecoding, Error> {
         let (pixels, [frames, height, width], first_tile) =
-            self.decode_on_device(latent, capture_first_tile)?;
+            self.decode_on_device(latent, capture_first_tile, &mut |_| None)?;
         Ok(VideoDecoding {
             pixels: Tensor::new(
                 vec![OUTPUT_CHANNELS, frames, height, width],
@@ -1056,38 +1132,53 @@ impl CudaVideoDecoder {
 
     /// Decodes a latent into RGB float32 frames retained on the GPU for native encoding.
     pub fn decode_device(&self, latent: &Tensor) -> Result<CudaVideoFrames, Error> {
-        let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false)?;
+        self.decode_device_with(latent, &mut |_| None)
+    }
+
+    /// `decode_device` where `remote` may answer with a canvas another machine decoded, which lets
+    /// the caller start those before this one walks its own chunks. A chunk `remote` declines is
+    /// decoded here.
+    pub fn decode_device_with(
+        &self,
+        latent: &Tensor,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<f32>>,
+    ) -> Result<CudaVideoFrames, Error> {
+        let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false, remote)?;
         CudaVideoFrames::from_rgb(pixels, frames, height, width)
     }
 
     /// Decodes a latent into 4:2:0 BT.709 limited-range video, converted on the GPU. The bytes
     /// match `Yuv420::from_pixels` of `decode`'s pixels.
     pub fn decode_yuv420(&self, latent: &Tensor) -> Result<Yuv420, Error> {
-        let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false)?;
+        let (pixels, [frames, height, width], _) =
+            self.decode_on_device(latent, false, &mut |_| None)?;
         Ok(yuv420(&pixels, frames, height, width)?)
     }
 
     /// Decodes a latent into pixels `[3, frames, height, width]` on the device and returns them
     /// with their shape.
-    fn decode_on_device(
-        &self,
-        latent: &Tensor,
-        capture_first_tile: bool,
-    ) -> Result<(DeviceBuffer, [usize; 3], Option<Tensor>), Error> {
-        let config = &self.config;
-        let &[channels, latent_frames, latent_height, latent_width] = latent.shape.as_slice()
-        else {
+    fn latent_extents(&self, latent: &Tensor) -> Result<[usize; 4], Error> {
+        let &[channels, frames, height, width] = latent.shape.as_slice() else {
             return Err(Error::Model(format!(
                 "latent shape {:?} is not [channels, frames, height, width]",
                 latent.shape
             )));
         };
-        if channels != config.latent_channels || latent_frames == 0 {
+        if channels != self.config.latent_channels || frames == 0 {
             return Err(Error::Model(format!(
                 "latent shape {:?} does not match the decoder",
                 latent.shape
             )));
         }
+        Ok([channels, frames, height, width])
+    }
+
+    /// The canvases of `wanted`, for a caller that blends them itself.
+    /// Everything a decode sets up before it walks the chunks, so that one chunk on its own and a
+    /// whole video take the same path.
+    fn context(&self, latent: &Tensor) -> Result<Decode, Error> {
+        let config = &self.config;
+        let [_, latent_frames, latent_height, latent_width] = self.latent_extents(latent)?;
         let plane_size = latent_frames * latent_height * latent_width;
         let denormalized = Tensor::new(
             latent.shape.clone(),
@@ -1101,9 +1192,7 @@ impl CudaVideoDecoder {
                 })
                 .collect(),
         );
-
         let (height, width) = (latent_height * SPATIAL_RATIO, latent_width * SPATIAL_RATIO);
-        let plane = height * width;
         let grid = TileGrid::new(height, width, self.tile_size, self.tile_overlap_min)?;
         let tiles = grid.count();
         // A single latent frame decodes on its own and keeps only its last frame.
@@ -1122,20 +1211,106 @@ impl CudaVideoDecoder {
         let patches = chunk_frames * grid.latent_height() * grid.latent_width();
         let tile_tokens = patches + config.registers + 1;
         let tokens = tiles * tile_tokens;
-
-        let mut workspace = Workspace::new(config, tokens, self.quantized, self.dense_ffn)?;
-        let angles = DeviceBuffer::from_f32(&rope_angles(
+        let plane = height * width;
+        Ok(Decode {
+            workspace: Workspace::new(config, tokens, self.quantized, self.dense_ffn)?,
+            angles: DeviceBuffer::from_f32(&rope_angles(
+                chunk_frames,
+                grid.latent_height(),
+                grid.latent_width(),
+                config.registers + 1,
+                ROPE_FREQUENCIES,
+                ROPE_BASE,
+            ))?,
+            canvas: DeviceBuffer::new(OUTPUT_CHANNELS * canvas_frames * plane * 4)?,
+            denormalized,
+            grid,
+            tiles,
+            chunks,
             chunk_frames,
-            grid.latent_height(),
-            grid.latent_width(),
-            config.registers + 1,
-            ROPE_FREQUENCIES,
-            ROPE_BASE,
-        ))?;
-        let canvas = DeviceBuffer::new(OUTPUT_CHANNELS * canvas_frames * plane * 4)?;
-        let overlap = DeviceBuffer::new(OUTPUT_CHANNELS * FRAME_OVERLAP * plane * 4)?;
-        let output = DeviceBuffer::new(OUTPUT_CHANNELS * output_frames * plane * 4)?;
+            padded_frames,
+            output_frames,
+            canvas_frames,
+            patches,
+            tile_tokens,
+            height,
+            width,
+            plane,
+            single_frame: latent_frames == 1,
+        })
+    }
 
+    /// Decodes one chunk into the context's canvas, before any blending with its neighbours.
+    fn fill_canvas(
+        &self,
+        decode: &mut Decode,
+        chunk: usize,
+        capture_first_tile: bool,
+    ) -> Result<Option<Tensor>, Error> {
+        let (first_frame, last_frame) = TemporalPlan::chunk_tokens(chunk, decode.padded_frames);
+        if !decode.single_frame && last_frame - first_frame != decode.chunk_frames {
+            return Err(Error::Model(format!(
+                "chunk {chunk} covers latent frames {first_frame}..{last_frame}"
+            )));
+        }
+        let rows = self.tile_rows(
+            &decode.denormalized,
+            first_frame,
+            decode.chunk_frames,
+            &decode.grid,
+            decode.tile_tokens,
+        );
+        decode.workspace.latent_rows.copy_from_host(&rows)?;
+        self.decode_tiles(
+            &decode.workspace,
+            decode.tiles,
+            decode.tile_tokens,
+            decode.patches,
+            &decode.angles,
+        )?;
+        let first_tile = if capture_first_tile {
+            Some(self.first_tile(&decode.workspace, decode.chunk_frames, &decode.grid)?)
+        } else {
+            None
+        };
+        // SAFETY: projected holds every tile's patch features and the canvas its full frames.
+        check(unsafe {
+            mmh3_vae_unpatchify_blend(
+                decode.workspace.projected.pointer(),
+                decode.grid.starts_y.pointer(),
+                decode.grid.starts_x.pointer(),
+                decode.grid.overlaps_y.pointer(),
+                decode.grid.overlaps_x.pointer(),
+                decode.grid.rows.starts.len() as c_int,
+                decode.grid.columns.starts.len() as c_int,
+                decode.grid.rows.length as c_int,
+                decode.grid.columns.length as c_int,
+                decode.chunk_frames as c_int,
+                decode.tile_tokens as c_int,
+                decode.canvas.pointer(),
+                decode.height as c_int,
+                decode.width as c_int,
+                ptr::null_mut(),
+            )
+        })?;
+        Ok(first_tile)
+    }
+
+    fn decode_on_device(
+        &self,
+        latent: &Tensor,
+        capture_first_tile: bool,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<f32>>,
+    ) -> Result<(DeviceBuffer, [usize; 3], Option<Tensor>), Error> {
+        let mut decode = self.context(latent)?;
+        let (plane, canvas_frames) = (decode.plane, decode.canvas_frames);
+        let overlap = DeviceBuffer::new(OUTPUT_CHANNELS * FRAME_OVERLAP * plane * 4)?;
+        let output = DeviceBuffer::new(OUTPUT_CHANNELS * decode.output_frames * plane * 4)?;
+        let output_frames = decode.output_frames;
+        let (chunks, single_frame) = (decode.chunks, decode.single_frame);
+        let (height, width) = (decode.height, decode.width);
+
+        let canvas_pointer = decode.canvas.pointer();
         let write =
             |first: usize, count: usize, blend: bool, position: usize| -> Result<usize, Error> {
                 // SAFETY: the canvas holds `canvas_frames` frames, the overlap `FRAME_OVERLAP` and
@@ -1143,7 +1318,7 @@ impl CudaVideoDecoder {
                 // output.
                 check(unsafe {
                     mmh3_vae_write_frames(
-                        canvas.pointer(),
+                        canvas_pointer,
                         canvas_frames as c_int,
                         first as c_int,
                         count as c_int,
@@ -1168,45 +1343,31 @@ impl CudaVideoDecoder {
         let mut first_tile = None;
         let mut position = 0;
         for chunk in 0..chunks {
-            let (first_frame, last_frame) = TemporalPlan::chunk_tokens(chunk, padded_frames);
-            if last_frame - first_frame != chunk_frames {
-                return Err(Error::Model(format!(
-                    "chunk {chunk} covers latent frames {first_frame}..{last_frame}"
-                )));
+            match remote(chunk) {
+                // A canvas another machine decoded, in the bytes this one would have produced.
+                Some(ref values) => {
+                    let expected = OUTPUT_CHANNELS * canvas_frames * plane;
+                    if values.len() != expected {
+                        return Err(Error::Model(format!(
+                            "chunk {chunk} arrived with {} values, not {expected}",
+                            values.len()
+                        )));
+                    }
+                    let bytes: Vec<u8> = values
+                        .iter()
+                        .flat_map(|value| value.to_le_bytes())
+                        .collect();
+                    decode.canvas.copy_from_host(&bytes)?;
+                }
+                None => {
+                    let captured =
+                        self.fill_canvas(&mut decode, chunk, capture_first_tile && chunk == 0)?;
+                    if captured.is_some() {
+                        first_tile = captured;
+                    }
+                }
             }
-            workspace.latent_rows.copy_from_host(&self.tile_rows(
-                &denormalized,
-                first_frame,
-                chunk_frames,
-                &grid,
-                tile_tokens,
-            ))?;
-            self.decode_tiles(&workspace, tiles, tile_tokens, patches, &angles)?;
-            if capture_first_tile && chunk == 0 {
-                first_tile = Some(self.first_tile(&workspace, chunk_frames, &grid)?);
-            }
-            // SAFETY: projected holds every tile's patch features and the canvas `canvas_frames`
-            // full frames.
-            check(unsafe {
-                mmh3_vae_unpatchify_blend(
-                    workspace.projected.pointer(),
-                    grid.starts_y.pointer(),
-                    grid.starts_x.pointer(),
-                    grid.overlaps_y.pointer(),
-                    grid.overlaps_x.pointer(),
-                    grid.rows.starts.len() as c_int,
-                    grid.columns.starts.len() as c_int,
-                    grid.rows.length as c_int,
-                    grid.columns.length as c_int,
-                    chunk_frames as c_int,
-                    tile_tokens as c_int,
-                    canvas.pointer(),
-                    height as c_int,
-                    width as c_int,
-                    ptr::null_mut(),
-                )
-            })?;
-            if latent_frames == 1 {
+            if single_frame {
                 write(canvas_frames - 1, 1, false, 0)?;
                 continue;
             }
@@ -1228,7 +1389,7 @@ impl CudaVideoDecoder {
                 // frames.
                 check(unsafe {
                     mmh3_vae_save_overlap(
-                        canvas.pointer(),
+                        canvas_pointer,
                         canvas_frames as c_int,
                         tail_first as c_int,
                         tail_count as c_int,

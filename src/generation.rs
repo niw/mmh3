@@ -104,6 +104,11 @@ pub struct Settings {
 }
 
 impl Settings {
+    /// The worker addresses as borrowed strings, for `worker::connect_all`.
+    pub fn workers_borrowed(&self) -> Vec<&str> {
+        self.workers.iter().map(String::as_str).collect()
+    }
+
     /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
     /// `arguments` gives the repeated `--reference` and `--worker` options.
     pub fn parse(
@@ -522,10 +527,9 @@ pub fn sample(
 /// Asks the first worker that holds the text encoder, or returns `None` so the caller encodes here.
 /// A worker that fails is reported and skipped: a generation never depends on one.
 fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
-    use crate::worker::Worker;
+    use crate::worker::{TEXT_ENCODER_ROLE as ROLE, Worker};
     use mmh3_core::worker::CAPABILITY_ENCODE_TEXT;
 
-    const ROLE: &str = "text_encoder.h3.int8_convrot";
     for address in &settings.workers {
         let mut worker = match Worker::connect(address, &settings.token) {
             Ok(worker) => worker,

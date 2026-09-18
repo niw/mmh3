@@ -5,16 +5,22 @@
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use mmh3_core::worker::{
-    self, CAPABILITY_ENCODE_TEXT, Checkpoint, EncodeText, Header, Hello, Kind, TRANSPORT_TCP,
-    TextStates, Welcome,
+    self, CAPABILITY_DECODE_VIDEO, CAPABILITY_ENCODE_TEXT, Canvas, Checkpoint, DecodeVideo,
+    EncodeText, Header, Hello, Kind, TRANSPORT_TCP, TextStates, Welcome,
 };
+use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufReader, BufWriter};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::mpsc::{Receiver, channel};
 use std::time::{Duration, Instant};
 
 pub const DEFAULT_PORT: u16 = 7833;
+/// The video VAE a leader and its workers agree on, as `--video-vae` picks it here.
+pub const VIDEO_VAE_ROLE: &str = "video_vae.h3.int8_convrot";
+pub const TEXT_ENCODER_ROLE: &str = "text_encoder.h3.int8_convrot";
 /// Bodies larger than this are refused before they are read.
 const BODY_LIMIT: u64 = 4 << 30;
 /// Stream buffers. The default 8 KiB turns a payload of hundreds of megabytes into tens of
@@ -33,6 +39,13 @@ type TextEncoder = mmh3_metal::text_encoder::MetalTextEncoder;
 /// The checkpoint a session has loaded, kept for the rest of it.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 type Resident = Option<(u64, TextEncoder)>;
+#[cfg(feature = "cuda")]
+type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
+#[cfg(feature = "metal")]
+type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
+/// A decoder and the tile geometry it was built for, which a request may change.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+type ResidentDecoder = Option<(u64, usize, usize, VideoDecoder)>;
 
 /// Checkpoints a worker offers, as `(role, path inside the models directory)`. Roles name what a
 /// file is for, since the file names differ between machines.
@@ -235,6 +248,49 @@ impl Worker {
         })
     }
 
+    /// One chunk's canvas, decoded wherever the video VAE lives.
+    pub fn decode_chunk(
+        &mut self,
+        role: &str,
+        latent: &Tensor,
+        chunk: usize,
+        tile_size: usize,
+        tile_overlap: usize,
+    ) -> Result<Vec<f32>, Box<dyn Error>> {
+        let checkpoint = self
+            .checkpoint(role)
+            .ok_or_else(|| format!("{} has no {role}", self.address))?
+            .clone();
+        let &[channels, frames, height, width] = latent.shape.as_slice() else {
+            return Err(format!("latent shape {:?} is not four dimensions", latent.shape).into());
+        };
+        let request = DecodeVideo {
+            checkpoint,
+            chunk: chunk as u32,
+            tile_size: tile_size as u32,
+            tile_overlap: tile_overlap as u32,
+            shape: [channels as u32, frames as u32, height as u32, width as u32],
+        };
+        let payload: Vec<u8> = latent
+            .data
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let (header, body) = self.call(Kind::DecodeVideo, &request.encode(), &payload)?;
+        if header.kind != Kind::Canvas {
+            return Err(format!("{} answered a chunk with {:?}", self.address, header.kind).into());
+        }
+        let canvas = Canvas::decode(&body)?;
+        let values = &body[Canvas::BYTES..];
+        if values.len() as u64 != canvas.values * 4 {
+            return Err(format!("{} sent {} bytes of canvas", self.address, values.len()).into());
+        }
+        Ok(values
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect())
+    }
+
     fn call(
         &mut self,
         kind: Kind,
@@ -315,6 +371,112 @@ fn probe(address: &str, token: &str) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// Chunks of a decode that other machines are working on. The leader asks for one when its own
+/// walk reaches it, and decodes it here if the machine that had it failed.
+pub struct RemoteCanvases {
+    receiver: Receiver<(usize, Result<Vec<f32>, String>)>,
+    delegated: Vec<usize>,
+    arrived: HashMap<usize, Vec<f32>>,
+}
+
+impl RemoteCanvases {
+    /// Hands the chunks out over the workers that serve decodes, keeping the first share for the
+    /// leader, and starts them at once. `role` is the video VAE both sides must agree on.
+    pub fn start(
+        workers: Vec<Worker>,
+        role: &str,
+        latent: &Tensor,
+        chunks: usize,
+        tile_size: usize,
+        tile_overlap: usize,
+    ) -> Self {
+        let workers: Vec<Worker> = workers
+            .into_iter()
+            .filter(|worker| {
+                worker.serves(CAPABILITY_DECODE_VIDEO) && worker.checkpoint(role).is_some()
+            })
+            .collect();
+        let (sender, receiver) = channel();
+        let mut delegated = Vec::new();
+        if workers.is_empty() || chunks < 2 {
+            return RemoteCanvases {
+                receiver,
+                delegated,
+                arrived: HashMap::new(),
+            };
+        }
+        // One share each, the leader included. The leader keeps the first chunks and the workers
+        // take the last ones, so this machine walks its own share while theirs is still coming and
+        // never waits at the start.
+        let shares = workers.len() + 1;
+        let latent = Arc::new(latent.clone());
+        let mut first = chunks.div_ceil(shares);
+        for mut worker in workers {
+            let share = (chunks - first).div_ceil(shares - 1).min(chunks - first);
+            let mine: Vec<usize> = (first..first + share).collect();
+            first += share;
+            if mine.is_empty() {
+                continue;
+            }
+            delegated.extend(mine.iter().copied());
+            let sender = sender.clone();
+            let latent = Arc::clone(&latent);
+            let role = role.to_owned();
+            std::thread::spawn(move || {
+                for chunk in mine {
+                    let result = worker
+                        .decode_chunk(&role, &latent, chunk, tile_size, tile_overlap)
+                        .map_err(|error| error.to_string());
+                    let failed = result.is_err();
+                    if sender.send((chunk, result)).is_err() || failed {
+                        // The leader decodes what is left of this worker's share itself.
+                        return;
+                    }
+                }
+            });
+        }
+        RemoteCanvases {
+            receiver,
+            delegated,
+            arrived: HashMap::new(),
+        }
+    }
+
+    pub fn chunks(&self) -> &[usize] {
+        &self.delegated
+    }
+
+    /// The canvas of `chunk` when another machine has it, waiting for it if it is still coming, and
+    /// `None` when this machine should decode it after all.
+    pub fn take(&mut self, chunk: usize) -> Option<Vec<f32>> {
+        if !self.delegated.contains(&chunk) {
+            return None;
+        }
+        loop {
+            if let Some(values) = self.arrived.remove(&chunk) {
+                return Some(values);
+            }
+            match self.receiver.recv() {
+                Ok((arrived, Ok(values))) => {
+                    self.arrived.insert(arrived, values);
+                }
+                Ok((arrived, Err(error))) => {
+                    eprintln!("warning: chunk {arrived} comes back here: {error}");
+                    self.delegated.retain(|other| *other != arrived);
+                    if arrived == chunk {
+                        return None;
+                    }
+                }
+                // Every worker is gone, so the rest is this machine's.
+                Err(_) => {
+                    self.delegated.retain(|other| *other != chunk);
+                    return None;
+                }
+            }
+        }
+    }
+}
+
 /// `mmh3 worker --listen ADDR [--models DIR] [--token FILE]`, which serves until it is stopped.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
@@ -392,8 +554,9 @@ fn session(
     stream.set_nodelay(true)?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER, stream.try_clone()?);
     let mut writer = BufWriter::with_capacity(STREAM_BUFFER, stream);
-    // The text encoder loads on the first prompt and stays for the rest of the session.
+    // The text encoder and the video decoder load on their first request and stay for the session.
     let mut encoder: Resident = None;
+    let mut decoder: ResidentDecoder = None;
 
     loop {
         let (header, body) = match worker::receive(&mut reader, BODY_LIMIT) {
@@ -417,7 +580,7 @@ fn session(
                     backend: BACKEND,
                     device: device_name(),
                     memory_bytes: memory_bytes(),
-                    capabilities: CAPABILITY_ENCODE_TEXT,
+                    capabilities: CAPABILITY_ENCODE_TEXT | CAPABILITY_DECODE_VIDEO,
                     transports: TRANSPORT_TCP,
                     speed: None,
                     checkpoints: checkpoints
@@ -443,6 +606,30 @@ fn session(
                             .flat_map(|value| value.to_le_bytes())
                             .collect();
                         reply(&mut writer, Kind::TextStates, &states.encode(), &payload)?;
+                    }
+                    Err(error) => {
+                        reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
+                    }
+                }
+            }
+            Kind::DecodeVideo => {
+                let started = Instant::now();
+                match decode_video(checkpoints, &body, &mut decoder) {
+                    Ok((chunk, values)) => {
+                        let canvas = Canvas {
+                            chunk,
+                            values: values.len() as u64,
+                        };
+                        let payload: Vec<u8> = values
+                            .iter()
+                            .flat_map(|value| value.to_le_bytes())
+                            .collect();
+                        println!(
+                            "decoded chunk {chunk} in {:.1} s, {} MiB back",
+                            started.elapsed().as_secs_f64(),
+                            payload.len() >> 20
+                        );
+                        reply(&mut writer, Kind::Canvas, &canvas.encode(), &payload)?;
                     }
                     Err(error) => {
                         reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
@@ -495,6 +682,66 @@ fn encode_text(
         started.elapsed().as_secs_f64()
     );
     Ok(context)
+}
+
+/// Decodes one chunk of a video for a leader, loading the video VAE if this session has not.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decode_video(
+    checkpoints: &[(Checkpoint, PathBuf)],
+    body: &[u8],
+    resident: &mut ResidentDecoder,
+) -> Result<(u32, Vec<f32>), Box<dyn Error>> {
+    let (request, descriptor_bytes) = DecodeVideo::decode(body)?;
+    let (checkpoint, path) = checkpoints
+        .iter()
+        .find(|(checkpoint, _)| {
+            checkpoint.role == request.checkpoint.role
+                && (request.checkpoint.digest == 0
+                    || request.checkpoint.digest == checkpoint.digest)
+        })
+        .ok_or_else(|| format!("no checkpoint for {}", request.checkpoint.role))?;
+    let (tile_size, tile_overlap) = (request.tile_size as usize, request.tile_overlap as usize);
+    if resident
+        .as_ref()
+        .map(|(digest, size, overlap, _)| (*digest, *size, *overlap))
+        != Some((checkpoint.digest, tile_size, tile_overlap))
+    {
+        let started = Instant::now();
+        let file = SafeTensors::open(path)?;
+        *resident = Some((
+            checkpoint.digest,
+            tile_size,
+            tile_overlap,
+            VideoDecoder::load(&file, "", tile_size, tile_overlap)?,
+        ));
+        println!(
+            "loaded {} in {:.1} s",
+            path.display(),
+            started.elapsed().as_secs_f64()
+        );
+    }
+    let shape: Vec<usize> = request
+        .shape
+        .iter()
+        .map(|&extent| extent as usize)
+        .collect();
+    let values = &body[descriptor_bytes..];
+    let expected = shape.iter().product::<usize>() * 4;
+    if values.len() != expected {
+        return Err(format!("a latent of {} bytes, not {expected}", values.len()).into());
+    }
+    let latent = Tensor::new(
+        shape,
+        values
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect(),
+    );
+    let decoder = &resident.as_ref().expect("just loaded").3;
+    Ok((
+        request.chunk,
+        decoder.decode_chunk(&latent, request.chunk as usize)?,
+    ))
 }
 
 fn device_name() -> String {

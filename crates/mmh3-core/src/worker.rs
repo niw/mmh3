@@ -31,6 +31,8 @@ pub enum Kind {
     EncodeText = 7,
     TextStates = 8,
     Error = 9,
+    DecodeVideo = 10,
+    Canvas = 11,
 }
 
 impl Kind {
@@ -45,6 +47,8 @@ impl Kind {
             7 => Kind::EncodeText,
             8 => Kind::TextStates,
             9 => Kind::Error,
+            10 => Kind::DecodeVideo,
+            11 => Kind::Canvas,
             _ => return None,
         })
     }
@@ -145,7 +149,8 @@ impl Encoder {
 /// Reads back what `Encoder` wrote, refusing anything that runs off the end.
 pub struct Decoder<'a> {
     bytes: &'a [u8],
-    position: usize,
+    /// Bytes read so far, which a descriptor of variable length reports to its caller.
+    pub position: usize,
 }
 
 impl<'a> Decoder<'a> {
@@ -234,6 +239,25 @@ pub struct Welcome {
 pub struct EncodeText {
     pub checkpoint: Checkpoint,
     pub ids: Vec<u32>,
+}
+
+/// One chunk of a video decode, with the whole latent so the worker denormalizes and tiles it the
+/// way the leader would. The tile geometry travels too, since it decides where the seams fall.
+#[derive(Clone, Debug)]
+pub struct DecodeVideo {
+    pub checkpoint: Checkpoint,
+    pub chunk: u32,
+    pub tile_size: u32,
+    pub tile_overlap: u32,
+    /// `[channels, frames, height, width]` of the latent that follows as FP32.
+    pub shape: [u32; 4],
+}
+
+/// A chunk's canvas before any blending, `[3, canvas frames, height, width]` FP32.
+#[derive(Clone, Debug)]
+pub struct Canvas {
+    pub chunk: u32,
+    pub values: u64,
 }
 
 /// `[tokens, hidden]` FP32, as the encoders already return it.
@@ -363,6 +387,64 @@ impl TextStates {
         Ok(TextStates {
             tokens: decoder.u64()? as usize,
             hidden: decoder.u64()? as usize,
+        })
+    }
+}
+
+impl DecodeVideo {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder
+            .string(&self.checkpoint.role)
+            .u64(self.checkpoint.digest)
+            .u32(self.chunk)
+            .u32(self.tile_size)
+            .u32(self.tile_overlap);
+        for extent in self.shape {
+            encoder.u32(extent);
+        }
+        encoder.finish()
+    }
+
+    /// The descriptor's length, after which the latent's FP32 values begin.
+    pub const BYTES: usize = 4 + 4 + 8 + 4 + 4 + 4 + 16;
+
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut decoder = Decoder::new(bytes);
+        let checkpoint = Checkpoint {
+            role: decoder.string()?,
+            digest: decoder.u64()?,
+        };
+        let request = DecodeVideo {
+            checkpoint,
+            chunk: decoder.u32()?,
+            tile_size: decoder.u32()?,
+            tile_overlap: decoder.u32()?,
+            shape: [
+                decoder.u32()?,
+                decoder.u32()?,
+                decoder.u32()?,
+                decoder.u32()?,
+            ],
+        };
+        Ok((request, decoder.position))
+    }
+}
+
+impl Canvas {
+    pub const BYTES: usize = 16;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u64(self.chunk as u64).u64(self.values);
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        Ok(Canvas {
+            chunk: decoder.u64()? as u32,
+            values: decoder.u64()?,
         })
     }
 }

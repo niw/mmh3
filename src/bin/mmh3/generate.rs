@@ -51,7 +51,20 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     )?;
     #[cfg(feature = "cuda")]
     {
-        let decoded = decoder.decode_device(&video)?;
+        // Chunks of the decode go to whichever machines answer, and this one walks the rest while
+        // they work. A chunk that does not come back is decoded here.
+        let mut remote = mmh3::worker::RemoteCanvases::start(
+            mmh3::worker::connect_all(&settings.workers_borrowed(), &settings.token),
+            mmh3::worker::VIDEO_VAE_ROLE,
+            &video,
+            decoder.plan(&video)?.chunks,
+            DEFAULT_TILE_SIZE,
+            DEFAULT_TILE_OVERLAP_MIN,
+        );
+        if !remote.chunks().is_empty() {
+            println!("chunks {:?} decode elsewhere", remote.chunks());
+        }
+        let decoded = decoder.decode_device_with(&video, &mut |chunk| remote.take(chunk))?;
         drop(decoder);
         output.write_cuda_video(&decoded)?;
     }
