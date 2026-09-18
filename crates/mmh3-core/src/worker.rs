@@ -34,6 +34,12 @@ pub enum Kind {
     DecodeVideo = 10,
     Canvas = 11,
     Release = 12,
+    OpenSession = 13,
+    SessionReady = 14,
+    StepShard = 15,
+    VelocityPart = 16,
+    Ready = 17,
+    CloseSession = 18,
 }
 
 impl Kind {
@@ -51,6 +57,12 @@ impl Kind {
             10 => Kind::DecodeVideo,
             11 => Kind::Canvas,
             12 => Kind::Release,
+            13 => Kind::OpenSession,
+            14 => Kind::SessionReady,
+            15 => Kind::StepShard,
+            16 => Kind::VelocityPart,
+            17 => Kind::Ready,
+            18 => Kind::CloseSession,
             _ => return None,
         })
     }
@@ -272,6 +284,197 @@ pub struct Canvas {
     pub bytes: u64,
     pub remote_address: u64,
     pub remote_key: u32,
+}
+
+/// Opening a shared-out step: everything a rank needs to stand up the same layout the leader has,
+/// except the latents, which change every step. Both sides work the shard out of `ranks`, so only
+/// which rank this worker takes crosses the wire.
+///
+/// Keyframes and references are not carried yet, so a run that has any keeps the DiT to itself.
+#[derive(Clone, Debug)]
+pub struct OpenSession {
+    pub checkpoint: Checkpoint,
+    pub ranks: u32,
+    pub rank: u32,
+    /// `[channels, frames, height, width]` of the video latent.
+    pub video_shape: [u32; 4],
+    /// `[channels, 2, frames]` of the audio latent.
+    pub audio_shape: [u32; 3],
+    /// `[tokens, text dim]` of the context that follows as FP32, with one modality byte per token.
+    pub context_shape: [u32; 2],
+    pub shift_video: f32,
+    pub shift_audio: f32,
+    pub vsa_sparsity: f32,
+    /// 0 for bf16 attention, 1 for INT8 QK with FP8 PV.
+    pub precision: u8,
+}
+
+/// Where one rank's memory sits, so the other can read it. One entry per region a step uses, in the
+/// order both sides make them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RemoteRegion {
+    /// What the region is for, as the backend names it.
+    pub kind: u32,
+    /// Which peer it belongs to, for the regions that are made one per peer.
+    pub peer: u32,
+    pub address: u64,
+    pub bytes: u64,
+    pub key: u32,
+}
+
+impl RemoteRegion {
+    pub const BYTES: usize = 28;
+}
+
+/// One step of a shared-out run: the sigma and the latents, which every rank embeds for itself.
+#[derive(Clone, Copy, Debug)]
+pub struct StepShard {
+    pub step: u32,
+    pub sigma: f32,
+}
+
+/// The rows of the velocity one rank ended with, before the video goes back into its own order.
+#[derive(Clone, Copy, Debug)]
+pub struct VelocityPart {
+    pub first_row: u32,
+    pub last_row: u32,
+    pub video_values: u64,
+    pub audio_values: u64,
+}
+
+impl OpenSession {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder
+            .string(&self.checkpoint.role)
+            .u64(self.checkpoint.digest)
+            .u32(self.ranks)
+            .u32(self.rank);
+        for value in self.video_shape {
+            encoder.u32(value);
+        }
+        for value in self.audio_shape {
+            encoder.u32(value);
+        }
+        for value in self.context_shape {
+            encoder.u32(value);
+        }
+        encoder
+            .f32(self.shift_video)
+            .f32(self.shift_audio)
+            .f32(self.vsa_sparsity)
+            .u8(self.precision);
+        encoder.finish()
+    }
+
+    /// Returns the descriptor and where the payload begins.
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut decoder = Decoder::new(bytes);
+        let checkpoint = Checkpoint {
+            role: decoder.string()?,
+            digest: decoder.u64()?,
+        };
+        let (ranks, rank) = (decoder.u32()?, decoder.u32()?);
+        let mut video_shape = [0u32; 4];
+        for value in &mut video_shape {
+            *value = decoder.u32()?;
+        }
+        let mut audio_shape = [0u32; 3];
+        for value in &mut audio_shape {
+            *value = decoder.u32()?;
+        }
+        let mut context_shape = [0u32; 2];
+        for value in &mut context_shape {
+            *value = decoder.u32()?;
+        }
+        let session = OpenSession {
+            checkpoint,
+            ranks,
+            rank,
+            video_shape,
+            audio_shape,
+            context_shape,
+            shift_video: decoder.f32()?,
+            shift_audio: decoder.f32()?,
+            vsa_sparsity: decoder.f32()?,
+            precision: decoder.u8()?,
+        };
+        Ok((session, decoder.position))
+    }
+}
+
+impl RemoteRegion {
+    pub fn encode_all(regions: &[RemoteRegion]) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(regions.len() as u32);
+        for region in regions {
+            encoder
+                .u32(region.kind)
+                .u32(region.peer)
+                .u64(region.address)
+                .u64(region.bytes)
+                .u32(region.key);
+        }
+        encoder.finish()
+    }
+
+    pub fn decode_all(bytes: &[u8]) -> io::Result<Vec<RemoteRegion>> {
+        let mut decoder = Decoder::new(bytes);
+        let count = decoder.u32()? as usize;
+        (0..count)
+            .map(|_| {
+                Ok(RemoteRegion {
+                    kind: decoder.u32()?,
+                    peer: decoder.u32()?,
+                    address: decoder.u64()?,
+                    bytes: decoder.u64()?,
+                    key: decoder.u32()?,
+                })
+            })
+            .collect()
+    }
+}
+
+impl StepShard {
+    pub const BYTES: usize = 8;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(self.step).f32(self.sigma);
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        Ok(StepShard {
+            step: decoder.u32()?,
+            sigma: decoder.f32()?,
+        })
+    }
+}
+
+impl VelocityPart {
+    pub const BYTES: usize = 24;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder
+            .u32(self.first_row)
+            .u32(self.last_row)
+            .u64(self.video_values)
+            .u64(self.audio_values);
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        Ok(VelocityPart {
+            first_row: decoder.u32()?,
+            last_row: decoder.u32()?,
+            video_values: decoder.u64()?,
+            audio_values: decoder.u64()?,
+        })
+    }
 }
 
 /// `[tokens, hidden]` FP32, as the encoders already return it.

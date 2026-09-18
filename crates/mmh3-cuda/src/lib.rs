@@ -10,6 +10,7 @@ pub mod gemm;
 pub mod loader;
 pub mod model;
 pub mod nvfp4;
+pub mod shard;
 pub mod text_encoder;
 pub mod vae;
 pub mod video_encoder;
@@ -164,6 +165,26 @@ pub(crate) unsafe fn copy_device(
 ) -> Result<(), CudaError> {
     // SAFETY: the caller keeps both ranges inside their allocations.
     check(unsafe { mmh3_cuda_copy_device(destination, source, bytes) })
+}
+
+/// Copies host bytes into device memory, in order with the kernels on the default stream.
+///
+/// # Safety
+/// The destination must hold `source.len()` bytes inside a live device allocation.
+pub unsafe fn upload(destination: *mut c_void, source: &[u8]) -> Result<(), CudaError> {
+    // SAFETY: the caller keeps the destination inside its allocation.
+    check(unsafe { mmh3_cuda_copy_to_device(destination, source.as_ptr().cast(), source.len()) })
+}
+
+/// Copies device memory into host bytes.
+///
+/// # Safety
+/// The source must hold `destination.len()` bytes inside a live device allocation.
+pub unsafe fn download(destination: &mut [u8], source: *const c_void) -> Result<(), CudaError> {
+    // SAFETY: the caller keeps the source inside its allocation.
+    check(unsafe {
+        mmh3_cuda_copy_to_host(destination.as_mut_ptr().cast(), source, destination.len())
+    })
 }
 
 /// An owned device allocation.

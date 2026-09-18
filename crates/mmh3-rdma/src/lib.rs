@@ -210,9 +210,30 @@ impl Region {
         bytes: usize,
         milliseconds: i32,
     ) -> Result<(), Error> {
-        if bytes > self.buffer.len() {
+        self.read_into(
+            connection,
+            0,
+            remote_address,
+            remote_key,
+            bytes,
+            milliseconds,
+        )
+    }
+
+    /// `read_from` landing `offset` bytes into this region, which is how a rank collects the peers'
+    /// shares of one sequence side by side.
+    pub fn read_into(
+        &mut self,
+        connection: &Connection,
+        offset: usize,
+        remote_address: u64,
+        remote_key: u32,
+        bytes: usize,
+        milliseconds: i32,
+    ) -> Result<(), Error> {
+        if offset + bytes > self.buffer.len() {
             return Err(Error(format!(
-                "a read of {bytes} bytes into {} of memory",
+                "a read of {bytes} bytes at {offset} into {} of memory",
                 self.buffer.len()
             )));
         }
@@ -221,7 +242,7 @@ impl Region {
             mmh3_rdma_read_all(
                 connection.handle,
                 self.handle,
-                self.buffer.as_mut_ptr().cast(),
+                self.buffer.as_mut_ptr().add(offset).cast(),
                 bytes,
                 remote_address,
                 remote_key,

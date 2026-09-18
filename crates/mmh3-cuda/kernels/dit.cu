@@ -895,3 +895,75 @@ extern "C" int mmh3_add_norm_quantize(float *residual, const __nv_bfloat16 *delt
     }
     return static_cast<int>(cudaGetLastError());
 }
+
+// Ulysses moves a block's attention between two layouts. Before it, a rank holds its own tokens and
+// every head; after it, every token and its own heads. Both kernels are pure gathers.
+//
+// NOTE: `grid_for` caps the grid at 8192 blocks, so both walk their work with a grid stride. A
+// 768p block exchanges several times that, and without the stride the tail is silently left behind.
+
+namespace {
+
+constexpr int SHARD_LANES = 8;
+
+// Gathers heads `[first_head, first_head + span)` out of `[tokens][tensors][heads][dim]` into
+// `[tokens][tensors][span][dim]`, which is the same shape the attention already reads. q, k and v
+// go together as three tensors and VSA's compressed query follows as one.
+__global__ void shard_pack_kernel(const float4 *source, float4 *packed, int64_t groups, int heads,
+                                  int dim_groups, int first_head, int span, int tensors) {
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < groups; index += stride) {
+        const int lane = static_cast<int>(index % dim_groups);
+        const int64_t rest = index / dim_groups;
+        const int head = static_cast<int>(rest % span) + first_head;
+        const int64_t above = rest / span;
+        const int tensor = static_cast<int>(above % tensors);
+        const int64_t token = above / tensors;
+        packed[index] = source[((token * tensors + tensor) * heads + head) * dim_groups + lane];
+    }
+}
+
+// Scatters one rank's share of an attention output, `[tokens][span][dim]`, into the rows this rank
+// carries onward, `[tokens][heads][dim]`, at head `first_head`.
+__global__ void shard_unpack_kernel(const float4 *part, float4 *output, int64_t groups, int heads,
+                                    int dim_groups, int first_head, int span) {
+    const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+    for (int64_t index = blockIdx.x * static_cast<int64_t>(blockDim.x) + threadIdx.x;
+         index < groups; index += stride) {
+        const int lane = static_cast<int>(index % dim_groups);
+        const int64_t rest = index / dim_groups;
+        const int head = static_cast<int>(rest % span) + first_head;
+        const int64_t token = rest / span;
+        output[(token * heads + head) * dim_groups + lane] = part[index];
+    }
+}
+
+} // namespace
+
+extern "C" int mmh3_dit_shard_pack(const void *source, void *packed, int tokens, int tensors,
+                                   int heads, int dim, int first_head, int span,
+                                   cudaStream_t stream) {
+    if (dim % SHARD_LANES != 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const int dim_groups = dim / SHARD_LANES;
+    const int64_t groups = static_cast<int64_t>(tokens) * tensors * span * dim_groups;
+    shard_pack_kernel<<<grid_for(static_cast<size_t>(groups)), ROW_THREADS, 0, stream>>>(
+        static_cast<const float4 *>(source), static_cast<float4 *>(packed), groups, heads,
+        dim_groups, first_head, span, tensors);
+    return static_cast<int>(cudaGetLastError());
+}
+
+extern "C" int mmh3_dit_shard_unpack(const void *part, void *output, int tokens, int heads, int dim,
+                                     int first_head, int span, cudaStream_t stream) {
+    if (dim % SHARD_LANES != 0) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
+    const int dim_groups = dim / SHARD_LANES;
+    const int64_t groups = static_cast<int64_t>(tokens) * span * dim_groups;
+    shard_unpack_kernel<<<grid_for(static_cast<size_t>(groups)), ROW_THREADS, 0, stream>>>(
+        static_cast<const float4 *>(part), static_cast<float4 *>(output), groups, heads, dim_groups,
+        first_head, span);
+    return static_cast<int>(cudaGetLastError());
+}

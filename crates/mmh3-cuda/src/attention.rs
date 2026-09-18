@@ -962,6 +962,10 @@ impl VsaWorkspace {
         Ok(overlap)
     }
 
+    pub fn heads(&self) -> usize {
+        self.heads
+    }
+
     pub fn new(plan: &VsaPlan, tokens: usize, heads: usize) -> Result<Self, CudaError> {
         Self::with_precision(plan, tokens, heads, AttentionPrecision::Bf16)
     }

@@ -17,6 +17,7 @@ use crate::model::{
 use crate::nvfp4::{
     self, AdapterSource, Columns, Nvfp4Activations, Nvfp4Input, Nvfp4Scale, Nvfp4Weight,
 };
+use crate::shard::{self, Region, ShardContext};
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -31,7 +32,9 @@ use mmh3_core::tensor::Tensor;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
+use std::ops::Range;
 use std::ptr;
+use std::time::Instant;
 
 pub use crate::model::Error;
 
@@ -259,6 +262,15 @@ pub enum LoraMode {
     Merge,
 }
 
+/// One rank's rows of the velocity, before the video goes back into its own order. Only a shared-out
+/// step produces these, and `assemble_velocity` turns them back into a whole one.
+#[derive(Clone, Debug)]
+pub struct VelocityPart {
+    pub rows: Range<usize>,
+    pub video: Vec<f32>,
+    pub audio: Vec<f32>,
+}
+
 /// Outputs of one call and the states captured along the way.
 pub struct DitOutputs {
     /// Residual stream `[tokens, hidden]` after each requested block.
@@ -269,6 +281,8 @@ pub struct DitOutputs {
     pub audio: Vec<f32>,
     /// Mean fraction of key blocks Sol-Attn routed exactly, over the blocks, when it ran.
     pub routed_fraction: Option<f64>,
+    /// This rank's rows, when the step was shared out. The velocity above is then empty.
+    pub part: Option<VelocityPart>,
 }
 
 /// Block-sparse attention for the blocks of one call.
@@ -353,6 +367,10 @@ impl CudaDit {
     }
 
     /// Selects quantized attention for the main DiT blocks. The text refiner stays in BF16.
+    pub fn attention_precision(&self) -> AttentionPrecision {
+        self.attention_precision
+    }
+
     pub fn set_attention_precision(&mut self, precision: AttentionPrecision) {
         self.attention_precision = precision;
     }
@@ -907,6 +925,266 @@ impl CudaDit {
         Ok(())
     }
 
+    /// A block's attention when the step is shared out: exchange the inputs, attend to this rank's
+    /// heads over the whole sequence, and exchange the output back. VSA only, since its entry point
+    /// is the one that takes the exchanged layout.
+    #[allow(clippy::too_many_arguments)]
+    fn sharded_attention(
+        &self,
+        prefix: &str,
+        workspace: &Workspace,
+        context: &mut ShardContext<'_>,
+        tokens: usize,
+        angles: *const c_void,
+        sparse: Option<&SparsePass>,
+    ) -> Result<(), Error> {
+        let config = &self.config;
+        let Some(SparsePass::Vsa {
+            workspace: vsa_workspace,
+            kept,
+        }) = sparse
+        else {
+            return Err(Error::Model("a sharded block needs VSA".to_owned()));
+        };
+        let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
+        let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
+        let (inputs, gate) = self.exchange_inputs(workspace, context, tokens)?;
+        let started = Instant::now();
+        let inner = context.shard.own_heads().len() * HEAD_DIM;
+        let attended = context
+            .exchange
+            .region(Region::Attended, tokens * inner * 2)?;
+        let layout = AttentionLayout {
+            token_stride: [
+                (3 * inner) as i64,
+                (3 * inner) as i64,
+                (3 * inner) as i64,
+                inner as i64,
+            ],
+            head_stride: [HEAD_DIM as i64; 4],
+            ..AttentionLayout::default()
+        };
+        // SAFETY: the exchanged inputs hold `tokens × 3 × own heads × 128` values in the layout the
+        // preparation and VSA already read, the gate holds one tensor of the same rows, and the
+        // angles cover every token because attention sees the whole sequence.
+        unsafe {
+            prepare_inputs_pointers(
+                inputs,
+                query_norm,
+                key_norm,
+                angles,
+                3 * config.rope_frequencies,
+                tokens,
+                context.shard.own_heads().len(),
+                config.norm_eps,
+                PreparedAttention::Vsa(vsa_workspace),
+            )?;
+            let base = inputs.cast::<u16>();
+            vsa_pointers(
+                base.cast(),
+                base.add(inner).cast(),
+                base.add(2 * inner).cast(),
+                gate.cast_const(),
+                inner,
+                attended,
+                &layout,
+                1.0 / (config.head_dim as f32).sqrt(),
+                *kept,
+                vsa_workspace,
+                AttentionInputs::Prepared,
+            )?;
+        }
+        // The attention is on the stream too, and the peers are about to read what it wrote.
+        crate::synchronize()?;
+        context.timing.attend += started.elapsed();
+        self.exchange_outputs(workspace, context, tokens)
+    }
+
+    /// Turns "my tokens, every head" into "every token, my heads". Each rank gathers its own share
+    /// straight into place and one share per peer into memory that peer reads, and comes back with
+    /// the whole sequence for the heads it attends with.
+    fn exchange_inputs(
+        &self,
+        workspace: &Workspace,
+        context: &mut ShardContext<'_>,
+        tokens: usize,
+    ) -> Result<(*mut c_void, *mut c_void), Error> {
+        let (shard, heads) = (&context.shard, self.config.heads);
+        let (rows, own) = (shard.own_tokens(), shard.own_heads());
+        let (own_inner, gated) = (own.len() * HEAD_DIM, workspace.gate.is_some());
+        let inputs_bytes = tokens * 3 * own_inner * 2;
+        let gate_bytes = tokens * own_inner * 2;
+        let inputs = context.exchange.region(Region::Inputs, inputs_bytes)?;
+        let gate = if gated {
+            context.exchange.region(Region::Gate, gate_bytes)?
+        } else {
+            ptr::null_mut()
+        };
+        let started = Instant::now();
+        let source = workspace.qkv.pointer();
+        let gate_source = workspace
+            .gate
+            .as_ref()
+            .map_or(ptr::null_mut(), |gate| gate.pointer());
+        for peer in 0..shard.ranks() {
+            let span = shard.heads[peer].clone();
+            let inner = span.len() * HEAD_DIM;
+            let (into_inputs, into_gate) = if peer == shard.rank {
+                // SAFETY: this rank's share sits at its own token offset in the whole sequence.
+                unsafe {
+                    (
+                        inputs.byte_add(rows.start * 3 * own_inner * 2),
+                        if gated {
+                            gate.byte_add(rows.start * own_inner * 2)
+                        } else {
+                            gate
+                        },
+                    )
+                }
+            } else {
+                (
+                    context
+                        .exchange
+                        .region(Region::SendInputs(peer), rows.len() * 3 * inner * 2)?,
+                    if gated {
+                        context
+                            .exchange
+                            .region(Region::SendGate(peer), rows.len() * inner * 2)?
+                    } else {
+                        ptr::null_mut()
+                    },
+                )
+            };
+            // SAFETY: qkv holds this rank's rows of every head, and the destinations were sized for
+            // the span above.
+            unsafe {
+                shard::pack(
+                    source,
+                    into_inputs,
+                    rows.len(),
+                    3,
+                    heads,
+                    HEAD_DIM,
+                    span.clone(),
+                )?;
+                if gated {
+                    shard::pack(gate_source, into_gate, rows.len(), 1, heads, HEAD_DIM, span)?;
+                }
+            }
+        }
+        // NOTE: the gathers are launched on a stream and the barrier is a socket message, so the
+        // device has to finish before a peer is told the memory is ready. Without this it reads
+        // whatever was there last.
+        crate::synchronize()?;
+        context.timing.gather += started.elapsed();
+        let started = Instant::now();
+        context.exchange.barrier()?;
+        context.timing.barrier += started.elapsed();
+        let started = Instant::now();
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            let taken = shard.tokens[peer].clone();
+            context.exchange.read(
+                peer,
+                Region::SendInputs(shard.rank),
+                0,
+                Region::Inputs,
+                taken.start * 3 * own_inner * 2,
+                taken.len() * 3 * own_inner * 2,
+            )?;
+            if gated {
+                context.exchange.read(
+                    peer,
+                    Region::SendGate(shard.rank),
+                    0,
+                    Region::Gate,
+                    taken.start * own_inner * 2,
+                    taken.len() * own_inner * 2,
+                )?;
+            }
+        }
+        context.timing.read += started.elapsed();
+        let started = Instant::now();
+        context.exchange.barrier()?;
+        context.timing.barrier += started.elapsed();
+        Ok((inputs, gate))
+    }
+
+    /// Turns "every token, my heads" back into "my tokens, every head", leaving a block's attention
+    /// output where the projection that follows expects it.
+    fn exchange_outputs(
+        &self,
+        workspace: &Workspace,
+        context: &mut ShardContext<'_>,
+        tokens: usize,
+    ) -> Result<(), Error> {
+        let (shard, heads) = (&context.shard, self.config.heads);
+        let (rows, own) = (shard.own_tokens(), shard.own_heads());
+        let own_inner = own.len() * HEAD_DIM;
+        let attended = context
+            .exchange
+            .region(Region::Attended, tokens * own_inner * 2)?;
+        // The peers read what attention just wrote, which on a machine whose wire cannot reach
+        // device memory means a copy into memory it can register.
+        context
+            .exchange
+            .publish(Region::Attended, tokens * own_inner * 2)?;
+        let started = Instant::now();
+        context.exchange.barrier()?;
+        context.timing.barrier += started.elapsed();
+        let started = Instant::now();
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            let inner = shard.heads[peer].len() * HEAD_DIM;
+            context.exchange.read(
+                peer,
+                Region::Attended,
+                rows.start * inner * 2,
+                Region::Received(peer),
+                0,
+                rows.len() * inner * 2,
+            )?;
+        }
+        context.timing.read += started.elapsed();
+        let started = Instant::now();
+        context.exchange.barrier()?;
+        context.timing.barrier += started.elapsed();
+        let started = Instant::now();
+        for peer in 0..shard.ranks() {
+            let span = shard.heads[peer].clone();
+            let part = if peer == shard.rank {
+                // SAFETY: this rank attended its own rows at their offset in the whole sequence.
+                unsafe { attended.byte_add(rows.start * own_inner * 2).cast_const() }
+            } else {
+                context
+                    .exchange
+                    .region(
+                        Region::Received(peer),
+                        rows.len() * span.len() * HEAD_DIM * 2,
+                    )?
+                    .cast_const()
+            };
+            // SAFETY: the part holds this rank's rows of the peer's heads, and the output holds
+            // this rank's rows of every head.
+            unsafe {
+                shard::unpack(
+                    part,
+                    workspace.attention.pointer(),
+                    rows.len(),
+                    heads,
+                    HEAD_DIM,
+                    span,
+                )?
+            };
+        }
+        context.timing.gather += started.elapsed();
+        Ok(())
+    }
+
     /// Attention and MLP halves of a block or refiner block. `modulation` carries the block
     /// modulation and `sparse` replaces dense attention with Sol-Attn. NVFP4 layers run the first
     /// `head` rows through their INT8 weights.
@@ -925,6 +1203,7 @@ impl CudaDit {
         modulation: Option<(&DeviceBuffer, &DeviceBuffer)>,
         pending: Option<&DeviceBuffer>,
         sparse: Option<&SparsePass>,
+        shard: Option<(&mut ShardContext<'_>, usize)>,
     ) -> Result<(), Error> {
         let config = &self.config;
         let modulate = |shift, scale| {
@@ -1018,119 +1297,125 @@ impl CudaDit {
         let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
         let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
         let angles = angles.map_or(ptr::null(), |angles| angles.pointer().cast_const());
-        let pairs = 3 * config.rope_frequencies;
-        let quantized = workspace
-            .attention_quantized
-            .as_ref()
-            .filter(|_| modulation.is_some());
-        // Sparse and quantized attention take their per-block inputs from the pass that normalizes
-        // q and k.
-        let prepared = match (sparse, quantized) {
-            (Some(SparsePass::Sol { workspace, .. }), _) => {
-                Some(PreparedAttention::Sparse(workspace))
-            }
-            (Some(SparsePass::Vsa { workspace, .. }), _) => Some(PreparedAttention::Vsa(workspace)),
-            (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
-            (None, None) => None,
-        };
-        let inputs = if prepared.is_some() {
-            AttentionInputs::Prepared
+        if let Some((context, whole)) = shard {
+            self.sharded_attention(prefix, workspace, context, whole, angles, sparse)?;
         } else {
-            AttentionInputs::Raw
-        };
-        // SAFETY: qkv holds `tokens × 3 × heads × 128` values and the angles cover every token.
-        unsafe {
-            match prepared {
-                Some(attention) => prepare_inputs_pointers(
-                    workspace.qkv.pointer(),
-                    query_norm,
-                    key_norm,
-                    angles,
-                    pairs,
-                    tokens,
-                    config.heads,
-                    config.norm_eps,
-                    attention,
-                )?,
-                None => check(mmh3_qk_norm_rope(
-                    workspace.qkv.pointer(),
-                    query_norm,
-                    key_norm,
-                    angles,
-                    pairs as c_int,
-                    tokens as c_int,
-                    config.heads as c_int,
-                    config.heads as c_int,
-                    config.norm_eps,
-                    ptr::null_mut(),
-                ))?,
-            }
-            let scale = 1.0 / (config.head_dim as f32).sqrt();
-            match sparse {
-                None => match quantized {
-                    Some(quantized) => dense_quantized_pointers(
+            let pairs = 3 * config.rope_frequencies;
+            let quantized = workspace
+                .attention_quantized
+                .as_ref()
+                .filter(|_| modulation.is_some());
+            // Sparse and quantized attention take their per-block inputs from the pass that normalizes
+            // q and k.
+            let prepared = match (sparse, quantized) {
+                (Some(SparsePass::Sol { workspace, .. }), _) => {
+                    Some(PreparedAttention::Sparse(workspace))
+                }
+                (Some(SparsePass::Vsa { workspace, .. }), _) => {
+                    Some(PreparedAttention::Vsa(workspace))
+                }
+                (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
+                (None, None) => None,
+            };
+            let inputs = if prepared.is_some() {
+                AttentionInputs::Prepared
+            } else {
+                AttentionInputs::Raw
+            };
+            // SAFETY: qkv holds `tokens × 3 × heads × 128` values and the angles cover every token.
+            unsafe {
+                match prepared {
+                    Some(attention) => prepare_inputs_pointers(
                         workspace.qkv.pointer(),
-                        workspace.attention.pointer(),
-                        scale,
-                        quantized,
-                        inputs,
-                    )?,
-                    None => dense_bf16_pointers(
-                        workspace.qkv.pointer(),
-                        workspace.attention.pointer(),
+                        query_norm,
+                        key_norm,
+                        angles,
+                        pairs,
                         tokens,
                         config.heads,
-                        scale,
+                        config.norm_eps,
+                        attention,
                     )?,
-                },
-                Some(pass) => {
-                    let inner = config.inner();
-                    let layout = AttentionLayout {
-                        token_stride: [
-                            (3 * inner) as i64,
-                            (3 * inner) as i64,
-                            (3 * inner) as i64,
-                            inner as i64,
-                        ],
-                        head_stride: [HEAD_DIM as i64; 4],
-                        ..AttentionLayout::default()
-                    };
-                    let qkv = workspace.qkv.pointer().cast::<u16>();
-                    match *pass {
-                        SparsePass::Sol {
-                            workspace: sparse_workspace,
-                            tau,
-                            sinks,
-                        } => sparse_pointers(
-                            qkv.cast(),
-                            qkv.add(inner).cast(),
-                            qkv.add(2 * inner).cast(),
+                    None => check(mmh3_qk_norm_rope(
+                        workspace.qkv.pointer(),
+                        query_norm,
+                        key_norm,
+                        angles,
+                        pairs as c_int,
+                        tokens as c_int,
+                        config.heads as c_int,
+                        config.heads as c_int,
+                        config.norm_eps,
+                        ptr::null_mut(),
+                    ))?,
+                }
+                let scale = 1.0 / (config.head_dim as f32).sqrt();
+                match sparse {
+                    None => match quantized {
+                        Some(quantized) => dense_quantized_pointers(
+                            workspace.qkv.pointer(),
+                            workspace.attention.pointer(),
+                            scale,
+                            quantized,
+                            inputs,
+                        )?,
+                        None => dense_bf16_pointers(
+                            workspace.qkv.pointer(),
                             workspace.attention.pointer(),
                             tokens,
                             config.heads,
-                            &layout,
                             scale,
-                            tau,
-                            sinks,
-                            sparse_workspace,
-                            inputs,
                         )?,
-                        SparsePass::Vsa {
-                            workspace: vsa_workspace,
-                            kept,
-                        } => vsa_pointers(
-                            qkv.cast(),
-                            qkv.add(inner).cast(),
-                            qkv.add(2 * inner).cast(),
-                            vsa_gate.unwrap_or(ptr::null()),
-                            inner,
-                            workspace.attention.pointer(),
-                            &layout,
-                            scale,
-                            kept,
-                            vsa_workspace,
-                            inputs,
-                        )?,
+                    },
+                    Some(pass) => {
+                        let inner = config.inner();
+                        let layout = AttentionLayout {
+                            token_stride: [
+                                (3 * inner) as i64,
+                                (3 * inner) as i64,
+                                (3 * inner) as i64,
+                                inner as i64,
+                            ],
+                            head_stride: [HEAD_DIM as i64; 4],
+                            ..AttentionLayout::default()
+                        };
+                        let qkv = workspace.qkv.pointer().cast::<u16>();
+                        match *pass {
+                            SparsePass::Sol {
+                                workspace: sparse_workspace,
+                                tau,
+                                sinks,
+                            } => sparse_pointers(
+                                qkv.cast(),
+                                qkv.add(inner).cast(),
+                                qkv.add(2 * inner).cast(),
+                                workspace.attention.pointer(),
+                                tokens,
+                                config.heads,
+                                &layout,
+                                scale,
+                                tau,
+                                sinks,
+                                sparse_workspace,
+                                inputs,
+                            )?,
+                            SparsePass::Vsa {
+                                workspace: vsa_workspace,
+                                kept,
+                            } => vsa_pointers(
+                                qkv.cast(),
+                                qkv.add(inner).cast(),
+                                qkv.add(2 * inner).cast(),
+                                vsa_gate.unwrap_or(ptr::null()),
+                                inner,
+                                workspace.attention.pointer(),
+                                &layout,
+                                scale,
+                                kept,
+                                vsa_workspace,
+                                inputs,
+                            )?,
+                        }
                     }
                 }
             }
@@ -1410,6 +1695,7 @@ impl CudaDit {
                 None,
                 None,
                 None,
+                None,
             )?;
         }
         self.normalize(
@@ -1432,12 +1718,68 @@ impl CudaDit {
         capture: &[usize],
         sparse: Option<&SparseAttention>,
     ) -> Result<DitOutputs, Error> {
+        self.run(inputs, capture, sparse, None)
+    }
+
+    /// One rank's share of a step. Ulysses gives this rank a run of the sequence to carry through
+    /// the blocks and a run of the heads to attend with, and `context` carries the two exchanges
+    /// each block needs. Rank 0 returns the velocity; the others return nothing to unpatchify.
+    pub fn forward_shard(
+        &self,
+        inputs: &DitInputs,
+        sparse: Option<&SparseAttention>,
+        context: &mut ShardContext<'_>,
+    ) -> Result<DitOutputs, Error> {
+        self.run(inputs, &[], sparse, Some(context))
+    }
+
+    fn run(
+        &self,
+        inputs: &DitInputs,
+        capture: &[usize],
+        sparse: Option<&SparseAttention>,
+        mut context: Option<&mut ShardContext<'_>>,
+    ) -> Result<DitOutputs, Error> {
         let config = &self.config;
         let hidden = config.hidden;
         let video_shape = &inputs.video.shape;
         let text_tokens = inputs.context.shape[0];
         let layout = PackedLayout::for_inputs(inputs);
         let tokens = layout.len();
+        // The rows this rank carries through the blocks. Without a shard that is every row, and the
+        // block loop below does not know the difference.
+        let rows = match &context {
+            Some(context) => context.shard.own_tokens(),
+            None => 0..tokens,
+        };
+        let heads = match &context {
+            Some(context) => context.shard.own_heads(),
+            None => 0..config.heads,
+        };
+        if let Some(context) = &context {
+            if context.shard.tokens.iter().map(Range::len).sum::<usize>() != tokens
+                || context.shard.heads.iter().map(Range::len).sum::<usize>() != config.heads
+            {
+                return Err(Error::Model(
+                    "a shard that does not cover the step".to_owned(),
+                ));
+            }
+            if !capture.is_empty() {
+                return Err(Error::Model(
+                    "a sharded step cannot capture blocks".to_owned(),
+                ));
+            }
+            if !self.nvfp4.is_empty() {
+                return Err(Error::Model(
+                    "a sharded step cannot run NVFP4 layers".to_owned(),
+                ));
+            }
+            if context.shard.rank > 0 && rows.start < text_tokens {
+                return Err(Error::Model(
+                    "the text rows must fall to rank 0 alone".to_owned(),
+                ));
+            }
+        }
         let timesteps = StepTimesteps::for_layout(
             &layout,
             inputs.sigma,
@@ -1470,6 +1812,11 @@ impl CudaDit {
         let plan = vsa_sparsity.map(|_| VsaPlan::for_layout(&layout));
         let quantized_dense =
             self.attention_precision == AttentionPrecision::Int8Fp8 && method.is_none();
+        if context.is_some() && plan.is_none() {
+            return Err(Error::Model(
+                "a sharded step needs VSA, whose attention takes the exchanged layout".to_owned(),
+            ));
+        }
 
         let mut buffers = self.buffers.borrow_mut();
         let ForwardBuffers {
@@ -1479,8 +1826,12 @@ impl CudaDit {
             text: cached_text,
         } = &mut *buffers;
         let shape = WorkspaceShape {
-            tokens,
-            expanded_rows: if fused { text_tokens } else { tokens },
+            tokens: rows.len(),
+            expanded_rows: if fused {
+                text_tokens.saturating_sub(rows.start).min(rows.len())
+            } else {
+                rows.len()
+            },
             adapter_rank,
             gated: plan.is_some() && self.has_vsa_gates(),
             nvfp4_columns: self
@@ -1532,18 +1883,23 @@ impl CudaDit {
         }
         match &plan {
             Some(plan)
-                if cached_vsa.as_ref().is_some_and(|(precision, cached, _)| {
-                    *precision == self.attention_precision && cached == plan
-                }) => {}
+                if cached_vsa
+                    .as_ref()
+                    .is_some_and(|(precision, cached, workspace)| {
+                        *precision == self.attention_precision
+                            && cached == plan
+                            && workspace.heads() == heads.len()
+                    }) => {}
             Some(plan) => {
                 *cached_vsa = None;
                 *cached_vsa = Some((
                     self.attention_precision,
                     plan.clone(),
+                    // A sharded step attends with its own heads over the whole sequence.
                     VsaWorkspace::with_precision(
                         plan,
                         tokens,
-                        config.heads,
+                        heads.len(),
                         self.attention_precision,
                     )?,
                 ));
@@ -1551,7 +1907,10 @@ impl CudaDit {
             None => *cached_vsa = None,
         }
 
-        let block_rows = i32_buffer(&layout.modulation_rows(&timesteps))?;
+        // Every table below is one entry per token, so a rank takes the slice its rows cover. The
+        // rope angles are the exception: attention sees the whole sequence once the inputs have
+        // been exchanged, so they stay whole.
+        let block_rows = i32_buffer(&layout.modulation_rows(&timesteps)[rows.clone()])?;
         let final_rows: Vec<usize> = layout
             .segments
             .iter()
@@ -1559,7 +1918,7 @@ impl CudaDit {
                 std::iter::repeat_n(timesteps.index_of(segment.kind), segment.len())
             })
             .collect();
-        let final_rows = i32_buffer(&final_rows)?;
+        let final_rows = i32_buffer(&final_rows[rows.clone()])?;
         let audio = layout.segment(SegmentKind::Audio);
         let video = layout.segment(SegmentKind::Video);
         let mut angles = layout.rope_angles(&self.inverse_frequencies);
@@ -1573,48 +1932,65 @@ impl CudaDit {
         let angles = DeviceBuffer::from_f32(&angles)?;
         let time_embedding = DeviceBuffer::from_f32(&timesteps.time_embedding(&self.adaln_table))?;
 
-        let text_bytes = text_tokens * hidden * 4;
-        match cached_text {
-            Some(text) if text.context == inputs.context => {
-                // SAFETY: both buffers hold the text rows.
-                unsafe {
-                    copy_device(
-                        workspace.residual.pointer(),
-                        text.states.pointer(),
-                        text_bytes,
-                    )?
-                };
-            }
-            _ => {
-                self.refine_text(&inputs.context, workspace)?;
-                let states = DeviceBuffer::new(text_bytes)?;
-                // SAFETY: both buffers hold the text rows.
-                unsafe { copy_device(states.pointer(), workspace.residual.pointer(), text_bytes)? };
-                *cached_text = Some(TextStates {
-                    context: inputs.context.clone(),
-                    states,
-                });
+        // The text rows sit at the start of the sequence, so rank 0 refines them and no other rank
+        // holds any of them.
+        if rows.start == 0 {
+            let text_bytes = text_tokens * hidden * 4;
+            match cached_text {
+                Some(text) if text.context == inputs.context => {
+                    // SAFETY: both buffers hold the text rows.
+                    unsafe {
+                        copy_device(
+                            workspace.residual.pointer(),
+                            text.states.pointer(),
+                            text_bytes,
+                        )?
+                    };
+                }
+                _ => {
+                    self.refine_text(&inputs.context, workspace)?;
+                    let states = DeviceBuffer::new(text_bytes)?;
+                    // SAFETY: both buffers hold the text rows.
+                    unsafe {
+                        copy_device(states.pointer(), workspace.residual.pointer(), text_bytes)?
+                    };
+                    *cached_text = Some(TextStates {
+                        context: inputs.context.clone(),
+                        states,
+                    });
+                }
             }
         }
 
-        let audio_rows = DeviceBuffer::from_f32(&pack_audio(&inputs.audio))?;
-        let video_rows = DeviceBuffer::from_f32(&video_rows)?;
-        self.linear(
+        // Each segment's patches enter the residual stream at its own place, and a rank embeds only
+        // the part of it that falls in its rows.
+        let embed =
+            |projection: &str, values: &[f32], segment: Range<usize>| -> Result<(), Error> {
+                let first = segment.start.max(rows.start);
+                let last = segment.end.min(rows.end);
+                if first >= last {
+                    return Ok(());
+                }
+                let width = values.len() / segment.len();
+                let taken = ((first - segment.start) * width)..((last - segment.start) * width);
+                let buffer = DeviceBuffer::from_f32(&values[taken])?;
+                self.linear(
+                    projection,
+                    buffer.pointer(),
+                    workspace
+                        .residual
+                        .pointer_at((first - rows.start) * hidden * 4),
+                    last - first,
+                    0,
+                    workspace,
+                )
+            };
+        embed(
             "audio_patch_proj",
-            audio_rows.pointer(),
-            workspace.residual.pointer_at(audio.start * hidden * 4),
-            audio.len(),
-            0,
-            workspace,
+            &pack_audio(&inputs.audio),
+            audio.start..audio.end,
         )?;
-        self.linear(
-            "video_patch_proj",
-            video_rows.pointer(),
-            workspace.residual.pointer_at(video.start * hidden * 4),
-            video.len(),
-            0,
-            workspace,
-        )?;
+        embed("video_patch_proj", &video_rows, video.start..video.end)?;
         for segment in &layout.segments {
             let (projection, rows) = match segment.kind {
                 SegmentKind::KeyframeVideo(index) => (
@@ -1635,15 +2011,7 @@ impl CudaDit {
                 ),
                 _ => continue,
             };
-            let rows = DeviceBuffer::from_f32(&rows)?;
-            self.linear(
-                projection,
-                rows.pointer(),
-                workspace.residual.pointer_at(segment.start * hidden * 4),
-                segment.len(),
-                0,
-                workspace,
-            )?;
+            embed(projection, &rows, segment.start..segment.end)?;
         }
         // NOTE: NVFP4 layers run the rows before the video (text, conditions and audio), about 1% of
         // the rows at 768p without conditions, through their INT8 weights. At 448×256 against the FP32 reference, this takes the velocity from
@@ -1694,19 +2062,20 @@ impl CudaDit {
             self.transformer_block(
                 &prefix,
                 workspace,
-                tokens,
+                rows.len(),
                 head,
                 Some(&angles),
                 Some((modulation, &block_rows)),
                 pending,
                 sparse_pass.as_ref(),
+                context.as_deref_mut().map(|context| (context, tokens)),
             )?;
             pending = Some(modulation);
             if let Some(SparsePass::Sol { workspace, .. }) = &sparse_pass {
                 routed += workspace.routed_fraction()?;
             }
             if capture.contains(&layer) {
-                self.add_pending(workspace, tokens, modulation, &block_rows)?;
+                self.add_pending(workspace, rows.len(), modulation, &block_rows)?;
                 pending = None;
                 let mut residual = workspace.residual.to_f32()?;
                 if let Some(plan) = &plan {
@@ -1717,7 +2086,7 @@ impl CudaDit {
             }
         }
         if let Some(modulation) = pending {
-            self.add_pending(workspace, tokens, modulation, &block_rows)?;
+            self.add_pending(workspace, rows.len(), modulation, &block_rows)?;
         }
 
         let final_modulation = DeviceBuffer::new(steps * FINAL_CHUNKS * hidden * 4)?;
@@ -1732,19 +2101,28 @@ impl CudaDit {
             workspace.residual.pointer(),
             workspace.projected.pointer(),
             true,
-            tokens,
+            rows.len(),
             Some((&final_modulation, &final_rows, FINAL_CHUNKS, 0, 1)),
         )?;
+        // A rank projects the part of each segment its rows cover, which is the whole of it when
+        // nothing is shared out.
         let project = |segment: mmh3_core::dit::layout::Segment,
                        layer: &str,
                        width: usize|
          -> Result<Vec<f32>, Error> {
-            let output = DeviceBuffer::new(segment.len() * width * 4)?;
+            let first = segment.start.max(rows.start);
+            let last = segment.end.min(rows.end);
+            if first >= last {
+                return Ok(Vec::new());
+            }
+            let output = DeviceBuffer::new((last - first) * width * 4)?;
             self.linear(
                 layer,
-                workspace.projected.pointer_at(segment.start * hidden * 4),
+                workspace
+                    .projected
+                    .pointer_at((first - rows.start) * hidden * 4),
                 output.pointer(),
-                segment.len(),
+                last - first,
                 0,
                 workspace,
             )?;
@@ -1755,10 +2133,25 @@ impl CudaDit {
             "final_layer.video_out",
             config.video_patch_features(),
         )?;
+        let audio_velocity = project(audio, "final_layer.audio_out", config.audio_channels)?;
+        if context.is_some() {
+            // The rows of one rank cannot be unpatchified on their own, and in VSA's order they are
+            // not even the rows the video wants. `assemble_velocity` puts the parts together.
+            return Ok(DitOutputs {
+                blocks,
+                video: Vec::new(),
+                audio: Vec::new(),
+                routed_fraction: None,
+                part: Some(VelocityPart {
+                    rows: rows.clone(),
+                    video: video_velocity,
+                    audio: audio_velocity,
+                }),
+            });
+        }
         if let Some(plan) = &plan {
             video_velocity = plan.restore_video(&video_velocity, config.video_patch_features());
         }
-        let audio_velocity = project(audio, "final_layer.audio_out", config.audio_channels)?;
         Ok(DitOutputs {
             blocks,
             video: unpatchify_video(&video_velocity, video_shape)
@@ -1771,6 +2164,79 @@ impl CudaDit {
                 .collect(),
             routed_fraction: matches!(sparse_pass, Some(SparsePass::Sol { .. }))
                 .then(|| routed / config.layers as f64),
+            part: None,
+        })
+    }
+
+    /// Puts the parts of a shared-out step back together, which only the rank that answers to the
+    /// caller needs to do. The parts may arrive in any order and must cover the sequence once.
+    pub fn assemble_velocity(
+        &self,
+        inputs: &DitInputs,
+        sparse: Option<&SparseAttention>,
+        parts: &[VelocityPart],
+    ) -> Result<DitOutputs, Error> {
+        let config = &self.config;
+        let layout = PackedLayout::for_inputs(inputs);
+        let (video, audio) = (
+            layout.segment(SegmentKind::Video),
+            layout.segment(SegmentKind::Audio),
+        );
+        let plan = sparse
+            .filter(|settings| layout.len() >= settings.min_tokens)
+            .and_then(|settings| match settings.method {
+                SparseMethod::Vsa { .. } => Some(VsaPlan::for_layout(&layout)),
+                _ => None,
+            });
+        let gather = |segment: mmh3_core::dit::layout::Segment,
+                      width: usize,
+                      take: &dyn Fn(&VelocityPart) -> &Vec<f32>|
+         -> Result<Vec<f32>, Error> {
+            let mut values = vec![0.0f32; segment.len() * width];
+            let mut covered = 0;
+            for part in parts {
+                let first = segment.start.max(part.rows.start);
+                let last = segment.end.min(part.rows.end);
+                if first >= last {
+                    continue;
+                }
+                let rows = take(part);
+                if rows.len() != (last - first) * width {
+                    return Err(Error::Model(format!(
+                        "a part of {} values for {} rows",
+                        rows.len(),
+                        last - first
+                    )));
+                }
+                values[(first - segment.start) * width..(last - segment.start) * width]
+                    .copy_from_slice(rows);
+                covered += last - first;
+            }
+            if covered != segment.len() {
+                return Err(Error::Model(format!(
+                    "the parts cover {covered} of {} rows",
+                    segment.len()
+                )));
+            }
+            Ok(values)
+        };
+        let mut video_velocity = gather(video, config.video_patch_features(), &|part| &part.video)?;
+        if let Some(plan) = &plan {
+            video_velocity = plan.restore_video(&video_velocity, config.video_patch_features());
+        }
+        let audio_velocity = gather(audio, config.audio_channels, &|part| &part.audio)?;
+        Ok(DitOutputs {
+            blocks: Vec::new(),
+            video: unpatchify_video(&video_velocity, &inputs.video.shape)
+                .into_iter()
+                .map(|value| -value)
+                .collect(),
+            audio: unpack_audio(&audio_velocity, &inputs.audio.shape)
+                .into_iter()
+                .map(|value| -value)
+                .collect(),
+            routed_fraction: None,
+            part: None,
         })
     }
 }

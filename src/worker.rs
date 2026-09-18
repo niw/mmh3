@@ -5,9 +5,12 @@
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use mmh3_core::worker::{
-    self, CAPABILITY_DECODE_VIDEO, CAPABILITY_ENCODE_TEXT, Canvas, Checkpoint, DecodeVideo,
-    EncodeText, Header, Hello, Kind, TRANSPORT_TCP, TextStates, Welcome,
+    self, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD, CAPABILITY_ENCODE_TEXT, Canvas,
+    Checkpoint, DecodeVideo, EncodeText, Header, Hello, Kind, OpenSession, TRANSPORT_TCP,
+    TextStates, Welcome,
 };
+#[cfg(feature = "cuda")]
+use mmh3_cuda::shard::{self, Shard};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufReader, BufWriter};
@@ -23,6 +26,9 @@ pub const VIDEO_VAE_ROLE: &str = "video_vae.h3.int8_convrot";
 pub const TEXT_ENCODER_ROLE: &str = "text_encoder.h3.int8_convrot";
 /// Bodies larger than this are refused before they are read.
 const BODY_LIMIT: u64 = 4 << 30;
+/// How long one exchange of a block may take before the run gives up on the peer.
+#[cfg(feature = "cuda")]
+const EXCHANGE_TIMEOUT: i32 = 60_000;
 /// Stream buffers. The default 8 KiB turns a payload of hundreds of megabytes into tens of
 /// thousands of syscalls, which a fast link notices.
 const STREAM_BUFFER: usize = 4 << 20;
@@ -691,11 +697,12 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         };
         let checkpoints = checkpoints.clone();
         let token = token.clone();
+        let models = models.clone();
         std::thread::spawn(move || {
             let peer = stream
                 .peer_addr()
                 .map_or_else(|_| "?".to_owned(), |address| address.to_string());
-            if let Err(error) = session(stream, &checkpoints, &token) {
+            if let Err(error) = session(stream, &models, &checkpoints, &token) {
                 eprintln!("worker session with {peer} ended: {error}");
             }
         });
@@ -706,6 +713,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn session(
     stream: TcpStream,
+    models: &Path,
     checkpoints: &[(Checkpoint, PathBuf)],
     token: &str,
 ) -> Result<(), Box<dyn Error>> {
@@ -743,7 +751,15 @@ fn session(
                     backend: BACKEND,
                     device: device_name(),
                     memory_bytes: memory_bytes(),
-                    capabilities: CAPABILITY_ENCODE_TEXT | CAPABILITY_DECODE_VIDEO,
+                    capabilities: CAPABILITY_ENCODE_TEXT
+                        | CAPABILITY_DECODE_VIDEO
+                        // A share of the DiT needs the reliable connection: a step exchanges far
+                        // more than a socket carries in the time it saves.
+                        | if offered.is_some() && models.join("diffusion_models").is_dir() {
+                            CAPABILITY_DIT_SHARD
+                        } else {
+                            0
+                        },
                     transports: TRANSPORT_TCP
                         | if offered.is_some() {
                             worker::TRANSPORT_RDMA
@@ -813,6 +829,25 @@ fn session(
                         reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
                     }
                 }
+            }
+            // A shared-out step takes the connection over until the leader closes it, since
+            // both ranks then barrier and read each other rather than trading requests.
+            #[cfg(feature = "cuda")]
+            Kind::OpenSession => {
+                let (open, payload) = OpenSession::decode(&body)?;
+                let Some(connection) = rdma.as_ref() else {
+                    let message = b"a shared-out step needs a reliable connection";
+                    reply(&mut writer, Kind::Error, message, &[])?;
+                    continue;
+                };
+                serve_shard(
+                    &mut reader,
+                    &mut writer,
+                    connection,
+                    models,
+                    &open,
+                    &body[payload..],
+                )?;
             }
             Kind::DecodeVideo => {
                 let started = Instant::now();
@@ -1000,4 +1035,510 @@ fn memory_bytes() -> u64 {
         .and_then(|value| value.split_whitespace().next())
         .and_then(|value| value.parse::<u64>().ok())
         .map_or(0, |kibibytes| kibibytes * 1024)
+}
+
+/// One rank's side of the exchanges a shared-out step makes. Both the leader and the worker build
+/// the same thing over the same connection: the socket carries the barriers, the reliable
+/// connection carries the payloads, and every region is registered once before the first block
+/// because registering hundreds of megabytes costs far more than moving them.
+#[cfg(feature = "cuda")]
+pub struct Exchanger<'a> {
+    rank: usize,
+    ranks: usize,
+    reader: &'a mut BufReader<TcpStream>,
+    writer: &'a mut BufWriter<TcpStream>,
+    connection: &'a Rdma,
+    /// Registered memory, which is the only kind the wire reaches.
+    regions: HashMap<shard::Region, Region>,
+    /// The regions a block computes in, which have to be device memory: attention reads its inputs
+    /// once per query tile, and doing that over host memory costs seven times as much.
+    computed: HashMap<shard::Region, mmh3_cuda::DeviceBuffer>,
+    peers: HashMap<shard::Region, worker::RemoteRegion>,
+}
+
+#[cfg(feature = "cuda")]
+impl<'a> Exchanger<'a> {
+    /// Registers every region a step will use and swaps the addresses with the peer. After this
+    /// nothing is allocated again, so the addresses the peer holds stay good for the run.
+    pub fn open(
+        shard: &Shard,
+        tokens: usize,
+        gated: bool,
+        reader: &'a mut BufReader<TcpStream>,
+        writer: &'a mut BufWriter<TcpStream>,
+        connection: &'a Rdma,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut regions = HashMap::new();
+        let mut computed = HashMap::new();
+        let mut table = Vec::new();
+        for (region, bytes) in shard::regions(shard, tokens, gated) {
+            // Everything gets registered memory, since a peer may read any of it. A region a block
+            // computes in gets a device buffer beside it, and the two are kept in step by `publish`
+            // on the way out and by the copy that follows a read on the way in.
+            let held = connection.register(vec![0u8; bytes])?;
+            let (kind, peer) = region.code();
+            table.push(worker::RemoteRegion {
+                kind,
+                peer,
+                address: held.address(),
+                bytes: bytes as u64,
+                key: held.remote_key(),
+            });
+            regions.insert(region, held);
+            if region.is_computed_in() {
+                computed.insert(region, mmh3_cuda::DeviceBuffer::zeroed(bytes)?);
+            }
+        }
+        worker::send(
+            writer,
+            Kind::SessionReady,
+            0,
+            &worker::RemoteRegion::encode_all(&table),
+            &[],
+        )?;
+        let (header, body) = worker::receive(reader, BODY_LIMIT)?;
+        if header.kind != Kind::SessionReady {
+            return Err(format!("a peer answered a session with {:?}", header.kind).into());
+        }
+        let peers = worker::RemoteRegion::decode_all(&body)?
+            .into_iter()
+            .filter_map(|entry| {
+                shard::Region::from_code(entry.kind, entry.peer).map(|region| (region, entry))
+            })
+            .collect();
+        Ok(Exchanger {
+            rank: shard.rank,
+            ranks: shard.ranks(),
+            reader,
+            writer,
+            connection,
+            regions,
+            computed,
+            peers,
+        })
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn exchange_error(message: String) -> mmh3_cuda::model::Error {
+    mmh3_cuda::model::Error::Model(message)
+}
+
+#[cfg(feature = "cuda")]
+impl shard::Exchange for Exchanger<'_> {
+    fn rank(&self) -> usize {
+        self.rank
+    }
+
+    fn ranks(&self) -> usize {
+        self.ranks
+    }
+
+    fn region(
+        &mut self,
+        region: shard::Region,
+        bytes: usize,
+    ) -> Result<*mut std::ffi::c_void, mmh3_cuda::model::Error> {
+        let held = self
+            .regions
+            .get(&region)
+            .ok_or_else(|| exchange_error(format!("no {region:?} was registered")))?;
+        if held.bytes() < bytes {
+            return Err(exchange_error(format!(
+                "{region:?} holds {} bytes, not the {bytes} a block wants",
+                held.bytes()
+            )));
+        }
+        match self.computed.get(&region) {
+            Some(device) => Ok(device.pointer()),
+            None => Ok(self
+                .regions
+                .get_mut(&region)
+                .expect("just found")
+                .as_mut_slice()
+                .as_mut_ptr()
+                .cast()),
+        }
+    }
+
+    fn publish(
+        &mut self,
+        region: shard::Region,
+        bytes: usize,
+    ) -> Result<(), mmh3_cuda::model::Error> {
+        let Some(device) = self.computed.get(&region) else {
+            return Ok(());
+        };
+        let held = self
+            .regions
+            .get_mut(&region)
+            .ok_or_else(|| exchange_error(format!("no {region:?} was registered")))?;
+        // SAFETY: both hold at least `bytes`, checked when they were made.
+        unsafe { mmh3_cuda::download(&mut held.as_mut_slice()[..bytes], device.pointer())? };
+        Ok(())
+    }
+
+    fn read(
+        &mut self,
+        peer: usize,
+        from: shard::Region,
+        peer_offset: usize,
+        into: shard::Region,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), mmh3_cuda::model::Error> {
+        if peer == self.rank {
+            return Err(exchange_error("a rank cannot read itself".to_owned()));
+        }
+        let remote = *self
+            .peers
+            .get(&from)
+            .ok_or_else(|| exchange_error(format!("rank {peer} offered no {from:?}")))?;
+        if peer_offset + bytes > remote.bytes as usize {
+            return Err(exchange_error(format!(
+                "{bytes} bytes at {peer_offset} of a {} byte {from:?}",
+                remote.bytes
+            )));
+        }
+        let held = self
+            .regions
+            .get_mut(&into)
+            .ok_or_else(|| exchange_error(format!("no {into:?} was registered")))?;
+        held.read_into(
+            self.connection,
+            offset,
+            remote.address + peer_offset as u64,
+            remote.key,
+            bytes,
+            EXCHANGE_TIMEOUT,
+        )
+        .map_err(|error| exchange_error(format!("reading {from:?} of rank {peer}: {error}")))?;
+        // What the wire could reach now has to reach the kernels.
+        if let Some(device) = self.computed.get(&into) {
+            let landed = &held.as_slice()[offset..offset + bytes];
+            // SAFETY: the device buffer is as long as the registered one, so the same range fits.
+            unsafe { mmh3_cuda::upload(device.pointer().byte_add(offset), landed)? };
+        }
+        Ok(())
+    }
+
+    fn barrier(&mut self) -> Result<(), mmh3_cuda::model::Error> {
+        worker::send(self.writer, Kind::Ready, 0, &[], &[])
+            .map_err(|error| exchange_error(format!("reaching a barrier: {error}")))?;
+        let (header, _) = worker::receive(self.reader, BODY_LIMIT)
+            .map_err(|error| exchange_error(format!("waiting at a barrier: {error}")))?;
+        if header.kind != Kind::Ready {
+            return Err(exchange_error(format!(
+                "a peer sent {:?} at a barrier",
+                header.kind
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Exchanger<'_> {
+    /// An ordinary message over the same socket the barriers use, so that a whole run goes through
+    /// one exchanger and the regions are registered once rather than once a step.
+    pub fn send(&mut self, kind: Kind, descriptor: &[u8], payload: &[u8]) -> std::io::Result<()> {
+        worker::send(self.writer, kind, 0, descriptor, payload)
+    }
+
+    pub fn receive(&mut self) -> std::io::Result<(worker::Header, Vec<u8>)> {
+        worker::receive(self.reader, BODY_LIMIT)
+    }
+}
+
+/// The DiT a digest names, wherever this machine keeps its diffusion models. A leader passes its
+/// own file by path and a worker will have named it something else, so the digest of the
+/// safetensors header is what the two agree on.
+#[cfg(feature = "cuda")]
+fn find_dit(models: &Path, checkpoint: &Checkpoint) -> Option<PathBuf> {
+    let directory = models.join("diffusion_models");
+    let mut files: Vec<PathBuf> = std::fs::read_dir(directory)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|kind| kind == "safetensors"))
+        .collect();
+    files.sort();
+    files
+        .into_iter()
+        .find(|path| SafeTensors::open(path).is_ok_and(|file| digest(&file) == checkpoint.digest))
+}
+
+/// A rank that is not the leader, running its share of every step until the leader closes the
+/// session. It holds the DiT and the registered regions for the whole run.
+#[cfg(feature = "cuda")]
+fn serve_shard(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    connection: &Rdma,
+    models: &Path,
+    open: &OpenSession,
+    payload: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    use mmh3_core::dit::inputs::DitInputs;
+    use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_core::dit::sparse::{SparseAttention, SparseMethod};
+    use mmh3_core::dit::timestep::Modality;
+
+    let path = find_dit(models, &open.checkpoint).ok_or_else(|| {
+        format!(
+            "no diffusion model here has the digest {:016x}",
+            open.checkpoint.digest
+        )
+    })?;
+    let started = Instant::now();
+    let mut dit = mmh3_cuda::dit::CudaDit::load(&SafeTensors::open(&path)?, "")?;
+    dit.set_attention_precision(if open.precision == 1 {
+        mmh3_cuda::attention::AttentionPrecision::Int8Fp8
+    } else {
+        mmh3_cuda::attention::AttentionPrecision::Bf16
+    });
+    println!(
+        "loaded {} in {:.1} s",
+        path.display(),
+        started.elapsed().as_secs_f64()
+    );
+
+    let shape = |dimensions: &[u32]| -> Vec<usize> {
+        dimensions.iter().map(|value| *value as usize).collect()
+    };
+    let (context_tokens, context_width) = (
+        open.context_shape[0] as usize,
+        open.context_shape[1] as usize,
+    );
+    let context_bytes = context_tokens * context_width * 4;
+    if payload.len() < context_bytes + context_tokens {
+        return Err("a session carried too few context bytes".into());
+    }
+    let context = Tensor::new(
+        vec![context_tokens, context_width],
+        payload[..context_bytes]
+            .chunks_exact(4)
+            .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+            .collect(),
+    );
+    let modalities: Vec<Modality> = payload[context_bytes..context_bytes + context_tokens]
+        .iter()
+        .map(|value| match value {
+            1 => Modality::Text,
+            2 => Modality::Audio,
+            _ => Modality::Video,
+        })
+        .collect();
+    // Every rank embeds the latents itself, so only their shapes are needed to lay the step out.
+    // The values arrive with each step.
+    let video_shape = shape(&open.video_shape);
+    let audio_shape = shape(&open.audio_shape);
+    let mut inputs = DitInputs {
+        video: Tensor::new(video_shape.clone(), vec![0.0; video_shape.iter().product()]),
+        audio: Tensor::new(audio_shape.clone(), vec![0.0; audio_shape.iter().product()]),
+        context,
+        context_modalities: modalities,
+        keyframes: Vec::new(),
+        references: Vec::new(),
+        sigma: 1.0,
+        shift_video: open.shift_video,
+        shift_audio: open.shift_audio,
+    };
+    let tokens = PackedLayout::for_inputs(&inputs).len();
+    let sparse = SparseAttention {
+        method: SparseMethod::Vsa {
+            sparsity: open.vsa_sparsity as f64,
+        },
+        start_fraction: 0.0,
+        min_tokens: 0,
+    };
+    let shard = Shard::even(
+        open.rank as usize,
+        open.ranks as usize,
+        tokens,
+        dit.config().heads,
+        1,
+    );
+    let gated = dit.has_vsa_gates();
+    let mut exchanger = Exchanger::open(&shard, tokens, gated, reader, writer, connection)?;
+    println!(
+        "rank {} of {} takes tokens {:?} and heads {:?}",
+        shard.rank,
+        shard.ranks(),
+        shard.own_tokens(),
+        shard.own_heads()
+    );
+
+    loop {
+        let (header, body) = exchanger.receive()?;
+        match header.kind {
+            Kind::CloseSession => return Ok(()),
+            Kind::StepShard => {}
+            other => return Err(format!("a leader sent {other:?} in a session").into()),
+        }
+        let step = worker::StepShard::decode(&body)?;
+        let values = &body[worker::StepShard::BYTES..];
+        let video_values: usize = video_shape.iter().product();
+        let audio_values: usize = audio_shape.iter().product();
+        if values.len() != (video_values + audio_values) * 4 {
+            return Err(format!("a step carried {} bytes of latent", values.len()).into());
+        }
+        let floats: Vec<f32> = values
+            .chunks_exact(4)
+            .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+            .collect();
+        inputs.video = Tensor::new(video_shape.clone(), floats[..video_values].to_vec());
+        inputs.audio = Tensor::new(audio_shape.clone(), floats[video_values..].to_vec());
+        inputs.sigma = step.sigma;
+
+        let started = Instant::now();
+        let mut context = mmh3_cuda::shard::ShardContext {
+            shard: shard.clone(),
+            exchange: &mut exchanger,
+            timing: Default::default(),
+        };
+        let outputs = dit.forward_shard(&inputs, Some(&sparse), &mut context)?;
+        let part = outputs.part.ok_or("a shared step returned no rows")?;
+        println!(
+            "step {} of rank {} in {:.1} s, {}",
+            step.step,
+            shard.rank,
+            started.elapsed().as_secs_f64(),
+            describe_timing(&context.timing, started.elapsed())
+        );
+        let descriptor = worker::VelocityPart {
+            first_row: part.rows.start as u32,
+            last_row: part.rows.end as u32,
+            video_values: part.video.len() as u64,
+            audio_values: part.audio.len() as u64,
+        };
+        let mut body = Vec::with_capacity((part.video.len() + part.audio.len()) * 4);
+        for value in part.video.iter().chain(&part.audio) {
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        exchanger.send(Kind::VelocityPart, &descriptor.encode(), &body)?;
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Worker {
+    /// Opens a shared-out run and takes the connection over until it ends. Nothing else may use
+    /// this worker while the exchanger lives, since from here on the two ranks barrier and read
+    /// each other rather than trading requests.
+    pub fn open_shard<'a>(
+        &'a mut self,
+        shard: &Shard,
+        tokens: usize,
+        gated: bool,
+        open: &OpenSession,
+        payload: &[u8],
+    ) -> Result<Exchanger<'a>, Box<dyn Error>> {
+        let Worker {
+            reader,
+            writer,
+            rdma,
+            ..
+        } = self;
+        let connection = rdma
+            .as_ref()
+            .ok_or("a shared-out step needs a reliable connection")?;
+        worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
+        Exchanger::open(shard, tokens, gated, reader, writer, connection)
+    }
+}
+
+/// The context and its modalities, as a session carries them.
+#[cfg(feature = "cuda")]
+pub fn session_payload(
+    context: &Tensor,
+    modalities: &[mmh3_core::dit::timestep::Modality],
+) -> Vec<u8> {
+    use mmh3_core::dit::timestep::Modality;
+
+    let mut payload = Vec::with_capacity(context.data.len() * 4 + context.shape[0]);
+    for value in &context.data {
+        payload.extend_from_slice(&value.to_le_bytes());
+    }
+    for token in 0..context.shape[0] {
+        // An empty list means every token is text, which is what the encoders give without
+        // pictures in the prompt.
+        payload.push(match modalities.get(token) {
+            Some(Modality::Text) | None => 1,
+            Some(Modality::Audio) => 2,
+            Some(Modality::Video) => 0,
+        });
+    }
+    payload
+}
+
+/// One step of a shared-out run from the leader's side: hand out the latents, take this rank's
+/// share, and collect what the others ended with.
+#[cfg(feature = "cuda")]
+pub fn step_shard(
+    exchanger: &mut Exchanger<'_>,
+    dit: &mmh3_cuda::dit::CudaDit,
+    inputs: &mmh3_core::dit::inputs::DitInputs,
+    sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+    shard: &Shard,
+    step: usize,
+) -> Result<mmh3_cuda::dit::DitOutputs, Box<dyn Error>> {
+    let started = Instant::now();
+    let descriptor = worker::StepShard {
+        step: step as u32,
+        sigma: inputs.sigma,
+    };
+    let mut latents = Vec::with_capacity((inputs.video.data.len() + inputs.audio.data.len()) * 4);
+    for value in inputs.video.data.iter().chain(&inputs.audio.data) {
+        latents.extend_from_slice(&value.to_le_bytes());
+    }
+    exchanger.send(Kind::StepShard, &descriptor.encode(), &latents)?;
+
+    let mut context = mmh3_cuda::shard::ShardContext {
+        shard: shard.clone(),
+        exchange: exchanger,
+        timing: Default::default(),
+    };
+    let outputs = dit.forward_shard(inputs, sparse, &mut context)?;
+    let timing = context.timing;
+    let mut parts = vec![outputs.part.ok_or("a shared step returned no rows")?];
+    for _ in 1..shard.ranks() {
+        let (header, body) = exchanger.receive()?;
+        if header.kind != Kind::VelocityPart {
+            return Err(format!("a rank answered a step with {:?}", header.kind).into());
+        }
+        let part = worker::VelocityPart::decode(&body)?;
+        let values = &body[worker::VelocityPart::BYTES..];
+        let wanted = (part.video_values + part.audio_values) as usize * 4;
+        if values.len() != wanted {
+            return Err(format!("a rank sent {} bytes of velocity", values.len()).into());
+        }
+        let floats: Vec<f32> = values
+            .chunks_exact(4)
+            .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+            .collect();
+        let split = part.video_values as usize;
+        parts.push(mmh3_cuda::dit::VelocityPart {
+            rows: part.first_row as usize..part.last_row as usize,
+            video: floats[..split].to_vec(),
+            audio: floats[split..].to_vec(),
+        });
+    }
+    println!("  {}", describe_timing(&timing, started.elapsed()));
+    Ok(dit.assemble_velocity(inputs, sparse, &parts)?)
+}
+
+/// Where a shared-out step went, which is what decides whether sharing one is worth it at all.
+#[cfg(feature = "cuda")]
+pub fn describe_timing(
+    timing: &mmh3_cuda::shard::ShardTiming,
+    whole: std::time::Duration,
+) -> String {
+    let seconds = |span: std::time::Duration| span.as_secs_f64();
+    format!(
+        "gather {:.1} s, barrier {:.1} s, read {:.1} s, attend {:.1} s, everything else {:.1} s",
+        seconds(timing.gather),
+        seconds(timing.barrier),
+        seconds(timing.read),
+        seconds(timing.attend),
+        seconds(whole).max(seconds(timing.total())) - seconds(timing.total()),
+    )
 }

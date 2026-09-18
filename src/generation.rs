@@ -49,6 +49,7 @@ pub const OPTIONS: &[&str] = &[
     "lora-strength",
     "lora-mode",
     "worker",
+    "shard-dit",
     "token",
     "attention",
     "attention-precision",
@@ -474,6 +475,42 @@ pub fn sample(
     let dit = load_dit(options, "dit", dit_file)?;
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
     let schedule = &settings.schedule;
+    // A machine that can take a share of every step, and a run whose shape one can be cut out of.
+    #[cfg(feature = "cuda")]
+    let mut target = shard_target(
+        settings,
+        options,
+        &dit,
+        sparse.as_ref(),
+        &context,
+        &context_modalities,
+        &video,
+        &audio,
+        keyframes.is_empty() && references.is_empty(),
+    );
+    #[cfg(feature = "cuda")]
+    let mut sharing = match &mut target {
+        Some(target) => {
+            let shard = target.shard.clone();
+            match target.worker.open_shard(
+                &shard,
+                target.tokens,
+                target.gated,
+                &target.open,
+                &target.payload,
+            ) {
+                Ok(exchanger) => Some(Sharing::With(exchanger, shard)),
+                Err(error) => {
+                    eprintln!("warning: opening a shared run: {error}");
+                    None
+                }
+            }
+        }
+        // `--shard-dit 1` runs the same path with nothing to carry anywhere, which tells the cost
+        // of the machinery apart from the cost of the link.
+        None => alone_shard(options, &dit, &context, &video, &audio, settings)
+            .map(|shard| Sharing::Alone(mmh3_cuda::shard::WholeExchange::new(), shard)),
+    };
     #[cfg(feature = "metal")]
     let prepared = dit.prepare_text(&context)?;
     for step in 0..steps {
@@ -491,7 +528,35 @@ pub fn sample(
         };
         let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
         #[cfg(feature = "cuda")]
-        let outputs = dit.forward(&inputs, &[], step_sparse.as_ref())?;
+        let outputs = match &mut sharing {
+            // Every rank runs the same step over its own rows, and the exchanges inside the blocks
+            // keep the attention whole. A rank that fails takes the run with it: there is no
+            // halfway through a step to fall back from.
+            Some(Sharing::With(exchanger, shard)) => crate::worker::step_shard(
+                exchanger,
+                &dit,
+                &inputs,
+                step_sparse.as_ref(),
+                shard,
+                step,
+            )?,
+            Some(Sharing::Alone(exchange, shard)) => {
+                let began = Instant::now();
+                let mut context = mmh3_cuda::shard::ShardContext {
+                    shard: shard.clone(),
+                    exchange,
+                    timing: Default::default(),
+                };
+                let outputs = dit.forward_shard(&inputs, step_sparse.as_ref(), &mut context)?;
+                println!(
+                    "  {}",
+                    crate::worker::describe_timing(&context.timing, began.elapsed())
+                );
+                let part = outputs.part.ok_or("a shared step returned no rows")?;
+                dit.assemble_velocity(&inputs, step_sparse.as_ref(), &[part])?
+            }
+            None => dit.forward(&inputs, &[], step_sparse.as_ref())?,
+        };
         #[cfg(feature = "metal")]
         let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref())?;
         euler_step(
@@ -674,4 +739,173 @@ fn encode_pictures(
         started.elapsed().as_secs_f64()
     );
     Ok(latents)
+}
+
+/// A worker that will take a share of every step, ready to open. Held apart from the exchange
+/// because the exchange borrows it for the whole run.
+#[cfg(feature = "cuda")]
+struct ShardTarget {
+    worker: crate::worker::Worker,
+    shard: mmh3_cuda::shard::Shard,
+    tokens: usize,
+    gated: bool,
+    open: mmh3_core::worker::OpenSession,
+    payload: Vec<u8>,
+}
+
+/// The first worker that can take a share of the DiT, or `None` to keep the whole step here. A run
+/// with conditions keeps it: the session carries no keyframes or references yet.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn shard_target(
+    settings: &Settings,
+    options: &HashMap<&str, &str>,
+    dit: &mmh3_cuda::dit::CudaDit,
+    sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+    context: &Tensor,
+    context_modalities: &[mmh3_core::dit::timestep::Modality],
+    video: &Tensor,
+    audio: &Tensor,
+    plain: bool,
+) -> Option<ShardTarget> {
+    use crate::worker::{Worker, digest, session_payload};
+    use mmh3_core::dit::inputs::DitInputs;
+    use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_core::dit::sparse::SparseMethod;
+    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
+    use mmh3_cuda::shard::Shard;
+
+    // NOTE: sharing the DiT is slower than keeping it here over this link, so it waits to be
+    // asked for. A 768p step exchanges 34 GB, which takes 4 s at the 8.3 GB/s two machines reach
+    // at once, against the 7 s of arithmetic it saves, and the barriers cost the rest.
+    let ranks = crate::cli::option_number(options, "shard-dit", 1).ok()?;
+    if ranks < 2 {
+        return None;
+    }
+    if settings.workers.is_empty() {
+        println!("sharing a step needs a worker, so the DiT stays here");
+        return None;
+    }
+    if ranks > 2 {
+        println!("only two machines can share a step so far, so the DiT stays here");
+        return None;
+    }
+    if !plain {
+        println!("a run with conditions keeps the DiT here");
+        return None;
+    }
+    let Some(SparseMethod::Vsa { sparsity }) = sparse.map(|settings| settings.method) else {
+        println!("sharing a step needs VSA, so the DiT stays here");
+        return None;
+    };
+    let path = crate::models::option_path(options, "dit", crate::models::DIT_FILE).ok()?;
+    let file = mmh3_core::safetensors::SafeTensors::open(std::path::Path::new(&path)).ok()?;
+    let checkpoint = Checkpoint {
+        role: "dit.h3".to_owned(),
+        digest: digest(&file),
+    };
+    drop(file);
+
+    for address in &settings.workers {
+        let worker = match Worker::connect(address, &settings.token) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("warning: worker {address}: {error}");
+                continue;
+            }
+        };
+        if !worker.serves(CAPABILITY_DIT_SHARD) || !worker.reads_remotely() {
+            continue;
+        }
+        let inputs = DitInputs {
+            video: video.clone(),
+            audio: audio.clone(),
+            context: context.clone(),
+            context_modalities: context_modalities.to_vec(),
+            keyframes: Vec::new(),
+            references: Vec::new(),
+            sigma: 1.0,
+            shift_video: settings.shift_video,
+            shift_audio: settings.shift_audio,
+        };
+        let tokens = PackedLayout::for_inputs(&inputs).len();
+        let shape = |dimensions: &[usize]| -> Vec<u32> {
+            dimensions.iter().map(|value| *value as u32).collect()
+        };
+        let open = OpenSession {
+            checkpoint: checkpoint.clone(),
+            ranks: 2,
+            rank: 1,
+            video_shape: shape(&video.shape).try_into().ok()?,
+            audio_shape: shape(&audio.shape).try_into().ok()?,
+            context_shape: shape(&context.shape).try_into().ok()?,
+            shift_video: settings.shift_video,
+            shift_audio: settings.shift_audio,
+            vsa_sparsity: sparsity as f32,
+            precision: match dit.attention_precision() {
+                mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => 1,
+                _ => 0,
+            },
+        };
+        println!(
+            "worker {} takes a share of every step, {tokens} tokens split in two",
+            worker.address
+        );
+        return Some(ShardTarget {
+            shard: Shard::even(0, 2, tokens, dit.config().heads, 1),
+            worker,
+            tokens,
+            gated: dit.has_vsa_gates(),
+            open,
+            payload: session_payload(context, context_modalities),
+        });
+    }
+    None
+}
+
+/// How a step is shared out, which is either with another machine or, for `--shard-dit 1`, with
+/// nobody at all so that the machinery can be timed on its own.
+#[cfg(feature = "cuda")]
+enum Sharing<'a> {
+    With(crate::worker::Exchanger<'a>, mmh3_cuda::shard::Shard),
+    Alone(mmh3_cuda::shard::WholeExchange, mmh3_cuda::shard::Shard),
+}
+
+/// The shard of a run that shares a step with nobody. One rank covers the whole sequence and every
+/// head, so the result is the whole step's, and what is left is the gathers and the waits.
+#[cfg(feature = "cuda")]
+fn alone_shard(
+    options: &HashMap<&str, &str>,
+    dit: &mmh3_cuda::dit::CudaDit,
+    context: &Tensor,
+    video: &Tensor,
+    audio: &Tensor,
+    settings: &Settings,
+) -> Option<mmh3_cuda::shard::Shard> {
+    use mmh3_core::dit::inputs::DitInputs;
+    use mmh3_core::dit::layout::PackedLayout;
+
+    if crate::cli::option_number(options, "shard-dit", 0).ok()? != 1 {
+        return None;
+    }
+    let inputs = DitInputs {
+        video: video.clone(),
+        audio: audio.clone(),
+        context: context.clone(),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references: Vec::new(),
+        sigma: 1.0,
+        shift_video: settings.shift_video,
+        shift_audio: settings.shift_audio,
+    };
+    let tokens = PackedLayout::for_inputs(&inputs).len();
+    println!("sharing every step with nobody, {tokens} tokens in one piece");
+    Some(mmh3_cuda::shard::Shard::even(
+        0,
+        1,
+        tokens,
+        dit.config().heads,
+        1,
+    ))
 }

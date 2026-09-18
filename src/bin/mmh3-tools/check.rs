@@ -21,8 +21,30 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         Some("clips") => check_clips(&arguments[1..]),
         Some("audio-vae") => check_audio_vae(&arguments[1..]),
         Some("text-encoder") => check_text_encoder(&arguments[1..]),
+        Some("shard") => check_shard(&arguments[1..]),
         _ => Err(USAGE.into()),
     }
+}
+
+/// The gathers that move a block's attention between a rank's tokens and a rank's heads. No
+/// weights and no network: only that every value lands where the other side will look for it.
+#[cfg(feature = "cuda")]
+fn check_shard(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    const USAGE: &str = "usage: mmh3-tools check shard [--tokens N] [--heads N] [--dim N]";
+    let options = parse_options(arguments, &["tokens", "heads", "dim"], USAGE)?;
+    // NOTE: the default passes the 8192-block grid cap, which is where a gather without a grid
+    // stride would start leaving values behind.
+    let tokens = option_number(&options, "tokens", 2731)?;
+    let heads = option_number(&options, "heads", 56)?;
+    let dim = option_number(&options, "dim", 128)?;
+    mmh3_cuda::shard::check_layout(tokens, heads, dim)?;
+    println!("{tokens} tokens of {heads} heads by {dim} split in two and came back whole");
+    Ok(())
+}
+
+#[cfg(not(feature = "cuda"))]
+fn check_shard(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    Err("this build has no CUDA backend".into())
 }
 
 /// One file of a golden directory written by tools/golden/h3_reference.py.
@@ -230,6 +252,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "linear-precision",
             "sparse-tau",
             "vsa-sparsity",
+            "shard",
         ],
         USAGE,
     )?;
@@ -265,7 +288,37 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let dit = load_dit(&options, "weights", dit_file_for(&inputs.references))?;
     let started = Instant::now();
     let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
-    let outputs = dit.forward(&inputs, &watched, sparse.as_ref())?;
+    // `--shard 1` runs the path a shared-out step takes, with one rank and nothing to carry
+    // anywhere, which has to give what a whole step gives.
+    let ranks: usize = option_number(&options, "shard", 0)?;
+    let outputs = if ranks > 0 {
+        use mmh3_cuda::shard::{Shard, ShardContext, WholeExchange};
+        let layout = PackedLayout::for_inputs(&inputs);
+        let mut exchange = WholeExchange::new();
+        let mut context = ShardContext {
+            shard: Shard::even(0, ranks, layout.len(), dit.config().heads, 1),
+            exchange: &mut exchange,
+            timing: Default::default(),
+        };
+        let part = dit.forward_shard(&inputs, sparse.as_ref(), &mut context)?;
+        let shared =
+            dit.assemble_velocity(&inputs, sparse.as_ref(), &[part.part.ok_or("no part")?])?;
+        // The same step without the shard, in the same process, so that the two can be compared
+        // directly instead of through the golden data.
+        let whole = dit.forward(&inputs, &[], sparse.as_ref())?;
+        for (what, left, right) in [
+            ("video", &shared.video, &whole.video),
+            ("audio", &shared.audio, &whole.audio),
+        ] {
+            let (cosine, difference, worst, scale) = compare(left, right);
+            println!(
+                "{what:<8} shared against whole  {cosine:.7}  {difference:.3e}  {worst:.3e}                   {scale:.3}"
+            );
+        }
+        shared
+    } else {
+        dit.forward(&inputs, &watched, sparse.as_ref())?
+    };
     let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
         format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
     });

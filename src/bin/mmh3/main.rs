@@ -12,7 +12,7 @@ const USAGE: &str = "usage:
                 [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
-                [--worker HOST[:PORT]]... [--token FILE] [--ffmpeg [FFMPEG_ARGUMENTS...]]
+                [--worker HOST[:PORT]]... [--shard-dit N] [--token FILE] [--ffmpeg [FFMPEG_ARGUMENTS...]]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
@@ -39,6 +39,9 @@ Arguments normally go after the generated inputs and before the output path.
 For a full invocation, use whole-argument {video}, {audio}, and {out} placeholders. No shell is invoked.
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
 directory has it.
+--shard-dit N splits every DiT step across N machines, Ulysses style, this one and N-1 workers. Over the 200 GbE
+between two DGX Sparks a 768p step goes from 13.4 s to 12.2 s, and a step exchanges 34 GB, so it asks for a
+worker that reads this machine's memory directly.
 --worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
 encoder encodes the prompt, so this machine never loads it. Anything a worker cannot do, or fails at, this
 machine does itself.";
