@@ -18,3 +18,5 @@ pub mod metal;
 pub mod models;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod video;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub mod worker;

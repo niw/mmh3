@@ -5,13 +5,14 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
+  mmh3 worker [--listen ADDR] [--models DIR] [--token FILE]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
                 [--reference-audio FILE]... [--reference-video FILE]...
                 [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
-                [--ffmpeg [FFMPEG_ARGUMENTS...]]
+                [--worker HOST[:PORT]]... [--token FILE] [--ffmpeg [FFMPEG_ARGUMENTS...]]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
@@ -37,13 +38,18 @@ A one-frame trial encode checks the ffmpeg arguments before generation.
 Arguments normally go after the generated inputs and before the output path.
 For a full invocation, use whole-argument {video}, {audio}, and {out} placeholders. No shell is invoked.
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
-directory has it.";
+directory has it.
+--worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
+encoder encodes the prompt, so this machine never loads it. Anything a worker cannot do, or fails at, this
+machine does itself.";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("generate") => generate::run(&arguments[1..]),
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        Some("worker") => mmh3::worker::serve(&arguments[1..]),
         #[cfg(not(any(feature = "cuda", feature = "metal")))]
         Some("generate") => {
             Err("this build has no GPU backend. Rebuild with --features cuda on Linux or --features metal on macOS".into())

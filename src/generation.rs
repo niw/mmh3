@@ -48,6 +48,8 @@ pub const OPTIONS: &[&str] = &[
     "lora",
     "lora-strength",
     "lora-mode",
+    "worker",
+    "token",
     "attention",
     "attention-precision",
     "linear-precision",
@@ -95,11 +97,15 @@ pub struct Settings {
     pub seed: u64,
     pub shift_video: f32,
     pub shift_audio: f32,
+    /// Addresses of `--worker`, machines this run may borrow.
+    pub workers: Vec<String>,
+    /// The shared secret of `--token`, empty when there is none.
+    pub token: String,
 }
 
 impl Settings {
     /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
-    /// `arguments` gives the repeated `--reference` options.
+    /// `arguments` gives the repeated `--reference` and `--worker` options.
     pub fn parse(
         options: &HashMap<&str, &str>,
         arguments: &[String],
@@ -224,6 +230,14 @@ impl Settings {
             seed: option_number(options, "seed", 0)? as u64,
             shift_video,
             shift_audio,
+            workers: option_values(arguments, "worker")
+                .iter()
+                .map(|address| (*address).to_owned())
+                .collect(),
+            token: match options.get("token") {
+                Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
+                None => String::new(),
+            },
         })
     }
 }
@@ -291,50 +305,63 @@ pub fn sample(
     let context = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
             let started = Instant::now();
-            let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
-            let file = SafeTensors::open(Path::new(&path))?;
-            let encoder = TextEncoder::load(&file)?;
-            let context = if prompt_references.is_empty() {
-                let ids = Tokenizer::h3().encode(&prompt);
-                encoder.encode(&ids, &[])?.context
+            // A worker that holds the text encoder spares this machine 27 GB and the load, but only
+            // for a prompt of plain text: pictures and clips still go through the vision tower here.
+            if prompt_references.is_empty()
+                && let Some(context) = encode_on_worker(settings, &Tokenizer::h3().encode(&prompt))
+            {
+                println!(
+                    "encoded {} prompt tokens on a worker in {:.1} s",
+                    context.shape[0],
+                    started.elapsed().as_secs_f64()
+                );
+                context
             } else {
-                #[cfg(feature = "metal")]
-                return Err("picture and sound prompts are not implemented on Metal yet".into());
-                #[cfg(feature = "cuda")]
-                {
-                    use mmh3_core::vision::vision_prompt;
-                    use mmh3_cuda::vision::CudaVisionEncoder;
+                let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
+                let file = SafeTensors::open(Path::new(&path))?;
+                let encoder = TextEncoder::load(&file)?;
+                let context = if prompt_references.is_empty() {
+                    let ids = Tokenizer::h3().encode(&prompt);
+                    encoder.encode(&ids, &[])?.context
+                } else {
+                    #[cfg(feature = "metal")]
+                    return Err("picture and sound prompts are not implemented on Metal yet".into());
+                    #[cfg(feature = "cuda")]
+                    {
+                        use mmh3_core::vision::vision_prompt;
+                        use mmh3_cuda::vision::CudaVisionEncoder;
 
-                    // One embedding per vision block: the pictures, then the pairs of every clip.
-                    let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
-                        Vec::new()
-                    } else {
-                        let vision = CudaVisionEncoder::load(&file)?;
-                        let mut embeddings = pictures
-                            .iter()
-                            .map(|picture| vision.encode(picture))
-                            .collect::<Result<Vec<_>, _>>()?;
-                        for blocks in &clip_blocks {
-                            for pair in blocks.chunks(2) {
-                                embeddings.push(vision.encode_frames(&pair[0], &pair[1])?);
+                        // One embedding per vision block: the pictures, then the pairs of every clip.
+                        let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
+                            Vec::new()
+                        } else {
+                            let vision = CudaVisionEncoder::load(&file)?;
+                            let mut embeddings = pictures
+                                .iter()
+                                .map(|picture| vision.encode(picture))
+                                .collect::<Result<Vec<_>, _>>()?;
+                            for blocks in &clip_blocks {
+                                for pair in blocks.chunks(2) {
+                                    embeddings.push(vision.encode_frames(&pair[0], &pair[1])?);
+                                }
                             }
-                        }
-                        embeddings
-                    };
-                    let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
-                    context_modalities = prompt.modalities.clone();
-                    encoder.encode_prompt(&prompt, &embeddings, &[])?.context
-                }
-            };
-            println!(
-                "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
-                context.shape[0],
-                pictures.len(),
-                settings.clips.len(),
-                settings.sounds.len(),
-                started.elapsed().as_secs_f64()
-            );
-            context
+                            embeddings
+                        };
+                        let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
+                        context_modalities = prompt.modalities.clone();
+                        encoder.encode_prompt(&prompt, &embeddings, &[])?.context
+                    }
+                };
+                println!(
+                    "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
+                    context.shape[0],
+                    pictures.len(),
+                    settings.clips.len(),
+                    settings.sounds.len(),
+                    started.elapsed().as_secs_f64()
+                );
+                context
+            }
         }
         (None, Some(path)) => {
             let file = SafeTensors::open(Path::new(path))?;
@@ -492,6 +519,32 @@ pub fn sample(
 /// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
 /// They take no condition noise, as the reference pipeline leaves reference audio clean.
 #[cfg(feature = "cuda")]
+/// Asks the first worker that holds the text encoder, or returns `None` so the caller encodes here.
+/// A worker that fails is reported and skipped: a generation never depends on one.
+fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
+    use crate::worker::Worker;
+    use mmh3_core::worker::CAPABILITY_ENCODE_TEXT;
+
+    const ROLE: &str = "text_encoder.h3.int8_convrot";
+    for address in &settings.workers {
+        let mut worker = match Worker::connect(address, &settings.token) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("warning: worker {address}: {error}");
+                continue;
+            }
+        };
+        if !worker.serves(CAPABILITY_ENCODE_TEXT) || worker.checkpoint(ROLE).is_none() {
+            continue;
+        }
+        match worker.encode_text(ROLE, ids) {
+            Ok(context) => return Some(context),
+            Err(error) => eprintln!("warning: worker {address}: {error}"),
+        }
+    }
+    None
+}
+
 fn encode_sounds(
     options: &HashMap<&str, &str>,
     sounds: &[Tensor],

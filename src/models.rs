@@ -202,7 +202,7 @@ pub fn option_path(
 }
 
 /// The models directory of `--models` or `MMH3_MODELS`.
-fn models_directory(options: &HashMap<&str, &str>) -> Option<PathBuf> {
+pub fn models_directory(options: &HashMap<&str, &str>) -> Option<PathBuf> {
     match options.get("models") {
         Some(directory) => Some(PathBuf::from(directory)),
         None => std::env::var_os(MODELS_VARIABLE).map(PathBuf::from),
