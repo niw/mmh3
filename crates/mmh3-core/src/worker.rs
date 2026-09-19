@@ -1072,8 +1072,6 @@ impl DecodeVideo {
 }
 
 impl Canvas {
-    pub const BYTES: usize = 28;
-
     pub fn encode(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
         encoder
@@ -1084,14 +1082,17 @@ impl Canvas {
         encoder.finish()
     }
 
-    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+    /// Returns the descriptor and where the payload begins, since a canvas that comes down the
+    /// socket follows it and the keys before it are as many as the paths its sender had.
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
         let mut decoder = Decoder::new(bytes);
-        Ok(Canvas {
+        let canvas = Canvas {
             chunk: decoder.u64()? as u32,
             bytes: decoder.u64()?,
             remote_address: decoder.u64()?,
             remote_keys: decode_keys(&mut decoder)?,
-        })
+        };
+        Ok((canvas, decoder.position))
     }
 }
 

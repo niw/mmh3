@@ -322,7 +322,7 @@ impl Worker {
                 )
                 .into());
             }
-            let offer = worker::Canvas::decode(&body)?;
+            let (offer, _) = worker::Canvas::decode(&body)?;
             self.write_from_staging(&offer)?;
             let seconds = started.elapsed().as_secs_f64();
             return Ok(((bytes as f64 / seconds) / 1e9, true));
@@ -440,11 +440,11 @@ impl Worker {
         if header.kind != Kind::Canvas {
             return Err(format!("{} answered a chunk with {:?}", self.address, header.kind).into());
         }
-        let canvas = Canvas::decode(&body)?;
+        let (canvas, descriptor_bytes) = Canvas::decode(&body)?;
         if !canvas.remote_keys.is_empty() {
             return self.read_canvas(&canvas);
         }
-        let payload = &body[Canvas::BYTES..];
+        let payload = &body[descriptor_bytes..];
         if payload.len() as u64 != canvas.bytes {
             return Err(format!("{} sent {} bytes of canvas", self.address, payload.len()).into());
         }
@@ -967,7 +967,7 @@ fn session(
             Kind::Bandwidth => reply(&mut writer, Kind::BandwidthDone, &[], &body)?,
             #[cfg(feature = "cuda")]
             Kind::Bandwidth => match (rdma.as_ref(), worker::Canvas::decode(&body)) {
-                (Some(_), Ok(request)) if !body.is_empty() => {
+                (Some(_), Ok((request, _))) if !body.is_empty() => {
                     let device = rdma_device().ok_or("this machine has no RoCE port")?;
                     let bytes = request.bytes as usize;
                     if staging.as_ref().map(Region::bytes).unwrap_or(0) < bytes {
