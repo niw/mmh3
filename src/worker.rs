@@ -171,8 +171,6 @@ type Rdma = mmh3_rdma::Link;
 type Region = mmh3_rdma::Region;
 #[cfg(not(feature = "cuda"))]
 type Rdma = ();
-#[cfg(not(feature = "cuda"))]
-type Region = ();
 
 /// This machine's RoCE device, or nothing when it has no active port. One device serves every
 /// connection of the process, so its memory is registered once however many peers read it.
@@ -232,6 +230,7 @@ pub struct Worker {
     writer: BufWriter<TcpStream>,
     request: u64,
     rdma: Option<Rdma>,
+    #[cfg(feature = "cuda")]
     staging: Option<Region>,
 }
 
@@ -261,6 +260,7 @@ impl Worker {
             },
             request: 0,
             rdma: None,
+            #[cfg(feature = "cuda")]
             staging: None,
             address,
         };
@@ -899,7 +899,9 @@ fn session(
     // still encoding its prompt.
     #[cfg(feature = "cuda")]
     let mut prepared: Option<(u64, mmh3_cuda::dit::CudaDit)> = None;
+    #[cfg(feature = "cuda")]
     let mut rdma: Option<Rdma> = None;
+    #[cfg(feature = "cuda")]
     let mut staging: Option<Region> = None;
 
     loop {
@@ -956,10 +958,13 @@ fn session(
                     rdma: offered.as_ref().map(|(_, addresses)| addresses.clone()),
                 };
                 reply(&mut writer, Kind::Welcome, &welcome.encode(), &[])?;
-                rdma = match (offered, hello.rdma) {
-                    (Some((connection, _)), Some(peer)) => join_rdma(connection, &peer),
-                    _ => None,
-                };
+                #[cfg(feature = "cuda")]
+                {
+                    rdma = match (offered, hello.rdma) {
+                        (Some((connection, _)), Some(peer)) => join_rdma(connection, &peer),
+                        _ => None,
+                    };
+                }
             }
             Kind::Ping => reply(&mut writer, Kind::Pong, &[], &[])?,
             // A measurement moves the same way a payload would: read out of this side's memory
