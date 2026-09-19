@@ -184,6 +184,73 @@ fn rdma_device() -> Option<&'static mmh3_rdma::Device> {
         .as_ref()
 }
 
+/// What this machine does at a GEMM of a DiT's shape and at a copy, which is what the shares of a
+/// shared-out step follow. Measured once, since it is a property of the machine and not of a run,
+/// and answered with nothing by a backend that cannot measure itself.
+pub fn measure_speed() -> Option<worker::Speed> {
+    // A machine does not change between runs, so the first one measures and the rest read. The
+    // file names the device it was measured on, and another one measures again.
+    let cache = crate::models::cache_file("speed.txt");
+    let name = device_name();
+    if let Some(text) = cache
+        .as_ref()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+    {
+        let mut lines = text.lines();
+        if lines.next() == Some(SPEED_HEADER) && lines.next() == Some(name.as_str()) {
+            let mut numbers = lines.next().unwrap_or_default().split_whitespace();
+            if let (Some(Ok(tops)), Some(Ok(bandwidth))) = (
+                numbers.next().map(str::parse),
+                numbers.next().map(str::parse),
+            ) {
+                return Some(worker::Speed {
+                    gemm_tops: tops,
+                    bandwidth_gbytes: bandwidth,
+                });
+            }
+        }
+    }
+    let speed = measure_now()?;
+    if let Some(path) = cache {
+        let text = format!(
+            "{SPEED_HEADER}\n{name}\n{} {}\n",
+            speed.gemm_tops, speed.bandwidth_gbytes
+        );
+        if let Some(directory) = path.parent() {
+            let _ = std::fs::create_dir_all(directory);
+        }
+        if let Err(error) = std::fs::write(&path, text) {
+            eprintln!("warning: writing {}: {error}", path.display());
+        }
+    }
+    Some(speed)
+}
+
+/// First line of the file `measure_speed` keeps, followed by the device and the two numbers. It
+/// goes up when what is measured changes, so an old file is not taken for a new one.
+const SPEED_HEADER: &str = "mmh3 machine speed 1";
+
+#[cfg(feature = "cuda")]
+fn measure_now() -> Option<worker::Speed> {
+    use mmh3_cuda::bench::{GemmKind, gemm, memory_copy};
+
+    // A block's own shape, so the number says something about the work it will be given.
+    let (m, n, k) = (4096, 5376, 5376);
+    let timing = gemm(GemmKind::Bf16, m, n, k, 10).ok()?;
+    let operations = 2.0 * m as f64 * n as f64 * k as f64;
+    let copy = memory_copy(1 << 28, 5).ok()?;
+    Some(worker::Speed {
+        gemm_tops: (operations / (timing.milliseconds as f64 * 1e-3) / 1e12) as f32,
+        bandwidth_gbytes: copy.copy_kernel_gigabytes_per_second,
+    })
+}
+
+/// A backend that cannot measure itself says so, and the shares fall back to being even.
+#[cfg(not(feature = "cuda"))]
+fn measure_now() -> Option<worker::Speed> {
+    None
+}
+
 /// Opens this machine's side of a connection, with one path per RoCE port, or nothing when it has
 /// none.
 fn open_rdma() -> Option<(Rdma, Vec<[u8; worker::RDMA_ADDRESS_BYTES]>)> {
@@ -286,6 +353,11 @@ impl Worker {
 
     pub fn serves(&self, capability: u32) -> bool {
         self.welcome.capabilities & capability != 0
+    }
+
+    /// What this worker measured of itself, or nothing when its backend cannot measure.
+    pub fn speed(&self) -> Option<worker::Speed> {
+        self.welcome.speed
     }
 
     /// The checkpoint this worker holds for `role`, if it holds one.
@@ -856,7 +928,14 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .collect();
     #[cfg(feature = "cuda")]
     crate::models::load_algorithm_cache();
+    let speed = measure_speed();
     println!("serving {} on {listen}", models.display());
+    if let Some(speed) = speed {
+        println!(
+            "  {:.1} TOPS at a block's GEMM, {:.1} GB/s copying",
+            speed.gemm_tops, speed.bandwidth_gbytes
+        );
+    }
     for (checkpoint, path) in &checkpoints {
         println!(
             "  {} {:016x} {}",
@@ -882,7 +961,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let peer = stream
                 .peer_addr()
                 .map_or_else(|_| "?".to_owned(), |address| address.to_string());
-            if let Err(error) = session(stream, &models, &checkpoints, &token, bare) {
+            if let Err(error) = session(stream, &models, &checkpoints, &token, bare, speed) {
                 eprintln!("worker session with {peer} ended: {error}");
             }
             #[cfg(feature = "cuda")]
@@ -899,6 +978,7 @@ fn session(
     checkpoints: &[(Checkpoint, PathBuf)],
     token: &str,
     bare: bool,
+    speed: Option<worker::Speed>,
 ) -> Result<(), Box<dyn Error>> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER, stream.try_clone()?);
@@ -945,6 +1025,7 @@ fn session(
                     backend: BACKEND,
                     device: device_name(),
                     memory_bytes: memory_bytes(),
+                    speed,
                     capabilities: CAPABILITY_ENCODE_TEXT
                         | CAPABILITY_DECODE_AUDIO
                         | CAPABILITY_DECODE_VIDEO
@@ -961,7 +1042,6 @@ fn session(
                         } else {
                             0
                         },
-                    speed: None,
                     checkpoints: checkpoints
                         .iter()
                         .map(|(checkpoint, _)| checkpoint.clone())
@@ -2301,13 +2381,37 @@ fn serve_shard(
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     let sparse = sparse_attention(&open.sparse);
-    let shard = Shard::even(
-        open.rank as usize,
-        open.ranks as usize,
-        tokens,
-        dit.config().heads,
-        1,
-    );
+    // The cuts the leader worked out, since it is the only rank that knows what every machine can
+    // do. An empty table is an even share, which is what a leader that measured nothing sends.
+    let shard = if open.shard.is_empty() {
+        Shard::even(
+            open.rank as usize,
+            open.ranks as usize,
+            tokens,
+            dit.config().heads,
+            1,
+        )
+    } else {
+        let span = |pair: [u32; 2]| pair[0] as usize..pair[1] as usize;
+        let shard = Shard {
+            rank: open.rank as usize,
+            tokens: open.shard.iter().map(|part| span(part.tokens)).collect(),
+            heads: open.shard.iter().map(|part| span(part.heads)).collect(),
+        };
+        if shard.ranks() != open.ranks as usize
+            || shard.tokens.last().map(|part| part.end) != Some(tokens)
+            || shard.heads.last().map(|part| part.end) != Some(dit.config().heads)
+        {
+            return Err(format!(
+                "a leader cut {tokens} tokens and {} heads into {:?} and {:?}",
+                dit.config().heads,
+                shard.tokens,
+                shard.heads
+            )
+            .into());
+        }
+        shard
+    };
     let gated = dit.has_vsa_gates();
     // The leader's choices for the GEMM shapes, which this rank runs rather than timing the
     // candidates while the wire and the other ranks have its device. A key of its own that the

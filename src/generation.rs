@@ -930,6 +930,16 @@ fn shard_target(
     // The workers `prepare_workers` reached, which are already reading this DiT.
     let mut workers = workers;
     workers.truncate(ranks.saturating_sub(1));
+    // What each machine says it can do, this one included. A machine that says nothing leaves
+    // every share equal, which is right when the machines match and wrong when they do not.
+    let measured: Vec<Option<f64>> =
+        std::iter::once(crate::worker::measure_speed().map(|speed| speed.gemm_tops as f64))
+            .chain(
+                workers
+                    .iter()
+                    .map(|worker| worker.speed().map(|speed| speed.gemm_tops as f64)),
+            )
+            .collect();
     if workers.is_empty() {
         if asked {
             println!("no worker can take a share of a step, so the DiT stays here");
@@ -958,6 +968,30 @@ fn shard_target(
     // rank that measures while the wire and the others have its device measures the load.
     let algorithm_key = mmh3_cuda::algorithms::key().unwrap_or_default();
     let algorithms = mmh3_cuda::algorithms::chosen_matmul();
+    let weights: Vec<f64> = measured.iter().map(|speed| speed.unwrap_or(1.0)).collect();
+    let shard = if measured.iter().all(Option::is_some) && ranks > 1 {
+        println!(
+            "the shares follow what the machines measured: {}",
+            weights
+                .iter()
+                .map(|weight| format!("{weight:.0} TOPS"))
+                .collect::<Vec<String>>()
+                .join(", ")
+        );
+        Shard::weighted(0, &weights, tokens, dit.config().heads, 1)
+    } else {
+        println!("every machine takes the same share, since one of them measures nothing");
+        Shard::even(0, ranks, tokens, dit.config().heads, 1)
+    };
+    let spans: Vec<mmh3_core::worker::ShardSpan> = shard
+        .tokens
+        .iter()
+        .zip(&shard.heads)
+        .map(|(tokens, heads)| mmh3_core::worker::ShardSpan {
+            tokens: [tokens.start as u32, tokens.end as u32],
+            heads: [heads.start as u32, heads.end as u32],
+        })
+        .collect();
     let open = |rank: usize| -> Option<OpenSession> {
         Some(OpenSession {
             checkpoint: checkpoint.clone(),
@@ -972,6 +1006,7 @@ fn shard_target(
             sparse: crate::worker::sparse_settings(sparse),
             conditions: session_conditions(keyframes, references),
             adapters: adapters.clone(),
+            shard: spans.clone(),
             algorithm_key: algorithm_key.clone(),
             algorithms: algorithms.clone(),
             precision: match dit.attention_precision() {
@@ -991,7 +1026,7 @@ fn shard_target(
             .join(", ")
     );
     Some(ShardTarget {
-        shard: Shard::even(0, ranks, tokens, dit.config().heads, 1),
+        shard: shard.clone(),
         workers,
         tokens,
         gated: dit.has_vsa_gates(),

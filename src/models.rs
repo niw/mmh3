@@ -119,6 +119,15 @@ pub fn video_vae_path(options: &HashMap<&str, &str>) -> Result<String, Box<dyn E
     }
 }
 
+/// A file mmh3 keeps between runs, in `$XDG_CACHE_HOME/mmh3` or `~/.cache/mmh3`.
+pub fn cache_file(name: &str) -> Option<PathBuf> {
+    let directory = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|directory| !directory.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+    Some(directory.join(format!("mmh3/{name}")))
+}
+
 /// File that keeps the cuBLASLt algorithms chosen for a table of GEMM shapes between runs, in
 /// `$XDG_CACHE_HOME/mmh3` or `~/.cache/mmh3`.
 #[cfg(feature = "cuda")]

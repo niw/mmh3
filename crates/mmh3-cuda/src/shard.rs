@@ -77,6 +77,64 @@ impl Shard {
         }
     }
 
+    /// Cuts `tokens` and `heads` into shares of `weights`, one per rank, so that a machine carries
+    /// what it can rather than its turn. Tokens still divide on a multiple of `alignment`, and
+    /// what the rounding leaves goes to the rank with the largest weight rather than to the last,
+    /// which under a weighted cut may be the slowest. Every rank keeps at least one unit of each,
+    /// since a rank with no heads or no rows has nothing to run and nowhere to put it.
+    pub fn weighted(
+        rank: usize,
+        weights: &[f64],
+        tokens: usize,
+        heads: usize,
+        alignment: usize,
+    ) -> Self {
+        let fastest = weights
+            .iter()
+            .enumerate()
+            .max_by(|left, right| left.1.total_cmp(right.1))
+            .map_or(0, |(index, _)| index);
+        let cut = |total: usize, step: usize| -> Vec<Range<usize>> {
+            let step = step.max(1);
+            let sum: f64 = weights.iter().map(|weight| weight.max(0.0)).sum();
+            let mut counts: Vec<usize> = weights
+                .iter()
+                .map(|weight| {
+                    let share = if sum > 0.0 {
+                        total as f64 * weight.max(0.0) / sum
+                    } else {
+                        total as f64 / weights.len() as f64
+                    };
+                    ((share / step as f64).floor() as usize * step).max(step)
+                })
+                .collect();
+            // The minimum may have overdrawn the total, so the fastest rank gives it back, and
+            // what is left over after the rounding goes to it instead.
+            let taken: usize = counts.iter().sum();
+            if taken <= total {
+                counts[fastest] += total - taken;
+            } else {
+                counts[fastest] = counts[fastest].saturating_sub(taken - total);
+            }
+            let mut ranges = Vec::with_capacity(counts.len());
+            let mut start = 0;
+            for count in counts {
+                let end = (start + count).min(total);
+                ranges.push(start..end);
+                start = end;
+            }
+            if let Some(last) = ranges.last_mut() {
+                last.end = total;
+            }
+            ranges
+        };
+        Shard {
+            rank,
+            tokens: cut(tokens, alignment),
+            heads: cut(heads, 1),
+        }
+    }
+
     pub fn ranks(&self) -> usize {
         self.tokens.len()
     }

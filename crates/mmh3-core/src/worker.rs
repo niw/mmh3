@@ -512,6 +512,17 @@ pub struct OpenSession {
     pub algorithm_key: String,
     /// The algorithms the leader chose for the GEMM shapes it has met.
     pub algorithms: Vec<Algorithm>,
+    /// What each rank carries, in rank order. Empty leaves every rank an equal share.
+    pub shard: Vec<ShardSpan>,
+}
+
+/// What one rank of a shared-out step carries: a run of the sequence and a run of the heads. The
+/// leader works the cuts out, since it is the only rank that knows what every machine can do, and
+/// sends them whole rather than sending what it decided them from.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShardSpan {
+    pub tokens: [u32; 2],
+    pub heads: [u32; 2],
 }
 
 /// One rank's write into another's region, for a pair of ranks whose path has no reliable
@@ -703,6 +714,14 @@ impl OpenSession {
                 .f32(adapter.strength)
                 .u8(adapter.mode);
         }
+        encoder.u32(self.shard.len() as u32);
+        for span in &self.shard {
+            encoder
+                .u32(span.tokens[0])
+                .u32(span.tokens[1])
+                .u32(span.heads[0])
+                .u32(span.heads[1]);
+        }
         encoder
             .string(&self.algorithm_key)
             .u32(self.algorithms.len() as u32);
@@ -760,6 +779,7 @@ impl OpenSession {
             precision: decoder.u8()?,
             conditions: Vec::new(),
             adapters: Vec::new(),
+            shard: Vec::new(),
             algorithm_key: String::new(),
             algorithms: Vec::new(),
         };
@@ -788,6 +808,14 @@ impl OpenSession {
                 mode: decoder.u8()?,
             });
         }
+        let count = decoder.u32()? as usize;
+        let mut shard = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            shard.push(ShardSpan {
+                tokens: [decoder.u32()?, decoder.u32()?],
+                heads: [decoder.u32()?, decoder.u32()?],
+            });
+        }
         let algorithm_key = decoder.string()?;
         let count = decoder.u32()? as usize;
         let mut algorithms = Vec::with_capacity(count.min(1024));
@@ -808,6 +836,7 @@ impl OpenSession {
         let session = OpenSession {
             conditions,
             adapters,
+            shard,
             algorithm_key,
             algorithms,
             ..session
