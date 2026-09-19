@@ -413,3 +413,24 @@ kernel void shard_unpack(device const float *part [[buffer(0)]], device float *o
     uint head = rest % span + p[4], token = rest / span;
     output[(token * heads + head) * dim + lane] = part[i];
 }
+
+// The exchange carries a block's attention tensors in bf16, which Metal has no type for, so they
+// convert on the way out and back. Rounds to nearest, ties to even, and leaves a NaN a NaN, which
+// is what mmh3_core::numeric does on the host.
+kernel void to_bf16(device const float *x [[buffer(0)]], device ushort *y [[buffer(1)]],
+                    constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    uint bits = as_type<uint>(x[i]);
+    if ((bits & 0x7F800000u) == 0x7F800000u && (bits & 0x007FFFFFu) != 0u)
+        y[p[1] + i] = ushort((bits >> 16) | 0x40u);
+    else
+        y[p[1] + i] = ushort((bits + 0x7FFFu + ((bits >> 16) & 1u)) >> 16);
+}
+
+kernel void from_bf16(device const ushort *x [[buffer(0)]], device float *y [[buffer(1)]],
+                      constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    y[i] = as_type<float>(uint(x[p[1] + i]) << 16);
+}

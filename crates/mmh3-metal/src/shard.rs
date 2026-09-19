@@ -5,8 +5,72 @@
 //! to see every key, so a block moves between "my tokens, every head" and "every token, my heads"
 //! and back. These are the two gathers that do it.
 
-use crate::{Error, Result, ops::Array};
+use crate::{Buffer, Device, Error, Result, ops::Array};
+use mmh3_core::shard::{ExchangeError, Region};
+use std::collections::HashMap;
 use std::ops::Range;
+
+/// Memory a Metal rank exchanges through. A region is named in bytes and holds INT8 rows, FP32
+/// scales or bf16 attention tensors depending on which one it is, so this is bytes rather than an
+/// `Array` of one element width.
+#[derive(Clone)]
+pub struct Memory {
+    device: Device,
+    buffer: Buffer,
+    bytes: usize,
+}
+
+impl Memory {
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Writes `values` as bf16 at `offset` bytes in, the width the exchange carries a block's
+    /// attention tensors in.
+    pub fn write_bf16(&self, offset: usize, values: &Array) -> Result<()> {
+        let count = values.len();
+        self.check(offset, count * 2)?;
+        self.device.run(
+            "to_bf16",
+            &[&values.buffer, &self.buffer],
+            &[count as u32, (offset / 2) as u32],
+            count,
+            false,
+        )
+    }
+
+    /// The `rows` by `cols` FP32 array of the bf16 values at `offset` bytes in.
+    pub fn read_bf16(&self, offset: usize, rows: usize, cols: usize) -> Result<Array> {
+        let count = rows
+            .checked_mul(cols)
+            .ok_or_else(|| Error("a read that overflows".into()))?;
+        self.check(offset, count * 2)?;
+        let values = Array::empty(&self.device, rows, cols)?;
+        self.device.run(
+            "from_bf16",
+            &[&self.buffer, &values.buffer],
+            &[count as u32, (offset / 2) as u32],
+            count,
+            false,
+        )?;
+        Ok(values)
+    }
+
+    /// An offset into a region is a byte offset, and a bf16 value straddling the end of one would
+    /// read a neighbour's memory rather than fail, so the extent is checked before the kernel.
+    fn check(&self, offset: usize, bytes: usize) -> Result<()> {
+        if offset % 2 != 0 {
+            return Err(Error(format!("a bf16 run at an odd offset {offset}")));
+        }
+        if offset.checked_add(bytes).is_none_or(|end| end > self.bytes) {
+            return Err(Error(format!(
+                "{bytes} bytes at {offset} of a region of {}",
+                self.bytes
+            )));
+        }
+        Ok(())
+    }
+}
 
 /// Gathers the heads `own_heads` out of `[tokens][tensors][heads][dim]` into
 /// `[tokens][tensors][own heads][dim]`, which is the shape the attention already reads. q, k and v
@@ -97,6 +161,95 @@ fn check(tensors: usize, heads: usize, own_heads: &Range<usize>, dim: usize) -> 
         )));
     }
     Ok(own_heads.len())
+}
+
+/// The exchange of a step that is not shared out after all: one rank, regions in this machine's
+/// own memory, and nothing to carry anywhere. A step through it has to come out the same as a step
+/// that never went near a shard, which is how a rank's own path is checked without a second
+/// machine.
+pub struct WholeExchange {
+    device: Device,
+    regions: HashMap<Region, Memory>,
+}
+
+impl WholeExchange {
+    pub fn new(device: &Device) -> Self {
+        Self {
+            device: device.clone(),
+            regions: HashMap::new(),
+        }
+    }
+}
+
+impl mmh3_core::shard::Exchange for WholeExchange {
+    type Memory = Memory;
+
+    fn rank(&self) -> usize {
+        0
+    }
+
+    fn ranks(&self) -> usize {
+        1
+    }
+
+    fn region(
+        &mut self,
+        region: Region,
+        bytes: usize,
+    ) -> std::result::Result<Memory, ExchangeError> {
+        if self.regions.get(&region).map_or(0, Memory::bytes) < bytes {
+            let zeros = vec![0u8; bytes];
+            let buffer = self
+                .device
+                .alloc(bytes, Some(&zeros))
+                .map_err(|error| ExchangeError(error.to_string()))?;
+            self.regions.insert(
+                region,
+                Memory {
+                    device: self.device.clone(),
+                    buffer,
+                    bytes,
+                },
+            );
+        }
+        Ok(self.regions[&region].clone())
+    }
+
+    fn write(
+        &mut self,
+        peer: usize,
+        _from: Region,
+        _offset: usize,
+        _into: Region,
+        _peer_offset: usize,
+        _bytes: usize,
+    ) -> std::result::Result<(), ExchangeError> {
+        Err(ExchangeError(format!(
+            "one rank cannot write to rank {peer}"
+        )))
+    }
+
+    fn publish(
+        &mut self,
+        _region: Region,
+        _offset: usize,
+        _bytes: usize,
+    ) -> std::result::Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    fn receive(
+        &mut self,
+        _region: Region,
+        _offset: usize,
+        _bytes: usize,
+    ) -> std::result::Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    fn barrier(&mut self) -> std::result::Result<(), ExchangeError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -197,6 +350,110 @@ mod tests {
         }
 
         assert_eq!(output.to_f32().unwrap(), whole.to_f32().unwrap());
+    }
+
+    /// The exchange carries bf16, so what goes out and comes back is what the host conversion
+    /// gives, not merely something close to it.
+    #[test]
+    fn bf16_matches_the_conversion_on_the_host() {
+        use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
+        use mmh3_core::shard::Exchange;
+
+        let device = Device::new().unwrap();
+        let values: Vec<f32> = [
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            0.5,
+            1.0 / 3.0,
+            -2.718_281_8,
+            1e-40,
+            3.4e38,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ]
+        .into_iter()
+        .chain((0..117).map(|i| (i as f32 - 58.0) / 7.0))
+        .collect();
+
+        let rows = values.len();
+        let array = Array::from_f32(&device, rows, 1, &values).unwrap();
+        let mut exchange = WholeExchange::new(&device);
+        let memory = exchange.region(Region::Attended, rows * 2).unwrap();
+        memory.write_bf16(0, &array).unwrap();
+
+        let found = memory.read_bf16(0, rows, 1).unwrap().to_f32().unwrap();
+        for (index, &value) in values.iter().enumerate() {
+            let expected = bf16_to_f32(f32_to_bf16(value));
+            assert_eq!(
+                found[index].to_bits(),
+                expected.to_bits(),
+                "value {index}, {value}"
+            );
+        }
+    }
+
+    /// A NaN stays a NaN rather than turning into an infinity, which a naive truncation does.
+    #[test]
+    fn bf16_keeps_a_nan_a_nan() {
+        use mmh3_core::shard::Exchange;
+
+        let device = Device::new().unwrap();
+        let array = Array::from_f32(&device, 1, 1, &[f32::NAN]).unwrap();
+        let mut exchange = WholeExchange::new(&device);
+        let memory = exchange.region(Region::Attended, 2).unwrap();
+        memory.write_bf16(0, &array).unwrap();
+        assert!(memory.read_bf16(0, 1, 1).unwrap().to_f32().unwrap()[0].is_nan());
+    }
+
+    /// Regions are addressed by byte offset, so a run that would reach past one is refused rather
+    /// than reading whatever is next to it.
+    #[test]
+    fn a_run_past_the_end_of_a_region_is_refused() {
+        use mmh3_core::shard::Exchange;
+
+        let device = Device::new().unwrap();
+        let mut exchange = WholeExchange::new(&device);
+        let memory = exchange.region(Region::Attended, 16).unwrap();
+        assert!(memory.bytes() >= 16);
+        let array = Array::from_f32(&device, 8, 1, &[1.0; 8]).unwrap();
+        assert!(memory.write_bf16(2, &array).is_err());
+        assert!(memory.read_bf16(2, 8, 1).is_err());
+        assert!(memory.read_bf16(1, 4, 1).is_err());
+        assert!(memory.write_bf16(0, &array).is_ok());
+    }
+
+    /// One rank keeps its regions and has nobody to write to, which is what makes it the exchange a
+    /// run uses to check the sharded path against itself.
+    #[test]
+    fn one_rank_keeps_its_regions_and_writes_to_nobody() {
+        use mmh3_core::shard::Exchange;
+
+        let device = Device::new().unwrap();
+        let mut exchange = WholeExchange::new(&device);
+        assert_eq!(exchange.rank(), 0);
+        assert_eq!(exchange.ranks(), 1);
+
+        let first = exchange.region(Region::Normalized, 64).unwrap();
+        let again = exchange.region(Region::Normalized, 32).unwrap();
+        assert_eq!(
+            first.bytes(),
+            again.bytes(),
+            "a smaller ask keeps the region"
+        );
+
+        let grown = exchange.region(Region::Normalized, 256).unwrap();
+        assert_eq!(grown.bytes(), 256);
+
+        assert!(
+            exchange
+                .write(1, Region::Normalized, 0, Region::Normalized, 0, 8)
+                .is_err()
+        );
+        assert!(exchange.publish(Region::Normalized, 0, 8).is_ok());
+        assert!(exchange.receive(Region::Normalized, 0, 8).is_ok());
+        assert!(exchange.barrier().is_ok());
     }
 
     #[test]
