@@ -14,7 +14,7 @@ use mmh3_core::{
         timestep::StepTimesteps,
     },
     safetensors::SafeTensors,
-    shard::{Exchange, ExchangeError, Region, Shard},
+    shard::{Exchange, ExchangeError, Region, Shard, regions as shard_regions},
     tensor::Tensor,
 };
 
@@ -191,6 +191,17 @@ impl MetalDit {
                 rows.len(),
                 c.hidden
             )));
+        }
+
+        // NOTE: every region a peer writes into has to exist before the barrier that carries the
+        // write, since a transport has nowhere to put what arrives for a region that was never
+        // made. That is why a rank makes them all up front rather than as it reaches them.
+        for (region, bytes) in shard_regions(shard, tokens, c.hidden, false) {
+            // This rank keeps its attention inputs in its own arrays and Metal has no VSA gate.
+            // Nothing outside writes to either, so neither is made.
+            if !matches!(region, Region::Inputs | Region::Gate) {
+                exchange.region(region, bytes).map_err(shard_error)?;
+            }
         }
 
         // This rank's rows go where its peers can read them, quantized as the projections take
