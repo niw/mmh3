@@ -12,9 +12,8 @@
 
 use crate::{CudaError, DeviceBuffer, check};
 use std::cell::Cell;
-use std::ffi::{CStr, c_char, c_int, c_void};
-use std::path::Path;
-use std::{fs, io, ptr};
+use std::ffi::{c_int, c_void};
+use std::ptr;
 
 unsafe extern "C" {
     fn mmh3_nvfp4_quantize(
@@ -86,9 +85,6 @@ unsafe extern "C" {
         k: i64,
         stream: *mut c_void,
     ) -> c_int;
-    fn mmh3_cublaslt_nvfp4_algorithms(algorithms: *mut ChosenAlgorithm, capacity: c_int) -> c_int;
-    fn mmh3_cublaslt_nvfp4_adopt(algorithms: *const ChosenAlgorithm, count: c_int);
-    fn mmh3_cublaslt_nvfp4_algorithm_key(key: *mut c_char, capacity: c_int) -> c_int;
 }
 
 /// How far the activations may grow over the previous call's largest magnitude before their block
@@ -572,118 +568,4 @@ pub fn linear_swiglu(
         )?;
         gemm_pointers(weight, activations, output.pointer(), rows)
     }
-}
-
-/// The cuBLASLt algorithm chosen for an NVFP4 GEMM of `m × k` activations and `n` outputs.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ChosenAlgorithm {
-    m: i64,
-    n: i64,
-    k: i64,
-    data: [u64; 8],
-}
-
-impl ChosenAlgorithm {
-    fn parse(line: &str) -> Option<Self> {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        let [m, n, k, words @ ..] = fields.as_slice() else {
-            return None;
-        };
-        if words.len() != 8 {
-            return None;
-        }
-        let mut data = [0; 8];
-        for (word, text) in data.iter_mut().zip(words) {
-            *word = u64::from_str_radix(text, 16).ok()?;
-        }
-        Some(ChosenAlgorithm {
-            m: m.parse().ok()?,
-            n: n.parse().ok()?,
-            k: k.parse().ok()?,
-            data,
-        })
-    }
-}
-
-/// First line of a file of chosen algorithms, followed by the line of `algorithm_key` and a line
-/// per shape: m, n, k and the eight words of the algorithm in hexadecimal.
-const ALGORITHMS_HEADER: &str = "mmh3 cuBLASLt NVFP4 algorithms";
-
-/// What the chosen algorithms depend on: the cuBLASLt version, the GPU and the descriptors.
-fn algorithm_key() -> Result<String, CudaError> {
-    let mut key = [0u8; 512];
-    // SAFETY: the buffer holds `key.len()` bytes.
-    check(unsafe {
-        mmh3_cublaslt_nvfp4_algorithm_key(key.as_mut_ptr().cast(), key.len() as c_int)
-    })?;
-    Ok(CStr::from_bytes_until_nul(&key)
-        .map(|key| key.to_string_lossy().into_owned())
-        .unwrap_or_default())
-}
-
-fn chosen_algorithms() -> Vec<ChosenAlgorithm> {
-    // SAFETY: a capacity of 0 writes nothing.
-    let count = unsafe { mmh3_cublaslt_nvfp4_algorithms(ptr::null_mut(), 0) } as usize;
-    let mut algorithms = vec![ChosenAlgorithm::default(); count];
-    // SAFETY: the vector holds `count` algorithms.
-    let total = unsafe { mmh3_cublaslt_nvfp4_algorithms(algorithms.as_mut_ptr(), count as c_int) };
-    algorithms.truncate(total as usize);
-    algorithms
-}
-
-/// Takes over the cuBLASLt algorithms that `save_algorithms` left in `path` for NVFP4 GEMM shapes
-/// and returns how many it took. It takes none from a missing or damaged file or from one written
-/// with another cuBLASLt version, GPU or descriptors.
-pub fn load_algorithms(path: &Path) -> io::Result<usize> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
-        Err(error) => return Err(error),
-    };
-    let key = algorithm_key().map_err(io::Error::other)?;
-    let mut lines = text.lines();
-    if lines.next() != Some(ALGORITHMS_HEADER) || lines.next() != Some(key.as_str()) {
-        return Ok(0);
-    }
-    let Some(algorithms) = lines
-        .map(ChosenAlgorithm::parse)
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok(0);
-    };
-    // SAFETY: the slice holds `algorithms.len()` algorithms.
-    unsafe { mmh3_cublaslt_nvfp4_adopt(algorithms.as_ptr(), algorithms.len() as c_int) };
-    Ok(algorithms.len())
-}
-
-/// Writes the cuBLASLt algorithms chosen for NVFP4 GEMM shapes in this process to `path` for
-/// `load_algorithms`, and returns whether it wrote. It writes nothing when there are none or the
-/// file already holds them.
-pub fn save_algorithms(path: &Path) -> io::Result<bool> {
-    let algorithms = chosen_algorithms();
-    if algorithms.is_empty() {
-        return Ok(false);
-    }
-    let mut text = format!(
-        "{ALGORITHMS_HEADER}\n{}\n",
-        algorithm_key().map_err(io::Error::other)?
-    );
-    for algorithm in &algorithms {
-        text.push_str(&format!("{} {} {}", algorithm.m, algorithm.n, algorithm.k));
-        for word in algorithm.data {
-            text.push_str(&format!(" {word:016x}"));
-        }
-        text.push('\n');
-    }
-    if fs::read_to_string(path).is_ok_and(|existing| existing == text) {
-        return Ok(false);
-    }
-    if let Some(directory) = path.parent() {
-        fs::create_dir_all(directory)?;
-    }
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, text)?;
-    fs::rename(&temporary, path)?;
-    Ok(true)
 }

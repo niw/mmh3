@@ -88,8 +88,8 @@ pub fn load_dit(
                 "requantized {layers} layers to NVFP4 in {:.1} s",
                 started.elapsed().as_secs_f64()
             );
-            if let Some(cache) = algorithm_cache() {
-                match mmh3_cuda::nvfp4::load_algorithms(&cache) {
+            if let Some(cache) = algorithm_cache("nvfp4") {
+                match mmh3_cuda::algorithms::load_nvfp4(&cache) {
                     Ok(0) => {}
                     Ok(count) => {
                         println!("took {count} cuBLASLt algorithms from {}", cache.display())
@@ -119,27 +119,45 @@ pub fn video_vae_path(options: &HashMap<&str, &str>) -> Result<String, Box<dyn E
     }
 }
 
-/// File that keeps the cuBLASLt algorithms chosen for the NVFP4 GEMMs between runs, in
+/// File that keeps the cuBLASLt algorithms chosen for a table of GEMM shapes between runs, in
 /// `$XDG_CACHE_HOME/mmh3` or `~/.cache/mmh3`.
 #[cfg(feature = "cuda")]
-fn algorithm_cache() -> Option<PathBuf> {
+fn algorithm_cache(table: &str) -> Option<PathBuf> {
     let directory = std::env::var_os("XDG_CACHE_HOME")
         .filter(|directory| !directory.is_empty())
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
-    Some(directory.join("mmh3/cublaslt-nvfp4-algorithms.txt"))
+    Some(directory.join(format!("mmh3/cublaslt-{table}-algorithms.txt")))
 }
 
-/// Keeps the cuBLASLt algorithms this run chose for NVFP4 GEMMs for later runs.
+/// Takes over the cuBLASLt algorithms earlier runs chose for the ordinary GEMM shapes. A run that
+/// has met its shapes before then times none of them, which is a second of its first step, and two
+/// ranks that read the same file choose alike rather than each timing under the other's load.
 #[cfg(feature = "cuda")]
-pub fn save_algorithm_cache() {
-    let Some(cache) = algorithm_cache() else {
+pub fn load_algorithm_cache() {
+    let Some(cache) = algorithm_cache("matmul") else {
         return;
     };
-    match mmh3_cuda::nvfp4::save_algorithms(&cache) {
+    match mmh3_cuda::algorithms::load_matmul(&cache) {
+        Ok(0) => {}
+        Ok(count) => println!("took {count} cuBLASLt algorithms from {}", cache.display()),
+        Err(error) => eprintln!("warning: reading {}: {error}", cache.display()),
+    }
+}
+
+/// Keeps the cuBLASLt algorithms this run chose for later runs.
+#[cfg(feature = "cuda")]
+pub fn save_algorithm_cache() {
+    let saved = |cache: &PathBuf, result: std::io::Result<bool>| match result {
         Ok(true) => println!("saved the cuBLASLt algorithms to {}", cache.display()),
         Ok(false) => {}
         Err(error) => eprintln!("warning: writing {}: {error}", cache.display()),
+    };
+    if let Some(cache) = algorithm_cache("matmul") {
+        saved(&cache, mmh3_cuda::algorithms::save_matmul(&cache));
+    }
+    if let Some(cache) = algorithm_cache("nvfp4") {
+        saved(&cache, mmh3_cuda::algorithms::save_nvfp4(&cache));
     }
 }
 

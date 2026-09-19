@@ -375,6 +375,24 @@ impl Adapter {
     pub const MERGE: u8 = 1;
 }
 
+/// A cuBLASLt algorithm the leader chose for a GEMM shape, which the other ranks take rather than
+/// timing the candidates themselves: a measurement that separates two of near-equal speed
+/// separates the arithmetic, and a rank measures while the wire and the others have its device.
+///
+/// The fields before the words are the key of the choice, and the words are the algorithm as
+/// cuBLASLt hands it over. The layout is the one the backend reads, so the table crosses without
+/// being rebuilt.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Algorithm {
+    pub kind: i64,
+    pub bias: i64,
+    pub m: i64,
+    pub n: i64,
+    pub k: i64,
+    pub data: [u64; 8],
+}
+
 /// Opening a shared-out step: everything a rank needs to stand up the same layout the leader has,
 /// except the latents, which change every step. Both sides work the shard out of `ranks`, so only
 /// which rank this worker takes crosses the wire.
@@ -400,6 +418,11 @@ pub struct OpenSession {
     pub adapters: Vec<Adapter>,
     /// 0 for bf16 attention, 1 for INT8 QK with FP8 PV.
     pub precision: u8,
+    /// What the leader's chosen algorithms depend on, as its backend names it. A rank whose own
+    /// name for it differs, a Metal one above all, takes none of them.
+    pub algorithm_key: String,
+    /// The algorithms the leader chose for the GEMM shapes it has met.
+    pub algorithms: Vec<Algorithm>,
 }
 
 /// Where one rank's memory sits, so the others can read it. One entry per region a step uses, in
@@ -456,6 +479,34 @@ impl PeerLink {
             links.push(PeerLink { peer, addresses });
         }
         Ok(links)
+    }
+}
+
+/// What a rank made of the session it was given: the regions it registered, for the leader to pass
+/// round, and how many of the leader's chosen algorithms it took. A rank that took none of them
+/// times its own candidates, which two ranks may answer differently.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionReady {
+    pub algorithms: u32,
+    pub regions: Vec<RemoteRegion>,
+}
+
+impl SessionReady {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(self.algorithms);
+        let mut bytes = encoder.finish();
+        bytes.extend(RemoteRegion::encode_all(&self.regions));
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        let algorithms = decoder.u32()?;
+        Ok(SessionReady {
+            algorithms,
+            regions: RemoteRegion::decode_all(decoder.rest())?,
+        })
     }
 }
 
@@ -523,6 +574,20 @@ impl OpenSession {
                 .f32(adapter.strength)
                 .u8(adapter.mode);
         }
+        encoder
+            .string(&self.algorithm_key)
+            .u32(self.algorithms.len() as u32);
+        for algorithm in &self.algorithms {
+            encoder
+                .u64(algorithm.kind as u64)
+                .u64(algorithm.bias as u64)
+                .u64(algorithm.m as u64)
+                .u64(algorithm.n as u64)
+                .u64(algorithm.k as u64);
+            for word in algorithm.data {
+                encoder.u64(word);
+            }
+        }
         encoder.finish()
     }
 
@@ -566,6 +631,8 @@ impl OpenSession {
             precision: decoder.u8()?,
             conditions: Vec::new(),
             adapters: Vec::new(),
+            algorithm_key: String::new(),
+            algorithms: Vec::new(),
         };
         let count = decoder.u32()? as usize;
         let mut conditions = Vec::with_capacity(count.min(64));
@@ -592,9 +659,28 @@ impl OpenSession {
                 mode: decoder.u8()?,
             });
         }
+        let algorithm_key = decoder.string()?;
+        let count = decoder.u32()? as usize;
+        let mut algorithms = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            let mut algorithm = Algorithm {
+                kind: decoder.u64()? as i64,
+                bias: decoder.u64()? as i64,
+                m: decoder.u64()? as i64,
+                n: decoder.u64()? as i64,
+                k: decoder.u64()? as i64,
+                ..Algorithm::default()
+            };
+            for word in &mut algorithm.data {
+                *word = decoder.u64()?;
+            }
+            algorithms.push(algorithm);
+        }
         let session = OpenSession {
             conditions,
             adapters,
+            algorithm_key,
+            algorithms,
             ..session
         };
         Ok((session, decoder.position))

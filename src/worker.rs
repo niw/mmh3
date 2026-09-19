@@ -726,6 +726,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             ))
         })
         .collect();
+    #[cfg(feature = "cuda")]
+    crate::models::load_algorithm_cache();
     println!("serving {} on {listen}", models.display());
     for (checkpoint, path) in &checkpoints {
         println!(
@@ -755,6 +757,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             if let Err(error) = session(stream, &models, &checkpoints, &token) {
                 eprintln!("worker session with {peer} ended: {error}");
             }
+            #[cfg(feature = "cuda")]
+            crate::models::save_algorithm_cache();
         });
     }
     Ok(())
@@ -1170,6 +1174,7 @@ impl<'a> Exchanger<'a> {
         hidden: usize,
         gated: bool,
         peers: Vec<Peer<'a>>,
+        algorithms: u32,
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
         let mut sockets = HashMap::new();
@@ -1194,7 +1199,7 @@ impl<'a> Exchanger<'a> {
             peers: HashMap::new(),
         };
         exchanger.link_peers()?;
-        exchanger.register(shard, tokens, hidden, gated)?;
+        exchanger.register(shard, tokens, hidden, gated, algorithms)?;
         Ok(exchanger)
     }
 
@@ -1281,13 +1286,15 @@ impl<'a> Exchanger<'a> {
         Ok(())
     }
 
-    /// Registers every region a step will use and passes the table of them round.
+    /// Registers every region a step will use and passes the table of them round. `algorithms` is
+    /// how many cuBLASLt choices this rank took from the leader, or sent as the leader.
     fn register(
         &mut self,
         shard: &Shard,
         tokens: usize,
         hidden: usize,
         gated: bool,
+        algorithms: u32,
     ) -> Result<(), Box<dyn Error>> {
         let device = rdma_device().ok_or("this machine has no RoCE port")?;
         let mut table = Vec::new();
@@ -1315,7 +1322,11 @@ impl<'a> Exchanger<'a> {
             self.send(
                 0,
                 Kind::SessionReady,
-                &worker::RemoteRegion::encode_all(&table),
+                &worker::SessionReady {
+                    algorithms,
+                    regions: table,
+                }
+                .encode(),
                 &[],
             )?;
             let (header, body) = self.receive(0)?;
@@ -1328,7 +1339,16 @@ impl<'a> Exchanger<'a> {
             for peer in 1..self.ranks {
                 let (header, body) = self.receive(peer)?;
                 self.expect(header, Kind::SessionReady, &body)?;
-                whole.extend(worker::RemoteRegion::decode_all(&body)?);
+                let ready = worker::SessionReady::decode(&body)?;
+                // A rank that took none of them times its own candidates, so the two may choose
+                // differently and the run is then only what these machines together produce.
+                if ready.algorithms == 0 && algorithms > 0 {
+                    println!(
+                        "rank {peer} took none of the {algorithms} cuBLASLt algorithms, so it \
+                         chooses its own"
+                    );
+                }
+                whole.extend(ready.regions);
             }
             let encoded = worker::RemoteRegion::encode_all(&whole);
             for peer in 1..self.ranks {
@@ -1784,6 +1804,15 @@ fn serve_shard(
         1,
     );
     let gated = dit.has_vsa_gates();
+    // The leader's choices for the GEMM shapes, which this rank runs rather than timing the
+    // candidates while the wire and the other ranks have its device. A key of its own that the
+    // leader's does not match, which is what another GPU or another backend has, leaves them.
+    let algorithms = match mmh3_cuda::algorithms::key() {
+        Ok(key) if key == open.algorithm_key => {
+            mmh3_cuda::algorithms::adopt_matmul(&open.algorithms)
+        }
+        _ => 0,
+    };
     // A worker's only socket is the one the leader opened, so the leader is its only peer here and
     // the connections to the other ranks come out of the rendezvous.
     let peers = vec![Peer {
@@ -1792,7 +1821,14 @@ fn serve_shard(
         writer,
         link: connection,
     }];
-    let mut exchanger = Exchanger::open(&shard, tokens, dit.config().hidden, gated, peers)?;
+    let mut exchanger = Exchanger::open(
+        &shard,
+        tokens,
+        dit.config().hidden,
+        gated,
+        peers,
+        algorithms as u32,
+    )?;
     println!(
         "rank {} of {} takes tokens {:?} and heads {:?}",
         shard.rank,
@@ -1895,6 +1931,7 @@ pub fn open_shard<'a>(
     tokens: usize,
     hidden: usize,
     gated: bool,
+    algorithms: u32,
 ) -> Result<Exchanger<'a>, Box<dyn Error>> {
     let mut peers = Vec::with_capacity(workers.len());
     for (index, worker) in workers.iter_mut().enumerate() {
@@ -1903,7 +1940,7 @@ pub fn open_shard<'a>(
             .ok_or("a worker was given no session to open")?;
         peers.push(worker.as_peer(index + 1, open, payload)?);
     }
-    Exchanger::open(shard, tokens, hidden, gated, peers)
+    Exchanger::open(shard, tokens, hidden, gated, peers, algorithms)
 }
 
 /// The block-sparse attention of a run, as a session carries it. Every rank has to choose the same

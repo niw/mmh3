@@ -80,6 +80,9 @@ struct Descriptors {
 // Bumped whenever the descriptors of mmh3_cublaslt_nvfp4 change, so that algorithms chosen for the
 // old ones are not taken over.
 constexpr int NVFP4_ALGORITHM_FORMAT = 1;
+// The same for the ordinary GEMM shapes. It goes up whenever the rule that picks between the
+// candidates changes, so that a file written under the old one is not taken over under the new.
+constexpr int MATMUL_ALGORITHM_FORMAT = 1;
 
 using Shape = std::tuple<int64_t, int64_t, int64_t>;
 
@@ -116,6 +119,18 @@ constexpr int NVFP4_CANDIDATES = 8;
 
 // An algorithm chosen for an NVFP4 GEMM shape, see mmh3_cublaslt_nvfp4_algorithms.
 struct Mmh3Nvfp4Algorithm {
+    int64_t m;
+    int64_t n;
+    int64_t k;
+    uint64_t data[8];
+};
+
+// An algorithm chosen for an ordinary GEMM shape, see mmh3_cublaslt_matmul_algorithms. The fields
+// before the words are the key of the choice: the kind of the operands, whether the call adds a
+// bias, and the shape.
+struct Mmh3MatmulAlgorithm {
+    int64_t kind;
+    int64_t bias;
     int64_t m;
     int64_t n;
     int64_t k;
@@ -435,9 +450,10 @@ extern "C" void mmh3_cublaslt_nvfp4_adopt(const Mmh3Nvfp4Algorithm *algorithms, 
     }
 }
 
-// Writes a line naming what the chosen NVFP4 algorithms depend on, the cuBLASLt version, the GPU
-// and the descriptors, to `key`, which holds `capacity` bytes.
-extern "C" int mmh3_cublaslt_nvfp4_algorithm_key(char *key, int capacity) {
+// Writes a line naming what a table of chosen algorithms depends on, the cuBLASLt version, the
+// GPU, the descriptors and the rule that picked between the candidates, to `key`, which holds
+// `capacity` bytes.
+static int algorithm_key(char *key, int capacity, const char *table, int format) {
     int device = 0;
     cudaDeviceProp properties;
     cudaError_t status = cudaGetDevice(&device);
@@ -448,8 +464,52 @@ extern "C" int mmh3_cublaslt_nvfp4_algorithm_key(char *key, int capacity) {
         return static_cast<int>(status);
     }
     const int written = std::snprintf(
-        key, static_cast<size_t>(capacity), "cuBLASLt %zu, %s, sm_%d%d, %d SMs, format %d",
+        key, static_cast<size_t>(capacity), "cuBLASLt %zu, %s, sm_%d%d, %d SMs, %s format %d",
         cublasLtGetVersion(), properties.name, properties.major, properties.minor,
-        properties.multiProcessorCount, NVFP4_ALGORITHM_FORMAT);
+        properties.multiProcessorCount, table, format);
     return written < 0 || written >= capacity ? static_cast<int>(cudaErrorInvalidValue) : 0;
+}
+
+extern "C" int mmh3_cublaslt_nvfp4_algorithm_key(char *key, int capacity) {
+    return algorithm_key(key, capacity, "NVFP4", NVFP4_ALGORITHM_FORMAT);
+}
+
+extern "C" int mmh3_cublaslt_matmul_algorithm_key(char *key, int capacity) {
+    return algorithm_key(key, capacity, "matmul", MATMUL_ALGORITHM_FORMAT);
+}
+
+// Copies up to `capacity` of the algorithms chosen for ordinary GEMM shapes to `algorithms` and
+// returns how many there are.
+extern "C" int mmh3_cublaslt_matmul_algorithms(Mmh3MatmulAlgorithm *algorithms, int capacity) {
+    const std::lock_guard<std::mutex> lock(matmul_algorithms_mutex);
+    int index = 0;
+    for (const auto &[key, algorithm] : matmul_algorithms) {
+        if (index < capacity) {
+            algorithms[index].kind = std::get<0>(key);
+            algorithms[index].bias = std::get<4>(key) ? 1 : 0;
+            algorithms[index].m = std::get<1>(key);
+            algorithms[index].n = std::get<2>(key);
+            algorithms[index].k = std::get<3>(key);
+            for (int word = 0; word < 8; word++) {
+                algorithms[index].data[word] = algorithm.data[word];
+            }
+        }
+        index++;
+    }
+    return index;
+}
+
+// Takes over algorithms for ordinary GEMM shapes that have none chosen yet.
+extern "C" void mmh3_cublaslt_matmul_adopt(const Mmh3MatmulAlgorithm *algorithms, int count) {
+    const std::lock_guard<std::mutex> lock(matmul_algorithms_mutex);
+    for (int index = 0; index < count; index++) {
+        cublasLtMatmulAlgo_t algorithm;
+        for (int word = 0; word < 8; word++) {
+            algorithm.data[word] = algorithms[index].data[word];
+        }
+        matmul_algorithms.emplace(std::make_tuple(static_cast<int>(algorithms[index].kind),
+                                                  algorithms[index].m, algorithms[index].n,
+                                                  algorithms[index].k, algorithms[index].bias != 0),
+                                  algorithm);
+    }
 }

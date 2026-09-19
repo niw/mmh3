@@ -493,6 +493,10 @@ pub fn sample(
     let mut sharing = match &mut target {
         Some(target) => {
             let shard = target.shard.clone();
+            let algorithms = target
+                .open
+                .first()
+                .map_or(0, |open| open.algorithms.len() as u32);
             match crate::worker::open_shard(
                 &mut target.workers,
                 &target.open,
@@ -501,6 +505,7 @@ pub fn sample(
                 target.tokens,
                 dit.config().hidden,
                 target.gated,
+                algorithms,
             ) {
                 Ok(exchanger) => Some(Sharing::With(Box::new(exchanger), shard)),
                 Err(error) => {
@@ -867,6 +872,10 @@ fn shard_target(
     let shape = |dimensions: &[usize]| -> Vec<u32> {
         dimensions.iter().map(|value| *value as u32).collect()
     };
+    // The workers run the leader's choices rather than timing the candidates themselves, since a
+    // rank that measures while the wire and the others have its device measures the load.
+    let algorithm_key = mmh3_cuda::algorithms::key().unwrap_or_default();
+    let algorithms = mmh3_cuda::algorithms::chosen_matmul();
     let open = |rank: usize| -> Option<OpenSession> {
         Some(OpenSession {
             checkpoint: checkpoint.clone(),
@@ -881,6 +890,8 @@ fn shard_target(
             sparse: crate::worker::sparse_settings(sparse),
             conditions: session_conditions(keyframes, references),
             adapters: adapters.clone(),
+            algorithm_key: algorithm_key.clone(),
+            algorithms: algorithms.clone(),
             precision: match dit.attention_precision() {
                 mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => 1,
                 _ => 0,
