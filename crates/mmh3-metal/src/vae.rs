@@ -218,7 +218,7 @@ impl MetalVideoDecoder {
     }
 
     pub fn decode(&self, latent: &Tensor, capture_first_tile: bool) -> Result<VideoDecoding> {
-        let (frames, first_tile) = self.decode_inner(latent, capture_first_tile)?;
+        let (frames, first_tile) = self.decode_inner(latent, capture_first_tile, &mut |_| None)?;
         Ok(VideoDecoding {
             pixels: frames.to_pixels()?,
             first_tile,
@@ -226,7 +226,30 @@ impl MetalVideoDecoder {
     }
 
     pub fn decode_device(&self, latent: &Tensor) -> Result<MetalVideoFrames> {
-        Ok(self.decode_inner(latent, false)?.0)
+        self.decode_device_with(latent, &mut |_| None)
+    }
+
+    /// `decode_device` where `remote` may answer with a canvas another machine decoded. It is
+    /// asked for the chunks in order and answers with nothing for the ones this machine decodes,
+    /// so the temporal tail carries from one chunk to the next as it does without it.
+    pub fn decode_device_with(
+        &self,
+        latent: &Tensor,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+    ) -> Result<MetalVideoFrames> {
+        Ok(self.decode_inner(latent, false, remote)?.0)
+    }
+
+    /// How a latent divides across machines: what a leader needs to hand the chunks round.
+    pub fn plan(&self, latent: &Tensor) -> Result<DecodePlan> {
+        let geometry = self.geometry(latent)?;
+        Ok(DecodePlan {
+            chunks: geometry.chunks,
+            canvas_frames: geometry.canvas_frames,
+            height: geometry.height,
+            width: geometry.width,
+            tiles: geometry.rows.starts.len() * geometry.columns.starts.len(),
+        })
     }
 
     /// Emit consecutive GPU-resident chunks, without retaining a full RGB video.
@@ -234,9 +257,19 @@ impl MetalVideoDecoder {
     pub fn decode_stream(
         &self,
         latent: &Tensor,
+        emit: impl FnMut(&MetalVideoFrames) -> Result<()>,
+    ) -> Result<()> {
+        self.decode_stream_with(latent, &mut |_| None, emit)
+    }
+
+    /// `decode_stream` where `remote` may answer with a canvas another machine decoded.
+    pub fn decode_stream_with(
+        &self,
+        latent: &Tensor,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
         mut emit: impl FnMut(&MetalVideoFrames) -> Result<()>,
     ) -> Result<()> {
-        self.decode_chunks(latent, false, &mut emit)?;
+        self.decode_chunks(latent, false, remote, &mut emit)?;
         Ok(())
     }
 
@@ -265,9 +298,10 @@ impl MetalVideoDecoder {
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
     ) -> Result<(MetalVideoFrames, Option<Tensor>)> {
         let mut output: Option<MetalVideoFrames> = None;
-        let first = self.decode_chunks(latent, capture_first_tile, &mut |part| {
+        let first = self.decode_chunks(latent, capture_first_tile, remote, &mut |part| {
             let total = if latent.shape[1] == 1 {
                 1
             } else {
@@ -452,10 +486,32 @@ impl MetalVideoDecoder {
         Ok((canvas, first_tile))
     }
 
+    /// A canvas another machine decoded, uploaded as it stands. One of the wrong size did not
+    /// come from this latent, so it is refused and the caller decodes that chunk here rather than
+    /// blending bytes it cannot account for.
+    fn upload_canvas(&self, geometry: &Geometry, bytes: &[u8]) -> Option<Array> {
+        let columns = geometry.canvas_frames * geometry.plane;
+        let expected = 3 * columns * 4;
+        if bytes.len() != expected {
+            eprintln!(
+                "warning: a canvas of {} bytes, not {expected}, so its chunk decodes here",
+                bytes.len()
+            );
+            return None;
+        }
+
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+            .collect();
+        Array::from_f32(&self.weights.device, 3, columns, &values).ok()
+    }
+
     fn decode_chunks(
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
+        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
         emit: &mut impl FnMut(&MetalVideoFrames) -> Result<()>,
     ) -> Result<Option<Tensor>> {
         let geometry = self.geometry(latent)?;
@@ -468,11 +524,22 @@ impl MetalVideoDecoder {
         let mut position = 0;
 
         for chunk in 0..chunks {
-            let (canvas, tile) =
-                self.fill_canvas(latent, &geometry, chunk, capture_first_tile && chunk == 0)?;
-            if tile.is_some() {
-                first_tile = tile;
-            }
+            let canvas = match remote(chunk).and_then(|bytes| self.upload_canvas(&geometry, &bytes))
+            {
+                Some(canvas) => canvas,
+                None => {
+                    let (canvas, tile) = self.fill_canvas(
+                        latent,
+                        &geometry,
+                        chunk,
+                        capture_first_tile && chunk == 0,
+                    )?;
+                    if tile.is_some() {
+                        first_tile = tile;
+                    }
+                    canvas
+                }
+            };
 
             let mut write =
                 |first: usize, count: usize, blend: bool, position: usize| -> Result<()> {
@@ -521,6 +588,23 @@ impl MetalVideoDecoder {
         }
 
         Ok(first_tile)
+    }
+}
+
+/// How a latent divides across machines: the chunks and the canvas each one leaves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecodePlan {
+    pub chunks: usize,
+    pub canvas_frames: usize,
+    pub height: usize,
+    pub width: usize,
+    pub tiles: usize,
+}
+
+impl DecodePlan {
+    /// Values in one chunk's canvas, `[3, canvas frames, height, width]`.
+    pub fn canvas_values(&self) -> usize {
+        3 * self.canvas_frames * self.height * self.width
     }
 }
 

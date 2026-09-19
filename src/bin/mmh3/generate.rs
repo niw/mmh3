@@ -61,35 +61,35 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         DEFAULT_TILE_SIZE,
         DEFAULT_TILE_OVERLAP_MIN,
     )?;
+    // Chunks of the decode go to whichever machines answer, and this one walks the rest while
+    // they work. A chunk that does not come back is decoded here.
+    let mut remote = mmh3::worker::RemoteCanvases::start(
+        mmh3::worker::connect_all(&settings.workers_borrowed(), &settings.token),
+        mmh3::worker::VIDEO_VAE_ROLE,
+        &video,
+        decoder.plan(&video)?.chunks,
+        DEFAULT_TILE_SIZE,
+        DEFAULT_TILE_OVERLAP_MIN,
+    );
+    if !remote.chunks().is_empty() {
+        println!("chunks {:?} decode elsewhere", remote.chunks());
+    }
     #[cfg(feature = "cuda")]
     {
-        // Chunks of the decode go to whichever machines answer, and this one walks the rest while
-        // they work. A chunk that does not come back is decoded here.
-        let mut remote = mmh3::worker::RemoteCanvases::start(
-            mmh3::worker::connect_all(&settings.workers_borrowed(), &settings.token),
-            mmh3::worker::VIDEO_VAE_ROLE,
-            &video,
-            decoder.plan(&video)?.chunks,
-            DEFAULT_TILE_SIZE,
-            DEFAULT_TILE_OVERLAP_MIN,
-        );
-        if !remote.chunks().is_empty() {
-            println!("chunks {:?} decode elsewhere", remote.chunks());
-        }
         let decoded = decoder.decode_device_with(&video, &mut |chunk| remote.take(chunk))?;
         drop(decoder);
         output.write_cuda_video(&decoded)?;
     }
     #[cfg(feature = "metal")]
     if output.streams_metal_video() {
-        decoder.decode_stream(&video, |frames| {
+        decoder.decode_stream_with(&video, &mut |chunk| remote.take(chunk), |frames| {
             output
                 .write_metal_video_chunk(frames)
                 .map_err(|e| mmh3_metal::Error(e.to_string()))
         })?;
         drop(decoder);
     } else {
-        let decoded = decoder.decode_device(&video)?;
+        let decoded = decoder.decode_device_with(&video, &mut |chunk| remote.take(chunk))?;
         drop(decoder);
         output.write_metal_video(&decoded)?;
     }

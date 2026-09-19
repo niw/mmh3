@@ -130,3 +130,76 @@ fn the_first_chunks_canvas_carries_the_frames_a_whole_decode_writes() {
         }
     }
 }
+
+/// A canvas handed in stands in for the one this machine would have built, so a decode fed its own
+/// canvases back comes out bit for bit what it produces on its own.
+#[test]
+fn a_canvas_from_elsewhere_stands_in_for_the_one_built_here() {
+    let directory = tempfile::tempdir().unwrap();
+    let decoder = decoder(directory.path());
+    let latent = sample_latent(12);
+    let chunks = TemporalPlan::new(12).chunks;
+
+    let expected = decoder.decode(&latent, false).unwrap().pixels;
+    let canvases: Vec<Vec<u8>> = (0..chunks)
+        .map(|chunk| decoder.decode_chunk(&latent, chunk).unwrap())
+        .collect();
+    let frames = decoder
+        .decode_device_with(&latent, &mut |chunk| Some(canvases[chunk].clone()))
+        .unwrap();
+
+    assert_eq!(frames.to_pixels().unwrap().data, expected.data);
+}
+
+/// A canvas of the wrong size did not come from this latent, so the chunk decodes here instead and
+/// the video is still whole.
+#[test]
+fn a_canvas_of_the_wrong_size_is_refused_and_the_chunk_decodes_here() {
+    let directory = tempfile::tempdir().unwrap();
+    let decoder = decoder(directory.path());
+    let latent = sample_latent(12);
+
+    let expected = decoder.decode(&latent, false).unwrap().pixels;
+    let short = decoder.decode_chunk(&latent, 0).unwrap().len() - 3;
+    let frames = decoder
+        .decode_device_with(&latent, &mut |_| Some(vec![0u8; short]))
+        .unwrap();
+
+    assert_eq!(frames.to_pixels().unwrap().data, expected.data);
+}
+
+/// The temporal tail carries from one chunk to the next, so the chunks are asked for in order.
+#[test]
+fn the_chunks_are_asked_for_in_order() {
+    let directory = tempfile::tempdir().unwrap();
+    let decoder = decoder(directory.path());
+    let latent = sample_latent(12);
+    let chunks = TemporalPlan::new(12).chunks;
+
+    let mut asked = Vec::new();
+    decoder
+        .decode_device_with(&latent, &mut |chunk| {
+            asked.push(chunk);
+            None
+        })
+        .unwrap();
+
+    assert_eq!(asked, (0..chunks).collect::<Vec<_>>());
+}
+
+#[test]
+fn the_plan_describes_the_canvases_a_leader_hands_round() {
+    let directory = tempfile::tempdir().unwrap();
+    let decoder = decoder(directory.path());
+    let latent = sample_latent(12);
+
+    let plan = decoder.plan(&latent).unwrap();
+    assert_eq!(plan.chunks, TemporalPlan::new(12).chunks);
+    assert_eq!(plan.canvas_frames, 28);
+    assert_eq!(plan.height, LATENT_EXTENT * 16);
+    assert_eq!(plan.width, LATENT_EXTENT * 16);
+    assert_eq!(
+        plan.canvas_values() * 4,
+        decoder.decode_chunk(&latent, 0).unwrap().len()
+    );
+}
