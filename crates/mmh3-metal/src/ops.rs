@@ -304,6 +304,28 @@ impl Array {
             );
         }
 
+        Self::from_quantized(device, input, scales, rows, cols)?.linear_packed(
+            weight,
+            outputs,
+            DType::I8,
+        )
+    }
+
+    /// An input another rank rotated and quantized, back in FP32 and still rotated. Rotated is
+    /// what a rotated weight wants: rotating one side alone is a different product, and one that
+    /// runs.
+    pub(crate) fn from_quantized(
+        device: &Device,
+        input: &Buffer,
+        scales: &Self,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self> {
+        let values = size(rows, cols)? / 4;
+        if input.0.bytes < values || scales.rows != rows || scales.cols != 1 {
+            return Err(Error("quantized input shape mismatch".into()));
+        }
+
         let restored = Self::empty(device, rows, cols)?;
         device.run(
             "dequantize_rows",
@@ -312,7 +334,7 @@ impl Array {
             values,
             false,
         )?;
-        restored.linear_packed(weight, outputs, DType::I8)
+        Ok(restored)
     }
 
     /// The product once the input is packed for `precision`: INT8 values where it is INT8 and
@@ -756,6 +778,147 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ConvRot is orthogonal, so rotating both sides of a product leaves the product alone. That
+    /// is what lets a rank hold rotated weights and feed them the rotated activations the exchange
+    /// delivers. Rotating one side alone would still run and still produce numbers.
+    #[test]
+    fn rotating_both_sides_of_a_product_leaves_it_alone() {
+        let device = Device::new().unwrap();
+        let (rows, cols, outputs) = (4usize, 512usize, 8usize);
+        let x = Array::from_f32(
+            &device,
+            rows,
+            cols,
+            &(0..rows * cols)
+                .map(|i| ((i * 31) % 251) as f32 / 251.0 - 0.5)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let w = Array::from_f32(
+            &device,
+            outputs,
+            cols,
+            &(0..outputs * cols)
+                .map(|i| ((i * 17) % 173) as f32 / 173.0 - 0.5)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let plain = x.linear(&w).unwrap().to_f32().unwrap();
+        let both = x
+            .rotate()
+            .unwrap()
+            .linear(&w.rotate().unwrap())
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        let largest = plain.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for (index, (&found, &want)) in both.iter().zip(plain.iter()).enumerate() {
+            assert!(
+                (found - want).abs() <= largest * 1e-5,
+                "value {index}: {found} against {want}"
+            );
+        }
+
+        // Rotating one side alone is a different product, which is the failure this guards.
+        let one = x.rotate().unwrap().linear(&w).unwrap().to_f32().unwrap();
+        assert!(
+            one.iter()
+                .zip(plain.iter())
+                .any(|(&found, &want)| (found - want).abs() > largest * 1e-3),
+            "rotating one side changed nothing, so this test proves nothing"
+        );
+    }
+
+    /// A LoRA's down projection runs on the rows the exchange delivers, which arrive rotated, so
+    /// its weights are rotated to meet them. Both sides use the same quantized rows here, so the
+    /// quantization cancels out of the comparison and what is left is the rotation alone: turning
+    /// the rows back and using the plain weights has to give what the rotated weights give.
+    #[test]
+    fn an_adapter_meets_the_exchanged_rows_in_the_rotated_frame() {
+        let device = Device::new().unwrap();
+        let (rows, cols, rank, outputs) = (4usize, 512usize, 8usize, 16usize);
+        let make = |r: usize, c: usize, step: usize, modulus: usize| {
+            Array::from_f32(
+                &device,
+                r,
+                c,
+                &(0..r * c)
+                    .map(|i| ((i * step) % modulus) as f32 / modulus as f32 - 0.5)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap()
+        };
+        let x = make(rows, cols, 31, 251);
+        let down = make(rank, cols, 17, 173);
+        let up = make(outputs, rank, 11, 97);
+
+        // NOTE: both sides below go through the same quantization so that it cancels out and only
+        // the rotation is under test. Do not turn this into a measurement of what quantizing
+        // costs: ConvRot spreads a row towards its largest value, which helps real activations
+        // and hurts flat values like these, so on this data it makes INT8 several times worse.
+        let rotated = x.rotate().unwrap();
+        let packed = device.alloc(rows * cols, None).unwrap();
+        let scales = Array::empty(&device, rows, 1).unwrap();
+        device
+            .run(
+                "pack_linear_input",
+                &[&rotated.buffer, &packed, &scales.buffer],
+                &[cols as u32, 1],
+                rows,
+                true,
+            )
+            .unwrap();
+        let delivered = Array::from_quantized(&device, &packed, &scales, rows, cols).unwrap();
+
+        let through_rotated_weights = delivered
+            .linear(&down.rotate().unwrap())
+            .unwrap()
+            .linear(&up)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        // The same rows turned back, against the weights as they are. ConvRot is its own inverse.
+        let through_plain_weights = delivered
+            .rotate()
+            .unwrap()
+            .linear(&down)
+            .unwrap()
+            .linear(&up)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+
+        let largest = through_plain_weights
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()));
+        for (index, (&found, &want)) in through_rotated_weights
+            .iter()
+            .zip(through_plain_weights.iter())
+            .enumerate()
+        {
+            assert!(
+                (found - want).abs() <= largest * 1e-4,
+                "value {index}: {found} against {want}, largest {largest}"
+            );
+        }
+
+        // What the quantization costs, reported rather than asserted: it is the same INT8 the
+        // exchange carries every row in, and CUDA's adapter consumes it too.
+        let exact = x
+            .linear(&down)
+            .unwrap()
+            .linear(&up)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        let worst = through_rotated_weights
+            .iter()
+            .zip(exact.iter())
+            .fold(0.0f32, |m, (&found, &want)| m.max((found - want).abs()));
+        eprintln!("quantization costs {worst:.6} of {largest:.6}");
     }
 
     /// The exchange carries a block's input already rotated and quantized, so a rank projecting a

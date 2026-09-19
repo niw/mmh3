@@ -256,15 +256,6 @@ impl Weights {
                 "{name}: an exchanged input reaches INT8 layers only"
             )));
         }
-        // NOTE: CUDA runs an adapter's down projection on the quantized rows themselves, so
-        // those rows are enough for it. Metal has no such path, so a rank holding only them
-        // cannot apply one. Refusing beats dropping the adapter silently.
-        if self.adapters.contains_key(name) {
-            return Err(Error(format!(
-                "{name}: an adapter needs the input a rank did not receive"
-            )));
-        }
-
         let cols = w.shape[1..].iter().product::<usize>();
         let mut result = Array::linear_quantized(
             &self.device,
@@ -281,6 +272,19 @@ impl Weights {
         let bias = format!("{name}.bias");
         if self.contains(&bias) {
             result = result.add(&self.vector(&bias)?)?;
+        }
+
+        // A LoRA's down projection runs on the rows this rank was handed, so the rows suffice.
+        // Its weights are rotated to meet them: the activations arrive rotated, and the product of
+        // two rotated sides is the product of the unrotated pair.
+        if let Some(adapter) = self.adapters.get(name) {
+            let rotated = Array::from_quantized(&self.device, input, scales, rows, cols)?;
+            result = result.add(
+                &rotated
+                    .linear(&adapter.down.rotate()?)?
+                    .linear(&adapter.up)?
+                    .unary(0, adapter.scale)?,
+            )?;
         }
 
         Ok(result)

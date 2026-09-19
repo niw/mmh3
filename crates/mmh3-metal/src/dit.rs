@@ -577,8 +577,21 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        let dit = MetalDit::load(&SafeTensors::open(&path).unwrap(), "").unwrap();
+        let mut dit = MetalDit::load(&SafeTensors::open(&path).unwrap(), "").unwrap();
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
+
+        // The turbo LoRA is in every real run here, so a rank that cannot take an adapted layer
+        // cannot take a share of a real step. Loaded when it is there.
+        let lora = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"))
+            .join("loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors");
+        if lora.exists() {
+            let added = dit
+                .add_lora(&SafeTensors::open(&lora).unwrap(), 1.0)
+                .unwrap();
+            eprintln!("{added} adapted layers");
+        } else {
+            eprintln!("no LoRA at {}, running without one", lora.display());
+        }
 
         let (c, device) = (dit.config.clone(), dit.weights.device.clone());
         let tokens = 64;
