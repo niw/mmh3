@@ -236,6 +236,56 @@ impl Weights {
         Ok(result)
     }
 
+    /// `linear` for an input another rank has already rotated and quantized, which is how a
+    /// block's input crosses the wire. Neither is done again: the rotation is in the bytes, and
+    /// quantizing a second time would not give them back.
+    pub fn linear_quantized(
+        &self,
+        input: &crate::Buffer,
+        scales: &Array,
+        rows: usize,
+        name: &str,
+    ) -> Result<Array> {
+        let key = format!("{name}.weight");
+        let w = self
+            .tensors
+            .get(&key)
+            .ok_or_else(|| Error(format!("missing tensor {key}")))?;
+        if w.dtype != DType::I8 {
+            return Err(Error(format!(
+                "{name}: an exchanged input reaches INT8 layers only"
+            )));
+        }
+        // NOTE: CUDA runs an adapter's down projection on the quantized rows themselves, so
+        // those rows are enough for it. Metal has no such path, so a rank holding only them
+        // cannot apply one. Refusing beats dropping the adapter silently.
+        if self.adapters.contains_key(name) {
+            return Err(Error(format!(
+                "{name}: an adapter needs the input a rank did not receive"
+            )));
+        }
+
+        let cols = w.shape[1..].iter().product::<usize>();
+        let mut result = Array::linear_quantized(
+            &self.device,
+            input,
+            scales,
+            &w.buffer,
+            rows,
+            cols,
+            w.shape[0],
+            self.linear_precision,
+        )?
+        .mul(&self.vector(&format!("{name}.weight_scale"))?)?;
+
+        let bias = format!("{name}.bias");
+        if self.contains(&bias) {
+            result = result.add(&self.vector(&bias)?)?;
+        }
+
+        Ok(result)
+    }
+
     pub fn norm(&self, x: &Array, name: &str, epsilon: f32) -> Result<Array> {
         let bias = format!("{name}.bias");
         let mut y = x.norm(

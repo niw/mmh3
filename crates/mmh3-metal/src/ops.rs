@@ -240,7 +240,6 @@ impl Array {
             .device()
             .alloc(self.len() * if int8 { 1 } else { 2 }, None)?;
         let scales = Self::empty(self.device(), self.rows, 1)?;
-        let out = Self::empty(self.device(), self.rows, outputs)?;
         self.device().run(
             "pack_linear_input",
             &[&self.buffer, &packed, &scales.buffer],
@@ -248,31 +247,111 @@ impl Array {
             self.rows,
             true,
         )?;
+        Self::product_of_packed(
+            self.device(),
+            &packed,
+            &scales,
+            weight,
+            self.rows,
+            self.cols,
+            outputs,
+            precision,
+        )
+    }
 
+    /// The product of an input that another rank already rotated and quantized: INT8 values with
+    /// one FP32 scale a row, as the exchange carries them. A rank must not quantize these again.
+    /// The rounding is not idempotent, so two ranks projecting the same tokens would disagree
+    /// about them, and a block's attention would see two different sequences.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn linear_quantized(
+        device: &Device,
+        input: &Buffer,
+        scales: &Self,
+        weight: &Buffer,
+        rows: usize,
+        cols: usize,
+        outputs: usize,
+        precision: LinearPrecision,
+    ) -> Result<Self> {
+        let values = size(rows, cols)? / 4;
+        if input.0.bytes < values
+            || scales.rows != rows
+            || scales.cols != 1
+            || outputs.checked_mul(cols) != Some(weight.0.bytes)
+        {
+            return Err(Error("quantized input shape mismatch".into()));
+        }
+
+        // The packed roads take the INT8 values as they are: a value in [-127, 127] is exact as a
+        // half, and the scale is applied to the rows of the result either way.
+        if precision != LinearPrecision::Fp32 {
+            let packed = if precision == LinearPrecision::Int8 {
+                input.clone()
+            } else {
+                let halves = device.alloc(values * 2, None)?;
+                device.run(
+                    "int8_to_half",
+                    &[input, &halves],
+                    &[values as u32, 0],
+                    values,
+                    false,
+                )?;
+                halves
+            };
+            return Self::product_of_packed(
+                device, &packed, scales, weight, rows, cols, outputs, precision,
+            );
+        }
+
+        let restored = Self::empty(device, rows, cols)?;
+        device.run(
+            "dequantize_rows",
+            &[input, &scales.buffer, &restored.buffer],
+            &[values as u32, cols as u32],
+            values,
+            false,
+        )?;
+        restored.linear_packed(weight, outputs, DType::I8)
+    }
+
+    /// The product once the input is packed for `precision`: INT8 values where it is INT8 and
+    /// halves otherwise, with one scale a row beside them. The scale is applied to the rows of the
+    /// result, so either packing answers with the same values.
+    #[allow(clippy::too_many_arguments)]
+    fn product_of_packed(
+        device: &Device,
+        packed: &Buffer,
+        scales: &Self,
+        weight: &Buffer,
+        rows: usize,
+        cols: usize,
+        outputs: usize,
+        precision: LinearPrecision,
+    ) -> Result<Self> {
+        let out = Self::empty(device, rows, outputs)?;
         if precision == LinearPrecision::MpsFp16 {
-            let slab_rows = (32 * 1024 * 1024 / 2 / self.cols).max(1);
-            let scratch = self
-                .device()
-                .alloc(slab_rows.min(outputs) * self.cols * 2, None)?;
+            let slab_rows = (32 * 1024 * 1024 / 2 / cols).max(1);
+            let scratch = device.alloc(slab_rows.min(outputs) * cols * 2, None)?;
             for first in (0..outputs).step_by(slab_rows) {
                 let count = slab_rows.min(outputs - first);
-                self.device().run(
+                device.run(
                     "int8_to_half",
                     &[weight, &scratch],
-                    &[(count * self.cols) as u32, (first * self.cols) as u32],
-                    count * self.cols,
+                    &[(count * cols) as u32, (first * cols) as u32],
+                    count * cols,
                     false,
                 )?;
                 // SAFETY: FP16 inputs cover M×K and the current N×K slab; output is FP32.
                 check(unsafe {
                     mmh3_metal_matmul(
-                        self.device().0.0.as_ptr(),
+                        device.0.0.as_ptr(),
                         packed.0.pointer.as_ptr(),
                         scratch.0.pointer.as_ptr(),
                         out.buffer.0.pointer.as_ptr(),
-                        self.rows,
+                        rows,
                         count,
-                        self.cols,
+                        cols,
                         outputs,
                         first,
                         true,
@@ -280,7 +359,7 @@ impl Array {
                 })?;
             }
 
-            self.device().run(
+            device.run(
                 "scale_linear_rows",
                 &[&out.buffer, &scales.buffer],
                 &[out.len() as u32, outputs as u32],
@@ -290,11 +369,15 @@ impl Array {
             return Ok(out);
         }
 
-        self.device().run(
-            if int8 { "mpp_int8" } else { "mpp_fp16" },
-            &[&packed, weight, &out.buffer, &scales.buffer],
-            &[self.rows as u32, outputs as u32, self.cols as u32],
-            self.rows.div_ceil(64) * outputs.div_ceil(64),
+        device.run(
+            if precision == LinearPrecision::Int8 {
+                "mpp_int8"
+            } else {
+                "mpp_fp16"
+            },
+            &[packed, weight, &out.buffer, &scales.buffer],
+            &[rows as u32, outputs as u32, cols as u32],
+            rows.div_ceil(64) * outputs.div_ceil(64),
             true,
         )?;
         Ok(out)
@@ -670,6 +753,87 @@ mod tests {
                 eprintln!(
                     "{precision:?} [{rows},{outputs},{cols}]: median {:.3} ms",
                     times[2]
+                );
+            }
+        }
+    }
+
+    /// The exchange carries a block's input already rotated and quantized, so a rank projecting a
+    /// peer's rows works from INT8 values it did not produce. Every road has to agree about what
+    /// those values mean, or two ranks would see two different sequences.
+    #[test]
+    fn a_quantized_input_projects_the_same_on_every_road() {
+        let device = Device::new().unwrap();
+        let (rows, cols, outputs) = (5usize, 128usize, 64usize);
+
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 37) % 211) as f32 / 211.0 - 0.5)
+            .collect();
+        let x = Array::from_f32(&device, rows, cols, &values).unwrap();
+        let packed = device.alloc(rows * cols, None).unwrap();
+        let scales = Array::empty(&device, rows, 1).unwrap();
+        device
+            .run(
+                "pack_linear_input",
+                &[&x.buffer, &packed, &scales.buffer],
+                &[cols as u32, 1],
+                rows,
+                true,
+            )
+            .unwrap();
+
+        let weight_bytes: Vec<u8> = (0..outputs * cols)
+            .map(|i| (((i * 53) % 255) as i32 - 127) as i8 as u8)
+            .collect();
+        let weight = device
+            .alloc(weight_bytes.len(), Some(&weight_bytes))
+            .unwrap();
+
+        // What the INT8 values mean: the integer product of a row and a column, times the row's
+        // scale. Read the quantized rows back rather than recomputing what the kernel chose.
+        let quantized: Vec<f32> = packed.to_f32().unwrap();
+        let bytes: Vec<i8> = quantized
+            .iter()
+            .flat_map(|value| value.to_bits().to_le_bytes())
+            .map(|byte| byte as i8)
+            .collect();
+        let row_scales = scales.to_f32().unwrap();
+        let mut expected = Vec::with_capacity(rows * outputs);
+        for row in 0..rows {
+            for output in 0..outputs {
+                let mut sum = 0i32;
+                for column in 0..cols {
+                    sum += bytes[row * cols + column] as i32
+                        * weight_bytes[output * cols + column] as i8 as i32;
+                }
+                expected.push(sum as f32 * row_scales[row]);
+            }
+        }
+
+        for precision in [
+            LinearPrecision::Fp32,
+            LinearPrecision::MpsFp16,
+            LinearPrecision::Fp16,
+            LinearPrecision::Int8,
+        ] {
+            if matches!(precision, LinearPrecision::Fp16 | LinearPrecision::Int8)
+                && !device.supports_tensor_ops()
+            {
+                continue;
+            }
+
+            let found = Array::linear_quantized(
+                &device, &packed, &scales, &weight, rows, cols, outputs, precision,
+            )
+            .unwrap()
+            .to_f32()
+            .unwrap();
+            let largest = expected.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            for (index, &want) in expected.iter().enumerate() {
+                assert!(
+                    (found[index] - want).abs() <= largest * 2e-3,
+                    "{precision:?} at {index}: {} against {want}",
+                    found[index]
                 );
             }
         }

@@ -434,3 +434,21 @@ kernel void from_bf16(device const ushort *x [[buffer(0)]], device float *y [[bu
         return;
     y[i] = as_type<float>(uint(x[p[1] + i]) << 16);
 }
+
+// An input another rank rotated and quantized, back in FP32. Only the road that runs products in
+// FP32 needs it; the packed roads take the INT8 values as they are.
+kernel void dequantize_rows(device const char *q [[buffer(0)]],
+                            device const float *scales [[buffer(1)]], device float *y [[buffer(2)]],
+                            constant uint *p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    y[i] = float(q[i]) * scales[i / p[1]];
+}
+
+// Moves a run of bytes into a region at a byte offset, which is how a rank's own rows reach the
+// memory its peers read.
+kernel void copy_bytes(device const char *x [[buffer(0)]], device char *y [[buffer(1)]],
+                       constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p[0])
+        y[p[2] + i] = x[p[1] + i];
+}

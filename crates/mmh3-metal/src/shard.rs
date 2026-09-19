@@ -56,6 +56,44 @@ impl Memory {
         Ok(values)
     }
 
+    /// Rotates and quantizes `values` into the region at `offset` bytes in, and answers with the
+    /// scale of every row beside them. This is how a rank publishes the rows it carries: the
+    /// exchange moves a block's input as its INT8 layers consume it, an eighth of the bytes of
+    /// what the projections would produce.
+    pub fn write_quantized(&self, offset: usize, values: &Array) -> Result<Array> {
+        let [rows, cols] = values.shape();
+        let count = values.len();
+        if offset.checked_add(count).is_none_or(|end| end > self.bytes) {
+            return Err(Error(format!(
+                "{count} bytes at {offset} of a region of {}",
+                self.bytes
+            )));
+        }
+
+        let rotated = values.rotate()?;
+        let scales = Array::empty(&self.device, rows, 1)?;
+        let packed = self.device.alloc(count, None)?;
+        self.device.run(
+            "pack_linear_input",
+            &[&rotated.buffer, &packed, &scales.buffer],
+            &[cols as u32, 1],
+            rows,
+            true,
+        )?;
+        self.device.run(
+            "copy_bytes",
+            &[&packed, &self.buffer],
+            &[count as u32, 0, offset as u32],
+            count,
+            false,
+        )?;
+        Ok(scales)
+    }
+
+    pub(crate) fn buffer(&self) -> &Buffer {
+        &self.buffer
+    }
+
     /// An offset into a region is a byte offset, and a bf16 value straddling the end of one would
     /// read a neighbour's memory rather than fail, so the extent is checked before the kernel.
     fn check(&self, offset: usize, bytes: usize) -> Result<()> {
@@ -454,6 +492,98 @@ mod tests {
         assert!(exchange.publish(Region::Normalized, 0, 8).is_ok());
         assert!(exchange.receive(Region::Normalized, 0, 8).is_ok());
         assert!(exchange.barrier().is_ok());
+    }
+
+    /// A rank publishes its rows by rotating and quantizing them into the region its peers read.
+    /// Projecting them back out has to give what projecting them here would have given: on the
+    /// INT8 road that is the same arithmetic on the same bytes, so it is an equality and not a
+    /// tolerance. The exchange may move the rows; it may not change what they mean.
+    #[test]
+    fn a_published_row_projects_to_what_it_would_have_here() {
+        use crate::LinearPrecision;
+        use mmh3_core::shard::Exchange;
+
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            eprintln!("no tensor ops on this device, skipping");
+            return;
+        }
+
+        // ConvRot wants a multiple of 256 features, which is what a block's width is.
+        let (rows, cols, outputs) = (4usize, 256usize, 64usize);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 29) % 197) as f32 / 197.0 - 0.5)
+            .collect();
+        let x = Array::from_f32(&device, rows, cols, &values).unwrap();
+        let weight_bytes: Vec<u8> = (0..outputs * cols)
+            .map(|i| (((i * 53) % 255) as i32 - 127) as i8 as u8)
+            .collect();
+        let weight = device
+            .alloc(weight_bytes.len(), Some(&weight_bytes))
+            .unwrap();
+
+        let mut exchange = WholeExchange::new(&device);
+        let region = exchange.region(Region::Normalized, rows * cols).unwrap();
+        let scales = region.write_quantized(0, &x).unwrap();
+
+        let there = Array::linear_quantized(
+            &device,
+            region.buffer(),
+            &scales,
+            &weight,
+            rows,
+            cols,
+            outputs,
+            LinearPrecision::Int8,
+        )
+        .unwrap()
+        .to_f32()
+        .unwrap();
+        let here = x
+            .rotate()
+            .unwrap()
+            .linear_int8(&weight, outputs, LinearPrecision::Int8)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+
+        assert_eq!(there.len(), here.len());
+        for (index, (&found, &want)) in there.iter().zip(here.iter()).enumerate() {
+            assert_eq!(found.to_bits(), want.to_bits(), "value {index}");
+        }
+    }
+
+    /// Every rank writes its own rows into the same region, so a write must not disturb the rows a
+    /// peer already put there.
+    #[test]
+    fn publishing_rows_leaves_a_peers_rows_alone() {
+        use mmh3_core::shard::Exchange;
+
+        let device = Device::new().unwrap();
+        let (rows, cols) = (4usize, 256usize);
+        let first = Array::from_f32(&device, rows, cols, &vec![0.25; rows * cols]).unwrap();
+        let second = Array::from_f32(&device, rows, cols, &vec![-0.5; rows * cols]).unwrap();
+
+        let mut exchange = WholeExchange::new(&device);
+        let region = exchange
+            .region(Region::Normalized, 2 * rows * cols)
+            .unwrap();
+        region.write_quantized(0, &first).unwrap();
+        let before = region.buffer().to_f32().unwrap();
+        region.write_quantized(rows * cols, &second).unwrap();
+        let after = region.buffer().to_f32().unwrap();
+
+        let untouched = rows * cols / 4;
+        assert_eq!(
+            before[..untouched],
+            after[..untouched],
+            "the first rank's rows moved"
+        );
+        assert_ne!(
+            before[untouched..],
+            after[untouched..],
+            "the second rank's rows did not land"
+        );
     }
 
     #[test]

@@ -133,6 +133,28 @@ impl MetalDit {
         )
     }
 
+    /// This rank's heads of a block's attention inputs, projected from the rotated INT8 rows the
+    /// exchange delivered rather than from the FP32 a whole block would have had. The rows are
+    /// every token's: a rank attends its own heads over the whole sequence, which is what the
+    /// exchange is for.
+    pub fn project_exchanged_inputs(
+        &self,
+        prefix: &str,
+        input: &crate::shard::Memory,
+        scales: &Array,
+        tokens: usize,
+        own_heads: std::ops::Range<usize>,
+    ) -> Result<Array> {
+        let c = &self.config;
+        let qkv = self.weights.linear_quantized(
+            input.buffer(),
+            scales,
+            tokens,
+            &format!("{prefix}.attn.qkv_proj"),
+        )?;
+        crate::shard::pack(&qkv, 3, c.heads, own_heads, c.head_dim)
+    }
+
     fn mlp(&self, x: &Array, prefix: &str) -> Result<Array> {
         self.weights.linear(
             &self
