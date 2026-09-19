@@ -638,11 +638,15 @@ pub fn sample(
     Ok((video, audio))
 }
 
-/// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
-/// They take no condition noise, as the reference pipeline leaves reference audio clean.
-#[cfg(feature = "cuda")]
+/// A build that opens no session with a worker encodes every prompt here.
+#[cfg(not(feature = "cuda"))]
+fn encode_on_worker(_settings: &Settings, _ids: &[u32]) -> Option<Tensor> {
+    None
+}
+
 /// Asks the first worker that holds the text encoder, or returns `None` so the caller encodes here.
 /// A worker that fails is reported and skipped: a generation never depends on one.
+#[cfg(feature = "cuda")]
 fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
     use crate::worker::{TEXT_ENCODER_ROLE as ROLE, Worker};
     use mmh3_core::worker::CAPABILITY_ENCODE_TEXT;
@@ -666,6 +670,9 @@ fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
     None
 }
 
+/// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
+/// They take no condition noise, as the reference pipeline leaves reference audio clean.
+#[cfg(feature = "cuda")]
 fn encode_sounds(
     options: &HashMap<&str, &str>,
     sounds: &[Tensor],

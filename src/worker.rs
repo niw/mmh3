@@ -4,10 +4,12 @@
 
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
+#[cfg(feature = "cuda")]
+use mmh3_core::worker::OpenSession;
 use mmh3_core::worker::{
     self, CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD,
     CAPABILITY_ENCODE_TEXT, Canvas, Checkpoint, DecodeAudio, DecodeVideo, EncodeText, Header,
-    Hello, Kind, OpenSession, Samples, TRANSPORT_TCP, TextStates, Welcome,
+    Hello, Kind, Samples, TRANSPORT_TCP, TextStates, Welcome,
 };
 #[cfg(feature = "cuda")]
 use mmh3_cuda::shard::{self, Shard};
@@ -47,12 +49,12 @@ type TextEncoder = mmh3_metal::text_encoder::MetalTextEncoder;
 /// The checkpoint a session has loaded, kept for the rest of it.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 type Resident = Option<(u64, TextEncoder)>;
+/// Only the CUDA decoder walks a video a chunk at a time. The Metal one decodes the whole latent,
+/// so a Metal worker offers no chunks and a run never asks it for one.
 #[cfg(feature = "cuda")]
 type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
-#[cfg(feature = "metal")]
-type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
 /// A decoder and the tile geometry it was built for, which a request may change.
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "cuda")]
 type ResidentDecoder = Option<(u64, usize, usize, VideoDecoder)>;
 #[cfg(feature = "cuda")]
 type AudioDecoder = mmh3_cuda::audio_vae::CudaAudioDecoder;
@@ -303,6 +305,7 @@ impl Worker {
     /// Moves `bytes` and returns the rate in gigabytes a second: over the socket it goes there and
     /// back, over a reliable connection it is read once, which is how the payloads travel.
     pub fn bandwidth(&mut self, bytes: usize) -> Result<(f64, bool), Box<dyn Error>> {
+        #[cfg(feature = "cuda")]
         if self.reads_remotely() {
             let request = worker::Canvas {
                 chunk: 0,
@@ -671,21 +674,27 @@ impl RemoteAudio {
         let (sender, receiver) = channel();
         let (role, latent) = (role.to_owned(), latent.clone());
         std::thread::spawn(move || {
-            let mut answer = None;
+            let mut candidates: Vec<Worker> = Vec::new();
             for address in &addresses {
-                let mut worker = match Worker::connect(address, &token) {
-                    Ok(worker) => worker,
-                    Err(_) => continue,
-                };
-                if !worker.serves(CAPABILITY_DECODE_AUDIO) || worker.checkpoint(&role).is_none() {
+                let Ok(worker) = Worker::connect(address, &token) else {
                     continue;
+                };
+                if worker.serves(CAPABILITY_DECODE_AUDIO) && worker.checkpoint(&role).is_some() {
+                    candidates.push(worker);
                 }
+            }
+            // A machine that takes a share of every step has the busier end of a run, and one that
+            // cannot is often another backend with nothing else to do, so the audio goes there
+            // first. The sort is stable, so the order given decides within each group.
+            candidates.sort_by_key(|worker| worker.serves(CAPABILITY_DIT_SHARD));
+            let mut answer = None;
+            for worker in &mut candidates {
                 match worker.decode_audio(&role, &latent) {
                     Ok(waveform) => {
                         answer = Some(waveform);
                         break;
                     }
-                    Err(error) => eprintln!("warning: the audio on {address}: {error}"),
+                    Err(error) => eprintln!("warning: the audio on {}: {error}", worker.address),
                 }
             }
             let _ = sender.send(answer);
@@ -883,6 +892,7 @@ fn session(
     let mut writer = BufWriter::with_capacity(STREAM_BUFFER, stream);
     // The text encoder and the video decoder load on their first request and stay for the session.
     let mut encoder: Resident = None;
+    #[cfg(feature = "cuda")]
     let mut decoder: ResidentDecoder = None;
     let mut audio: ResidentAudio = None;
     // A DiT read before it was asked for, which `PrepareCheckpoint` starts while the leader is
@@ -918,8 +928,13 @@ fn session(
                     device: device_name(),
                     memory_bytes: memory_bytes(),
                     capabilities: CAPABILITY_ENCODE_TEXT
-                        | CAPABILITY_DECODE_VIDEO
                         | CAPABILITY_DECODE_AUDIO
+                        // A chunk of a decode, rather than a whole video, is a CUDA path.
+                        | if cfg!(feature = "cuda") {
+                            CAPABILITY_DECODE_VIDEO
+                        } else {
+                            0
+                        }
                         // A share of the DiT needs the reliable connection: a step exchanges far
                         // more than a socket carries in the time it saves.
                         | if offered.is_some() && models.join("diffusion_models").is_dir() {
@@ -949,6 +964,9 @@ fn session(
             Kind::Ping => reply(&mut writer, Kind::Pong, &[], &[])?,
             // A measurement moves the same way a payload would: read out of this side's memory
             // when there is a reliable connection, echoed down the socket when there is not.
+            #[cfg(not(feature = "cuda"))]
+            Kind::Bandwidth => reply(&mut writer, Kind::BandwidthDone, &[], &body)?,
+            #[cfg(feature = "cuda")]
             Kind::Bandwidth => match (rdma.as_ref(), worker::Canvas::decode(&body)) {
                 (Some(_), Ok(request)) if !body.is_empty() => {
                     let device = rdma_device().ok_or("this machine has no RoCE port")?;
@@ -1010,6 +1028,12 @@ fn session(
                     Err(error) => eprintln!("warning: a prepared checkpoint: {error}"),
                 }
             }
+            #[cfg(not(feature = "cuda"))]
+            Kind::OpenSession => {
+                let message = b"this build takes no share of a step";
+                reply(&mut writer, Kind::Error, message, &[])?;
+            }
+            #[cfg(feature = "cuda")]
             Kind::OpenSession => {
                 let (open, payload) = OpenSession::decode(&body)?;
                 let Some(connection) = rdma.as_ref() else {
@@ -1056,6 +1080,12 @@ fn session(
                     }
                 }
             }
+            #[cfg(not(feature = "cuda"))]
+            Kind::DecodeVideo => {
+                let message = b"this build decodes a whole video, not a chunk of one";
+                reply(&mut writer, Kind::Error, message, &[])?;
+            }
+            #[cfg(feature = "cuda")]
             Kind::DecodeVideo => {
                 let started = Instant::now();
                 match decode_video(checkpoints, &body, &mut decoder) {
@@ -1220,7 +1250,7 @@ fn decode_audio(
     Ok(decoder.decode(&latent)?)
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg(feature = "cuda")]
 fn decode_video(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
