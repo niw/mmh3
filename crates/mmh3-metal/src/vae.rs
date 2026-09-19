@@ -3,7 +3,7 @@ use crate::{Error, Result, model::Weights, ops::Array};
 use mmh3_core::{
     safetensors::SafeTensors,
     tensor::Tensor,
-    vae::{TemporalPlan, rope_angles, split_tiles},
+    vae::{TemporalPlan, TileAxis, rope_angles, split_tiles},
 };
 
 pub const DEFAULT_TILE_SIZE: usize = 256;
@@ -240,6 +240,27 @@ impl MetalVideoDecoder {
         Ok(())
     }
 
+    /// One chunk's canvas, `[3, canvas frames, height, width]` FP32 as little-endian bytes, before
+    /// any blending with its neighbours, which the caller does. Bytes rather than values because
+    /// they travel to another machine. Matches the CUDA `decode_chunk` in size and layout, though
+    /// not in value: the arithmetic is this backend's own.
+    pub fn decode_chunk(&self, latent: &Tensor, chunk: usize) -> Result<Vec<u8>> {
+        let geometry = self.geometry(latent)?;
+        if chunk >= geometry.chunks {
+            return Err(Error(format!(
+                "chunk {chunk} of a latent with {} chunks",
+                geometry.chunks
+            )));
+        }
+
+        let (canvas, _) = self.fill_canvas(latent, &geometry, chunk, false)?;
+        Ok(canvas
+            .to_f32()?
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect())
+    }
+
     fn decode_inner(
         &self,
         latent: &Tensor,
@@ -285,12 +306,7 @@ impl MetalVideoDecoder {
         ))
     }
 
-    fn decode_chunks(
-        &self,
-        latent: &Tensor,
-        capture_first_tile: bool,
-        emit: &mut impl FnMut(&MetalVideoFrames) -> Result<()>,
-    ) -> Result<Option<Tensor>> {
+    fn geometry(&self, latent: &Tensor) -> Result<Geometry> {
         let &[channels, latent_frames, lh, lw] = latent.shape.as_slice() else {
             return Err(Error(
                 "video latent must be [channels, frames, height, width]".into(),
@@ -305,8 +321,6 @@ impl MetalVideoDecoder {
         let rows = split_tiles(height, self.tile_size, self.overlap);
         let columns = split_tiles(width, self.tile_size, self.overlap);
         let (th, tw) = (rows.length, columns.length);
-        let mean = self.weights.host("latents_mean")?.data;
-        let std = self.weights.host("latents_std")?.data;
         let (chunks, cf, output_frames) = if latent_frames == 1 {
             (1, 1, 1)
         } else {
@@ -314,87 +328,152 @@ impl MetalVideoDecoder {
             (plan.chunks, 7, plan.frames)
         };
 
-        let canvas_frames = cf * 4;
-        let plane = height * width;
+        Ok(Geometry {
+            channels,
+            latent_frames,
+            lh,
+            lw,
+            height,
+            width,
+            plane: height * width,
+            rows,
+            columns,
+            th,
+            tw,
+            chunks,
+            cf,
+            canvas_frames: cf * 4,
+            output_frames,
+            mean: self.weights.host("latents_mean")?.data,
+            std: self.weights.host("latents_std")?.data,
+        })
+    }
+
+    /// One chunk's canvas, tiled and blended across rows and columns. The temporal tail of the
+    /// chunk before it is not blended in: a whole decode does that as it writes frames out, and a
+    /// leader handing chunks round does it once the canvases have arrived.
+    fn fill_canvas(
+        &self,
+        latent: &Tensor,
+        geometry: &Geometry,
+        chunk: usize,
+        capture_first_tile: bool,
+    ) -> Result<(Array, Option<Tensor>)> {
+        let &Geometry {
+            channels,
+            latent_frames,
+            lh,
+            lw,
+            height,
+            width,
+            plane,
+            th,
+            tw,
+            cf,
+            canvas_frames,
+            ..
+        } = geometry;
+        let (rows, columns) = (&geometry.rows, &geometry.columns);
+        let (mean, std) = (&geometry.mean, &geometry.std);
+        let device = &self.weights.device;
+        let canvas = Array::empty(device, 3, canvas_frames * plane)?;
+        let mut first_tile = None;
+        let mut previous: Vec<Option<Array>> = vec![None; columns.starts.len()];
+
+        for (row, &top) in rows.starts.iter().enumerate() {
+            let mut left_tile: Option<Array> = None;
+            for (column, &left) in columns.starts.iter().enumerate() {
+                let mut values = Vec::with_capacity(cf * (th / 16) * (tw / 16) * channels);
+                for t in 0..cf {
+                    for y in 0..th / 16 {
+                        for x in 0..tw / 16 {
+                            for c in 0..channels {
+                                let index = ((c * latent_frames
+                                    + (chunk * 5 + t).min(latent_frames - 1))
+                                    * lh
+                                    + top / 16
+                                    + y)
+                                    * lw
+                                    + left / 16
+                                    + x;
+                                values.push(latent.data[index] * std[c] + mean[c]);
+                            }
+                        }
+                    }
+                }
+
+                let tile = self.tile(&values, cf, th / 16, tw / 16)?;
+                if capture_first_tile && row == 0 && column == 0 {
+                    first_tile = Some(Tensor::new(vec![3, canvas_frames, th, tw], tile.to_f32()?));
+                }
+
+                let kept_h = rows
+                    .starts
+                    .get(row + 1)
+                    .map_or(height - top, |next| next - top);
+                let kept_w = columns
+                    .starts
+                    .get(column + 1)
+                    .map_or(width - left, |next| next - left);
+                let overlap_y = if row == 0 { 0 } else { rows.overlaps[row - 1] };
+                let overlap_x = if column == 0 {
+                    0
+                } else {
+                    columns.overlaps[column - 1]
+                };
+
+                let above = previous[column].as_ref().unwrap_or(&tile);
+                let beside = left_tile.as_ref().unwrap_or(&tile);
+                let n = 3 * canvas_frames * kept_h * kept_w;
+                device.run(
+                    "video_blend_tile",
+                    &[&tile.buffer, &above.buffer, &beside.buffer, &canvas.buffer],
+                    &[
+                        n as u32,
+                        width as u32,
+                        height as u32,
+                        th as u32,
+                        tw as u32,
+                        top as u32,
+                        left as u32,
+                        kept_h as u32,
+                        kept_w as u32,
+                        overlap_y as u32,
+                        overlap_x as u32,
+                    ],
+                    n,
+                    false,
+                )?;
+                previous[column] = Some(tile.clone());
+                left_tile = Some(tile);
+            }
+        }
+
+        Ok((canvas, first_tile))
+    }
+
+    fn decode_chunks(
+        &self,
+        latent: &Tensor,
+        capture_first_tile: bool,
+        emit: &mut impl FnMut(&MetalVideoFrames) -> Result<()>,
+    ) -> Result<Option<Tensor>> {
+        let geometry = self.geometry(latent)?;
+        let (height, width, plane) = (geometry.height, geometry.width, geometry.plane);
+        let (chunks, canvas_frames) = (geometry.chunks, geometry.canvas_frames);
+        let (latent_frames, output_frames) = (geometry.latent_frames, geometry.output_frames);
         let device = &self.weights.device;
         let mut first_tile = None;
         let mut tail = Array::zeros(device, 3, 5 * plane)?;
         let mut position = 0;
 
         for chunk in 0..chunks {
-            let canvas = Array::empty(device, 3, canvas_frames * plane)?;
-            let mut previous: Vec<Option<Array>> = vec![None; columns.starts.len()];
-            for (row, &top) in rows.starts.iter().enumerate() {
-                let mut left_tile: Option<Array> = None;
-                for (column, &left) in columns.starts.iter().enumerate() {
-                    let mut values = Vec::with_capacity(cf * (th / 16) * (tw / 16) * channels);
-                    for t in 0..cf {
-                        for y in 0..th / 16 {
-                            for x in 0..tw / 16 {
-                                for c in 0..channels {
-                                    let index = ((c * latent_frames
-                                        + (chunk * 5 + t).min(latent_frames - 1))
-                                        * lh
-                                        + top / 16
-                                        + y)
-                                        * lw
-                                        + left / 16
-                                        + x;
-                                    values.push(latent.data[index] * std[c] + mean[c]);
-                                }
-                            }
-                        }
-                    }
-
-                    let tile = self.tile(&values, cf, th / 16, tw / 16)?;
-                    if capture_first_tile && chunk == 0 && row == 0 && column == 0 {
-                        first_tile =
-                            Some(Tensor::new(vec![3, canvas_frames, th, tw], tile.to_f32()?));
-                    }
-
-                    let kept_h = rows
-                        .starts
-                        .get(row + 1)
-                        .map_or(height - top, |next| next - top);
-                    let kept_w = columns
-                        .starts
-                        .get(column + 1)
-                        .map_or(width - left, |next| next - left);
-                    let overlap_y = if row == 0 { 0 } else { rows.overlaps[row - 1] };
-                    let overlap_x = if column == 0 {
-                        0
-                    } else {
-                        columns.overlaps[column - 1]
-                    };
-
-                    let above = previous[column].as_ref().unwrap_or(&tile);
-                    let beside = left_tile.as_ref().unwrap_or(&tile);
-                    let n = 3 * canvas_frames * kept_h * kept_w;
-                    device.run(
-                        "video_blend_tile",
-                        &[&tile.buffer, &above.buffer, &beside.buffer, &canvas.buffer],
-                        &[
-                            n as u32,
-                            width as u32,
-                            height as u32,
-                            th as u32,
-                            tw as u32,
-                            top as u32,
-                            left as u32,
-                            kept_h as u32,
-                            kept_w as u32,
-                            overlap_y as u32,
-                            overlap_x as u32,
-                        ],
-                        n,
-                        false,
-                    )?;
-                    previous[column] = Some(tile.clone());
-                    left_tile = Some(tile);
-                }
+            let (canvas, tile) =
+                self.fill_canvas(latent, &geometry, chunk, capture_first_tile && chunk == 0)?;
+            if tile.is_some() {
+                first_tile = tile;
             }
 
-            drop(previous);
             let mut write =
                 |first: usize, count: usize, blend: bool, position: usize| -> Result<()> {
                     let count = count.min(output_frames.saturating_sub(position));
@@ -443,4 +522,25 @@ impl MetalVideoDecoder {
 
         Ok(first_tile)
     }
+}
+
+/// How a latent decodes: the tile and chunk geometry that a whole video and a single chunk share.
+struct Geometry {
+    channels: usize,
+    latent_frames: usize,
+    lh: usize,
+    lw: usize,
+    height: usize,
+    width: usize,
+    plane: usize,
+    rows: TileAxis,
+    columns: TileAxis,
+    th: usize,
+    tw: usize,
+    chunks: usize,
+    cf: usize,
+    canvas_frames: usize,
+    output_frames: usize,
+    mean: Vec<f32>,
+    std: Vec<f32>,
 }

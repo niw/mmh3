@@ -49,12 +49,12 @@ type TextEncoder = mmh3_metal::text_encoder::MetalTextEncoder;
 /// The checkpoint a session has loaded, kept for the rest of it.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 type Resident = Option<(u64, TextEncoder)>;
-/// Only the CUDA decoder walks a video a chunk at a time. The Metal one decodes the whole latent,
-/// so a Metal worker offers no chunks and a run never asks it for one.
 #[cfg(feature = "cuda")]
 type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
+#[cfg(feature = "metal")]
+type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
 /// A decoder and the tile geometry it was built for, which a request may change.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 type ResidentDecoder = Option<(u64, usize, usize, VideoDecoder)>;
 #[cfg(feature = "cuda")]
 type AudioDecoder = mmh3_cuda::audio_vae::CudaAudioDecoder;
@@ -892,7 +892,6 @@ fn session(
     let mut writer = BufWriter::with_capacity(STREAM_BUFFER, stream);
     // The text encoder and the video decoder load on their first request and stay for the session.
     let mut encoder: Resident = None;
-    #[cfg(feature = "cuda")]
     let mut decoder: ResidentDecoder = None;
     let mut audio: ResidentAudio = None;
     // A DiT read before it was asked for, which `PrepareCheckpoint` starts while the leader is
@@ -931,12 +930,7 @@ fn session(
                     memory_bytes: memory_bytes(),
                     capabilities: CAPABILITY_ENCODE_TEXT
                         | CAPABILITY_DECODE_AUDIO
-                        // A chunk of a decode, rather than a whole video, is a CUDA path.
-                        | if cfg!(feature = "cuda") {
-                            CAPABILITY_DECODE_VIDEO
-                        } else {
-                            0
-                        }
+                        | CAPABILITY_DECODE_VIDEO
                         // A share of the DiT needs the reliable connection: a step exchanges far
                         // more than a socket carries in the time it saves.
                         | if offered.is_some() && models.join("diffusion_models").is_dir() {
@@ -1085,73 +1079,73 @@ fn session(
                     }
                 }
             }
-            #[cfg(not(feature = "cuda"))]
-            Kind::DecodeVideo => {
-                let message = b"this build decodes a whole video, not a chunk of one";
-                reply(&mut writer, Kind::Error, message, &[])?;
-            }
-            #[cfg(feature = "cuda")]
             Kind::DecodeVideo => {
                 let started = Instant::now();
                 match decode_video(checkpoints, &body, &mut decoder) {
                     Ok((chunk, payload)) => {
                         let megabytes = payload.len() >> 20;
-                        let mut canvas = Canvas {
+                        // A reliable connection has the leader read the canvas out of this side's
+                        // memory. Only the CUDA build opens one.
+                        #[cfg(feature = "cuda")]
+                        if rdma.is_some() {
+                            // One registered canvas serves the session. Registering hundreds of
+                            // megabytes costs seconds, so every chunk copies into the same memory,
+                            // which only ever grows.
+                            let device = match rdma_device() {
+                                Some(device) => device,
+                                None => {
+                                    let message = b"this machine has no RoCE port";
+                                    reply(&mut writer, Kind::Error, message, &[])?;
+                                    continue;
+                                }
+                            };
+                            if staging.as_ref().map(Region::bytes).unwrap_or(0) < payload.len() {
+                                staging = None;
+                                match device.register(vec![0u8; payload.len()]) {
+                                    Ok(region) => staging = Some(region),
+                                    Err(error) => {
+                                        let message = format!("registering a canvas: {error}");
+                                        reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
+                                        continue;
+                                    }
+                                }
+                            }
+                            let region = staging.as_mut().expect("just registered");
+                            region.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
+                            let canvas = Canvas {
+                                chunk,
+                                bytes: payload.len() as u64,
+                                remote_address: region.address(),
+                                remote_keys: region.remote_keys().to_vec(),
+                            };
+                            println!(
+                                "decoded chunk {chunk} in {:.1} s, {megabytes} MiB to read",
+                                started.elapsed().as_secs_f64()
+                            );
+                            reply(&mut writer, Kind::Canvas, &canvas.encode(), &[])?;
+                            // The memory holds this canvas until the leader says it has read it.
+                            let (release, _) = worker::receive(&mut reader, BODY_LIMIT)?;
+                            if release.kind != Kind::Release {
+                                return Err(format!(
+                                    "a leader sent {:?} while a canvas waited",
+                                    release.kind
+                                )
+                                .into());
+                            }
+                            continue;
+                        }
+                        // Without one the canvas goes down the socket.
+                        let canvas = Canvas {
                             chunk,
                             bytes: payload.len() as u64,
                             remote_address: 0,
                             remote_keys: Vec::new(),
                         };
-                        // Without a reliable connection the canvas goes down the socket.
-                        let Some(link) = rdma.as_ref() else {
-                            println!(
-                                "decoded chunk {chunk} in {:.1} s, {megabytes} MiB back",
-                                started.elapsed().as_secs_f64()
-                            );
-                            reply(&mut writer, Kind::Canvas, &canvas.encode(), &payload)?;
-                            continue;
-                        };
-                        // One registered canvas serves the session. Registering hundreds of
-                        // megabytes costs seconds, so every chunk copies into the same memory,
-                        // which only ever grows.
-                        let device = match rdma_device() {
-                            Some(device) => device,
-                            None => {
-                                let message = b"this machine has no RoCE port";
-                                reply(&mut writer, Kind::Error, message, &[])?;
-                                continue;
-                            }
-                        };
-                        let _ = link;
-                        if staging.as_ref().map(Region::bytes).unwrap_or(0) < payload.len() {
-                            staging = None;
-                            match device.register(vec![0u8; payload.len()]) {
-                                Ok(region) => staging = Some(region),
-                                Err(error) => {
-                                    let message = format!("registering a canvas: {error}");
-                                    reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
-                                    continue;
-                                }
-                            }
-                        }
-                        let region = staging.as_mut().expect("just registered");
-                        region.as_mut_slice()[..payload.len()].copy_from_slice(&payload);
-                        canvas.remote_address = region.address();
-                        canvas.remote_keys = region.remote_keys().to_vec();
                         println!(
-                            "decoded chunk {chunk} in {:.1} s, {megabytes} MiB to read",
+                            "decoded chunk {chunk} in {:.1} s, {megabytes} MiB back",
                             started.elapsed().as_secs_f64()
                         );
-                        reply(&mut writer, Kind::Canvas, &canvas.encode(), &[])?;
-                        // The memory holds this canvas until the leader says it has read it.
-                        let (release, _) = worker::receive(&mut reader, BODY_LIMIT)?;
-                        if release.kind != Kind::Release {
-                            return Err(format!(
-                                "a leader sent {:?} while a canvas waited",
-                                release.kind
-                            )
-                            .into());
-                        }
+                        reply(&mut writer, Kind::Canvas, &canvas.encode(), &payload)?;
                     }
                     Err(error) => {
                         reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
@@ -1255,7 +1249,7 @@ fn decode_audio(
     Ok(decoder.decode(&latent)?)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn decode_video(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
