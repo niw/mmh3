@@ -1805,8 +1805,8 @@ impl<'a> Exchanger<'a> {
 }
 
 #[cfg(feature = "cuda")]
-fn exchange_error(message: String) -> mmh3_cuda::model::Error {
-    mmh3_cuda::model::Error::Model(message)
+fn exchange_error(message: String) -> shard::ExchangeError {
+    shard::ExchangeError(message)
 }
 
 #[cfg(feature = "cuda")]
@@ -1817,7 +1817,7 @@ impl Exchanger<'_> {
     ///
     /// Both ends of a pair decide this the same way: a rank with no port registers nothing, so it
     /// names no address, so neither side has a connection to the other and both queue.
-    fn exchange_pending(&mut self) -> Result<(), mmh3_cuda::model::Error> {
+    fn exchange_pending(&mut self) -> Result<(), shard::ExchangeError> {
         let mut peers: Vec<usize> = self
             .sockets
             .keys()
@@ -1839,7 +1839,7 @@ impl Exchanger<'_> {
 
     /// This rank's writes to `peer`, the last of them saying so. A rank with nothing to send says
     /// that too, so the other end never waits for a message that is not coming.
-    fn send_pending(&mut self, peer: usize) -> Result<(), mmh3_cuda::model::Error> {
+    fn send_pending(&mut self, peer: usize) -> Result<(), shard::ExchangeError> {
         let queued = self.pending.remove(&peer).unwrap_or_default();
         let Exchanger {
             sockets, regions, ..
@@ -1895,7 +1895,7 @@ impl Exchanger<'_> {
     }
 
     /// What `peer` wrote, put where its region says, until the one that says it is the last.
-    fn take_pending(&mut self, peer: usize) -> Result<(), mmh3_cuda::model::Error> {
+    fn take_pending(&mut self, peer: usize) -> Result<(), shard::ExchangeError> {
         loop {
             let Exchanger {
                 sockets, regions, ..
@@ -1940,6 +1940,8 @@ impl Exchanger<'_> {
 
 #[cfg(feature = "cuda")]
 impl shard::Exchange for Exchanger<'_> {
+    type Memory = *mut std::ffi::c_void;
+
     fn rank(&self) -> usize {
         self.rank
     }
@@ -1952,7 +1954,7 @@ impl shard::Exchange for Exchanger<'_> {
         &mut self,
         region: shard::Region,
         bytes: usize,
-    ) -> Result<*mut std::ffi::c_void, mmh3_cuda::model::Error> {
+    ) -> Result<*mut std::ffi::c_void, shard::ExchangeError> {
         let held = self
             .regions
             .get(&region)
@@ -1980,7 +1982,7 @@ impl shard::Exchange for Exchanger<'_> {
         region: shard::Region,
         offset: usize,
         bytes: usize,
-    ) -> Result<(), mmh3_cuda::model::Error> {
+    ) -> Result<(), shard::ExchangeError> {
         let Some(device) = self.computed.get(&region) else {
             return Ok(());
         };
@@ -1999,7 +2001,8 @@ impl shard::Exchange for Exchanger<'_> {
             mmh3_cuda::download(
                 &mut held.as_mut_slice()[offset..offset + bytes],
                 device.pointer().byte_add(offset),
-            )?
+            )
+            .map_err(|error| exchange_error(format!("taking {region:?} off the device: {error}")))?
         };
         Ok(())
     }
@@ -2009,7 +2012,7 @@ impl shard::Exchange for Exchanger<'_> {
         region: shard::Region,
         offset: usize,
         bytes: usize,
-    ) -> Result<(), mmh3_cuda::model::Error> {
+    ) -> Result<(), shard::ExchangeError> {
         let Some(device) = self.computed.get(&region) else {
             return Ok(());
         };
@@ -2028,7 +2031,8 @@ impl shard::Exchange for Exchanger<'_> {
             mmh3_cuda::upload(
                 device.pointer().byte_add(offset),
                 &held.as_slice()[offset..offset + bytes],
-            )?
+            )
+            .map_err(|error| exchange_error(format!("putting {region:?} on the device: {error}")))?
         };
         Ok(())
     }
@@ -2041,7 +2045,7 @@ impl shard::Exchange for Exchanger<'_> {
         into: shard::Region,
         peer_offset: usize,
         bytes: usize,
-    ) -> Result<(), mmh3_cuda::model::Error> {
+    ) -> Result<(), shard::ExchangeError> {
         if peer == self.rank {
             return Err(exchange_error("a rank cannot write to itself".to_owned()));
         }
@@ -2104,14 +2108,14 @@ impl shard::Exchange for Exchanger<'_> {
         Ok(())
     }
 
-    fn barrier(&mut self) -> Result<(), mmh3_cuda::model::Error> {
+    fn barrier(&mut self) -> Result<(), shard::ExchangeError> {
         self.exchange_pending()?;
-        let arrive = |exchanger: &mut Self, peer: usize| -> Result<(), mmh3_cuda::model::Error> {
+        let arrive = |exchanger: &mut Self, peer: usize| -> Result<(), shard::ExchangeError> {
             exchanger
                 .send(peer, Kind::Ready, &[], &[])
                 .map_err(|error| exchange_error(format!("reaching a barrier: {error}")))
         };
-        let wait = |exchanger: &mut Self, peer: usize| -> Result<(), mmh3_cuda::model::Error> {
+        let wait = |exchanger: &mut Self, peer: usize| -> Result<(), shard::ExchangeError> {
             let (header, _) = exchanger
                 .receive(peer)
                 .map_err(|error| exchange_error(format!("waiting at a barrier: {error}")))?;

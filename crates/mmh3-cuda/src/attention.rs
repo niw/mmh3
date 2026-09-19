@@ -6,7 +6,7 @@ use mmh3_core::dit::vsa::{VSA_TILE, VsaPlan};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
-pub const HEAD_DIM: usize = 128;
+pub use mmh3_core::shard::HEAD_DIM;
 
 /// Strides in elements of the query, key, value and output tensors, in that order, and the
 /// attention pattern.

@@ -65,6 +65,12 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl From<mmh3_core::shard::ExchangeError> for Error {
+    fn from(error: mmh3_core::shard::ExchangeError) -> Self {
+        Error::Model(error.0)
+    }
+}
+
 impl From<CudaError> for Error {
     fn from(error: CudaError) -> Self {
         Error::Cuda(error)

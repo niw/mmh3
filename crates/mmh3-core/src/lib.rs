@@ -9,6 +9,7 @@ pub mod numeric;
 pub mod picture;
 pub mod random;
 pub mod safetensors;
+pub mod shard;
 pub mod tensor;
 pub mod tokenizer;
 pub mod vae;
