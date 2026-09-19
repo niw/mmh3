@@ -191,31 +191,34 @@ pub fn measure_speed() -> Option<worker::Speed> {
     // A machine does not change between runs, so the first one measures and the rest read. The
     // file names the device it was measured on, and another one measures again.
     let cache = crate::models::cache_file("speed.txt");
-    let name = device_name();
-    if let Some(text) = cache
+    let (name, road) = (device_name(), road());
+    let kept = cache
         .as_ref()
         .and_then(|path| std::fs::read_to_string(path).ok())
-    {
-        let mut lines = text.lines();
-        if lines.next() == Some(SPEED_HEADER) && lines.next() == Some(name.as_str()) {
-            let mut numbers = lines.next().unwrap_or_default().split_whitespace();
-            if let (Some(Ok(tops)), Some(Ok(bandwidth))) = (
-                numbers.next().map(str::parse),
-                numbers.next().map(str::parse),
-            ) {
-                return Some(worker::Speed {
-                    gemm_tops: tops,
-                    bandwidth_gbytes: bandwidth,
-                });
-            }
-        }
+        .filter(|text| {
+            let mut lines = text.lines();
+            lines.next() == Some(SPEED_HEADER) && lines.next() == Some(name.as_str())
+        })
+        .unwrap_or_default();
+    if let Some(speed) = kept.lines().skip(2).find_map(|line| parse_road(line, road)) {
+        return Some(speed);
     }
+
     let speed = measure_now()?;
     if let Some(path) = cache {
-        let text = format!(
-            "{SPEED_HEADER}\n{name}\n{} {}\n",
+        // The roads already measured are kept: a run on one of them should not pay to measure
+        // again because a run on another came between.
+        let mut text = format!("{SPEED_HEADER}\n{name}\n");
+        for line in kept.lines().skip(2) {
+            if parse_road(line, road).is_none() && !line.trim().is_empty() {
+                text.push_str(line);
+                text.push('\n');
+            }
+        }
+        text.push_str(&format!(
+            "{road} {} {}\n",
             speed.gemm_tops, speed.bandwidth_gbytes
-        );
+        ));
         if let Some(directory) = path.parent() {
             let _ = std::fs::create_dir_all(directory);
         }
@@ -226,9 +229,42 @@ pub fn measure_speed() -> Option<worker::Speed> {
     Some(speed)
 }
 
-/// First line of the file `measure_speed` keeps, followed by the device and the two numbers. It
-/// goes up when what is measured changes, so an old file is not taken for a new one.
-const SPEED_HEADER: &str = "mmh3 machine speed 1";
+/// One kept line, when it is the road asked for.
+fn parse_road(line: &str, road: &str) -> Option<worker::Speed> {
+    let mut fields = line.split_whitespace();
+    if fields.next()? != road {
+        return None;
+    }
+
+    Some(worker::Speed {
+        gemm_tops: fields.next()?.parse().ok()?,
+        bandwidth_gbytes: fields.next()?.parse().ok()?,
+    })
+}
+
+/// The precision a block's products run in here, which is what the measurement is of. The same
+/// arithmetic on another road is another number, so a kept measurement names the road it took.
+fn road() -> &'static str {
+    #[cfg(feature = "cuda")]
+    {
+        "bf16"
+    }
+    #[cfg(feature = "metal")]
+    {
+        // NOTE: the default of `--linear-precision` on Metal. A run told to take another road is
+        // measured against this one, which `Welcome` is sent too early to know about.
+        "mps-fp16"
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        "none"
+    }
+}
+
+/// First line of the file `measure_speed` keeps, followed by the device and then a line for every
+/// road measured on it. It goes up when what is measured changes, so an old file is not taken for
+/// a new one.
+const SPEED_HEADER: &str = "mmh3 machine speed 2";
 
 #[cfg(feature = "cuda")]
 fn measure_now() -> Option<worker::Speed> {
@@ -245,8 +281,26 @@ fn measure_now() -> Option<worker::Speed> {
     })
 }
 
-/// A backend that cannot measure itself says so, and the shares fall back to being even.
-#[cfg(not(feature = "cuda"))]
+#[cfg(feature = "metal")]
+fn measure_now() -> Option<worker::Speed> {
+    use mmh3_metal::bench::{gemm_operations_per_second, memory_copy_bytes_per_second};
+
+    // The same shape CUDA measures, so the two numbers can be compared and a share cut between
+    // them. The road differs and that is the point: each machine times the one it will take.
+    let (m, n, k) = (4096, 5376, 5376);
+    let device = mmh3_metal::Device::new().ok()?;
+    let operations =
+        gemm_operations_per_second(&device, mmh3_metal::LinearPrecision::MpsFp16, m, n, k, 10)
+            .ok()?;
+    let copy = memory_copy_bytes_per_second(&device, 1 << 28, 5).ok()?;
+    Some(worker::Speed {
+        gemm_tops: (operations / 1e12) as f32,
+        bandwidth_gbytes: (copy / 1e9) as f32,
+    })
+}
+
+/// A backend that cannot measure itself says so, and it is given no share of a step.
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 fn measure_now() -> Option<worker::Speed> {
     None
 }

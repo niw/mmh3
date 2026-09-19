@@ -3,6 +3,7 @@
 #![cfg(target_os = "macos")]
 
 pub mod audio_vae;
+pub mod bench;
 pub mod dit;
 mod model;
 pub mod ops;
