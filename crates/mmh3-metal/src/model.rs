@@ -107,6 +107,13 @@ impl Weights {
         })
     }
 
+    /// Whether a layer's weights are INT8, which is what an exchanged block input reaches.
+    pub fn is_int8(&self, name: &str) -> bool {
+        self.tensors
+            .get(&format!("{name}.weight"))
+            .is_some_and(|w| w.dtype == DType::I8)
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name)
     }
