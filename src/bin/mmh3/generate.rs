@@ -43,6 +43,16 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let mut output = mmh3::output::prepare(ffmpeg_arguments, spec, &video_path)?;
     let (video, audio) = sample(&options, &settings)?;
 
+    // The audio goes to a worker on a connection of its own, since a worker finishes its share of
+    // the video before this machine finishes blending its own and is idle until then.
+    #[cfg(feature = "cuda")]
+    let remote_audio = mmh3::worker::RemoteAudio::start(
+        settings.workers.clone(),
+        settings.token.clone(),
+        mmh3::worker::AUDIO_VAE_ROLE,
+        &audio,
+    );
+
     let started = Instant::now();
     let path = video_vae_path(&options)?;
     let decoder = VideoDecoder::load(
@@ -88,12 +98,29 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         started.elapsed().as_secs_f64()
     );
     let started = Instant::now();
-    let path = option_path(&options, "audio-vae", AUDIO_VAE_FILE)?;
-    let waveform = AudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
-    println!(
-        "decoded the audio in {:.1} s",
-        started.elapsed().as_secs_f64()
-    );
+    #[cfg(feature = "cuda")]
+    let remote_waveform = remote_audio.take();
+    #[cfg(not(feature = "cuda"))]
+    let remote_waveform: Option<mmh3_core::tensor::Tensor> = None;
+    let waveform = match remote_waveform {
+        Some(waveform) => {
+            println!(
+                "took the audio from a worker in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+            waveform
+        }
+        None => {
+            let path = option_path(&options, "audio-vae", AUDIO_VAE_FILE)?;
+            let waveform =
+                AudioDecoder::load(&SafeTensors::open(Path::new(&path))?, "")?.decode(&audio)?;
+            println!(
+                "decoded the audio in {:.1} s",
+                started.elapsed().as_secs_f64()
+            );
+            waveform
+        }
+    };
     let started = Instant::now();
     output.write_audio(waveform)?;
     output.finish()?;

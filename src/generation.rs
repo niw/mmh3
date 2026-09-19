@@ -306,82 +306,125 @@ pub fn sample(
     }
     prompt_references.extend(settings.sounds.iter().map(|_| PromptReference::Sound));
 
-    #[allow(unused_mut)]
-    let mut context_modalities = Vec::new();
-    let context = match (prompt, options.get("context")) {
-        (Some(prompt), None) => {
-            let started = Instant::now();
-            // A worker that holds the text encoder spares this machine 27 GB and the load, but only
-            // for a prompt of plain text: pictures and clips still go through the vision tower here.
-            if prompt_references.is_empty()
-                && let Some(context) = encode_on_worker(settings, &Tokenizer::h3().encode(&prompt))
-            {
-                println!(
-                    "encoded {} prompt tokens on a worker in {:.1} s",
-                    context.shape[0],
-                    started.elapsed().as_secs_f64()
-                );
-                context
-            } else {
-                let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
-                let file = SafeTensors::open(Path::new(&path))?;
-                let encoder = TextEncoder::load(&file)?;
-                let context = if prompt_references.is_empty() {
-                    let ids = Tokenizer::h3().encode(&prompt);
-                    encoder.encode(&ids, &[])?.context
-                } else {
-                    #[cfg(feature = "metal")]
-                    return Err("picture and sound prompts are not implemented on Metal yet".into());
-                    #[cfg(feature = "cuda")]
-                    {
-                        use mmh3_core::vision::vision_prompt;
-                        use mmh3_cuda::vision::CudaVisionEncoder;
+    // Which DiT a run uses is the settings' business and not the prompt's, so the workers can be
+    // told to read it, and this machine can read its own, while the prompt is still encoding.
+    let has_references = !(settings.references.is_empty()
+        && settings.sounds.is_empty()
+        && settings.clips.is_empty());
+    let dit_file = if has_references {
+        REFERENCE_DIT_FILE
+    } else {
+        DIT_FILE
+    };
+    #[cfg(feature = "cuda")]
+    let prepared_workers = prepare_workers(settings, options, dit_file);
 
-                        // One embedding per vision block: the pictures, then the pairs of every clip.
-                        let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
-                            Vec::new()
+    let encode_context = || -> Result<(Tensor, Vec<mmh3_core::dit::timestep::Modality>), String> {
+        #[allow(unused_mut)]
+        let mut context_modalities = Vec::new();
+        let encode = || -> Result<Tensor, Box<dyn Error>> {
+            Ok(match (prompt, options.get("context")) {
+                (Some(prompt), None) => {
+                    let started = Instant::now();
+                    // A worker that holds the text encoder spares this machine 27 GB and the load, but only
+                    // for a prompt of plain text: pictures and clips still go through the vision tower here.
+                    if prompt_references.is_empty()
+                        && let Some(context) =
+                            encode_on_worker(settings, &Tokenizer::h3().encode(&prompt))
+                    {
+                        println!(
+                            "encoded {} prompt tokens on a worker in {:.1} s",
+                            context.shape[0],
+                            started.elapsed().as_secs_f64()
+                        );
+                        context
+                    } else {
+                        let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
+                        let file = SafeTensors::open(Path::new(&path))?;
+                        let encoder = TextEncoder::load(&file)?;
+                        let context = if prompt_references.is_empty() {
+                            let ids = Tokenizer::h3().encode(&prompt);
+                            encoder.encode(&ids, &[])?.context
                         } else {
-                            let vision = CudaVisionEncoder::load(&file)?;
-                            let mut embeddings = pictures
-                                .iter()
-                                .map(|picture| vision.encode(picture))
-                                .collect::<Result<Vec<_>, _>>()?;
-                            for blocks in &clip_blocks {
-                                for pair in blocks.chunks(2) {
-                                    embeddings.push(vision.encode_frames(&pair[0], &pair[1])?);
-                                }
+                            #[cfg(feature = "metal")]
+                            return Err(
+                                "picture and sound prompts are not implemented on Metal yet".into(),
+                            );
+                            #[cfg(feature = "cuda")]
+                            {
+                                use mmh3_core::vision::vision_prompt;
+                                use mmh3_cuda::vision::CudaVisionEncoder;
+
+                                // One embedding per vision block: the pictures, then the pairs of every clip.
+                                let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
+                                    Vec::new()
+                                } else {
+                                    let vision = CudaVisionEncoder::load(&file)?;
+                                    let mut embeddings = pictures
+                                        .iter()
+                                        .map(|picture| vision.encode(picture))
+                                        .collect::<Result<Vec<_>, _>>()?;
+                                    for blocks in &clip_blocks {
+                                        for pair in blocks.chunks(2) {
+                                            embeddings
+                                                .push(vision.encode_frames(&pair[0], &pair[1])?);
+                                        }
+                                    }
+                                    embeddings
+                                };
+                                let prompt =
+                                    vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
+                                context_modalities = prompt.modalities.clone();
+                                encoder.encode_prompt(&prompt, &embeddings, &[])?.context
                             }
-                            embeddings
                         };
-                        let prompt = vision_prompt(&Tokenizer::h3(), &prompt, &prompt_references);
-                        context_modalities = prompt.modalities.clone();
-                        encoder.encode_prompt(&prompt, &embeddings, &[])?.context
+                        println!(
+                            "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
+                            context.shape[0],
+                            pictures.len(),
+                            settings.clips.len(),
+                            settings.sounds.len(),
+                            started.elapsed().as_secs_f64()
+                        );
+                        context
                     }
-                };
-                println!(
-                    "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
-                    context.shape[0],
-                    pictures.len(),
-                    settings.clips.len(),
-                    settings.sounds.len(),
-                    started.elapsed().as_secs_f64()
-                );
-                context
+                }
+                (None, Some(path)) => {
+                    let file = SafeTensors::open(Path::new(path))?;
+                    let mut context = Tensor::load(
+                        &file,
+                        file.get("context")
+                            .ok_or("the context file has no context tensor")?,
+                    )?;
+                    if context.shape.len() == 3 && context.shape[0] == 1 {
+                        context.shape.remove(0);
+                    }
+                    context
+                }
+                _ => return Err("pass a prompt or --context, not both".into()),
+            })
+        };
+        let context = encode().map_err(|error| error.to_string())?;
+        Ok((context, context_modalities))
+    };
+    // The DiT waits on nothing the prompt makes, and reading it is mostly reading, so it goes
+    // while the encoder has the device.
+    #[cfg(feature = "cuda")]
+    let (context, context_modalities, dit) =
+        std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
+            let encoded = scope.spawn(encode_context);
+            let dit = load_dit(options, "dit", dit_file)?;
+            match encoded.join() {
+                Ok(Ok((context, modalities))) => Ok((context, modalities, dit)),
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => Err("encoding the prompt panicked".into()),
             }
-        }
-        (None, Some(path)) => {
-            let file = SafeTensors::open(Path::new(path))?;
-            let mut context = Tensor::load(
-                &file,
-                file.get("context")
-                    .ok_or("the context file has no context tensor")?,
-            )?;
-            if context.shape.len() == 3 && context.shape[0] == 1 {
-                context.shape.remove(0);
-            }
-            context
-        }
-        _ => return Err("pass a prompt or --context, not both".into()),
+        })?;
+    #[cfg(not(feature = "cuda"))]
+    let (context, context_modalities, dit) = {
+        let (context, modalities) =
+            encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
+        (context, modalities, load_dit(options, "dit", dit_file)?)
     };
     if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
@@ -410,9 +453,6 @@ pub fn sample(
     #[cfg(feature = "metal")]
     let soundtrack_latents: Vec<Tensor> = Vec::new();
 
-    let has_references = !(settings.references.is_empty()
-        && settings.sounds.is_empty()
-        && settings.clips.is_empty());
     let (keyframes, references) = if !has_references {
         let keyframes = settings
             .keyframes
@@ -467,12 +507,6 @@ pub fn sample(
         context.shape[0]
     );
 
-    let dit_file = if references.is_empty() {
-        DIT_FILE
-    } else {
-        REFERENCE_DIT_FILE
-    };
-    let dit = load_dit(options, "dit", dit_file)?;
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
     let schedule = &settings.schedule;
     // A machine that can take a share of every step, and a run whose shape one can be cut out of.
@@ -488,6 +522,7 @@ pub fn sample(
         &audio,
         &keyframes,
         &references,
+        prepared_workers,
     );
     #[cfg(feature = "cuda")]
     let mut sharing = match &mut target {
@@ -770,6 +805,60 @@ struct ShardTarget {
     payload: Vec<u8>,
 }
 
+/// Connects to the workers a shared-out run would use and names the DiT it will share, so that
+/// they read it while this machine still has a prompt to encode. The connections are the ones the
+/// session opens on, since what a worker reads early is only there for the connection it came on.
+#[cfg(feature = "cuda")]
+fn prepare_workers(
+    settings: &Settings,
+    options: &HashMap<&str, &str>,
+    dit_file: &str,
+) -> Vec<crate::worker::Worker> {
+    use crate::worker::{Worker, digest};
+    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint};
+
+    let ranks =
+        crate::cli::option_number(options, "shard-dit", settings.workers.len() + 1).unwrap_or(0);
+    if ranks < 2 || settings.workers.is_empty() {
+        return Vec::new();
+    }
+    let Ok(path) = crate::models::option_path(options, "dit", dit_file) else {
+        return Vec::new();
+    };
+    let checkpoint = match mmh3_core::safetensors::SafeTensors::open(std::path::Path::new(&path)) {
+        Ok(file) => Checkpoint {
+            role: "dit.h3".to_owned(),
+            digest: digest(&file),
+        },
+        Err(error) => {
+            eprintln!("warning: reading {path}: {error}");
+            return Vec::new();
+        }
+    };
+    let mut workers = Vec::new();
+    for address in &settings.workers {
+        if workers.len() + 1 >= ranks {
+            break;
+        }
+        let mut worker = match Worker::connect(address, &settings.token) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("warning: worker {address}: {error}");
+                continue;
+            }
+        };
+        if !worker.serves(CAPABILITY_DIT_SHARD) || !worker.reads_remotely() {
+            continue;
+        }
+        if let Err(error) = worker.prepare(&checkpoint) {
+            eprintln!("warning: worker {address}: {error}");
+            continue;
+        }
+        workers.push(worker);
+    }
+    workers
+}
+
 /// The first worker that can take a share of the DiT, or `None` to keep the whole step here.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
@@ -784,11 +873,12 @@ fn shard_target(
     audio: &Tensor,
     keyframes: &[mmh3_core::dit::inputs::Keyframe],
     references: &[mmh3_core::dit::inputs::Reference],
+    workers: Vec<crate::worker::Worker>,
 ) -> Option<ShardTarget> {
-    use crate::worker::{Worker, digest, session_conditions, session_payload};
+    use crate::worker::{digest, session_conditions, session_payload};
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
-    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
+    use mmh3_core::worker::{Checkpoint, OpenSession};
     use mmh3_cuda::shard::Shard;
 
     // A worker that only encodes the prompt and decodes some chunks is worth 9% of a run, which is
@@ -830,24 +920,9 @@ fn shard_target(
     };
     drop(file);
 
-    // The workers that can take a share, in the order they were given, up to the rank count.
-    let mut workers = Vec::new();
-    for address in &settings.workers {
-        if workers.len() + 1 >= ranks {
-            break;
-        }
-        let worker = match Worker::connect(address, &settings.token) {
-            Ok(worker) => worker,
-            Err(error) => {
-                eprintln!("warning: worker {address}: {error}");
-                continue;
-            }
-        };
-        if !worker.serves(CAPABILITY_DIT_SHARD) || !worker.reads_remotely() {
-            continue;
-        }
-        workers.push(worker);
-    }
+    // The workers `prepare_workers` reached, which are already reading this DiT.
+    let mut workers = workers;
+    workers.truncate(ranks.saturating_sub(1));
     if workers.is_empty() {
         if asked {
             println!("no worker can take a share of a step, so the DiT stays here");

@@ -41,6 +41,9 @@ pub enum Kind {
     Ready = 17,
     CloseSession = 18,
     SessionLinks = 19,
+    PrepareCheckpoint = 20,
+    DecodeAudio = 21,
+    Samples = 22,
 }
 
 impl Kind {
@@ -65,6 +68,9 @@ impl Kind {
             17 => Kind::Ready,
             18 => Kind::CloseSession,
             19 => Kind::SessionLinks,
+            20 => Kind::PrepareCheckpoint,
+            21 => Kind::DecodeAudio,
+            22 => Kind::Samples,
             _ => return None,
         })
     }
@@ -235,6 +241,22 @@ pub struct Checkpoint {
     pub digest: u64,
 }
 
+impl Checkpoint {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.string(&self.role).u64(self.digest);
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        Ok(Checkpoint {
+            role: decoder.string()?,
+            digest: decoder.u64()?,
+        })
+    }
+}
+
 /// A worker's own measurement of itself, omitted when it cannot benchmark.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Speed {
@@ -288,6 +310,71 @@ pub struct DecodeVideo {
     pub tile_overlap: u32,
     /// `[channels, frames, height, width]` of the latent that follows as FP32.
     pub shape: [u32; 4],
+}
+
+/// A run's audio latent for a worker to decode while the leader decodes the video. It is small
+/// enough that it and the waveform go down the socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecodeAudio {
+    pub checkpoint: Checkpoint,
+    /// `[channels, 2, frames]` of the latent that follows as FP32.
+    pub shape: [u32; 3],
+}
+
+impl DecodeAudio {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder
+            .string(&self.checkpoint.role)
+            .u64(self.checkpoint.digest);
+        for value in self.shape {
+            encoder.u32(value);
+        }
+        encoder.finish()
+    }
+
+    /// Returns the descriptor and where the payload begins.
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut decoder = Decoder::new(bytes);
+        let checkpoint = Checkpoint {
+            role: decoder.string()?,
+            digest: decoder.u64()?,
+        };
+        let mut shape = [0u32; 3];
+        for value in &mut shape {
+            *value = decoder.u32()?;
+        }
+        Ok((DecodeAudio { checkpoint, shape }, decoder.position))
+    }
+}
+
+/// A decoded waveform, with its shape as the decoder hands it over and the samples as FP32 in the
+/// payload.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Samples {
+    pub shape: Vec<u32>,
+}
+
+impl Samples {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(self.shape.len() as u32);
+        for value in &self.shape {
+            encoder.u32(*value);
+        }
+        encoder.finish()
+    }
+
+    /// Returns the descriptor and where the payload begins.
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut decoder = Decoder::new(bytes);
+        let count = decoder.u32()? as usize;
+        let mut shape = Vec::with_capacity(count.min(8));
+        for _ in 0..count {
+            shape.push(decoder.u32()?);
+        }
+        Ok((Samples { shape }, decoder.position))
+    }
 }
 
 /// A chunk's canvas before any blending, `[3, canvas frames, height, width]` FP32, counted in
