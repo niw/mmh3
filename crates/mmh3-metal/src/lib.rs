@@ -7,6 +7,7 @@ pub mod bench;
 pub mod dit;
 mod model;
 pub mod ops;
+pub mod shard;
 pub mod text_encoder;
 pub mod vae;
 

@@ -388,3 +388,28 @@ kernel void scale_linear_rows(device float *x [[buffer(0)]],
     if (i < p[0])
         x[i] *= scales[i / p[1]];
 }
+
+// Gathers the heads one rank owns out of [tokens][tensors][heads][dim] into
+// [tokens][tensors][span][dim], the shape the attention already reads.
+kernel void shard_pack(device const float *source [[buffer(0)]], device float *packed [[buffer(1)]],
+                       constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    uint dim = p[1], span = p[2], tensors = p[3], heads = p[4];
+    uint lane = i % dim, rest = i / dim;
+    uint head = rest % span + p[5], above = rest / span;
+    uint tensor = above % tensors, token = above / tensors;
+    packed[i] = source[((token * tensors + tensor) * heads + head) * dim + lane];
+}
+
+// Scatters one rank's share of an attention output, [tokens][span][dim], into the rows this rank
+// carries onward, [tokens][heads][dim], at head p[4]. The heads it does not own are left alone.
+kernel void shard_unpack(device const float *part [[buffer(0)]], device float *output [[buffer(1)]],
+                         constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    uint dim = p[1], span = p[2], heads = p[3];
+    uint lane = i % dim, rest = i / dim;
+    uint head = rest % span + p[4], token = rest / span;
+    output[(token * heads + head) * dim + lane] = part[i];
+}
