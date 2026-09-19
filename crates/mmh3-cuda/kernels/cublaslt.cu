@@ -95,6 +95,21 @@ std::map<MatmulKey, cublasLtMatmulAlgo_t> matmul_algorithms;
 // How many heuristic candidates a new shape times against each other. cuBLASLt offers only a few
 // for the convolution shapes of the VAE encoder, so the list is as long as it will fill.
 constexpr int MATMUL_CANDIDATES = 32;
+// How much faster than the standing choice a candidate has to be, in every pass, to displace it.
+// Over the shapes of a run the ratio between the heuristic's first candidate and the fastest one
+// is either under 1.13, where it is noise on a measurement of tenths of a millisecond, or over
+// 1.35, where it is a kernel that really is slower. The gap sits above the noise, and a candidate
+// that clears it in one pass but not in the next has not cleared it.
+constexpr float MATMUL_GAP = 1.35f;
+// How long one timing pass runs for, how many calls that may take, and how many passes are timed.
+constexpr float MATMUL_MEASURE_MS = 1.0f;
+constexpr int MATMUL_REPEATS = 500;
+constexpr int MATMUL_PASSES = 3;
+// Below this a shape is not timed at all. A kernel of tens of microseconds is mostly launch
+// overhead, so the measurements of its candidates cross from run to run, and taking one half again
+// slower than the best would cost microseconds. It takes the heuristic's first candidate, which is
+// the only choice that does not move.
+constexpr float MATMUL_TRIVIAL_MS = 0.05f;
 constexpr int NVFP4_CANDIDATES = 8;
 
 } // namespace
@@ -191,33 +206,82 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    float best = 0.0f;
-    int best_index = -1;
+    // NOTE: two algorithms round differently, so a measurement that picks between two of
+    // near-equal speed picks the arithmetic, and the same call then answers differently in two
+    // processes, or in two ranks of one run. A small shape runs in microseconds, where the launch
+    // overhead and the clock dominate a single call, so a candidate is timed over as many calls as
+    // fit in MATMUL_MEASURE_MS, and has to beat the standing choice by MATMUL_GAP in every pass to
+    // displace it.
+    auto measure = [&](const cublasLtMatmulAlgo_t &algorithm, float *passes) {
+        auto time = [&](int repeats) {
+            cudaEventRecord(start, stream);
+            for (int repeat = 0; repeat < repeats; repeat++) {
+                if (run(&algorithm) != CUBLAS_STATUS_SUCCESS) {
+                    return -1.0f;
+                }
+            }
+            cudaEventRecord(stop, stream);
+            float elapsed = 0.0f;
+            if (cudaEventSynchronize(stop) != cudaSuccess ||
+                cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
+                return -1.0f;
+            }
+            return elapsed / static_cast<float>(repeats);
+        };
+        const float once = time(1);
+        if (once < 0.0f) {
+            return false;
+        }
+        int repeats = static_cast<int>(MATMUL_MEASURE_MS / (once > 1e-4f ? once : 1e-4f));
+        repeats = repeats < 1 ? 1 : (repeats > MATMUL_REPEATS ? MATMUL_REPEATS : repeats);
+        for (int pass = 0; pass < MATMUL_PASSES; pass++) {
+            const float elapsed = time(repeats);
+            if (elapsed < 0.0f) {
+                return false;
+            }
+            passes[pass] = elapsed;
+        }
+        return true;
+    };
+    float times[MATMUL_CANDIDATES][MATMUL_PASSES];
+    int chosen = -1;
     for (int index = 0; index < returned; index++) {
         // The first run of a candidate loads its kernel, which costs more than the call itself.
         if (run(&results[index].algo) != CUBLAS_STATUS_SUCCESS) {
             continue;
         }
-        cudaEventRecord(start, stream);
-        const cublasStatus_t timed = run(&results[index].algo);
-        cudaEventRecord(stop, stream);
-        float elapsed = 0.0f;
-        if (timed != CUBLAS_STATUS_SUCCESS || cudaEventSynchronize(stop) != cudaSuccess ||
-            cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
+        if (!measure(results[index].algo, times[index])) {
             continue;
         }
-        if (best_index < 0 || elapsed < best) {
-            best = elapsed;
-            best_index = index;
+        if (chosen < 0) {
+            chosen = index;
+        } else {
+            bool faster = true;
+            for (int pass = 0; pass < MATMUL_PASSES; pass++) {
+                faster = faster && times[index][pass] * MATMUL_GAP <= times[chosen][pass];
+            }
+            if (faster) {
+                chosen = index;
+            }
+        }
+        if (index == 0) {
+            // The fastest pass, since a pass only ever loses time to something else on the device.
+            float fastest = times[0][0];
+            for (int pass = 1; pass < MATMUL_PASSES; pass++) {
+                fastest = times[0][pass] < fastest ? times[0][pass] : fastest;
+            }
+            if (fastest < MATMUL_TRIVIAL_MS) {
+                break;
+            }
         }
     }
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
-    if (best_index < 0) {
+    if (chosen < 0) {
         return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
     }
-    matmul_algorithms[key] = results[best_index].algo;
-    return status_code(run(&results[best_index].algo));
+    matmul_algorithms[key] = results[chosen].algo;
+    return status_code(run(&results[chosen].algo));
 }
 
 extern "C" int mmh3_cublaslt_linear(int kind, const void *input, const void *weight,
@@ -319,7 +383,12 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
             cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
             continue;
         }
-        if (best_index < 0 || elapsed < best) {
+        // NOTE: two algorithms round differently, so a measurement that decides between two of
+        // near-equal speed decides the arithmetic by noise, and the same call then answers
+        // differently in two processes. A later candidate has to beat the standing choice by
+        // MATMUL_GAP to displace it, which leaves the choice to the heuristic's order wherever
+        // the speeds are close.
+        if (best_index < 0 || elapsed * MATMUL_GAP < best) {
             best = elapsed;
             best_index = index;
         }

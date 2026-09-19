@@ -15,6 +15,9 @@ constexpr int THREADS = 256;
 constexpr int GROUPS = 32;
 // Pixels one block of group_norm_partials_kernel reduces.
 constexpr int PARTIAL_PIXELS = 256;
+// Channels it holds a sum and a sum of squares of, which is 8 KiB of shared memory at the 1024 the
+// encoder's last normalization has.
+constexpr int GROUP_NORM_MAX_CHANNELS = 4096;
 
 unsigned grid_for(size_t count) {
     size_t blocks = (count + THREADS - 1) / THREADS;
@@ -107,20 +110,20 @@ __global__ void im2col_kernel(const __half *__restrict__ input, int height, int 
 // Sums and sums of squares of each group over PARTIAL_PIXELS pixels per block, into
 // partials[frame, block, group, 2]. The statistics of the reference are per frame, so a frame is
 // the grid's second axis and never mixes with another.
+//
+// NOTE: a thread's channels land in shared memory and the groups add them up in channel order.
+// Adding them into the group with atomics left the order to the scheduler, and two encodes of one
+// clip then gave two different latents. `channel_sums` holds `channels` pairs.
 __global__ void __launch_bounds__(THREADS)
     group_norm_partials_kernel(const __half *__restrict__ input, int pixels, int channels,
                                float *__restrict__ partials) {
-    __shared__ float sums[GROUPS * 2];
-    for (int index = threadIdx.x; index < GROUPS * 2; index += THREADS) {
-        sums[index] = 0.0f;
-    }
-    __syncthreads();
+    extern __shared__ float channel_sums[];
     const int group_size = channels / GROUPS;
     input += static_cast<size_t>(blockIdx.y) * pixels * channels;
     partials += static_cast<size_t>(blockIdx.y) * gridDim.x * GROUPS * 2;
     const size_t first = static_cast<size_t>(blockIdx.x) * PARTIAL_PIXELS;
     const size_t last = min(first + PARTIAL_PIXELS, static_cast<size_t>(pixels));
-    // Threads stride over channels, so each keeps the sums of fixed groups.
+    // Threads stride over channels, so the reads of one pixel are contiguous.
     for (int channel = threadIdx.x; channel < channels; channel += THREADS) {
         float sum = 0.0f, squares = 0.0f;
         for (size_t pixel = first; pixel < last; pixel++) {
@@ -128,13 +131,18 @@ __global__ void __launch_bounds__(THREADS)
             sum += value;
             squares = fmaf(value, value, squares);
         }
-        const int group = channel / group_size;
-        atomicAdd(&sums[group * 2], sum);
-        atomicAdd(&sums[group * 2 + 1], squares);
+        channel_sums[channel * 2] = sum;
+        channel_sums[channel * 2 + 1] = squares;
     }
     __syncthreads();
-    for (int index = threadIdx.x; index < GROUPS * 2; index += THREADS) {
-        partials[static_cast<size_t>(blockIdx.x) * GROUPS * 2 + index] = sums[index];
+    for (int group = threadIdx.x; group < GROUPS; group += THREADS) {
+        float sum = 0.0f, squares = 0.0f;
+        for (int channel = group * group_size; channel < (group + 1) * group_size; channel++) {
+            sum += channel_sums[channel * 2];
+            squares += channel_sums[channel * 2 + 1];
+        }
+        partials[static_cast<size_t>(blockIdx.x) * GROUPS * 2 + group * 2] = sum;
+        partials[static_cast<size_t>(blockIdx.x) * GROUPS * 2 + group * 2 + 1] = squares;
     }
 }
 
@@ -548,12 +556,14 @@ extern "C" int mmh3_video_encoder_group_norm_statistics(const __half *input, int
                                                         int channels, float epsilon,
                                                         float *partials, float *statistics,
                                                         cudaStream_t stream) {
-    if (channels % GROUPS != 0 || pixels <= 0 || frames <= 0) {
+    if (channels % GROUPS != 0 || pixels <= 0 || frames <= 0 ||
+        channels > GROUP_NORM_MAX_CHANNELS) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const int blocks = (pixels + PARTIAL_PIXELS - 1) / PARTIAL_PIXELS;
-    group_norm_partials_kernel<<<dim3(blocks, frames), THREADS, 0, stream>>>(input, pixels,
-                                                                             channels, partials);
+    const size_t shared = static_cast<size_t>(channels) * 2 * sizeof(float);
+    group_norm_partials_kernel<<<dim3(blocks, frames), THREADS, shared, stream>>>(
+        input, pixels, channels, partials);
     group_norm_statistics_kernel<<<frames, GROUPS, 0, stream>>>(
         partials, blocks, static_cast<double>(pixels) * (channels / GROUPS), epsilon, statistics);
     return static_cast<int>(cudaGetLastError());
@@ -566,12 +576,14 @@ extern "C" int mmh3_video_encoder_group_norm_silu(const __half *input, int frame
                                                   const __half *bias, float epsilon,
                                                   float *partials, float *statistics,
                                                   __half *output, cudaStream_t stream) {
-    if (channels % GROUPS != 0 || pixels <= 0 || frames <= 0) {
+    if (channels % GROUPS != 0 || pixels <= 0 || frames <= 0 ||
+        channels > GROUP_NORM_MAX_CHANNELS) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const int blocks = (pixels + PARTIAL_PIXELS - 1) / PARTIAL_PIXELS;
-    group_norm_partials_kernel<<<dim3(blocks, frames), THREADS, 0, stream>>>(input, pixels,
-                                                                             channels, partials);
+    const size_t shared = static_cast<size_t>(channels) * 2 * sizeof(float);
+    group_norm_partials_kernel<<<dim3(blocks, frames), THREADS, shared, stream>>>(
+        input, pixels, channels, partials);
     group_norm_statistics_kernel<<<frames, GROUPS, 0, stream>>>(
         partials, blocks, static_cast<double>(pixels) * (channels / GROUPS), epsilon, statistics);
     group_norm_silu_kernel<<<dim3(grid_for(static_cast<size_t>(pixels) * channels), frames),
