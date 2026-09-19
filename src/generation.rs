@@ -854,7 +854,7 @@ fn prepare_workers(
                 continue;
             }
         };
-        if !worker.serves(CAPABILITY_DIT_SHARD) || !worker.reads_remotely() {
+        if !worker.serves(CAPABILITY_DIT_SHARD) {
             continue;
         }
         if let Err(error) = worker.prepare(&checkpoint) {

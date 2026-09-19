@@ -44,6 +44,7 @@ pub enum Kind {
     PrepareCheckpoint = 20,
     DecodeAudio = 21,
     Samples = 22,
+    ShardWrite = 23,
 }
 
 impl Kind {
@@ -71,6 +72,7 @@ impl Kind {
             20 => Kind::PrepareCheckpoint,
             21 => Kind::DecodeAudio,
             22 => Kind::Samples,
+            23 => Kind::ShardWrite,
             _ => return None,
         })
     }
@@ -510,6 +512,46 @@ pub struct OpenSession {
     pub algorithm_key: String,
     /// The algorithms the leader chose for the GEMM shapes it has met.
     pub algorithms: Vec<Algorithm>,
+}
+
+/// One rank's write into another's region, for a pair of ranks whose path has no reliable
+/// connection: the bytes follow the descriptor down the socket instead of crossing on their own.
+/// The writes of one exchange go out together, and `last` closes it, so a rank knows when it has
+/// everything a peer meant to send, including when that is nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShardWrite {
+    /// The region the bytes land in, as `Region::code` names it.
+    pub kind: u32,
+    pub peer: u32,
+    pub offset: u64,
+    pub bytes: u64,
+    pub last: u8,
+}
+
+impl ShardWrite {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder
+            .u32(self.kind)
+            .u32(self.peer)
+            .u64(self.offset)
+            .u64(self.bytes)
+            .u8(self.last);
+        encoder.finish()
+    }
+
+    /// Returns the descriptor and where the payload begins.
+    pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let mut decoder = Decoder::new(bytes);
+        let write = ShardWrite {
+            kind: decoder.u32()?,
+            peer: decoder.u32()?,
+            offset: decoder.u64()?,
+            bytes: decoder.u64()?,
+            last: decoder.u8()?,
+        };
+        Ok((write, decoder.position))
+    }
 }
 
 /// Where one rank's memory sits, so the others can read it. One entry per region a step uses, in
