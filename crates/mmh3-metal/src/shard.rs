@@ -90,6 +90,35 @@ impl Memory {
         Ok(scales)
     }
 
+    /// Writes `values` as FP32 at `offset` bytes in, which is how the scale of every row travels
+    /// beside the rows themselves.
+    pub fn write_f32(&self, offset: usize, values: &Array) -> Result<()> {
+        let bytes = values.len() * 4;
+        self.check_bytes(offset, bytes)?;
+        self.device.run(
+            "copy_bytes",
+            &[&values.buffer, &self.buffer],
+            &[bytes as u32, 0, offset as u32],
+            bytes,
+            false,
+        )
+    }
+
+    /// The `rows` by `cols` FP32 array at `offset` bytes in.
+    pub fn read_f32(&self, offset: usize, rows: usize, cols: usize) -> Result<Array> {
+        let out = Array::empty(&self.device, rows, cols)?;
+        let bytes = out.len() * 4;
+        self.check_bytes(offset, bytes)?;
+        self.device.run(
+            "copy_bytes",
+            &[&self.buffer, &out.buffer],
+            &[bytes as u32, offset as u32, 0],
+            bytes,
+            false,
+        )?;
+        Ok(out)
+    }
+
     pub(crate) fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -100,6 +129,10 @@ impl Memory {
         if offset % 2 != 0 {
             return Err(Error(format!("a bf16 run at an odd offset {offset}")));
         }
+        self.check_bytes(offset, bytes)
+    }
+
+    fn check_bytes(&self, offset: usize, bytes: usize) -> Result<()> {
         if offset.checked_add(bytes).is_none_or(|end| end > self.bytes) {
             return Err(Error(format!(
                 "{bytes} bytes at {offset} of a region of {}",

@@ -3,6 +3,7 @@ use crate::{
     Device, Error, Result,
     model::Weights,
     ops::{Array, RowMap},
+    shard::Memory,
 };
 use mmh3_core::{
     dit::{
@@ -13,8 +14,14 @@ use mmh3_core::{
         timestep::StepTimesteps,
     },
     safetensors::SafeTensors,
+    shard::{Exchange, ExchangeError, Region, Shard},
     tensor::Tensor,
 };
+
+/// A transport's failure in this backend's terms, since a block reports one error type.
+fn shard_error(error: ExchangeError) -> Error {
+    Error(error.0)
+}
 
 pub struct MetalDit {
     weights: Weights,
@@ -153,6 +160,202 @@ impl MetalDit {
             &format!("{prefix}.attn.qkv_proj"),
         )?;
         crate::shard::pack(&qkv, 3, c.heads, own_heads, c.head_dim)
+    }
+
+    /// One rank's share of a block's attention.
+    ///
+    /// A rank carries its own run of the sequence through everything else in a block, but a query
+    /// has to see every key. So the rows are exchanged as the INT8 layers consume them, this rank
+    /// projects the whole sequence for its own heads alone, attends them, and the shares come back
+    /// to the rows it carries. `normalized` is this rank's rows, as the block's first
+    /// normalization leaves them.
+    pub fn sharded_attention<E>(
+        &self,
+        normalized: &Array,
+        prefix: &str,
+        angles: Option<&Array>,
+        shard: &Shard,
+        exchange: &mut E,
+    ) -> Result<Array>
+    where
+        E: Exchange<Memory = Memory>,
+    {
+        let c = &self.config;
+        let tokens: usize = shard.tokens.iter().map(|rows| rows.len()).sum();
+        let (rows, own) = (shard.own_tokens(), shard.own_heads());
+        let own_inner = own.len() * c.head_dim;
+        if normalized.shape() != [rows.len(), c.hidden] {
+            return Err(Error(format!(
+                "this rank carries {:?}, not [{}, {}]",
+                normalized.shape(),
+                rows.len(),
+                c.hidden
+            )));
+        }
+
+        // This rank's rows go where its peers can read them, quantized as the projections take
+        // them, which is an eighth of the bytes the projections would produce.
+        let input = exchange
+            .region(Region::Normalized, tokens * c.hidden)
+            .map_err(shard_error)?;
+        let scales = exchange
+            .region(Region::Scales, tokens * 4)
+            .map_err(shard_error)?;
+        let mine = input.write_quantized(rows.start * c.hidden, normalized)?;
+        scales.write_f32(rows.start * 4, &mine)?;
+        exchange
+            .publish(
+                Region::Normalized,
+                rows.start * c.hidden,
+                rows.len() * c.hidden,
+            )
+            .map_err(shard_error)?;
+        exchange
+            .publish(Region::Scales, rows.start * 4, rows.len() * 4)
+            .map_err(shard_error)?;
+        self.exchange_rows(shard, exchange, &rows)?;
+
+        // Every token, this rank's heads. The projection runs over the whole sequence because the
+        // attention that follows does.
+        let qkv = self.project_exchanged_inputs(
+            prefix,
+            &input,
+            &scales.read_f32(0, tokens, 1)?,
+            tokens,
+            own.clone(),
+        )?;
+        let part = |offset: usize, name: &str| -> Result<Array> {
+            let x = qkv
+                .slice(0, tokens, offset, own_inner)?
+                .reshape(tokens * own.len(), c.head_dim)?;
+            let x = self
+                .weights
+                .norm(&x, &format!("{prefix}.attn.{name}_norm"), c.norm_eps)?
+                .reshape(tokens, own_inner)?;
+            match angles {
+                Some(angles) => x.rope(own.len(), angles),
+                None => Ok(x),
+            }
+        };
+        let (q, k) = (part(0, "q")?, part(own_inner, "k")?);
+        let v = qkv.slice(0, tokens, 2 * own_inner, own_inner)?;
+        let attended = q.attention(&k, &v, own.len(), own.len(), false)?;
+
+        // Back to "my tokens, every head". A rank's own share is scattered straight into place and
+        // the peers' shares land beside it.
+        let whole = Array::zeros(&self.weights.device, rows.len(), c.inner())?;
+        self.exchange_attended(shard, exchange, &rows, &attended, &whole)?;
+        self.weights
+            .linear(&whole, &format!("{prefix}.attn.out_proj"))
+    }
+
+    /// Pushes this rank's rows of a block's input to every peer and waits for theirs.
+    fn exchange_rows<E>(
+        &self,
+        shard: &Shard,
+        exchange: &mut E,
+        rows: &std::ops::Range<usize>,
+    ) -> Result<()>
+    where
+        E: Exchange<Memory = Memory>,
+    {
+        let hidden = self.config.hidden;
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            for (region, width) in [(Region::Normalized, hidden), (Region::Scales, 4)] {
+                exchange
+                    .write(
+                        peer,
+                        region,
+                        rows.start * width,
+                        region,
+                        rows.start * width,
+                        rows.len() * width,
+                    )
+                    .map_err(shard_error)?;
+            }
+        }
+        exchange.barrier().map_err(shard_error)?;
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            let taken = shard.tokens[peer].clone();
+            for (region, width) in [(Region::Normalized, hidden), (Region::Scales, 4)] {
+                exchange
+                    .receive(region, taken.start * width, taken.len() * width)
+                    .map_err(shard_error)?;
+            }
+        }
+        // Nothing may be overwritten until every rank has read it.
+        exchange.barrier().map_err(shard_error)
+    }
+
+    /// Turns "every token, my heads" back into "my tokens, every head".
+    fn exchange_attended<E>(
+        &self,
+        shard: &Shard,
+        exchange: &mut E,
+        rows: &std::ops::Range<usize>,
+        attended: &Array,
+        whole: &Array,
+    ) -> Result<()>
+    where
+        E: Exchange<Memory = Memory>,
+    {
+        let c = &self.config;
+        let tokens: usize = shard.tokens.iter().map(|taken| taken.len()).sum();
+        let own = shard.own_heads();
+        let own_inner = own.len() * c.head_dim;
+
+        let mine = exchange
+            .region(Region::Attended, tokens * own_inner * 2)
+            .map_err(shard_error)?;
+        mine.write_bf16(0, attended)?;
+        for peer in 0..shard.ranks() {
+            if peer == shard.rank {
+                continue;
+            }
+            let taken = shard.tokens[peer].clone();
+            exchange
+                .publish(
+                    Region::Attended,
+                    taken.start * own_inner * 2,
+                    taken.len() * own_inner * 2,
+                )
+                .map_err(shard_error)?;
+            exchange
+                .write(
+                    peer,
+                    Region::Attended,
+                    taken.start * own_inner * 2,
+                    Region::Received(shard.rank),
+                    0,
+                    taken.len() * own_inner * 2,
+                )
+                .map_err(shard_error)?;
+        }
+        exchange.barrier().map_err(shard_error)?;
+
+        for peer in 0..shard.ranks() {
+            let span = shard.heads[peer].clone();
+            let inner = span.len() * c.head_dim;
+            let part = if peer == shard.rank {
+                mine.read_bf16(rows.start * own_inner * 2, rows.len(), own_inner)?
+            } else {
+                let from = exchange
+                    .region(Region::Received(peer), rows.len() * inner * 2)
+                    .map_err(shard_error)?;
+                exchange
+                    .receive(Region::Received(peer), 0, rows.len() * inner * 2)
+                    .map_err(shard_error)?;
+                from.read_bf16(0, rows.len(), inner)?
+            };
+            crate::shard::unpack(&part, whole, c.heads, span, c.head_dim)?;
+        }
+        exchange.barrier().map_err(shard_error)
     }
 
     fn mlp(&self, x: &Array, prefix: &str) -> Result<Array> {
@@ -348,5 +551,69 @@ impl MetalDit {
             audio,
             routed_fraction: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shard::WholeExchange;
+    use std::path::Path;
+
+    /// One rank sharing a step with nobody has to come out as a block that never went near a
+    /// shard. It is not an equality: the exchange carries a block's attention output in bf16 and
+    /// an ordinary block keeps it in FP32, so the two differ by that rounding and nothing else.
+    ///
+    /// The tiny fixture cannot reach this path — ConvRot wants a multiple of 256 features and its
+    /// weights are FP32, not INT8 — so this runs against a real checkpoint when one is there.
+    #[test]
+    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
+    fn one_rank_attends_a_block_as_a_whole_one_does() {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"))
+            .join("diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors");
+        if !path.exists() {
+            eprintln!("no checkpoint at {}, skipping", path.display());
+            return;
+        }
+
+        let started = std::time::Instant::now();
+        let dit = MetalDit::load(&SafeTensors::open(&path).unwrap(), "").unwrap();
+        eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
+
+        let (c, device) = (dit.config.clone(), dit.weights.device.clone());
+        let tokens = 64;
+        let values: Vec<f32> = (0..tokens * c.hidden)
+            .map(|i| ((i * 31) % 251) as f32 / 251.0 - 0.5)
+            .collect();
+        let x = Array::from_f32(&device, tokens, c.hidden, &values).unwrap();
+
+        let whole = dit
+            .attention(&x, "blocks.0", None)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        let shard = Shard::even(0, 1, tokens, c.heads, 1);
+        let mut exchange = WholeExchange::new(&device);
+        let shared = dit
+            .sharded_attention(&x, "blocks.0", None, &shard, &mut exchange)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+
+        assert_eq!(shared.len(), whole.len());
+        let largest = whole.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let mut worst = 0.0f32;
+        for (index, (&found, &want)) in shared.iter().zip(whole.iter()).enumerate() {
+            let error = (found - want).abs();
+            worst = worst.max(error);
+            assert!(
+                error <= largest * 0.02,
+                "value {index}: {found} against {want}, largest {largest}"
+            );
+        }
+        eprintln!(
+            "worst {worst:.6} against a largest of {largest:.6}, {:.3}%",
+            100.0 * worst / largest
+        );
     }
 }
