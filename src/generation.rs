@@ -930,16 +930,41 @@ fn shard_target(
     // The workers `prepare_workers` reached, which are already reading this DiT.
     let mut workers = workers;
     workers.truncate(ranks.saturating_sub(1));
-    // What each machine says it can do, this one included. A machine that says nothing leaves
-    // every share equal, which is right when the machines match and wrong when they do not.
-    let measured: Vec<Option<f64>> =
-        std::iter::once(crate::worker::measure_speed().map(|speed| speed.gemm_tops as f64))
-            .chain(
-                workers
-                    .iter()
-                    .map(|worker| worker.speed().map(|speed| speed.gemm_tops as f64)),
-            )
+    // What each machine says it can do, this one included.
+    let mine = crate::worker::measure_speed().map(|speed| speed.gemm_tops as f64);
+    let mut measured: Vec<Option<f64>> = std::iter::once(mine)
+        .chain(
+            workers
+                .iter()
+                .map(|worker| worker.speed().map(|speed| speed.gemm_tops as f64)),
+        )
+        .collect();
+    // A machine that says nothing cannot be given a share in proportion to it. Where some
+    // measured and some did not, the ones that did not take no share of a step rather than an
+    // equal one on no evidence: a share too large for a machine holds every other rank at every
+    // barrier of every block. They are still asked for a prompt and for chunks. Where none
+    // measured, which is a cluster whose backend cannot measure itself, the shares stay even,
+    // since machines that all say nothing are most likely alike.
+    if mine.is_some() && measured.iter().any(Option::is_none) {
+        let refused: Vec<&str> = workers
+            .iter()
+            .filter(|worker| worker.speed().is_none())
+            .map(|worker| worker.address.as_str())
             .collect();
+        if !refused.is_empty() {
+            println!(
+                "{} takes no share of a step, since it measures nothing to cut one by",
+                refused.join(", ")
+            );
+        }
+        let mut keep = measured[1..]
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<bool>>();
+        keep.reverse();
+        workers.retain(|_| keep.pop().unwrap_or(false));
+        measured.retain(Option::is_some);
+    }
     if workers.is_empty() {
         if asked {
             println!("no worker can take a share of a step, so the DiT stays here");
@@ -980,7 +1005,7 @@ fn shard_target(
         );
         Shard::weighted(0, &weights, tokens, dit.config().heads, 1)
     } else {
-        println!("every machine takes the same share, since one of them measures nothing");
+        println!("every machine takes the same share, since none of them measures itself");
         Shard::even(0, ranks, tokens, dit.config().heads, 1)
     };
     let spans: Vec<mmh3_core::worker::ShardSpan> = shard
