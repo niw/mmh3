@@ -436,6 +436,88 @@ impl MetalDit {
         })
     }
 
+    /// Puts the parts of a shared-out step back together, which only the rank answering to the
+    /// caller needs to do. The parts may arrive in any order and must cover the sequence once.
+    ///
+    /// This is where the projections a rank answers with become the velocity: the negation
+    /// happens here, once, and a rank that negated its own rows would be counted twice.
+    ///
+    /// It reads the config and the layout and nothing else — no weights, no device — so a leader
+    /// can put a step together without holding a DiT it never runs.
+    pub fn assemble_velocity(
+        &self,
+        inputs: &DitInputs,
+        sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+        parts: &[VelocityRows],
+    ) -> Result<DitOutput> {
+        // A VSA run hands back rows in the order the attention wanted rather than the order the
+        // video does, and this backend has nothing to put them back with. Refusing beats
+        // assembling rows whose order nothing here can account for.
+        if sparse.is_some() {
+            return Err(Error(
+                "Metal currently supports dense attention without VSA gates".into(),
+            ));
+        }
+
+        let c = &self.config;
+        let layout = PackedLayout::for_inputs(inputs);
+        let gather = |kind: SegmentKind,
+                      width: usize,
+                      take: &dyn Fn(&VelocityRows) -> &Vec<f32>|
+         -> Result<Vec<f32>> {
+            let segment = layout.segment(kind);
+            let mut values = vec![0.0f32; segment.len() * width];
+            let mut covered = 0;
+            for part in parts {
+                let first = segment.start.max(part.rows.start);
+                let last = segment.end.min(part.rows.end);
+                if first >= last {
+                    continue;
+                }
+
+                let rows = take(part);
+                if rows.len() != (last - first) * width {
+                    return Err(Error(format!(
+                        "a part of {} values for {} rows",
+                        rows.len(),
+                        last - first
+                    )));
+                }
+                values[(first - segment.start) * width..(last - segment.start) * width]
+                    .copy_from_slice(rows);
+                covered += last - first;
+            }
+
+            // A cut that leaves a gap would otherwise assemble zeros and look like a picture that
+            // simply did not diffuse there, which is a long way from where the cut is.
+            if covered != segment.len() {
+                return Err(Error(format!(
+                    "the parts cover {covered} of {} rows",
+                    segment.len()
+                )));
+            }
+            Ok(values)
+        };
+
+        let video = gather(SegmentKind::Video, c.video_patch_features(), &|part| {
+            &part.video
+        })?;
+        let audio = gather(SegmentKind::Audio, c.audio_channels, &|part| &part.audio)?;
+        Ok(DitOutput {
+            text_states: Vec::new(),
+            blocks: Vec::new(),
+            video: unpatchify_video(&video, &inputs.video.shape)
+                .into_iter()
+                .map(|value| -value)
+                .collect(),
+            audio: unpack_audio(&audio, &inputs.audio.shape)
+                .into_iter()
+                .map(|value| -value)
+                .collect(),
+            routed_fraction: None,
+        })
+    }
+
     fn forward_inner(
         &self,
         inputs: &DitInputs,
@@ -922,6 +1004,84 @@ mod tests {
         );
     }
 
+    /// The gather, the order and the sign, with no model behind them. The tiny fixture serves
+    /// here where it cannot serve the sharded step, because assembling reads the config and the
+    /// layout and never touches a weight.
+    #[test]
+    fn assembling_parts_rebuilds_a_whole_step() {
+        let file = SafeTensors::open(Path::new(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/dit_tiny.safetensors"
+        )))
+        .unwrap();
+        let dit = MetalDit::load(&file, "weight.").unwrap();
+        let c = dit.config.clone();
+        let inputs = sample_inputs(&c);
+        let layout = PackedLayout::for_inputs(&inputs);
+        let (video, audio) = (
+            layout.segment(SegmentKind::Video),
+            layout.segment(SegmentKind::Audio),
+        );
+        let (video_width, audio_width) = (c.video_patch_features(), c.audio_channels);
+
+        // A projection nobody computed, but one every row of which is distinguishable, so a row
+        // put in the wrong place shows up as a wrong value rather than as a plausible one.
+        let whole_video: Vec<f32> = (0..video.len() * video_width)
+            .map(|i| i as f32 + 0.5)
+            .collect();
+        let whole_audio: Vec<f32> = (0..audio.len() * audio_width)
+            .map(|i| -(i as f32) - 0.25)
+            .collect();
+        let slice = |whole: &[f32],
+                     segment: &mmh3_core::dit::layout::Segment,
+                     width,
+                     rows: &std::ops::Range<usize>| {
+            let first = segment.start.max(rows.start);
+            let last = segment.end.min(rows.end);
+            if first >= last {
+                return Vec::new();
+            }
+            whole[(first - segment.start) * width..(last - segment.start) * width].to_vec()
+        };
+        let part = |rows: std::ops::Range<usize>| VelocityRows {
+            video: slice(&whole_video, &video, video_width, &rows),
+            audio: slice(&whole_audio, &audio, audio_width, &rows),
+            rows,
+        };
+
+        // Cut anywhere, hand them over in any order: the answer is the whole step negated once.
+        let tokens = layout.len();
+        let cut = tokens / 3;
+        let out = dit
+            .assemble_velocity(&inputs, None, &[part(cut..tokens), part(0..cut)])
+            .unwrap();
+        let want_video: Vec<f32> = unpatchify_video(&whole_video, &inputs.video.shape)
+            .into_iter()
+            .map(|v| -v)
+            .collect();
+        let want_audio: Vec<f32> = unpack_audio(&whole_audio, &inputs.audio.shape)
+            .into_iter()
+            .map(|v| -v)
+            .collect();
+        assert_eq!(out.video, want_video, "video");
+        assert_eq!(out.audio, want_audio, "audio");
+
+        // A gap is refused rather than assembled as zeros, which would read as a patch of the
+        // picture that simply did not diffuse.
+        assert!(
+            dit.assemble_velocity(&inputs, None, &[part(0..cut)])
+                .is_err(),
+            "parts that cover only part of the sequence should be refused"
+        );
+        // So is a part whose values do not match the rows it claims.
+        let mut short = part(0..tokens);
+        short.video.pop();
+        assert!(
+            dit.assemble_velocity(&inputs, None, &[short]).is_err(),
+            "a part of the wrong length should be refused"
+        );
+    }
+
     /// The text is refined once and lives at the front, so the rank that carries the front of the
     /// sequence is the one that may hold it. That is rank 0 while every rank takes a share, and
     /// stops being rank 0 the moment a rank keeps its number and takes none — which is what a
@@ -1013,20 +1173,14 @@ mod tests {
             .unwrap();
         assert_eq!(part.rows, 0..tokens, "one rank carries the whole sequence");
 
-        // A share answers with the projection, still patchified and not yet negated, so the
-        // comparison does here what a leader does when it assembles the parts.
-        let video: Vec<f32> = unpatchify_video(&part.video, &inputs.video.shape)
-            .into_iter()
-            .map(|v| -v)
-            .collect();
-        let audio: Vec<f32> = unpack_audio(&part.audio, &inputs.audio.shape)
-            .into_iter()
-            .map(|v| -v)
-            .collect();
+        // NOTE: assembled by the function a leader assembles with, not by a copy of it written
+        // here. A test that spells out the convention itself agrees with whatever the code says,
+        // which is how a negated share passed this comparison for a day.
+        let assembled = dit.assemble_velocity(&inputs, None, &[part]).unwrap();
 
         for (name, found, want) in [
-            ("video", &video, &whole.video),
-            ("audio", &audio, &whole.audio),
+            ("video", &assembled.video, &whole.video),
+            ("audio", &assembled.audio, &whole.audio),
         ] {
             assert_eq!(found.len(), want.len(), "{name} length");
             let largest = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
