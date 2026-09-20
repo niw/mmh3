@@ -787,27 +787,43 @@ mod tests {
         dit.set_linear_precision(crate::LinearPrecision::Int8)
             .unwrap();
         let c = dit.config.clone();
-        let mut inputs = sample_inputs(&c);
+        let inputs = sample_inputs(&c);
         let first = dit.forward(&inputs, &[], None).unwrap();
-
-        // A part in a million on one value of the latent.
-        inputs.video.data[0] += 1e-6 * inputs.video.data[0].abs().max(1e-3);
-        let second = dit.forward(&inputs, &[], None).unwrap();
-
         let largest = first.video.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let worst = second
-            .video
-            .iter()
-            .zip(first.video.iter())
-            .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+
+        let moved = |nudge: f32| -> f32 {
+            let mut inputs = sample_inputs(&c);
+            inputs.video.data[0] += nudge * inputs.video.data[0].abs().max(1e-3);
+            let second = dit.forward(&inputs, &[], None).unwrap();
+            second
+                .video
+                .iter()
+                .zip(first.video.iter())
+                .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()))
+        };
+
+        let (small, large) = (moved(1e-6), moved(1e-4));
         eprintln!(
-            "a part in a million of one input moves the output by {worst:.6} of {largest:.6}, {:.3}%",
-            100.0 * worst / largest
+            "of a largest of {largest:.6}: a part in a million moves {small:.6} ({:.2}%), a \
+             hundred times that moves {large:.6} ({:.2}%)",
+            100.0 * small / largest,
+            100.0 * large / largest
         );
         assert!(
-            worst > largest * 0.1,
-            "the model no longer amplifies a part in a million, so a whole step may be a fair \
-             comparison after all: {worst} of {largest}"
+            small > largest * 0.1,
+            "a part in a million no longer moves the output, so a whole step may be a fair \
+             comparison after all: {small} of {largest}"
+        );
+        // NOTE: the discriminating check. A model that were merely ill-conditioned would answer a
+        // nudge a hundred times larger with a response a hundred times larger. This one saturates,
+        // because what moves is discrete: one INT8 value crosses a rounding edge and fifty blocks
+        // later most of the velocity has changed, and crossing it by more changes no more. Without
+        // this the test would read as "the model is delicate", which is the wrong lesson and would
+        // send the next person looking for conditioning rather than for a boundary.
+        assert!(
+            large < small * 10.0,
+            "the response scales with the nudge, so this is conditioning and not a boundary: \
+             {small} against {large}"
         );
     }
 
