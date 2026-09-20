@@ -276,6 +276,11 @@ impl Checkpoint {
 pub struct Speed {
     pub gemm_tops: f32,
     pub bandwidth_gbytes: f32,
+    /// What this machine does at a block's attention, which the sequence cut cannot be made by:
+    /// a rank attends its own heads over the WHOLE sequence, so what attention costs it follows
+    /// its share of the heads and not its share of the tokens. Zero from a machine that measured
+    /// no such thing, and the cut then prices both by the product alone, as it used to.
+    pub attention_tops: f32,
 }
 
 /// A machine's RoCE address, opaque here: `mmh3_rdma::Address` gives it meaning. A machine offers
@@ -1108,7 +1113,8 @@ impl Welcome {
                 encoder
                     .u8(1)
                     .f32(speed.gemm_tops)
-                    .f32(speed.bandwidth_gbytes);
+                    .f32(speed.bandwidth_gbytes)
+                    .f32(speed.attention_tops);
             }
             None => {
                 encoder.u8(0);
@@ -1135,6 +1141,7 @@ impl Welcome {
             _ => Some(Speed {
                 gemm_tops: decoder.f32()?,
                 bandwidth_gbytes: decoder.f32()?,
+                attention_tops: decoder.f32()?,
             }),
         };
         let count = decoder.u32()? as usize;
@@ -1369,6 +1376,7 @@ mod tests {
             speed: Some(Speed {
                 gemm_tops: 181.6,
                 bandwidth_gbytes: 227.7,
+                attention_tops: 42.5,
             }),
             checkpoints: vec![Checkpoint {
                 role: "text_encoder.h3.int8_convrot".to_owned(),
@@ -1385,6 +1393,7 @@ mod tests {
         assert_eq!(decoded.device, welcome.device);
         assert_eq!(decoded.capabilities, welcome.capabilities);
         assert_eq!(decoded.speed.unwrap().gemm_tops, 181.6);
+        assert_eq!(decoded.speed.unwrap().attention_tops, 42.5);
         assert_eq!(decoded.checkpoints, welcome.checkpoints);
     }
 

@@ -91,17 +91,20 @@ impl Shard {
     /// since a rank with no heads or no rows has nothing to run and nowhere to put it.
     pub fn weighted(
         rank: usize,
-        weights: &[f64],
+        tokens_by: &[f64],
+        heads_by: &[f64],
         tokens: usize,
         heads: usize,
         alignment: usize,
     ) -> Self {
-        let fastest = weights
-            .iter()
-            .enumerate()
-            .max_by(|left, right| left.1.total_cmp(right.1))
-            .map_or(0, |(index, _)| index);
-        let cut = |total: usize, step: usize| -> Vec<Range<usize>> {
+        let cut = |weights: &[f64], total: usize, step: usize| -> Vec<Range<usize>> {
+            // What the rounding leaves goes to the fastest at this kind of work rather than to
+            // the last, which under a weighted cut may be the slowest.
+            let fastest = weights
+                .iter()
+                .enumerate()
+                .max_by(|left, right| left.1.total_cmp(right.1))
+                .map_or(0, |(index, _)| index);
             let step = step.max(1);
             let sum: f64 = weights.iter().map(|weight| weight.max(0.0)).sum();
             let mut counts: Vec<usize> = weights
@@ -137,8 +140,8 @@ impl Shard {
         };
         Shard {
             rank,
-            tokens: cut(tokens, alignment),
-            heads: cut(heads, 1),
+            tokens: cut(tokens_by, tokens, alignment),
+            heads: cut(heads_by, heads, 1),
         }
     }
 

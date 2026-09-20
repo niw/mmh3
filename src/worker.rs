@@ -203,8 +203,8 @@ fn rdma_device() -> Option<&'static mmh3_rdma::Device> {
         .as_ref()
 }
 
-/// What this machine does at a GEMM of a DiT's shape and at a copy, which is what the shares of a
-/// shared-out step follow. Measured once, since it is a property of the machine and not of a run,
+/// What this machine does at the two kinds of work a block is made of, which is what the shares of
+/// a shared-out step follow. Measured once, since it is a property of the machine and not of a run,
 /// and answered with nothing by a backend that cannot measure itself.
 pub fn measure_speed() -> Option<worker::Speed> {
     // A machine does not change between runs, so the first one measures and the rest read. The
@@ -235,8 +235,8 @@ pub fn measure_speed() -> Option<worker::Speed> {
             }
         }
         text.push_str(&format!(
-            "{road} {} {}\n",
-            speed.gemm_tops, speed.bandwidth_gbytes
+            "{road} {} {} {}\n",
+            speed.gemm_tops, speed.bandwidth_gbytes, speed.attention_tops
         ));
         if let Some(directory) = path.parent() {
             let _ = std::fs::create_dir_all(directory);
@@ -258,6 +258,9 @@ fn parse_road(line: &str, road: &str) -> Option<worker::Speed> {
     Some(worker::Speed {
         gemm_tops: fields.next()?.parse().ok()?,
         bandwidth_gbytes: fields.next()?.parse().ok()?,
+        // A file kept before a machine measured its attention says nothing about it, and the cut
+        // then prices both kinds of work by the product, as it used to.
+        attention_tops: fields.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
     })
 }
 
@@ -283,20 +286,26 @@ fn road() -> &'static str {
 /// First line of the file `measure_speed` keeps, followed by the device and then a line for every
 /// road measured on it. It goes up when what is measured changes, so an old file is not taken for
 /// a new one.
-const SPEED_HEADER: &str = "mmh3 machine speed 2";
+const SPEED_HEADER: &str = "mmh3 machine speed 3";
 
 #[cfg(feature = "cuda")]
 fn measure_now() -> Option<worker::Speed> {
-    use mmh3_cuda::bench::{GemmKind, gemm, memory_copy};
+    use mmh3_cuda::bench::{GemmKind, attention, gemm, memory_copy};
 
     // A block's own shape, so the number says something about the work it will be given.
     let (m, n, k) = (4096, 5376, 5376);
     let timing = gemm(GemmKind::Bf16, m, n, k, 10).ok()?;
     let operations = 2.0 * m as f64 * n as f64 * k as f64;
     let copy = memory_copy(1 << 28, 5).ok()?;
+    // The other half of a block, and the half a token cut does not shrink. One head over the
+    // sequence is what a rank is given more or less of, so that is what is timed.
+    let (tokens, heads) = (ATTENTION_TOKENS, 1);
+    let milliseconds = attention(tokens, heads, 5).ok()?;
     Some(worker::Speed {
         gemm_tops: (operations / (timing.milliseconds as f64 * 1e-3) / 1e12) as f32,
         bandwidth_gbytes: copy.copy_kernel_gigabytes_per_second,
+        attention_tops: (attention_operations(tokens, heads) / (milliseconds as f64 * 1e-3) / 1e12)
+            as f32,
     })
 }
 
@@ -316,6 +325,20 @@ fn measure_now() -> Option<worker::Speed> {
         gemm_tops: (operations / 1e12) as f32,
         bandwidth_gbytes: (copy / 1e9) as f32,
     })
+}
+
+/// Sequence length the attention measurement takes, which is a 768p step's order rather than a
+/// round number: what a machine does at a hundred tokens says nothing about what it does at forty
+/// thousand.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub const ATTENTION_TOKENS: usize = 8192;
+
+/// Multiply-accumulates one head of dense attention over `tokens` does, counted as two matrix
+/// products of `tokens × tokens × HEAD_DIM` and two operations each, which is what both backends
+/// have to count for the two numbers to be comparable.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn attention_operations(tokens: usize, heads: usize) -> f64 {
+    4.0 * tokens as f64 * tokens as f64 * mmh3_core::shard::HEAD_DIM as f64 * heads as f64
 }
 
 /// A backend that cannot measure itself says so, and it is given no share of a step.
@@ -1010,8 +1033,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!("serving {} on {listen}", models.display());
     if let Some(speed) = speed {
         println!(
-            "  {:.1} TOPS at a block's GEMM, {:.1} GB/s copying",
-            speed.gemm_tops, speed.bandwidth_gbytes
+            "  {:.1} TOPS at a block's GEMM, {:.1} at its attention, {:.1} GB/s copying",
+            speed.gemm_tops, speed.attention_tops, speed.bandwidth_gbytes
         );
     }
     for (checkpoint, path) in &checkpoints {

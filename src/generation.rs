@@ -937,13 +937,9 @@ fn shard_target(
     let mut workers = workers;
     workers.truncate(ranks.saturating_sub(1));
     // What each machine says it can do, this one included.
-    let mine = crate::worker::measure_speed().map(|speed| speed.gemm_tops as f64);
-    let mut measured: Vec<Option<f64>> = std::iter::once(mine)
-        .chain(
-            workers
-                .iter()
-                .map(|worker| worker.speed().map(|speed| speed.gemm_tops as f64)),
-        )
+    let mine = crate::worker::measure_speed();
+    let mut measured: Vec<Option<mmh3_core::worker::Speed>> = std::iter::once(mine)
+        .chain(workers.iter().map(|worker| worker.speed()))
         .collect();
     // A machine that says nothing cannot be given a share in proportion to it. Where some
     // measured and some did not, the ones that did not take no share of a step rather than an
@@ -998,17 +994,42 @@ fn shard_target(
     // The workers run the leader's choices rather than timing the candidates themselves, since a
     // rank that measures while the wire and the others have its device measures the load.
     let (algorithm_key, algorithms) = chosen_algorithms();
-    let weights: Vec<f64> = measured.iter().map(|speed| speed.unwrap_or(1.0)).collect();
+    // A block is two kinds of work and a machine is not equally good at both. The projections
+    // and the MLP follow a rank's tokens, and attention follows its heads, since a rank attends
+    // its own heads over the whole sequence however few tokens it carries. So the two axes are
+    // cut by their own measurements. A machine that measured no attention is priced by its
+    // product on both, which is what every cut did before.
+    let products: Vec<f64> = measured
+        .iter()
+        .map(|speed| speed.map_or(1.0, |speed| speed.gemm_tops as f64))
+        .collect();
+    let attentions: Vec<f64> = measured
+        .iter()
+        .zip(&products)
+        .map(
+            |(speed, product)| match speed.map(|speed| speed.attention_tops as f64) {
+                Some(attention) if attention > 0.0 => attention,
+                _ => *product,
+            },
+        )
+        .collect();
     let shard = if measured.iter().all(Option::is_some) && ranks > 1 {
+        let say = |what: &str, weights: &[f64]| {
+            format!(
+                "{what} {}",
+                weights
+                    .iter()
+                    .map(|weight| format!("{weight:.0}"))
+                    .collect::<Vec<String>>()
+                    .join(", ")
+            )
+        };
         println!(
-            "the shares follow what the machines measured: {}",
-            weights
-                .iter()
-                .map(|weight| format!("{weight:.0} TOPS"))
-                .collect::<Vec<String>>()
-                .join(", ")
+            "the shares follow what the machines measured: {}, {} TOPS",
+            say("tokens by", &products),
+            say("heads by", &attentions)
         );
-        Shard::weighted(0, &weights, tokens, dit.config().heads, 1)
+        Shard::weighted(0, &products, &attentions, tokens, dit.config().heads, 1)
     } else {
         println!("every machine takes the same share, since none of them measures itself");
         Shard::even(0, ranks, tokens, dit.config().heads, 1)
