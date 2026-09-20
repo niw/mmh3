@@ -2251,16 +2251,14 @@ impl Exchanger<'_> {
         Ok(())
     }
 
-    /// Whether this rank already reaches `peer` without dialing it: a socket the session opened,
-    /// or a connection into its memory.
+    /// Whether this rank already has a socket to `peer`, which is the one the session opened
+    /// where there is one.
+    ///
+    /// A connection into a peer's memory does not count. Every pair needs a socket whether or not
+    /// it has one, because the barriers and the writes that wait for them go down it: the
+    /// connection carries payloads and says nothing about when they arrive.
     fn reaches(&self, peer: usize) -> bool {
-        if self.sockets.contains_key(&peer) {
-            return true;
-        }
-        #[cfg(feature = "cuda")]
-        return self.links.contains_key(&peer);
-        #[cfg(not(feature = "cuda"))]
-        false
+        self.sockets.contains_key(&peer)
     }
 
     /// Whether what this rank owes `peer` goes down a socket. Every pair has one or the other
@@ -2562,15 +2560,19 @@ impl shard::Exchange for Exchanger<'_> {
             }
             Ok(())
         };
-        if self.rank > 0 {
-            arrive(self, 0)?;
-            return wait(self, 0);
-        }
-        for peer in 1..self.ranks {
-            wait(self, peer)?;
-        }
-        for peer in 1..self.ranks {
-            arrive(self, peer)?;
+        // Every rank reaches every other, so a barrier is pairwise rather than a star through one
+        // of them: the lower rank of a pair arrives first and the higher waits first, the same
+        // rule the writes follow, so two ranks cannot both be waiting to be heard.
+        let mut peers: Vec<usize> = (0..self.ranks).filter(|peer| *peer != self.rank).collect();
+        peers.sort_unstable();
+        for peer in peers {
+            if self.rank < peer {
+                arrive(self, peer)?;
+                wait(self, peer)?;
+            } else {
+                wait(self, peer)?;
+                arrive(self, peer)?;
+            }
         }
         Ok(())
     }
