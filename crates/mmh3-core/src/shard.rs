@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::ops::Range;
+use std::time::Duration;
 
 /// Values in one attention head, which every backend lays out the same way.
 pub const HEAD_DIM: usize = 128;
@@ -296,4 +297,35 @@ pub trait Exchange {
     /// Every rank has reached this point, so what they wrote may be read and what they read may be
     /// written again.
     fn barrier(&mut self) -> Result<(), ExchangeError>;
+}
+
+/// Where a shared-out step went, which is what decides whether sharing one is worth it at all.
+///
+/// The four are exclusive and cover a block's share between them, so a backend charges every span
+/// to exactly one. `attend` is the only one that would still be there if the step ran alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ShardTiming {
+    /// Gathering a block's inputs and scattering its output, and the wait for the device that
+    /// follows each, since a peer may not read memory a kernel has not finished writing.
+    pub gather: Duration,
+    /// Waiting for the peers to reach the same point.
+    pub barrier: Duration,
+    /// Reading the peers' memory.
+    pub read: Duration,
+    /// Attention itself, over the whole sequence for this rank's heads.
+    pub attend: Duration,
+}
+
+impl ShardTiming {
+    pub fn total(&self) -> Duration {
+        self.gather + self.barrier + self.read + self.attend
+    }
+}
+
+/// One rank's share of a step and the transport its blocks exchange over. `M` is what the
+/// transport's regions answer with, which is a backend's own business and nothing else here.
+pub struct ShardContext<'a, M> {
+    pub shard: Shard,
+    pub exchange: &'a mut dyn Exchange<Memory = M>,
+    pub timing: ShardTiming,
 }

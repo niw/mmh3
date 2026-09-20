@@ -14,13 +14,12 @@ use crate::{CudaError, DeviceBuffer, check};
 /// mmh3-core and this module is the CUDA side of them: the gathers, the timing and the exchange a
 /// run uses when it shares a step with nobody.
 pub use mmh3_core::shard::{
-    Exchange, ExchangeError, HEAD_DIM, Region, Shard, VelocityRows, regions,
+    Exchange, ExchangeError, HEAD_DIM, Region, Shard, ShardTiming, VelocityRows, regions,
 };
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::ops::Range;
 use std::ptr;
-use std::time::Duration;
 
 unsafe extern "C" {
     fn mmh3_dit_shard_pack(
@@ -46,33 +45,9 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// Where a shared-out step spent its time, so that the split can be judged against the arithmetic
-/// it saves rather than against a guess. The caller clears it between steps.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct ShardTiming {
-    /// Gathering a block's inputs and scattering its output, and the wait for the device that
-    /// follows each, since a peer may not read memory a kernel has not finished writing.
-    pub gather: Duration,
-    /// Waiting for the peers to reach the same point.
-    pub barrier: Duration,
-    /// Reading the peers' memory.
-    pub read: Duration,
-    /// Attention itself, over the whole sequence for this rank's heads.
-    pub attend: Duration,
-}
-
-impl ShardTiming {
-    pub fn total(&self) -> Duration {
-        self.gather + self.barrier + self.read + self.attend
-    }
-}
-
-/// One rank's share of a step and the transport its blocks exchange over.
-pub struct ShardContext<'a> {
-    pub shard: Shard,
-    pub exchange: &'a mut dyn Exchange<Memory = *mut c_void>,
-    pub timing: ShardTiming,
-}
+/// This backend's regions answer with a device pointer, and that is the only word of a shard's
+/// timing or its context that is a backend's own.
+pub type ShardContext<'a> = mmh3_core::shard::ShardContext<'a, *mut c_void>;
 
 /// The exchange of a step that is not shared out after all: one rank, regions in this machine's own
 /// memory, and nothing to carry anywhere. A step through it has to come out the same as a step that

@@ -2797,15 +2797,16 @@ pub fn share_a_step(
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     shard: &Shard,
     exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
-    _elapsed: impl Fn() -> Duration,
+    elapsed: impl Fn() -> Duration,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
-    // NOTE: nothing said about the time. This backend measures none of the parts, and a line of
-    // zeros reads as a measurement. It belongs here when a second rank makes the numbers mean
-    // something.
-    Ok((
-        dit.forward_shard(inputs, sparse, shard, exchange)?,
-        String::new(),
-    ))
+    let mut context = mmh3_metal::shard::ShardContext {
+        shard: shard.clone(),
+        exchange,
+        timing: Default::default(),
+    };
+    let part = dit.forward_shard(inputs, sparse, &mut context)?;
+    let timing = describe_timing(&context.timing, elapsed());
+    Ok((part, timing))
 }
 
 /// Reads the DiT a run is about to share, so that it is here when the session opens rather than
@@ -3299,9 +3300,21 @@ pub fn step_shard(
 }
 
 /// Where a shared-out step went, which is what decides whether sharing one is worth it at all.
-#[cfg(feature = "cuda")]
+///
+/// NOTE: `read` and `barrier` divide the same work differently on every transport, so the four
+/// names do not mean one thing. A connection that writes into a peer's memory when a rank asks it
+/// to charges the wire to `read` and leaves `barrier` as very nearly pure waiting, which is what
+/// RoCE does here: 1.2 s and 1.4 s between two Sparks. A transport that queues the asks and moves
+/// them when it reaches the barrier charges the wire to `barrier` and leaves `read` counting the
+/// queueing alone, which is what the socket exchange does, since `barrier` flushes what is pending
+/// before it says anything: 0.5 s and 21.3 s over one.
+///
+/// So a small `read` beside a large `barrier` says nothing on its own about whether a rank waited
+/// or the wire was slow. Only the two ranks' lines together tell them apart, and only once it is
+/// known which kind of transport wrote them.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn describe_timing(
-    timing: &mmh3_cuda::shard::ShardTiming,
+    timing: &mmh3_core::shard::ShardTiming,
     whole: std::time::Duration,
 ) -> String {
     let seconds = |span: std::time::Duration| span.as_secs_f64();

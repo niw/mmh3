@@ -3,7 +3,7 @@ use crate::{
     Device, Error, Result,
     model::Weights,
     ops::{Array, RowMap},
-    shard::Memory,
+    shard::ShardContext,
 };
 use mmh3_core::{
     dit::{
@@ -14,9 +14,10 @@ use mmh3_core::{
         timestep::StepTimesteps,
     },
     safetensors::SafeTensors,
-    shard::{Exchange, ExchangeError, Region, Shard, VelocityRows, regions as shard_regions},
+    shard::{ExchangeError, Region, VelocityRows, regions as shard_regions},
     tensor::Tensor,
 };
+use std::time::Instant;
 
 /// A transport's failure in this backend's terms, since a block reports one error type.
 fn shard_error(error: ExchangeError) -> Error {
@@ -171,10 +172,10 @@ impl MetalDit {
         normalized: &Array,
         prefix: &str,
         angles: Option<&Array>,
-        shard: &Shard,
-        exchange: &mut dyn Exchange<Memory = Memory>,
+        context: &mut ShardContext,
     ) -> Result<Array> {
         let c = &self.config;
+        let shard = context.shard.clone();
         let tokens: usize = shard.tokens.iter().map(|rows| rows.len()).sum();
         let (rows, own) = (shard.own_tokens(), shard.own_heads());
         let own_inner = own.len() * c.head_dim;
@@ -190,38 +191,54 @@ impl MetalDit {
         // NOTE: every region a peer writes into has to exist before the barrier that carries the
         // write, since a transport has nowhere to put what arrives for a region that was never
         // made. That is why a rank makes them all up front rather than as it reaches them.
-        for (region, bytes) in shard_regions(shard, tokens, c.hidden, false) {
+        for (region, bytes) in shard_regions(&shard, tokens, c.hidden, false) {
             // This rank keeps its attention inputs in its own arrays and Metal has no VSA gate.
             // Nothing outside writes to either, so neither is made.
             if !matches!(region, Region::Inputs | Region::Gate) {
-                exchange.region(region, bytes).map_err(shard_error)?;
+                context
+                    .exchange
+                    .region(region, bytes)
+                    .map_err(shard_error)?;
             }
         }
 
         // This rank's rows go where its peers can read them, quantized as the projections take
         // them, which is an eighth of the bytes the projections would produce.
-        let input = exchange
+        let started = Instant::now();
+        let input = context
+            .exchange
             .region(Region::Normalized, tokens * c.hidden)
             .map_err(shard_error)?;
-        let scales = exchange
+        let scales = context
+            .exchange
             .region(Region::Scales, tokens * 4)
             .map_err(shard_error)?;
         let mine = input.write_quantized(rows.start * c.hidden, normalized)?;
         scales.write_f32(rows.start * 4, &mine)?;
-        exchange
+        context
+            .exchange
             .publish(
                 Region::Normalized,
                 rows.start * c.hidden,
                 rows.len() * c.hidden,
             )
             .map_err(shard_error)?;
-        exchange
+        context
+            .exchange
             .publish(Region::Scales, rows.start * 4, rows.len() * 4)
             .map_err(shard_error)?;
-        self.exchange_rows(shard, exchange, &rows)?;
+        // NOTE: this backend queues its work and answers before the device has done it, so a span
+        // measured without waiting is charged to whichever later call happens to read a buffer
+        // back. The waits below are what make the four numbers mean what they say. They add no
+        // work, since every one of them is a wait the step would take anyway.
+        self.weights.device.synchronize()?;
+        context.timing.gather += started.elapsed();
+
+        self.exchange_rows(context, &rows)?;
 
         // Every token, this rank's heads. The projection runs over the whole sequence because the
         // attention that follows does.
+        let started = Instant::now();
         let qkv = self.project_exchanged_inputs(
             prefix,
             &input,
@@ -245,11 +262,13 @@ impl MetalDit {
         let (q, k) = (part(0, "q")?, part(own_inner, "k")?);
         let v = qkv.slice(0, tokens, 2 * own_inner, own_inner)?;
         let attended = q.attention(&k, &v, own.len(), own.len(), false)?;
+        self.weights.device.synchronize()?;
+        context.timing.attend += started.elapsed();
 
         // Back to "my tokens, every head". A rank's own share is scattered straight into place and
         // the peers' shares land beside it.
         let whole = Array::zeros(&self.weights.device, rows.len(), c.inner())?;
-        self.exchange_attended(shard, exchange, &rows, &attended, &whole)?;
+        self.exchange_attended(context, &rows, &attended, &whole)?;
         self.weights
             .linear(&whole, &format!("{prefix}.attn.out_proj"))
     }
@@ -257,17 +276,19 @@ impl MetalDit {
     /// Pushes this rank's rows of a block's input to every peer and waits for theirs.
     fn exchange_rows(
         &self,
-        shard: &Shard,
-        exchange: &mut dyn Exchange<Memory = Memory>,
+        context: &mut ShardContext,
         rows: &std::ops::Range<usize>,
     ) -> Result<()> {
         let hidden = self.config.hidden;
+        let shard = context.shard.clone();
+        let started = Instant::now();
         for peer in 0..shard.ranks() {
             if peer == shard.rank {
                 continue;
             }
             for (region, width) in [(Region::Normalized, hidden), (Region::Scales, 4)] {
-                exchange
+                context
+                    .exchange
                     .write(
                         peer,
                         region,
@@ -279,53 +300,74 @@ impl MetalDit {
                     .map_err(shard_error)?;
             }
         }
-        exchange.barrier().map_err(shard_error)?;
+        context.timing.read += started.elapsed();
+
+        let started = Instant::now();
+        context.exchange.barrier().map_err(shard_error)?;
+        context.timing.barrier += started.elapsed();
+
+        let started = Instant::now();
         for peer in 0..shard.ranks() {
             if peer == shard.rank {
                 continue;
             }
             let taken = shard.tokens[peer].clone();
             for (region, width) in [(Region::Normalized, hidden), (Region::Scales, 4)] {
-                exchange
+                context
+                    .exchange
                     .receive(region, taken.start * width, taken.len() * width)
                     .map_err(shard_error)?;
             }
         }
+        self.weights.device.synchronize()?;
+        context.timing.read += started.elapsed();
+
         // Nothing may be overwritten until every rank has read it.
-        exchange.barrier().map_err(shard_error)
+        let started = Instant::now();
+        context.exchange.barrier().map_err(shard_error)?;
+        context.timing.barrier += started.elapsed();
+        Ok(())
     }
 
     /// Turns "every token, my heads" back into "my tokens, every head".
     fn exchange_attended(
         &self,
-        shard: &Shard,
-        exchange: &mut dyn Exchange<Memory = Memory>,
+        context: &mut ShardContext,
         rows: &std::ops::Range<usize>,
         attended: &Array,
         whole: &Array,
     ) -> Result<()> {
         let c = &self.config;
+        let shard = context.shard.clone();
         let tokens: usize = shard.tokens.iter().map(|taken| taken.len()).sum();
         let own = shard.own_heads();
         let own_inner = own.len() * c.head_dim;
 
-        let mine = exchange
+        let started = Instant::now();
+        let mine = context
+            .exchange
             .region(Region::Attended, tokens * own_inner * 2)
             .map_err(shard_error)?;
         mine.write_bf16(0, attended)?;
+        self.weights.device.synchronize()?;
+        context.timing.gather += started.elapsed();
+
+        let started = Instant::now();
         for peer in 0..shard.ranks() {
             if peer == shard.rank {
                 continue;
             }
             let taken = shard.tokens[peer].clone();
-            exchange
+            context
+                .exchange
                 .publish(
                     Region::Attended,
                     taken.start * own_inner * 2,
                     taken.len() * own_inner * 2,
                 )
                 .map_err(shard_error)?;
-            exchange
+            context
+                .exchange
                 .write(
                     peer,
                     Region::Attended,
@@ -336,8 +378,13 @@ impl MetalDit {
                 )
                 .map_err(shard_error)?;
         }
-        exchange.barrier().map_err(shard_error)?;
+        context.timing.read += started.elapsed();
 
+        let started = Instant::now();
+        context.exchange.barrier().map_err(shard_error)?;
+        context.timing.barrier += started.elapsed();
+
+        let started = Instant::now();
         for peer in 0..shard.ranks() {
             let span = shard.heads[peer].clone();
             let inner = span.len() * c.head_dim;
@@ -349,17 +396,25 @@ impl MetalDit {
                 // answer. Only what a peer sends is worth that.
                 attended.slice(rows.start, rows.len(), 0, own_inner)?
             } else {
-                let from = exchange
+                let from = context
+                    .exchange
                     .region(Region::Received(peer), rows.len() * inner * 2)
                     .map_err(shard_error)?;
-                exchange
+                context
+                    .exchange
                     .receive(Region::Received(peer), 0, rows.len() * inner * 2)
                     .map_err(shard_error)?;
                 from.read_bf16(0, rows.len(), inner)?
             };
             crate::shard::unpack(&part, whole, c.heads, span, c.head_dim)?;
         }
-        exchange.barrier().map_err(shard_error)
+        self.weights.device.synchronize()?;
+        context.timing.gather += started.elapsed();
+
+        let started = Instant::now();
+        context.exchange.barrier().map_err(shard_error)?;
+        context.timing.barrier += started.elapsed();
+        Ok(())
     }
 
     fn mlp(&self, x: &Array, prefix: &str) -> Result<Array> {
@@ -417,20 +472,13 @@ impl MetalDit {
         &self,
         inputs: &DitInputs,
         sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
-        shard: &Shard,
-        exchange: &mut dyn Exchange<Memory = Memory>,
+        context: &mut ShardContext,
     ) -> Result<VelocityRows> {
         let prepared = self.prepare_text(&inputs.context)?;
-        let out = self.forward_inner(
-            inputs,
-            &[],
-            sparse,
-            &prepared.text,
-            false,
-            Some((shard, exchange)),
-        )?;
+        let rows = context.shard.own_tokens();
+        let out = self.forward_inner(inputs, &[], sparse, &prepared.text, false, Some(context))?;
         Ok(VelocityRows {
-            rows: shard.own_tokens(),
+            rows,
             video: out.video,
             audio: out.audio,
         })
@@ -525,7 +573,7 @@ impl MetalDit {
         sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
         text: &Array,
         capture_text: bool,
-        mut shard: Option<(&Shard, &mut dyn Exchange<Memory = Memory>)>,
+        mut shard: Option<&mut ShardContext>,
     ) -> Result<DitOutput> {
         if sparse.is_some() || self.has_vsa_gates() {
             return Err(Error(
@@ -566,7 +614,8 @@ impl MetalDit {
         // The rows this rank carries. Without a shard that is every row, and nothing below knows
         // the difference.
         let carried = match &shard {
-            Some((shard, _)) => {
+            Some(context) => {
+                let shard = &context.shard;
                 let tokens = layout.len();
                 if shard.tokens.iter().map(|rows| rows.len()).sum::<usize>() != tokens
                     || shard.heads.iter().map(|heads| heads.len()).sum::<usize>() != c.heads
@@ -668,9 +717,7 @@ impl MetalDit {
                 .norm(&hidden, &format!("{p}.norm1"), c.norm_eps)?
                 .modulate(&m, &rows, 0, 1)?;
             let attended = match &mut shard {
-                Some((shard, exchange)) => {
-                    self.sharded_attention(&norm, &p, Some(&angles), shard, *exchange)?
-                }
+                Some(context) => self.sharded_attention(&norm, &p, Some(&angles), context)?,
                 None => self.attention(&norm, &p, Some(&angles))?,
             };
             hidden = hidden.add_gated(&attended, &m, &rows, 2)?;
@@ -739,6 +786,7 @@ impl MetalDit {
 mod tests {
     use super::*;
     use crate::shard::WholeExchange;
+    use mmh3_core::shard::Shard;
     use std::path::Path;
 
     /// The real checkpoint with the turbo LoRA on it, or nothing when the models are not here.
@@ -935,10 +983,14 @@ mod tests {
         )
         .unwrap();
 
-        let alone = Shard::even(0, 1, tokens, c.heads, 1);
         let mut one = crate::shard::WholeExchange::new(&device);
+        let mut alone = ShardContext {
+            shard: Shard::even(0, 1, tokens, c.heads, 1),
+            exchange: &mut one,
+            timing: Default::default(),
+        };
         let whole = dit
-            .sharded_attention(&x, "blocks.0", None, &alone, &mut one)
+            .sharded_attention(&x, "blocks.0", None, &mut alone)
             .unwrap()
             .to_f32()
             .unwrap();
@@ -958,8 +1010,13 @@ mod tests {
             for rank in 0..2 {
                 let rows = shards[rank].own_tokens();
                 let mine = x.slice(rows.start, rows.len(), 0, c.hidden).unwrap();
+                let mut context = ShardContext {
+                    shard: shards[rank].clone(),
+                    exchange: &mut exchanges[rank],
+                    timing: Default::default(),
+                };
                 parts[rank] = dit
-                    .sharded_attention(&mine, "blocks.0", None, &shards[rank], &mut exchanges[rank])
+                    .sharded_attention(&mine, "blocks.0", None, &mut context)
                     .unwrap()
                     .to_f32()
                     .unwrap();
@@ -1106,7 +1163,12 @@ mod tests {
         let run = |shard: &Shard| {
             let device = dit.weights.device.clone();
             let mut exchange = crate::shard::WholeExchange::new(&device);
-            dit.forward_shard(&inputs, None, shard, &mut exchange)
+            let mut context = ShardContext {
+                shard: shard.clone(),
+                exchange: &mut exchange,
+                timing: Default::default(),
+            };
+            dit.forward_shard(&inputs, None, &mut context)
                 .err()
                 .map(|error| error.0)
         };
@@ -1166,11 +1228,13 @@ mod tests {
 
         let whole = dit.forward(&inputs, &[], None).unwrap();
         let tokens = PackedLayout::for_inputs(&inputs).len();
-        let shard = Shard::even(0, 1, tokens, c.heads, 1);
         let mut exchange = crate::shard::WholeExchange::new(&dit.weights.device);
-        let part = dit
-            .forward_shard(&inputs, None, &shard, &mut exchange)
-            .unwrap();
+        let mut context = ShardContext {
+            shard: Shard::even(0, 1, tokens, c.heads, 1),
+            exchange: &mut exchange,
+            timing: Default::default(),
+        };
+        let part = dit.forward_shard(&inputs, None, &mut context).unwrap();
         assert_eq!(part.rows, 0..tokens, "one rank carries the whole sequence");
 
         // NOTE: assembled by the function a leader assembles with, not by a copy of it written
@@ -1221,10 +1285,14 @@ mod tests {
             .unwrap()
             .to_f32()
             .unwrap();
-        let shard = Shard::even(0, 1, tokens, c.heads, 1);
         let mut exchange = WholeExchange::new(&device);
+        let mut context = ShardContext {
+            shard: Shard::even(0, 1, tokens, c.heads, 1),
+            exchange: &mut exchange,
+            timing: Default::default(),
+        };
         let shared = dit
-            .sharded_attention(&x, "blocks.0", None, &shard, &mut exchange)
+            .sharded_attention(&x, "blocks.0", None, &mut context)
             .unwrap()
             .to_f32()
             .unwrap();

@@ -7,6 +7,10 @@
 
 use crate::{Buffer, Device, Error, Result, ops::Array};
 pub use mmh3_core::shard::VelocityRows;
+
+/// This backend's regions answer with memory a Metal buffer stands behind, and that is the only
+/// word of a shard's context or its timing that is a backend's own.
+pub type ShardContext<'a> = mmh3_core::shard::ShardContext<'a, Memory>;
 use mmh3_core::shard::{ExchangeError, Region};
 use std::collections::HashMap;
 use std::ops::Range;
