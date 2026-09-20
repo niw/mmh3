@@ -14,7 +14,7 @@ use mmh3_core::{
         timestep::StepTimesteps,
     },
     safetensors::SafeTensors,
-    shard::{Exchange, ExchangeError, Region, Shard, regions as shard_regions},
+    shard::{Exchange, ExchangeError, Region, Shard, VelocityRows, regions as shard_regions},
     tensor::Tensor,
 };
 
@@ -53,14 +53,6 @@ impl PreparedText<'_> {
         self.model
             .forward_inner(inputs, capture, sparse, &self.text, false, None)
     }
-}
-
-/// One rank's share of a step's velocity: the part of each segment its rows cover, still
-/// patchified and packed. A leader puts the parts together; one rank's part is the whole.
-pub struct ShardedVelocity {
-    pub rows: std::ops::Range<usize>,
-    pub video: Vec<f32>,
-    pub audio: Vec<f32>,
 }
 
 pub struct DitOutput {
@@ -430,7 +422,7 @@ impl MetalDit {
         sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
         shard: &Shard,
         exchange: &mut dyn Exchange<Memory = Memory>,
-    ) -> Result<ShardedVelocity> {
+    ) -> Result<VelocityRows> {
         let prepared = self.prepare_text(&inputs.context)?;
         let out = self.forward_inner(
             inputs,
@@ -440,7 +432,7 @@ impl MetalDit {
             false,
             Some((shard, exchange)),
         )?;
-        Ok(ShardedVelocity {
+        Ok(VelocityRows {
             rows: shard.own_tokens(),
             video: out.video,
             audio: out.audio,

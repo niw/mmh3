@@ -6,6 +6,7 @@
 //! and back. These are the two gathers that do it.
 
 use crate::{Buffer, Device, Error, Result, ops::Array};
+pub use mmh3_core::shard::VelocityRows;
 use mmh3_core::shard::{ExchangeError, Region};
 use std::collections::HashMap;
 use std::ops::Range;

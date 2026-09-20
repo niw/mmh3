@@ -2,13 +2,15 @@
 //! `notes/worker.md`. A worker holds checkpoints the leader may not have, so both sides name them by
 //! role and confirm them by digest.
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::safetensors::SafeTensors;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::shard;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::shard::Shard;
 use mmh3_core::tensor::Tensor;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::worker::OpenSession;
 use mmh3_core::worker::{
     self, CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD,
@@ -55,6 +57,11 @@ type Resident = Option<(u64, TextEncoder)>;
 type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
 #[cfg(feature = "metal")]
 type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
+/// The DiT a rank runs its share of a step on.
+#[cfg(feature = "cuda")]
+type Dit = mmh3_cuda::dit::CudaDit;
+#[cfg(feature = "metal")]
+type Dit = mmh3_metal::dit::MetalDit;
 /// A decoder and the tile geometry it was built for, which a request may change.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 type ResidentDecoder = Option<(u64, usize, usize, VideoDecoder)>;
@@ -1045,8 +1052,7 @@ fn session(
     let mut audio: ResidentAudio = None;
     // A DiT read before it was asked for, which `PrepareCheckpoint` starts while the leader is
     // still encoding its prompt.
-    #[cfg(feature = "cuda")]
-    let mut prepared: Option<(u64, mmh3_cuda::dit::CudaDit)> = None;
+    let mut prepared: Option<(u64, Dit)> = None;
     #[cfg(feature = "cuda")]
     let mut rdma: Option<Rdma> = None;
     #[cfg(feature = "cuda")]
@@ -1170,27 +1176,20 @@ fn session(
             }
             // A shared-out step takes the connection over until the leader closes it, since
             // both ranks then barrier and read each other rather than trading requests.
-            #[cfg(feature = "cuda")]
             Kind::PrepareCheckpoint => {
                 // A notification rather than a request: the leader has a prompt to encode and does
                 // not wait for the read, which is the whole point of sending it early.
-                #[cfg(feature = "cuda")]
                 match worker::Checkpoint::decode(&body) {
                     Ok(checkpoint) => prepared = prepare_dit(models, &checkpoint),
                     Err(error) => eprintln!("warning: a prepared checkpoint: {error}"),
                 }
             }
-            #[cfg(not(feature = "cuda"))]
-            Kind::OpenSession => {
-                let message = b"this build takes no share of a step";
-                reply(&mut writer, Kind::Error, message, &[])?;
-            }
-            #[cfg(feature = "cuda")]
             Kind::OpenSession => {
                 let (open, payload) = OpenSession::decode(&body)?;
                 if let Err(error) = serve_shard(
                     &mut reader,
                     &mut writer,
+                    #[cfg(feature = "cuda")]
                     rdma.as_ref(),
                     models,
                     &open,
@@ -2380,7 +2379,7 @@ impl Exchanger<'_> {
 /// The file a digest names, in the given directories of this machine's models. A leader passes its
 /// own by path and a worker will have named it something else, so the digest of the safetensors
 /// header is what the two agree on.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn find_checkpoint(models: &Path, digest_wanted: u64, directories: &[&str]) -> Option<PathBuf> {
     let mut files: Vec<PathBuf> = directories
         .iter()
@@ -2397,7 +2396,7 @@ fn find_checkpoint(models: &Path, digest_wanted: u64, directories: &[&str]) -> O
 
 /// The keyframes and references of a session, read back from what `session_conditions` named and
 /// `session_payload` carried.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn session_conditions_of(
     open: &OpenSession,
     mut values: &[u8],
@@ -2457,17 +2456,116 @@ fn session_conditions_of(
     Ok((keyframes, references))
 }
 
+/// How the attention of a shared step runs, which only one backend offers a choice about.
+#[cfg(feature = "cuda")]
+fn set_attention_precision(dit: &mut Dit, precision: u8) -> Result<(), Box<dyn Error>> {
+    dit.set_attention_precision(if precision == 1 {
+        mmh3_cuda::attention::AttentionPrecision::Int8Fp8
+    } else {
+        mmh3_cuda::attention::AttentionPrecision::Bf16
+    });
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn set_attention_precision(_dit: &mut Dit, precision: u8) -> Result<(), Box<dyn Error>> {
+    if precision == 1 {
+        return Err("this build attends in BF16 only".into());
+    }
+    Ok(())
+}
+
+/// One of the leader's LoRAs or patches, in its own order.
+#[cfg(feature = "cuda")]
+fn add_adapter(
+    dit: &mut Dit,
+    file: &SafeTensors,
+    adapter: &mmh3_core::worker::Adapter,
+) -> Result<usize, Box<dyn Error>> {
+    let mode = if adapter.mode == mmh3_core::worker::Adapter::MERGE {
+        mmh3_cuda::dit::LoraMode::Merge
+    } else {
+        mmh3_cuda::dit::LoraMode::Adapter
+    };
+    Ok(dit.add_lora(file, adapter.strength, mode)?)
+}
+
+#[cfg(feature = "metal")]
+fn add_adapter(
+    dit: &mut Dit,
+    file: &SafeTensors,
+    adapter: &mmh3_core::worker::Adapter,
+) -> Result<usize, Box<dyn Error>> {
+    if adapter.mode == mmh3_core::worker::Adapter::MERGE {
+        return Err("this build takes LoRAs as adapters, not merged into the weights".into());
+    }
+    Ok(dit.add_lora(file, adapter.strength)?)
+}
+
+/// How many of the leader's GEMM choices this rank took. A rank whose key the leader's does not
+/// match, which is what another backend is, takes none and chooses its own.
+#[cfg(feature = "cuda")]
+fn adopt_algorithms(open: &OpenSession) -> usize {
+    match mmh3_cuda::algorithms::key() {
+        Ok(key) if key == open.algorithm_key => {
+            mmh3_cuda::algorithms::adopt_matmul(&open.algorithms)
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "metal")]
+fn adopt_algorithms(_open: &OpenSession) -> usize {
+    0
+}
+
+/// This rank's share of one step, and whatever it can say about where the time went.
+#[cfg(feature = "cuda")]
+fn share_a_step(
+    dit: &Dit,
+    inputs: &DitInputs,
+    sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+    shard: &Shard,
+    exchanger: &mut Exchanger<'_>,
+    elapsed: impl Fn() -> Duration,
+) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
+    let mut context = mmh3_cuda::shard::ShardContext {
+        shard: shard.clone(),
+        exchange: exchanger,
+        timing: Default::default(),
+    };
+    let outputs = dit.forward_shard(inputs, sparse, &mut context)?;
+    let part = outputs.part.ok_or("a shared step returned no rows")?;
+    let timing = describe_timing(&context.timing, elapsed());
+    Ok((part, timing))
+}
+
+#[cfg(feature = "metal")]
+fn share_a_step(
+    dit: &Dit,
+    inputs: &DitInputs,
+    sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+    shard: &Shard,
+    exchanger: &mut Exchanger<'_>,
+    _elapsed: impl Fn() -> Duration,
+) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
+    // NOTE: nothing said about the time. This backend measures none of the parts, and a line of
+    // zeros reads as a measurement. It belongs here when a second rank makes the numbers mean
+    // something.
+    Ok((
+        dit.forward_shard(inputs, sparse, shard, exchanger)?,
+        String::new(),
+    ))
+}
+
 /// Reads the DiT a run is about to share, so that it is here when the session opens rather than
 /// after it. The leader sends this while it still has its prompt to encode.
-#[cfg(feature = "cuda")]
-fn prepare_dit(
-    models: &Path,
-    checkpoint: &worker::Checkpoint,
-) -> Option<(u64, mmh3_cuda::dit::CudaDit)> {
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn prepare_dit(models: &Path, checkpoint: &worker::Checkpoint) -> Option<(u64, Dit)> {
     let path = find_checkpoint(models, checkpoint.digest, &["diffusion_models"])?;
     let started = Instant::now();
     let file = SafeTensors::open(&path).ok()?;
-    match mmh3_cuda::dit::CudaDit::load(&file, "") {
+    match Dit::load(&file, "") {
         Ok(dit) => {
             println!(
                 "read {} in {:.1} s before it was asked for",
@@ -2485,17 +2583,16 @@ fn prepare_dit(
 
 /// A rank that is not the leader, running its share of every step until the leader closes the
 /// session. It holds the DiT and the registered regions for the whole run.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn serve_shard(
     reader: &mut BufReader<TcpStream>,
     writer: &mut BufWriter<TcpStream>,
-    connection: Option<&Rdma>,
+    #[cfg(feature = "cuda")] connection: Option<&Rdma>,
     models: &Path,
     open: &OpenSession,
     payload: &[u8],
-    prepared: Option<(u64, mmh3_cuda::dit::CudaDit)>,
+    prepared: Option<(u64, Dit)>,
 ) -> Result<(), Box<dyn Error>> {
-    use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
     use mmh3_core::dit::timestep::Modality;
 
@@ -2512,7 +2609,7 @@ fn serve_shard(
                     )
                 })?;
             let started = Instant::now();
-            let dit = mmh3_cuda::dit::CudaDit::load(&SafeTensors::open(&path)?, "")?;
+            let dit = Dit::load(&SafeTensors::open(&path)?, "")?;
             println!(
                 "loaded {} in {:.1} s",
                 path.display(),
@@ -2521,11 +2618,7 @@ fn serve_shard(
             dit
         }
     };
-    dit.set_attention_precision(if open.precision == 1 {
-        mmh3_cuda::attention::AttentionPrecision::Int8Fp8
-    } else {
-        mmh3_cuda::attention::AttentionPrecision::Bf16
-    });
+    set_attention_precision(&mut dit, open.precision)?;
     // The leader's LoRAs and patches, in the order it added them, since they do not commute.
     for adapter in &open.adapters {
         let path =
@@ -2536,12 +2629,7 @@ fn serve_shard(
                 )
             })?;
         let started = Instant::now();
-        let mode = if adapter.mode == mmh3_core::worker::Adapter::MERGE {
-            mmh3_cuda::dit::LoraMode::Merge
-        } else {
-            mmh3_cuda::dit::LoraMode::Adapter
-        };
-        let layers = dit.add_lora(&SafeTensors::open(&path)?, adapter.strength, mode)?;
+        let layers = add_adapter(&mut dit, &SafeTensors::open(&path)?, adapter)?;
         println!(
             "added {} to {layers} layers at strength {} in {:.1} s",
             path.display(),
@@ -2630,12 +2718,7 @@ fn serve_shard(
     // The leader's choices for the GEMM shapes, which this rank runs rather than timing the
     // candidates while the wire and the other ranks have its device. A key of its own that the
     // leader's does not match, which is what another GPU or another backend has, leaves them.
-    let algorithms = match mmh3_cuda::algorithms::key() {
-        Ok(key) if key == open.algorithm_key => {
-            mmh3_cuda::algorithms::adopt_matmul(&open.algorithms)
-        }
-        _ => 0,
-    };
+    let algorithms = adopt_algorithms(open);
     // A worker's only socket is the one the leader opened, so the leader is its only peer here and
     // the connections to the other ranks come out of the rendezvous.
     let peers = vec![Peer {
@@ -2645,6 +2728,7 @@ fn serve_shard(
         backend: 0,
         reader,
         writer,
+        #[cfg(feature = "cuda")]
         link: connection,
     }];
     let mut exchanger = Exchanger::open(
@@ -2686,21 +2770,22 @@ fn serve_shard(
         inputs.sigma = step.sigma;
 
         let started = Instant::now();
-        let mut context = mmh3_cuda::shard::ShardContext {
-            shard: shard.clone(),
-            exchange: &mut exchanger,
-            timing: Default::default(),
-        };
         let step_sparse =
             sparse.filter(|sparse| sparse.applies_to_step(step.step as usize, open.steps as usize));
-        let outputs = dit.forward_shard(&inputs, step_sparse.as_ref(), &mut context)?;
-        let part = outputs.part.ok_or("a shared step returned no rows")?;
+        let (part, timing) = share_a_step(
+            &dit,
+            &inputs,
+            step_sparse.as_ref(),
+            &shard,
+            &mut exchanger,
+            || started.elapsed(),
+        )?;
         println!(
-            "step {} of rank {} in {:.1} s, {}",
+            "step {} of rank {} in {:.1} s{}{timing}",
             step.step,
             shard.rank,
             started.elapsed().as_secs_f64(),
-            describe_timing(&context.timing, started.elapsed())
+            if timing.is_empty() { "" } else { ", " }
         );
         let descriptor = worker::VelocityPart {
             first_row: part.rows.start as u32,
@@ -2793,7 +2878,7 @@ pub fn sparse_settings(
 }
 
 /// What `sparse_settings` carried, as the blocks take it.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn sparse_attention(
     settings: &worker::SparseSettings,
 ) -> Option<mmh3_core::dit::sparse::SparseAttention> {
