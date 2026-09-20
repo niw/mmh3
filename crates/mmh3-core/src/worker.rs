@@ -54,6 +54,8 @@ pub enum Kind {
     DecodeAudio = 21,
     Samples = 22,
     ShardWrite = 23,
+    /// One rank announcing itself on a socket it dialed to a peer of the same run.
+    JoinShard = 24,
 }
 
 impl Kind {
@@ -82,6 +84,7 @@ impl Kind {
             21 => Kind::DecodeAudio,
             22 => Kind::Samples,
             23 => Kind::ShardWrite,
+            24 => Kind::JoinShard,
             _ => return None,
         })
     }
@@ -544,6 +547,10 @@ pub struct ShardSpan {
 /// everything a peer meant to send, including when that is nothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShardWrite {
+    /// The rank the bytes are for, which is not always the rank they arrive from: two workers have
+    /// no socket to each other, so what one owes the other goes to the leader and the leader
+    /// passes it on.
+    pub to: u32,
     /// The region the bytes land in, as `Region::code` names it.
     pub kind: u32,
     pub peer: u32,
@@ -556,6 +563,7 @@ impl ShardWrite {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
         encoder
+            .u32(self.to)
             .u32(self.kind)
             .u32(self.peer)
             .u64(self.offset)
@@ -568,6 +576,7 @@ impl ShardWrite {
     pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
         let mut decoder = Decoder::new(bytes);
         let write = ShardWrite {
+            to: decoder.u32()?,
             kind: decoder.u32()?,
             peer: decoder.u32()?,
             offset: decoder.u64()?,
@@ -641,13 +650,85 @@ impl PeerLink {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionReady {
     pub algorithms: u32,
+    /// The port this rank's session listens on for the peers that reach it over a socket, or
+    /// zero where it offers none. The leader pairs it with the host it reached this rank at,
+    /// since a rank behind more than one interface cannot say which of them a peer should use.
+    pub listen_port: u32,
     pub regions: Vec<RemoteRegion>,
+}
+
+/// What a rank says on a socket it has just dialed to a peer, so the peer knows who called and
+/// that it belongs to this run.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JoinShard {
+    pub rank: u32,
+    pub token: String,
+}
+
+impl JoinShard {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(self.rank).string(&self.token);
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        Ok(JoinShard {
+            rank: decoder.u32()?,
+            token: decoder.string()?,
+        })
+    }
+}
+
+/// Where one rank listens, as the leader passes it on to the others.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PeerListen {
+    pub rank: u32,
+    pub address: String,
+}
+
+/// What the leader answers every rank with once they have all reported: where each of them
+/// listens, and the regions of all of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionTable {
+    pub listens: Vec<PeerListen>,
+    pub regions: Vec<RemoteRegion>,
+}
+
+impl SessionTable {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(self.listens.len() as u32);
+        for listen in &self.listens {
+            encoder.u32(listen.rank).string(&listen.address);
+        }
+        let mut bytes = encoder.finish();
+        bytes.extend(RemoteRegion::encode_all(&self.regions));
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        let count = decoder.u32()? as usize;
+        let mut listens = Vec::with_capacity(count.min(64));
+        for _ in 0..count {
+            listens.push(PeerListen {
+                rank: decoder.u32()?,
+                address: decoder.string()?,
+            });
+        }
+        Ok(SessionTable {
+            listens,
+            regions: RemoteRegion::decode_all(decoder.rest())?,
+        })
+    }
 }
 
 impl SessionReady {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
-        encoder.u32(self.algorithms);
+        encoder.u32(self.algorithms).u32(self.listen_port);
         let mut bytes = encoder.finish();
         bytes.extend(RemoteRegion::encode_all(&self.regions));
         bytes
@@ -656,8 +737,10 @@ impl SessionReady {
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let mut decoder = Decoder::new(bytes);
         let algorithms = decoder.u32()?;
+        let listen_port = decoder.u32()?;
         Ok(SessionReady {
             algorithms,
+            listen_port,
             regions: RemoteRegion::decode_all(decoder.rest())?,
         })
     }

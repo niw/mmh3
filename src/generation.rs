@@ -541,6 +541,7 @@ pub fn sample(
                 dit.config().hidden,
                 target.gated,
                 algorithms,
+                &settings.token,
             ) {
                 Ok(exchanger) => Some(Sharing::With(Box::new(exchanger), shard)),
                 Err(error) => {

@@ -1208,6 +1208,7 @@ fn session(
                     &open,
                     &body[payload..],
                     prepared.take(),
+                    token,
                 ) {
                     reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?;
                     return Err(error);
@@ -1481,6 +1482,15 @@ fn describe_protocol(theirs: u32, who: &str) -> String {
     )
 }
 
+/// The host part of `address`, which is what a peer dials when the leader passes it on.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn host_of(address: &str) -> String {
+    match address.rsplit_once(':') {
+        Some((host, _)) => host.to_owned(),
+        None => address.to_owned(),
+    }
+}
+
 fn device_name() -> String {
     #[cfg(feature = "cuda")]
     {
@@ -1503,12 +1513,36 @@ fn memory_bytes() -> u64 {
         .map_or(0, |kibibytes| kibibytes * 1024)
 }
 
-/// One rank's socket to another: every peer for the leader, the leader alone for a worker, since
-/// the barriers go through it and the workers never talk to each other over TCP.
+/// One rank's socket to another. The leader arrives holding the session's socket to each worker,
+/// and a rank opens its own to the peers it has neither a socket nor a connection to, so the two
+/// kinds sit side by side.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-struct Socket<'a> {
-    reader: &'a mut BufReader<TcpStream>,
-    writer: &'a mut BufWriter<TcpStream>,
+enum Socket<'a> {
+    Session {
+        reader: &'a mut BufReader<TcpStream>,
+        writer: &'a mut BufWriter<TcpStream>,
+    },
+    Peer {
+        reader: BufReader<TcpStream>,
+        writer: BufWriter<TcpStream>,
+    },
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl Socket<'_> {
+    fn reader(&mut self) -> &mut BufReader<TcpStream> {
+        match self {
+            Socket::Session { reader, .. } => reader,
+            Socket::Peer { reader, .. } => reader,
+        }
+    }
+
+    fn writer(&mut self) -> &mut BufWriter<TcpStream> {
+        match self {
+            Socket::Session { writer, .. } => writer,
+            Socket::Peer { writer, .. } => writer,
+        }
+    }
 }
 
 /// What one rank brings to a shared-out run: its socket to the leader or, for the leader, to each
@@ -1518,6 +1552,8 @@ pub struct Peer<'a> {
     pub rank: usize,
     /// Which backend this peer runs, as `Welcome` named it.
     pub backend: u8,
+    /// The host this rank reached the peer at, which is the one it tells the other ranks to use.
+    pub host: String,
     reader: &'a mut BufReader<TcpStream>,
     writer: &'a mut BufWriter<TcpStream>,
     /// The connection to this peer, where the path between the two machines has one and this
@@ -1685,6 +1721,14 @@ pub struct Exchanger<'a> {
     /// The backend each peer runs, which decides whether its choices are comparable with this
     /// rank's at all.
     backends: HashMap<usize, u8>,
+    /// Where this rank's session waits for the peers that dial it.
+    listener: Option<TcpListener>,
+    /// Where every rank listens, as the leader worked it out and passed it round.
+    listens: Vec<worker::PeerListen>,
+    /// The host this rank reached each peer at, which the leader passes on.
+    hosts: HashMap<usize, String>,
+    /// What a peer has to offer before this rank will talk to it.
+    token: String,
     /// What a peer with no connection is owed, until the barrier that sends it.
     pending: HashMap<usize, Vec<Queued>>,
     /// Where this rank's blocks compute. Attention reads its inputs once per query tile, so a
@@ -1780,21 +1824,24 @@ impl<'a> Exchanger<'a> {
         gated: bool,
         peers: Vec<Peer<'a>>,
         algorithms: u32,
+        token: &str,
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
         let mut sockets = HashMap::new();
         let mut backends = HashMap::new();
+        let mut hosts = HashMap::new();
         #[cfg(feature = "cuda")]
         let mut links = HashMap::new();
         for peer in peers {
             backends.insert(peer.rank, peer.backend);
+            hosts.insert(peer.rank, peer.host);
             #[cfg(feature = "cuda")]
             if let Some(link) = peer.link {
                 links.insert(peer.rank, LinkOf::Held(link));
             }
             sockets.insert(
                 peer.rank,
-                Socket {
+                Socket::Session {
                     reader: peer.reader,
                     writer: peer.writer,
                 },
@@ -1808,12 +1855,19 @@ impl<'a> Exchanger<'a> {
             links,
             regions: HashMap::new(),
             backends,
+            // A rank the leader reaches is a rank its peers may have to dial, so every one of
+            // them waits on a port of its own for the length of the session.
+            listener: TcpListener::bind("0.0.0.0:0").ok(),
+            listens: Vec::new(),
+            hosts,
+            token: token.to_owned(),
             pending: HashMap::new(),
             computed: Computed::default(),
             peers: HashMap::new(),
         };
         exchanger.link_peers()?;
         exchanger.register(shard, tokens, hidden, gated, algorithms)?;
+        exchanger.dial_peers()?;
         Ok(exchanger)
     }
 
@@ -1910,9 +1964,11 @@ impl<'a> Exchanger<'a> {
                                 .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
                                 .collect()
                         });
-                    let addresses = addresses.ok_or_else(|| {
-                        format!("rank {peer} offered no connection and has no socket here either")
-                    })?;
+                    // A peer that offered nothing has no transport of its own, so the connection
+                    // made for it is dropped and the pair uses the socket they dial instead.
+                    let Some(addresses) = addresses else {
+                        continue;
+                    };
                     link.connect(&addresses)?;
                     self.links.insert(peer, LinkOf::Opened(link));
                 }
@@ -1990,12 +2046,18 @@ impl<'a> Exchanger<'a> {
             self.regions.insert(region, held);
             self.computed.make(region, bytes)?;
         }
-        let table = if self.rank > 0 {
+        let listen_port = self
+            .listener
+            .as_ref()
+            .and_then(|listener| listener.local_addr().ok())
+            .map_or(0, |address| address.port() as u32);
+        let whole = if self.rank > 0 {
             self.send(
                 0,
                 Kind::SessionReady,
                 &worker::SessionReady {
                     algorithms,
+                    listen_port,
                     regions: table,
                 }
                 .encode(),
@@ -2003,15 +2065,29 @@ impl<'a> Exchanger<'a> {
             )?;
             let (header, body) = self.receive(0)?;
             self.expect(header, Kind::SessionReady, &body)?;
-            worker::RemoteRegion::decode_all(&body)?
+            worker::SessionTable::decode(&body)?
         } else {
             // The leader collects every rank's table and sends the whole of it back, so that a
             // rank looks an entry up by its owner rather than counting on the lists lining up.
-            let mut whole = table;
+            let mut whole = worker::SessionTable {
+                listens: Vec::new(),
+                regions: table,
+            };
             for peer in 1..self.ranks {
                 let (header, body) = self.receive(peer)?;
                 self.expect(header, Kind::SessionReady, &body)?;
                 let ready = worker::SessionReady::decode(&body)?;
+                // The host is the one this rank reached the peer at: a machine behind more than
+                // one interface cannot say which of them its peers should use, and the leader
+                // already knows one that works.
+                if ready.listen_port > 0
+                    && let Some(host) = self.hosts.get(&peer)
+                {
+                    whole.listens.push(worker::PeerListen {
+                        rank: peer as u32,
+                        address: format!("{host}:{}", ready.listen_port),
+                    });
+                }
                 // A CUDA rank that took none of them times its own candidates, so the two may
                 // choose differently and the run is then only what these machines together
                 // produce. A rank on another backend never had them to take, which is ordinary
@@ -2025,15 +2101,16 @@ impl<'a> Exchanger<'a> {
                          chooses its own"
                     );
                 }
-                whole.extend(ready.regions);
+                whole.regions.extend(ready.regions);
             }
-            let encoded = worker::RemoteRegion::encode_all(&whole);
+            let encoded = whole.encode();
             for peer in 1..self.ranks {
                 self.send(peer, Kind::SessionReady, &encoded, &[])?;
             }
             whole
         };
-        for entry in table {
+        self.listens = whole.listens.clone();
+        for entry in whole.regions {
             if entry.owner as usize == self.rank {
                 continue;
             }
@@ -2058,13 +2135,13 @@ impl<'a> Exchanger<'a> {
         payload: &[u8],
     ) -> Result<(), Box<dyn Error>> {
         let socket = self.socket(peer)?;
-        worker::send(socket.writer, kind, 0, descriptor, payload)?;
+        worker::send(socket.writer(), kind, 0, descriptor, payload)?;
         Ok(())
     }
 
     fn receive(&mut self, peer: usize) -> Result<(worker::Header, Vec<u8>), Box<dyn Error>> {
         let socket = self.socket(peer)?;
-        Ok(worker::receive(socket.reader, BODY_LIMIT)?)
+        Ok(worker::receive(socket.reader(), BODY_LIMIT)?)
     }
 
     fn expect(
@@ -2101,12 +2178,107 @@ impl Exchanger<'_> {
     ///
     /// Both ends of a pair decide this the same way: a rank with no port registers nothing, so it
     /// names no address, so neither side has a connection to the other and both queue.
-    fn exchange_pending(&mut self) -> Result<(), shard::ExchangeError> {
-        let mut peers: Vec<usize> = self.sockets.keys().copied().collect();
-        // A peer this rank can write into the memory of is owed nothing here. There are no such
-        // peers on a backend with no transport of its own, where every write is already queued.
+    /// Opens a socket to every rank this one can reach by neither a socket nor a connection, so
+    /// that what two ranks owe each other goes straight there rather than through anybody.
+    ///
+    /// The lower rank of a pair dials and the higher accepts, and a rank takes every call before
+    /// it makes any, so the two orders cannot wait on each other. A pair that cannot manage it
+    /// refuses the run and names both ends: a run that quietly went somewhere slower would be
+    /// worse than one that stopped.
+    fn dial_peers(&mut self) -> Result<(), Box<dyn Error>> {
+        let wanted: Vec<usize> = (0..self.ranks)
+            .filter(|peer| *peer != self.rank && !self.reaches(*peer))
+            .collect();
+        let calls = wanted.iter().filter(|peer| **peer < self.rank).count();
+        for _ in 0..calls {
+            let listener = self
+                .listener
+                .as_ref()
+                .ok_or("this rank has no port for its peers to call")?;
+            let (stream, from) = listener.accept()?;
+            let mut reader = BufReader::with_capacity(STREAM_BUFFER, stream.try_clone()?);
+            let (header, body) = worker::receive(&mut reader, BODY_LIMIT)?;
+            if header.kind != Kind::JoinShard {
+                return Err(
+                    format!("a peer opened with {:?} rather than joining", header.kind).into(),
+                );
+            }
+            let join = worker::JoinShard::decode(&body)?;
+            if join.token != self.token {
+                return Err(format!("{from} offered the wrong token").into());
+            }
+            self.sockets.insert(
+                join.rank as usize,
+                Socket::Peer {
+                    reader,
+                    writer: BufWriter::with_capacity(STREAM_BUFFER, stream),
+                },
+            );
+        }
+        for peer in wanted.into_iter().filter(|peer| *peer > self.rank) {
+            let address = self
+                .listens
+                .iter()
+                .find(|listen| listen.rank as usize == peer)
+                .map(|listen| listen.address.clone())
+                .ok_or_else(|| format!("rank {peer} named no port to call it on"))?;
+            let stream = TcpStream::connect(&address).map_err(|error| {
+                format!(
+                    "rank {} cannot reach rank {peer} at {address}: {error}",
+                    self.rank
+                )
+            })?;
+            let mut writer = BufWriter::with_capacity(STREAM_BUFFER, stream.try_clone()?);
+            worker::send(
+                &mut writer,
+                Kind::JoinShard,
+                0,
+                &worker::JoinShard {
+                    rank: self.rank as u32,
+                    token: self.token.clone(),
+                }
+                .encode(),
+                &[],
+            )?;
+            self.sockets.insert(
+                peer,
+                Socket::Peer {
+                    reader: BufReader::with_capacity(STREAM_BUFFER, stream),
+                    writer,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Whether this rank already reaches `peer` without dialing it: a socket the session opened,
+    /// or a connection into its memory.
+    fn reaches(&self, peer: usize) -> bool {
+        if self.sockets.contains_key(&peer) {
+            return true;
+        }
         #[cfg(feature = "cuda")]
-        peers.retain(|peer| !self.links.contains_key(peer));
+        return self.links.contains_key(&peer);
+        #[cfg(not(feature = "cuda"))]
+        false
+    }
+
+    /// Whether what this rank owes `peer` goes down a socket. Every pair has one or the other
+    /// after the rendezvous, so this is the ranks a connection does not already reach.
+    fn over_socket(&self, peer: usize) -> bool {
+        #[cfg(feature = "cuda")]
+        return !self.links.contains_key(&peer);
+        #[cfg(not(feature = "cuda"))]
+        true
+    }
+
+    /// Sends every write this rank owes and takes in what it is owed, over the sockets. A pair
+    /// trades directly: the lower rank sends first and the higher takes first, so two ranks that
+    /// both send cannot fill each other's socket and stop.
+    fn exchange_pending(&mut self) -> Result<(), shard::ExchangeError> {
+        let mut peers: Vec<usize> = (0..self.ranks)
+            .filter(|peer| *peer != self.rank && self.over_socket(*peer))
+            .collect();
         peers.sort_unstable();
         for peer in peers {
             if self.rank < peer {
@@ -2123,14 +2295,16 @@ impl Exchanger<'_> {
     /// This rank's writes to `peer`, the last of them saying so. A rank with nothing to send says
     /// that too, so the other end never waits for a message that is not coming.
     fn send_pending(&mut self, peer: usize) -> Result<(), shard::ExchangeError> {
-        let queued = self.pending.remove(&peer).unwrap_or_default();
+        let mine: Vec<Queued> = self.pending.remove(&peer).unwrap_or_default();
+        let total = mine.len();
         let Exchanger {
             sockets, regions, ..
         } = self;
         let socket = sockets
             .get_mut(&peer)
             .ok_or_else(|| exchange_error(format!("no socket to rank {peer}")))?;
-        for (index, write) in queued.iter().enumerate() {
+        let mut sent = 0;
+        for write in &mine {
             let held = regions
                 .get(&write.from)
                 .ok_or_else(|| exchange_error(format!("no {:?} was made", write.from)))?;
@@ -2144,15 +2318,17 @@ impl Exchanger<'_> {
                 )));
             }
             let (kind, into_peer) = write.into.code();
+            sent += 1;
             let descriptor = worker::ShardWrite {
+                to: peer as u32,
                 kind,
                 peer: into_peer,
                 offset: write.peer_offset as u64,
                 bytes: write.bytes as u64,
-                last: u8::from(index + 1 == queued.len()),
+                last: u8::from(sent == total),
             };
             worker::send(
-                socket.writer,
+                socket.writer(),
                 Kind::ShardWrite,
                 0,
                 &descriptor.encode(),
@@ -2160,13 +2336,14 @@ impl Exchanger<'_> {
             )
             .map_err(|error| exchange_error(format!("writing to rank {peer}: {error}")))?;
         }
-        if queued.is_empty() {
+        if total == 0 {
             let descriptor = worker::ShardWrite {
+                to: peer as u32,
                 last: 1,
                 ..worker::ShardWrite::default()
             };
             worker::send(
-                socket.writer,
+                socket.writer(),
                 Kind::ShardWrite,
                 0,
                 &descriptor.encode(),
@@ -2186,7 +2363,7 @@ impl Exchanger<'_> {
             let socket = sockets
                 .get_mut(&peer)
                 .ok_or_else(|| exchange_error(format!("no socket to rank {peer}")))?;
-            let (header, body) = worker::receive(socket.reader, BODY_LIMIT)
+            let (header, body) = worker::receive(socket.reader(), BODY_LIMIT)
                 .map_err(|error| exchange_error(format!("reading from rank {peer}: {error}")))?;
             if header.kind != Kind::ShardWrite {
                 return Err(exchange_error(format!(
@@ -2196,6 +2373,14 @@ impl Exchanger<'_> {
             }
             let (write, payload_at) = worker::ShardWrite::decode(&body)
                 .map_err(|error| exchange_error(format!("a write of rank {peer}: {error}")))?;
+            // Every pair trades directly, so a write that names anybody else went astray rather
+            // than asking to be passed on.
+            if write.to as usize != self.rank {
+                return Err(exchange_error(format!(
+                    "rank {peer} sent a write meant for rank {}",
+                    write.to
+                )));
+            }
             if write.bytes > 0 {
                 let region = shard::Region::from_code(write.kind, write.peer).ok_or_else(|| {
                     exchange_error(format!("rank {peer} named region {}", write.kind))
@@ -2347,11 +2532,6 @@ impl shard::Exchange for Exchanger<'_> {
             )
             .map_err(|error| exchange_error(format!("writing {into:?} of rank {peer}: {error}")))?;
             return Ok(());
-        }
-        if !self.sockets.contains_key(&peer) {
-            return Err(exchange_error(format!(
-                "rank {peer} has neither a connection here nor a socket"
-            )));
         }
         self.pending.entry(peer).or_default().push(Queued {
             from,
@@ -2638,6 +2818,7 @@ fn serve_shard(
     open: &OpenSession,
     payload: &[u8],
     prepared: Option<(u64, Dit)>,
+    token: &str,
 ) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::layout::PackedLayout;
     use mmh3_core::dit::timestep::Modality;
@@ -2772,6 +2953,8 @@ fn serve_shard(
         // A worker never compares its choices with the leader's, so it does not need to be told
         // which backend the leader runs. Only the leader reads this, about its workers.
         backend: 0,
+        // Only the leader tells anyone where to dial, so what a worker holds here is never read.
+        host: String::new(),
         reader,
         writer,
         #[cfg(feature = "cuda")]
@@ -2784,6 +2967,7 @@ fn serve_shard(
         gated,
         peers,
         algorithms as u32,
+        token,
     )?;
     println!(
         "rank {} of {} takes tokens {:?} and heads {:?}",
@@ -2869,6 +3053,7 @@ impl Worker {
         Ok(Peer {
             rank,
             backend: self.welcome.backend,
+            host: host_of(&self.address),
             reader,
             writer,
             link,
@@ -2888,6 +3073,7 @@ pub fn open_shard<'a>(
     hidden: usize,
     gated: bool,
     algorithms: u32,
+    token: &str,
 ) -> Result<Exchanger<'a>, Box<dyn Error>> {
     let mut peers = Vec::with_capacity(workers.len());
     for (index, worker) in workers.iter_mut().enumerate() {
@@ -2896,7 +3082,7 @@ pub fn open_shard<'a>(
             .ok_or("a worker was given no session to open")?;
         peers.push(worker.as_peer(index + 1, open, payload)?);
     }
-    Exchanger::open(shard, tokens, hidden, gated, peers, algorithms)
+    Exchanger::open(shard, tokens, hidden, gated, peers, algorithms, token)
 }
 
 /// The block-sparse attention of a run, as a session carries it. Every rank has to choose the same
