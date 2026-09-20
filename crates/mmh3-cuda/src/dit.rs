@@ -315,11 +315,7 @@ pub struct CudaDit {
 impl CudaDit {
     /// Uploads a pruned DiT checkpoint. `prefix` is prepended to every checkpoint tensor name.
     pub fn load(file: &SafeTensors, prefix: &str) -> Result<Self, Error> {
-        let config = DitConfig::from_shapes(|name| {
-            file.get(&format!("{prefix}{name}"))
-                .map(|info| info.shape.clone())
-        })
-        .map_err(Error::Model)?;
+        let config = DitConfig::of(file, prefix).map_err(Error::Model)?;
         if config.head_dim != HEAD_DIM {
             return Err(Error::Model(format!(
                 "head dimension {} is not {HEAD_DIM}",

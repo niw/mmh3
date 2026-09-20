@@ -38,6 +38,23 @@ impl DitConfig {
 
     /// Infers the configuration of a pruned checkpoint from tensor shapes, keyed by checkpoint
     /// tensor name.
+    /// The shape of a DiT read from its checkpoint header alone, with no weights uploaded
+    /// anywhere. A leader that hands every step to its ranks and only puts the parts back
+    /// together needs this and none of the 21 GB behind it.
+    pub fn of(file: &crate::safetensors::SafeTensors, prefix: &str) -> Result<Self, String> {
+        Self::from_shapes(|name| {
+            file.get(&format!("{prefix}{name}"))
+                .map(|info| info.shape.clone())
+        })
+    }
+
+    /// Whether this checkpoint has the VSA gate projections, which decides the regions a shared
+    /// step exchanges through. Read from the header beside the shape.
+    pub fn gated(file: &crate::safetensors::SafeTensors, prefix: &str) -> bool {
+        file.get(&format!("{prefix}blocks.0.attn.to_gate_compress.weight"))
+            .is_some()
+    }
+
     pub fn from_shapes(shape_of: impl Fn(&str) -> Option<Vec<usize>>) -> Result<Self, String> {
         let shape = |name: &str| shape_of(name).ok_or_else(|| format!("missing tensor {name}"));
         let count = |prefix: &str| {

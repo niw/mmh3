@@ -65,10 +65,7 @@ pub struct DitOutput {
 
 impl MetalDit {
     pub fn load(file: &SafeTensors, prefix: &str) -> Result<Self> {
-        let config = DitConfig::from_shapes(|name| {
-            file.get(&format!("{prefix}{name}"))
-                .map(|i| i.shape.clone())
-        })?;
+        let config = DitConfig::of(file, prefix)?;
         let weights = Weights::load(file, prefix)?;
         let time_table = weights.host("adaln_t_table")?;
         let inv_freq = weights.host("rope.inv_freq")?.data;
