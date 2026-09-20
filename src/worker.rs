@@ -62,6 +62,11 @@ type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
 pub(crate) type Dit = mmh3_cuda::dit::CudaDit;
 #[cfg(feature = "metal")]
 pub(crate) type Dit = mmh3_metal::dit::MetalDit;
+/// What a whole step answers with, which a leader reads once it has assembled the parts.
+#[cfg(feature = "cuda")]
+pub(crate) type DitStep = mmh3_cuda::dit::DitOutputs;
+#[cfg(feature = "metal")]
+pub(crate) type DitStep = mmh3_metal::dit::DitOutput;
 /// The exchange a rank uses when it shares a step with nobody.
 #[cfg(feature = "cuda")]
 pub(crate) type SoleExchange = mmh3_cuda::shard::WholeExchange;
@@ -3064,6 +3069,7 @@ impl Worker {
         let Worker {
             reader,
             writer,
+            #[cfg(feature = "cuda")]
             rdma,
             ..
         } = self;
@@ -3076,6 +3082,7 @@ impl Worker {
             host: host_of(&self.address),
             reader,
             writer,
+            #[cfg(feature = "cuda")]
             link,
         })
     }
@@ -3107,7 +3114,7 @@ pub fn open_shard<'a>(
 
 /// The block-sparse attention of a run, as a session carries it. Every rank has to choose the same
 /// attention on the same steps, so what crosses the wire is the schedule and not one step of it.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn sparse_settings(
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
 ) -> worker::SparseSettings {
@@ -3151,7 +3158,7 @@ pub fn sparse_attention(
 }
 
 /// A latent's shape as a session names it, or zeroes when there is none.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn condition_shape<const N: usize>(latent: Option<&Tensor>) -> [u32; N] {
     let mut shape = [0u32; N];
     if let Some(latent) = latent {
@@ -3164,7 +3171,7 @@ fn condition_shape<const N: usize>(latent: Option<&Tensor>) -> [u32; N] {
 
 /// The keyframes and references of a run as a session names them, in the order their latents follow
 /// the context in the payload.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn session_conditions(
     keyframes: &[mmh3_core::dit::inputs::Keyframe],
     references: &[mmh3_core::dit::inputs::Reference],
@@ -3197,7 +3204,7 @@ pub fn session_conditions(
 
 /// The context, its modalities and the conditions' latents, as a session carries them. The
 /// conditions follow in the order `session_conditions` lists them, video before audio.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn session_payload(
     context: &Tensor,
     modalities: &[mmh3_core::dit::timestep::Modality],
@@ -3240,12 +3247,12 @@ pub fn session_payload(
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn step_shard(
     exchanger: &mut Exchanger<'_>,
-    dit: &mmh3_cuda::dit::CudaDit,
+    dit: &Dit,
     inputs: &mmh3_core::dit::inputs::DitInputs,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     shard: &Shard,
     step: usize,
-) -> Result<mmh3_cuda::dit::DitOutputs, Box<dyn Error>> {
+) -> Result<DitStep, Box<dyn Error>> {
     let started = Instant::now();
     let descriptor = worker::StepShard {
         step: step as u32,

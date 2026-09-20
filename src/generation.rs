@@ -316,7 +316,6 @@ pub fn sample(
     } else {
         DIT_FILE
     };
-    #[cfg(feature = "cuda")]
     let prepared_workers = prepare_workers(settings, options, dit_file);
 
     let encode_context = || -> Result<(Tensor, Vec<mmh3_core::dit::timestep::Modality>), String> {
@@ -510,7 +509,6 @@ pub fn sample(
     let sparse = sparse_attention(options, dit.has_vsa_gates())?;
     let schedule = &settings.schedule;
     // A machine that can take a share of every step, and a run whose shape one can be cut out of.
-    #[cfg(feature = "cuda")]
     let mut target = shard_target(
         settings,
         options,
@@ -524,7 +522,6 @@ pub fn sample(
         &references,
         prepared_workers,
     );
-    #[cfg(feature = "cuda")]
     let mut sharing = match &mut target {
         Some(target) => {
             let shard = target.shard.clone();
@@ -562,7 +559,7 @@ pub fn sample(
             &references,
             settings,
         )
-        .map(|shard| Sharing::Alone(mmh3_cuda::shard::WholeExchange::new(), shard)),
+        .map(|shard| Sharing::Alone(sole_exchange(&dit), shard)),
     };
     #[cfg(feature = "metal")]
     let prepared = dit.prepare_text(&context)?;
@@ -811,7 +808,7 @@ fn encode_pictures(
 
 /// A worker that will take a share of every step, ready to open. Held apart from the exchange
 /// because the exchange borrows it for the whole run.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 struct ShardTarget {
     workers: Vec<crate::worker::Worker>,
     shard: mmh3_core::shard::Shard,
@@ -894,8 +891,8 @@ fn shard_target(
     use crate::worker::{digest, session_conditions, session_payload};
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_core::shard::Shard;
     use mmh3_core::worker::{Checkpoint, OpenSession};
-    use mmh3_cuda::shard::Shard;
 
     // A worker that only encodes the prompt and decodes some chunks is worth 9% of a run, which is
     // not worth a second machine. Sharing every step is worth 35%, so it is what `--worker` does
@@ -1000,8 +997,7 @@ fn shard_target(
     };
     // The workers run the leader's choices rather than timing the candidates themselves, since a
     // rank that measures while the wire and the others have its device measures the load.
-    let algorithm_key = mmh3_cuda::algorithms::key().unwrap_or_default();
-    let algorithms = mmh3_cuda::algorithms::chosen_matmul();
+    let (algorithm_key, algorithms) = chosen_algorithms();
     let weights: Vec<f64> = measured.iter().map(|speed| speed.unwrap_or(1.0)).collect();
     let shard = if measured.iter().all(Option::is_some) && ranks > 1 {
         println!(
@@ -1043,10 +1039,7 @@ fn shard_target(
             shard: spans.clone(),
             algorithm_key: algorithm_key.clone(),
             algorithms: algorithms.clone(),
-            precision: match dit.attention_precision() {
-                mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => 1,
-                _ => 0,
-            },
+            precision: attention_precision(dit),
         })
     };
     let open: Option<Vec<OpenSession>> = (1..ranks).map(open).collect();
@@ -1071,7 +1064,7 @@ fn shard_target(
 
 /// The LoRAs and patches of `--patch` and `--lora`, as a session names them: by the digest of the
 /// file, since the machines name the files differently.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn session_adapters(
     options: &HashMap<&str, &str>,
 ) -> Result<Vec<mmh3_core::worker::Adapter>, Box<dyn Error>> {
@@ -1117,6 +1110,48 @@ enum Sharing<'a> {
     Alone(crate::worker::SoleExchange, mmh3_core::shard::Shard),
 }
 
+/// The exchange a rank uses when it shares with nobody. One backend's is made from the device it
+/// computes on and the other's needs nothing, so the difference lives here rather than at the use.
+#[cfg(feature = "cuda")]
+fn sole_exchange(_dit: &crate::worker::Dit) -> crate::worker::SoleExchange {
+    crate::worker::SoleExchange::new()
+}
+
+#[cfg(feature = "metal")]
+fn sole_exchange(dit: &crate::worker::Dit) -> crate::worker::SoleExchange {
+    crate::worker::SoleExchange::new(dit.device())
+}
+
+/// The GEMM choices a leader hands its workers, and the key that says whose they are. A backend
+/// that chooses nothing hands nothing over, and a key that matches no rank is what leaves every
+/// machine choosing for itself.
+#[cfg(feature = "cuda")]
+fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
+    (
+        mmh3_cuda::algorithms::key().unwrap_or_default(),
+        mmh3_cuda::algorithms::chosen_matmul(),
+    )
+}
+
+#[cfg(feature = "metal")]
+fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
+    (String::new(), Vec::new())
+}
+
+/// How a session says this leader attends, which only one backend offers a choice about.
+#[cfg(feature = "cuda")]
+fn attention_precision(dit: &crate::worker::Dit) -> u8 {
+    match dit.attention_precision() {
+        mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => 1,
+        _ => 0,
+    }
+}
+
+#[cfg(feature = "metal")]
+fn attention_precision(_dit: &crate::worker::Dit) -> u8 {
+    0
+}
+
 /// The shard of a run that shares a step with nobody. One rank covers the whole sequence and every
 /// head, so the result is the whole step's, and what is left is the gathers and the waits.
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -1130,7 +1165,7 @@ fn alone_shard(
     keyframes: &[mmh3_core::dit::inputs::Keyframe],
     references: &[mmh3_core::dit::inputs::Reference],
     settings: &Settings,
-) -> Option<mmh3_cuda::shard::Shard> {
+) -> Option<mmh3_core::shard::Shard> {
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
 
@@ -1150,7 +1185,7 @@ fn alone_shard(
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     println!("sharing every step with nobody, {tokens} tokens in one piece");
-    Some(mmh3_cuda::shard::Shard::even(
+    Some(mmh3_core::shard::Shard::even(
         0,
         1,
         tokens,
