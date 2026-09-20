@@ -580,7 +580,6 @@ pub fn sample(
             shift_audio: settings.shift_audio,
         };
         let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
-        #[cfg(feature = "cuda")]
         let outputs = match &mut sharing {
             // Every rank runs the same step over its own rows, and the exchanges inside the blocks
             // keep the attention whole. A rank that fails takes the run with it: there is no
@@ -608,10 +607,19 @@ pub fn sample(
                 }
                 dit.assemble_velocity(&inputs, step_sparse.as_ref(), &[part])?
             }
-            None => dit.forward(&inputs, &[], step_sparse.as_ref())?,
+            // A run that shares a step with nobody takes the whole one, which on Metal goes
+            // through the text this run refined once rather than through the DiT directly.
+            None => {
+                #[cfg(feature = "cuda")]
+                {
+                    dit.forward(&inputs, &[], step_sparse.as_ref())?
+                }
+                #[cfg(feature = "metal")]
+                {
+                    prepared.forward(&inputs, &[], step_sparse.as_ref())?
+                }
+            }
         };
-        #[cfg(feature = "metal")]
-        let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref())?;
         euler_step(
             &mut video.data,
             &outputs.video,
@@ -806,7 +814,7 @@ fn encode_pictures(
 #[cfg(feature = "cuda")]
 struct ShardTarget {
     workers: Vec<crate::worker::Worker>,
-    shard: mmh3_cuda::shard::Shard,
+    shard: mmh3_core::shard::Shard,
     tokens: usize,
     gated: bool,
     open: Vec<mmh3_core::worker::OpenSession>,
@@ -816,7 +824,7 @@ struct ShardTarget {
 /// Connects to the workers a shared-out run would use and names the DiT it will share, so that
 /// they read it while this machine still has a prompt to encode. The connections are the ones the
 /// session opens on, since what a worker reads early is only there for the connection it came on.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn prepare_workers(
     settings: &Settings,
     options: &HashMap<&str, &str>,
@@ -868,12 +876,12 @@ fn prepare_workers(
 }
 
 /// The first worker that can take a share of the DiT, or `None` to keep the whole step here.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[allow(clippy::too_many_arguments)]
 fn shard_target(
     settings: &Settings,
     options: &HashMap<&str, &str>,
-    dit: &mmh3_cuda::dit::CudaDit,
+    dit: &crate::worker::Dit,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     context: &Tensor,
     context_modalities: &[mmh3_core::dit::timestep::Modality],
@@ -1103,19 +1111,19 @@ fn session_adapters(
 
 /// How a step is shared out, which is either with another machine or, for `--shard-dit 1`, with
 /// nobody at all so that the machinery can be timed on its own.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 enum Sharing<'a> {
-    With(Box<crate::worker::Exchanger<'a>>, mmh3_cuda::shard::Shard),
-    Alone(mmh3_cuda::shard::WholeExchange, mmh3_cuda::shard::Shard),
+    With(Box<crate::worker::Exchanger<'a>>, mmh3_core::shard::Shard),
+    Alone(crate::worker::SoleExchange, mmh3_core::shard::Shard),
 }
 
 /// The shard of a run that shares a step with nobody. One rank covers the whole sequence and every
 /// head, so the result is the whole step's, and what is left is the gathers and the waits.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 #[allow(clippy::too_many_arguments)]
 fn alone_shard(
     options: &HashMap<&str, &str>,
-    dit: &mmh3_cuda::dit::CudaDit,
+    dit: &crate::worker::Dit,
     context: &Tensor,
     video: &Tensor,
     audio: &Tensor,

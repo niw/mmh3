@@ -59,9 +59,14 @@ type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
 type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
 /// The DiT a rank runs its share of a step on.
 #[cfg(feature = "cuda")]
-type Dit = mmh3_cuda::dit::CudaDit;
+pub(crate) type Dit = mmh3_cuda::dit::CudaDit;
 #[cfg(feature = "metal")]
-type Dit = mmh3_metal::dit::MetalDit;
+pub(crate) type Dit = mmh3_metal::dit::MetalDit;
+/// The exchange a rank uses when it shares a step with nobody.
+#[cfg(feature = "cuda")]
+pub(crate) type SoleExchange = mmh3_cuda::shard::WholeExchange;
+#[cfg(feature = "metal")]
+pub(crate) type SoleExchange = mmh3_metal::shard::WholeExchange;
 /// A decoder and the tile geometry it was built for, which a request may change.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 type ResidentDecoder = Option<(u64, usize, usize, VideoDecoder)>;
@@ -3045,7 +3050,7 @@ fn serve_shard(
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Worker {
     /// This worker as a rank of a shared-out run, with the session opened on it. Nothing else may
     /// use the worker while the exchanger lives, since from here on the ranks barrier and read
@@ -3062,6 +3067,7 @@ impl Worker {
             rdma,
             ..
         } = self;
+        #[cfg(feature = "cuda")]
         let link = rdma.as_ref();
         worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
         Ok(Peer {
@@ -3077,7 +3083,7 @@ impl Worker {
 
 /// Opens a run on every worker and stands the leader's side of it up. The workers take ranks 1
 /// upwards in the order they are given, which is the order `OpenSession` named them.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn open_shard<'a>(
     workers: &'a mut [Worker],
     opens: &[OpenSession],
@@ -3231,7 +3237,7 @@ pub fn session_payload(
 
 /// One step of a shared-out run from the leader's side: hand out the latents, take this rank's
 /// share, and collect what the others ended with.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn step_shard(
     exchanger: &mut Exchanger<'_>,
     dit: &mmh3_cuda::dit::CudaDit,
