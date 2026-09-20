@@ -18,7 +18,7 @@ use crate::model::{
 use crate::nvfp4::{
     self, AdapterSource, Columns, Nvfp4Activations, Nvfp4Input, Nvfp4Scale, Nvfp4Weight,
 };
-use crate::shard::{self, Region, ShardContext};
+use crate::shard::{self, Region, ShardContext, VelocityRows};
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -267,15 +267,6 @@ pub enum LoraMode {
     Merge,
 }
 
-/// One rank's rows of the velocity, before the video goes back into its own order. Only a shared-out
-/// step produces these, and `assemble_velocity` turns them back into a whole one.
-#[derive(Clone, Debug)]
-pub struct VelocityPart {
-    pub rows: Range<usize>,
-    pub video: Vec<f32>,
-    pub audio: Vec<f32>,
-}
-
 /// Outputs of one call and the states captured along the way.
 pub struct DitOutputs {
     /// Residual stream `[tokens, hidden]` after each requested block.
@@ -287,7 +278,7 @@ pub struct DitOutputs {
     /// Mean fraction of key blocks Sol-Attn routed exactly, over the blocks, when it ran.
     pub routed_fraction: Option<f64>,
     /// This rank's rows, when the step was shared out. The velocity above is then empty.
-    pub part: Option<VelocityPart>,
+    pub part: Option<VelocityRows>,
 }
 
 /// Block-sparse attention for the blocks of one call.
@@ -2356,7 +2347,7 @@ impl CudaDit {
                 video: Vec::new(),
                 audio: Vec::new(),
                 routed_fraction: None,
-                part: Some(VelocityPart {
+                part: Some(VelocityRows {
                     rows: rows.clone(),
                     video: video_velocity,
                     audio: audio_velocity,
@@ -2388,7 +2379,7 @@ impl CudaDit {
         &self,
         inputs: &DitInputs,
         sparse: Option<&SparseAttention>,
-        parts: &[VelocityPart],
+        parts: &[VelocityRows],
     ) -> Result<DitOutputs, Error> {
         let config = &self.config;
         let layout = PackedLayout::for_inputs(inputs);
@@ -2404,7 +2395,7 @@ impl CudaDit {
             });
         let gather = |segment: mmh3_core::dit::layout::Segment,
                       width: usize,
-                      take: &dyn Fn(&VelocityPart) -> &Vec<f32>|
+                      take: &dyn Fn(&VelocityRows) -> &Vec<f32>|
          -> Result<Vec<f32>, Error> {
             let mut values = vec![0.0f32; segment.len() * width];
             let mut covered = 0;

@@ -16,6 +16,25 @@ use std::ops::Range;
 /// Values in one attention head, which every backend lays out the same way.
 pub const HEAD_DIM: usize = 128;
 
+/// One rank's rows of the velocity a shared-out step produces, before the video goes back into
+/// its own order. Every backend answers with this and the leader puts the rows together, so it is
+/// named here rather than twice.
+///
+/// Not to be confused with `worker::VelocityPart`, which is the handful of numbers describing
+/// these rows on the wire.
+///
+/// NOTE: these are the projections as the final layer leaves them, NOT the velocity. A whole step
+/// answers with the velocity, which is their negation, but a rank answers with them as they are
+/// and the leader negates once when it assembles the parts. A rank that negates its own rows
+/// sends them back the wrong way, and rows driven away from the data look like rows that were
+/// never diffused at all, which is a long way from where the sign is.
+#[derive(Clone, Debug)]
+pub struct VelocityRows {
+    pub rows: Range<usize>,
+    pub video: Vec<f32>,
+    pub audio: Vec<f32>,
+}
+
 /// What a transport could not do, in its own words. A backend turns this into whatever its own
 /// calls answer with.
 #[derive(Clone, Debug, PartialEq, Eq)]

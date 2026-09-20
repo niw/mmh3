@@ -13,7 +13,9 @@ use crate::{CudaError, DeviceBuffer, check};
 /// The split, the regions and the transport are the same words on every backend, so they live in
 /// mmh3-core and this module is the CUDA side of them: the gathers, the timing and the exchange a
 /// run uses when it shares a step with nobody.
-pub use mmh3_core::shard::{Exchange, ExchangeError, HEAD_DIM, Region, Shard, regions};
+pub use mmh3_core::shard::{
+    Exchange, ExchangeError, HEAD_DIM, Region, Shard, VelocityRows, regions,
+};
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::ops::Range;

@@ -1491,6 +1491,8 @@ struct Socket<'a> {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Peer<'a> {
     pub rank: usize,
+    /// Which backend this peer runs, as `Welcome` named it.
+    pub backend: u8,
     reader: &'a mut BufReader<TcpStream>,
     writer: &'a mut BufWriter<TcpStream>,
     /// The connection to this peer, where the path between the two machines has one and this
@@ -1655,6 +1657,9 @@ pub struct Exchanger<'a> {
     links: HashMap<usize, LinkOf<'a>>,
     /// The memory a peer's writes land in.
     regions: HashMap<shard::Region, Held>,
+    /// The backend each peer runs, which decides whether its choices are comparable with this
+    /// rank's at all.
+    backends: HashMap<usize, u8>,
     /// What a peer with no connection is owed, until the barrier that sends it.
     pending: HashMap<usize, Vec<Queued>>,
     /// Where this rank's blocks compute. Attention reads its inputs once per query tile, so a
@@ -1753,9 +1758,11 @@ impl<'a> Exchanger<'a> {
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
         let mut sockets = HashMap::new();
+        let mut backends = HashMap::new();
         #[cfg(feature = "cuda")]
         let mut links = HashMap::new();
         for peer in peers {
+            backends.insert(peer.rank, peer.backend);
             #[cfg(feature = "cuda")]
             if let Some(link) = peer.link {
                 links.insert(peer.rank, LinkOf::Held(link));
@@ -1775,6 +1782,7 @@ impl<'a> Exchanger<'a> {
             #[cfg(feature = "cuda")]
             links,
             regions: HashMap::new(),
+            backends,
             pending: HashMap::new(),
             computed: Computed::default(),
             peers: HashMap::new(),
@@ -1959,9 +1967,14 @@ impl<'a> Exchanger<'a> {
                 let (header, body) = self.receive(peer)?;
                 self.expect(header, Kind::SessionReady, &body)?;
                 let ready = worker::SessionReady::decode(&body)?;
-                // A rank that took none of them times its own candidates, so the two may choose
-                // differently and the run is then only what these machines together produce.
-                if ready.algorithms == 0 && algorithms > 0 {
+                // A CUDA rank that took none of them times its own candidates, so the two may
+                // choose differently and the run is then only what these machines together
+                // produce. A rank on another backend never had them to take, which is ordinary
+                // and says nothing: warning there would make a Mac warn on every run.
+                if ready.algorithms == 0
+                    && algorithms > 0
+                    && self.backends.get(&peer) == Some(&worker::BACKEND_CUDA)
+                {
                     println!(
                         "rank {peer} took none of the {algorithms} cuBLASLt algorithms, so it \
                          chooses its own"
@@ -2627,6 +2640,9 @@ fn serve_shard(
     // the connections to the other ranks come out of the rendezvous.
     let peers = vec![Peer {
         rank: 0,
+        // A worker never compares its choices with the leader's, so it does not need to be told
+        // which backend the leader runs. Only the leader reads this, about its workers.
+        backend: 0,
         reader,
         writer,
         link: connection,
@@ -2721,6 +2737,7 @@ impl Worker {
         worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
         Ok(Peer {
             rank,
+            backend: self.welcome.backend,
             reader,
             writer,
             link,
@@ -2929,7 +2946,7 @@ pub fn step_shard(
             .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
             .collect();
         let split = part.video_values as usize;
-        parts.push(mmh3_cuda::dit::VelocityPart {
+        parts.push(shard::VelocityRows {
             rows: part.first_row as usize..part.last_row as usize,
             video: floats[..split].to_vec(),
             audio: floats[split..].to_vec(),
