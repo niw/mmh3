@@ -1495,6 +1495,77 @@ pub struct Peer<'a> {
     link: Option<&'a Rdma>,
 }
 
+/// What a block addresses a region by: a pointer where this backend reaches its memory by one.
+#[cfg(feature = "cuda")]
+type BlockMemory = *mut std::ffi::c_void;
+
+/// Where a rank's blocks compute, beside the host memory its peers write into. This is the whole
+/// of what an exchange does differently from one backend to the next: the sockets above it, the
+/// queueing, the order two ranks send in and the barriers are the same everywhere.
+///
+/// A backend that cannot compute in the memory a peer writes to keeps its own beside each region
+/// and copies between the two. One that can answers with that memory and copies nothing.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct Computed(HashMap<shard::Region, mmh3_cuda::DeviceBuffer>);
+
+#[cfg(feature = "cuda")]
+impl Computed {
+    /// Memory for a region a block computes in, kept for the run. Regions a block only exchanges
+    /// through are not given any: they are read and written where the peer left them.
+    fn make(&mut self, region: shard::Region, bytes: usize) -> Result<(), Box<dyn Error>> {
+        if region.is_computed_in() {
+            self.0
+                .insert(region, mmh3_cuda::DeviceBuffer::zeroed(bytes)?);
+        }
+        Ok(())
+    }
+
+    /// Whether this backend holds memory of its own for `region`, and so has something to copy.
+    fn holds(&self, region: shard::Region) -> bool {
+        self.0.contains_key(&region)
+    }
+
+    /// What a block addresses `region` by. `held` is the host memory a peer writes into, which a
+    /// backend with nothing of its own beside it answers with.
+    fn memory(&self, region: shard::Region, held: &mut [u8]) -> BlockMemory {
+        match self.0.get(&region) {
+            Some(buffer) => buffer.pointer(),
+            None => held.as_mut_ptr().cast(),
+        }
+    }
+
+    /// Copies what a block computed in `region` into `into`, which is what a peer reads.
+    fn download(
+        &self,
+        region: shard::Region,
+        offset: usize,
+        into: &mut [u8],
+    ) -> Result<(), shard::ExchangeError> {
+        let Some(buffer) = self.0.get(&region) else {
+            return Ok(());
+        };
+        // SAFETY: this buffer is as long as the held one, so the same range fits both.
+        unsafe { mmh3_cuda::download(into, buffer.pointer().byte_add(offset)) }
+            .map_err(|error| exchange_error(format!("taking {region:?} off the device: {error}")))
+    }
+
+    /// Copies what a peer wrote into the memory a block computes in.
+    fn upload(
+        &self,
+        region: shard::Region,
+        offset: usize,
+        from: &[u8],
+    ) -> Result<(), shard::ExchangeError> {
+        let Some(buffer) = self.0.get(&region) else {
+            return Ok(());
+        };
+        // SAFETY: as `download`.
+        unsafe { mmh3_cuda::upload(buffer.pointer().byte_add(offset), from) }
+            .map_err(|error| exchange_error(format!("putting {region:?} on the device: {error}")))
+    }
+}
+
 /// One rank's side of the exchanges a shared-out step makes. Every rank builds the same thing: the
 /// sockets carry the barriers, the connections carry the payloads, and every region is registered
 /// once before the first block because registering hundreds of megabytes costs far more than
@@ -1515,9 +1586,9 @@ pub struct Exchanger<'a> {
     regions: HashMap<shard::Region, Held>,
     /// What a peer with no connection is owed, until the barrier that sends it.
     pending: HashMap<usize, Vec<Queued>>,
-    /// The regions a block computes in, which have to be device memory: attention reads its inputs
-    /// once per query tile, and doing that over host memory costs seven times as much.
-    computed: HashMap<shard::Region, mmh3_cuda::DeviceBuffer>,
+    /// Where this rank's blocks compute. Attention reads its inputs once per query tile, so a
+    /// backend that would do that over host memory pays about seven times as much.
+    computed: Computed,
     peers: HashMap<(usize, shard::Region), worker::RemoteRegion>,
 }
 
@@ -1626,7 +1697,7 @@ impl<'a> Exchanger<'a> {
             links,
             regions: HashMap::new(),
             pending: HashMap::new(),
-            computed: HashMap::new(),
+            computed: Computed::default(),
             peers: HashMap::new(),
         };
         exchanger.link_peers()?;
@@ -1761,10 +1832,7 @@ impl<'a> Exchanger<'a> {
                 keys,
             });
             self.regions.insert(region, held);
-            if region.is_computed_in() {
-                self.computed
-                    .insert(region, mmh3_cuda::DeviceBuffer::zeroed(bytes)?);
-            }
+            self.computed.make(region, bytes)?;
         }
         let table = if self.rank > 0 {
             self.send(
@@ -1994,7 +2062,7 @@ impl Exchanger<'_> {
 
 #[cfg(feature = "cuda")]
 impl shard::Exchange for Exchanger<'_> {
-    type Memory = *mut std::ffi::c_void;
+    type Memory = BlockMemory;
 
     fn rank(&self) -> usize {
         self.rank
@@ -2008,10 +2076,10 @@ impl shard::Exchange for Exchanger<'_> {
         &mut self,
         region: shard::Region,
         bytes: usize,
-    ) -> Result<*mut std::ffi::c_void, shard::ExchangeError> {
+    ) -> Result<BlockMemory, shard::ExchangeError> {
         let held = self
             .regions
-            .get(&region)
+            .get_mut(&region)
             .ok_or_else(|| exchange_error(format!("no {region:?} was registered")))?;
         if held.bytes() < bytes {
             return Err(exchange_error(format!(
@@ -2019,16 +2087,7 @@ impl shard::Exchange for Exchanger<'_> {
                 held.bytes()
             )));
         }
-        match self.computed.get(&region) {
-            Some(device) => Ok(device.pointer()),
-            None => Ok(self
-                .regions
-                .get_mut(&region)
-                .expect("just found")
-                .as_mut_slice()
-                .as_mut_ptr()
-                .cast()),
-        }
+        Ok(self.computed.memory(region, held.as_mut_slice()))
     }
 
     fn publish(
@@ -2037,9 +2096,9 @@ impl shard::Exchange for Exchanger<'_> {
         offset: usize,
         bytes: usize,
     ) -> Result<(), shard::ExchangeError> {
-        let Some(device) = self.computed.get(&region) else {
+        if !self.computed.holds(region) {
             return Ok(());
-        };
+        }
         let held = self
             .regions
             .get_mut(&region)
@@ -2050,15 +2109,11 @@ impl shard::Exchange for Exchanger<'_> {
                 held.bytes()
             )));
         }
-        // SAFETY: the device buffer is as long as the registered one, so the same range fits.
-        unsafe {
-            mmh3_cuda::download(
-                &mut held.as_mut_slice()[offset..offset + bytes],
-                device.pointer().byte_add(offset),
-            )
-            .map_err(|error| exchange_error(format!("taking {region:?} off the device: {error}")))?
-        };
-        Ok(())
+        self.computed.download(
+            region,
+            offset,
+            &mut held.as_mut_slice()[offset..offset + bytes],
+        )
     }
 
     fn receive(
@@ -2067,9 +2122,9 @@ impl shard::Exchange for Exchanger<'_> {
         offset: usize,
         bytes: usize,
     ) -> Result<(), shard::ExchangeError> {
-        let Some(device) = self.computed.get(&region) else {
+        if !self.computed.holds(region) {
             return Ok(());
-        };
+        }
         let held = self
             .regions
             .get(&region)
@@ -2080,15 +2135,8 @@ impl shard::Exchange for Exchanger<'_> {
                 held.bytes()
             )));
         }
-        // SAFETY: the device buffer is as long as the registered one, so the same range fits.
-        unsafe {
-            mmh3_cuda::upload(
-                device.pointer().byte_add(offset),
-                &held.as_slice()[offset..offset + bytes],
-            )
-            .map_err(|error| exchange_error(format!("putting {region:?} on the device: {error}")))?
-        };
-        Ok(())
+        self.computed
+            .upload(region, offset, &held.as_slice()[offset..offset + bytes])
     }
 
     fn write(
