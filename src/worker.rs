@@ -1482,7 +1482,8 @@ fn describe_protocol(theirs: u32, who: &str) -> String {
     )
 }
 
-/// The host part of `address`, which is what a peer dials when the leader passes it on.
+/// The host part of `address`. It is what the OTHER ranks dial, not what the leader reached this
+/// one at, and the two are the same for every machine except the one the leader is running on.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn host_of(address: &str) -> String {
     match address.rsplit_once(':') {
@@ -2251,11 +2252,25 @@ impl Exchanger<'_> {
         Ok(())
     }
 
+    /// Whether this rank writes into `peer`'s memory rather than sending to it. A backend with no
+    /// transport of its own reaches nobody this way, which is what leaves every write to a socket.
+    fn reaches_memory(&self, peer: usize) -> bool {
+        #[cfg(feature = "cuda")]
+        {
+            self.links.contains_key(&peer)
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = peer;
+            false
+        }
+    }
+
     /// Whether this rank already has a socket to `peer`, which is the one the session opened
     /// where there is one.
     ///
-    /// A connection into a peer's memory does not count. Every pair needs a socket whether or not
-    /// it has one, because the barriers and the writes that wait for them go down it: the
+    /// Reaching a peer's memory does not count. Every pair needs a socket whether or not it has a
+    /// connection, because the barriers and the writes that wait for them go down it: a
     /// connection carries payloads and says nothing about when they arrive.
     fn reaches(&self, peer: usize) -> bool {
         self.sockets.contains_key(&peer)
@@ -2264,10 +2279,7 @@ impl Exchanger<'_> {
     /// Whether what this rank owes `peer` goes down a socket. Every pair has one or the other
     /// after the rendezvous, so this is the ranks a connection does not already reach.
     fn over_socket(&self, peer: usize) -> bool {
-        #[cfg(feature = "cuda")]
-        return !self.links.contains_key(&peer);
-        #[cfg(not(feature = "cuda"))]
-        true
+        !self.reaches_memory(peer)
     }
 
     /// Sends every write this rank owes and takes in what it is owed, over the sockets. A pair
