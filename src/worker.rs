@@ -3,6 +3,10 @@
 //! role and confirm them by digest.
 
 use mmh3_core::safetensors::SafeTensors;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use mmh3_core::shard;
+#[cfg(feature = "cuda")]
+use mmh3_core::shard::Shard;
 use mmh3_core::tensor::Tensor;
 #[cfg(feature = "cuda")]
 use mmh3_core::worker::OpenSession;
@@ -11,8 +15,6 @@ use mmh3_core::worker::{
     CAPABILITY_ENCODE_TEXT, Canvas, Checkpoint, DecodeAudio, DecodeVideo, EncodeText, Header,
     Hello, Kind, Samples, TRANSPORT_TCP, TextStates, Welcome,
 };
-#[cfg(feature = "cuda")]
-use mmh3_cuda::shard::{self, Shard};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufReader, BufWriter};
@@ -1566,6 +1568,76 @@ impl Computed {
     }
 }
 
+/// What a block addresses a region by on Metal: the memory itself, since a Metal buffer belongs
+/// to the context that made it and a host pointer is not one.
+// NOTE: nothing calls this yet. `Exchanger` and the transport around it are still CUDA's, so the
+// Metal half of the seam compiles and is reached by nobody. The allow goes when they are un-gated.
+#[cfg(feature = "metal")]
+#[allow(dead_code)]
+type BlockMemory = mmh3_metal::shard::Memory;
+
+/// Where a rank's blocks compute, beside the host memory its peers write into.
+///
+/// Metal keeps its own memory for EVERY region rather than only the computed-in ones, and copies
+/// for all of them. It has no choice: a block cannot compute in the host buffer a peer writes to,
+/// because a buffer belongs to the context that made it and `held` is plain memory. So `memory`
+/// has no fallback to give, and the invariant that every registered region was made at session
+/// open is what holds it up rather than a convenience.
+#[cfg(feature = "metal")]
+#[derive(Default)]
+#[allow(dead_code)]
+struct Computed(HashMap<shard::Region, mmh3_metal::shard::Memory>);
+
+#[cfg(feature = "metal")]
+#[allow(dead_code)]
+impl Computed {
+    fn make(&mut self, region: shard::Region, bytes: usize) -> Result<(), Box<dyn Error>> {
+        let device = mmh3_metal::Device::shared()?;
+        self.0
+            .insert(region, mmh3_metal::shard::Memory::zeroed(&device, bytes)?);
+        Ok(())
+    }
+
+    fn holds(&self, region: shard::Region) -> bool {
+        self.0.contains_key(&region)
+    }
+
+    fn memory(&self, region: shard::Region, _held: &mut [u8]) -> BlockMemory {
+        self.0
+            .get(&region)
+            .cloned()
+            .expect("every registered region is made when the session opens")
+    }
+
+    fn download(
+        &self,
+        region: shard::Region,
+        offset: usize,
+        into: &mut [u8],
+    ) -> Result<(), shard::ExchangeError> {
+        let Some(memory) = self.0.get(&region) else {
+            return Ok(());
+        };
+        memory
+            .read_bytes(offset, into)
+            .map_err(|error| exchange_error(format!("taking {region:?} off the device: {error}")))
+    }
+
+    fn upload(
+        &self,
+        region: shard::Region,
+        offset: usize,
+        from: &[u8],
+    ) -> Result<(), shard::ExchangeError> {
+        let Some(memory) = self.0.get(&region) else {
+            return Ok(());
+        };
+        memory
+            .write_bytes(offset, from)
+            .map_err(|error| exchange_error(format!("putting {region:?} on the device: {error}")))
+    }
+}
+
 /// One rank's side of the exchanges a shared-out step makes. Every rank builds the same thing: the
 /// sockets carry the barriers, the connections carry the payloads, and every region is registered
 /// once before the first block because registering hundreds of megabytes costs far more than
@@ -1926,7 +1998,8 @@ impl<'a> Exchanger<'a> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[cfg_attr(not(feature = "cuda"), allow(dead_code))]
 fn exchange_error(message: String) -> shard::ExchangeError {
     shard::ExchangeError(message)
 }

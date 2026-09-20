@@ -155,6 +155,29 @@ impl Device {
         check(unsafe { mmh3_metal_synchronize(self.0.0.as_ptr()) })
     }
 
+    /// The device this thread computes on, made on the first ask and kept.
+    ///
+    /// A buffer belongs to the context that made it and no other context may read it, so memory a
+    /// block computes in and memory an exchange hands round have to come from one device. Making
+    /// a second one also pays to compile the kernels again, which is not free.
+    pub fn shared() -> Result<Self> {
+        thread_local! {
+            static SHARED: std::cell::RefCell<Option<Device>> =
+                const { std::cell::RefCell::new(None) };
+        }
+
+        SHARED.with(|shared| {
+            let mut shared = shared.borrow_mut();
+            match shared.as_ref() {
+                Some(device) => Ok(device.clone()),
+                None => {
+                    let device = Self::new()?;
+                    Ok(shared.insert(device).clone())
+                }
+            }
+        })
+    }
+
     pub fn new() -> Result<Self> {
         let source = CString::new(include_str!("../kernels/ops.metal")).unwrap();
         let tensor_source = CString::new(include_str!("../kernels/matmul.metal")).unwrap();
@@ -248,6 +271,21 @@ impl Drop for Allocation {
 #[derive(Clone)]
 pub(crate) struct Buffer(Rc<Allocation>);
 impl Buffer {
+    /// The bytes this buffer holds, which is how a region reaches the host memory a peer reads.
+    pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
+        self.0.device.synchronize()?;
+        let mut data = vec![0u8; self.0.bytes];
+        // SAFETY: the destination covers the entire allocation. Commands have completed.
+        unsafe {
+            mmh3_metal_read(
+                self.0.pointer.as_ptr(),
+                data.as_mut_ptr().cast(),
+                self.0.bytes,
+            )
+        }
+        Ok(data)
+    }
+
     pub(crate) fn to_f32(&self) -> Result<Vec<f32>> {
         self.0.device.synchronize()?;
         let mut data = vec![0.0; self.0.bytes / 4];

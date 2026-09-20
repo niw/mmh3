@@ -37,7 +37,7 @@ impl Weights {
         prefix: &str,
         keep: impl Fn(&str) -> bool,
     ) -> Result<Self> {
-        let device = Device::new()?;
+        let device = Device::shared()?;
         let mut tensors = HashMap::new();
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(prefix) else {

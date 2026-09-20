@@ -142,6 +142,28 @@ impl Memory {
         )
     }
 
+    /// Reads `into.len()` bytes from `offset` bytes in, which is how what a block computed
+    /// reaches the host memory a peer reads.
+    pub fn read_bytes(&self, offset: usize, into: &mut [u8]) -> Result<()> {
+        self.check_bytes(offset, into.len())?;
+        let part = Self::zeroed(&self.device, into.len())?;
+        part.copy_from(self, offset, 0, into.len())?;
+        into.copy_from_slice(&part.buffer.to_bytes()?);
+        Ok(())
+    }
+
+    /// Writes `from` at `offset` bytes in, which is how what a peer wrote reaches the memory a
+    /// block computes in.
+    pub fn write_bytes(&self, offset: usize, from: &[u8]) -> Result<()> {
+        self.check_bytes(offset, from.len())?;
+        let part = Self {
+            device: self.device.clone(),
+            buffer: self.device.alloc(from.len(), Some(from))?,
+            bytes: from.len(),
+        };
+        self.copy_from(&part, 0, offset, from.len())
+    }
+
     pub(crate) fn buffer(&self) -> &Buffer {
         &self.buffer
     }
