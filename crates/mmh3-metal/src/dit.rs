@@ -666,7 +666,7 @@ mod tests {
     /// The real checkpoint with the turbo LoRA on it, or nothing when the models are not here.
     /// The tiny fixture cannot stand in: ConvRot wants a multiple of 256 features and its weights
     /// are FP32 rather than INT8, so it fails the sharded path on both counts.
-    fn checkpoint() -> Option<MetalDit> {
+    fn checkpoint(with_lora: bool) -> Option<MetalDit> {
         let models = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../../models"));
         let path = models.join("diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors");
         if !path.exists() {
@@ -682,24 +682,22 @@ mod tests {
         // cannot take a share of a real step.
         let lora =
             models.join("loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors");
-        // NOTE: MMH3_TEST_NO_LORA runs these without one, which is how the divergence below was
-        // narrowed to an adapted step rather than a sharded one.
-        if lora.exists() && std::env::var_os("MMH3_TEST_NO_LORA").is_none() {
+        if with_lora && lora.exists() {
             let added = dit
                 .add_lora(&SafeTensors::open(&lora).unwrap(), 1.0)
                 .unwrap();
             eprintln!("{added} adapted layers");
-        } else {
-            eprintln!("no LoRA at {}, running without one", lora.display());
         }
         Some(dit)
     }
 
-    /// Diagnostic: the one layer an exchanged input reaches, compared straight across.
+    /// The one layer an exchanged input reaches, with an adapter on it, against the same layer
+    /// given the rows a block would have had. This is where the adapted path can be checked
+    /// honestly: one layer, with no fifty blocks of amplification behind it.
     #[test]
-    #[ignore = "diagnostic"]
-    fn diagnose_one_layer() {
-        let Some(mut dit) = checkpoint() else {
+    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
+    fn an_exchanged_input_projects_to_what_the_block_would_have() {
+        let Some(mut dit) = checkpoint(true) else {
             return;
         };
         dit.set_linear_precision(crate::LinearPrecision::Int8)
@@ -738,36 +736,25 @@ mod tests {
             .zip(here.iter())
             .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
         eprintln!(
-            "qkv_proj: worst {worst:.6} of {largest:.6}, {:.3}%",
+            "qkv_proj: worst {worst:.6} of {largest:.6}, {:.4}%",
             100.0 * worst / largest
+        );
+        assert!(
+            worst <= largest * 1e-5,
+            "worst {worst} of a largest of {largest}"
         );
     }
 
-    /// A whole step through the sharded path, one rank sharing with nobody, against the same step
-    /// through the ordinary one. This is every block rather than one, so it is where a mistake in
-    /// the rows a rank carries or in the tables sliced to them would show, which attending a
-    /// single block cannot see.
-    #[test]
-    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
-    fn one_rank_runs_a_whole_step_as_a_whole_one_does() {
-        let Some(mut dit) = checkpoint() else {
-            return;
-        };
-        // The exchange carries a block's input as INT8. A step that is not shared runs its
-        // activations at whatever road it is on, so only the INT8 road is the same arithmetic.
-        dit.set_linear_precision(crate::LinearPrecision::Int8)
-            .unwrap();
-
-        let c = dit.config.clone();
+    /// The smallest latent the layout accepts, to keep a fifty-block step short.
+    fn sample_inputs(c: &DitConfig) -> DitInputs {
         let ramp = |count: usize, step: usize, modulus: usize| -> Vec<f32> {
             (0..count)
                 .map(|i| ((i * step) % modulus) as f32 / modulus as f32 - 0.5)
                 .collect()
         };
-        // The smallest latent the layout accepts, to keep a 50-block step short.
         let video_shape = vec![c.video_channels, 1, 2, 2];
         let audio_shape = vec![c.audio_channels, 2, 4];
-        let inputs = DitInputs {
+        DitInputs {
             video: Tensor::new(
                 video_shape.clone(),
                 ramp(video_shape.iter().product(), 31, 251),
@@ -783,7 +770,71 @@ mod tests {
             sigma: 0.5,
             shift_video: 6.0,
             shift_audio: 3.0,
+        }
+    }
+
+    /// How far apart two ordinary steps land when their inputs differ by a part in a million.
+    /// This is here to stop anyone, including me, reading a whole step's output as a check on a
+    /// path: at this sensitivity such a comparison measures the model and not the code. It asserts
+    /// that the sensitivity is large, so if the model ever stops behaving this way, the reasoning
+    /// the test beside it rests on stops being true and this says so.
+    #[test]
+    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
+    fn sensitivity_makes_a_whole_step_useless_as_a_comparison() {
+        let Some(mut dit) = checkpoint(true) else {
+            return;
         };
+        dit.set_linear_precision(crate::LinearPrecision::Int8)
+            .unwrap();
+        let c = dit.config.clone();
+        let mut inputs = sample_inputs(&c);
+        let first = dit.forward(&inputs, &[], None).unwrap();
+
+        // A part in a million on one value of the latent.
+        inputs.video.data[0] += 1e-6 * inputs.video.data[0].abs().max(1e-3);
+        let second = dit.forward(&inputs, &[], None).unwrap();
+
+        let largest = first.video.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = second
+            .video
+            .iter()
+            .zip(first.video.iter())
+            .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+        eprintln!(
+            "a part in a million of one input moves the output by {worst:.6} of {largest:.6}, {:.3}%",
+            100.0 * worst / largest
+        );
+        assert!(
+            worst > largest * 0.1,
+            "the model no longer amplifies a part in a million, so a whole step may be a fair \
+             comparison after all: {worst} of {largest}"
+        );
+    }
+
+    /// A whole step through the sharded path, one rank sharing with nobody, against the same step
+    /// through the ordinary one. This is every block rather than one, so it is where a mistake in
+    /// the rows a rank carries or in the tables sliced to them would show, which attending a
+    /// single block cannot see.
+    ///
+    /// NOTE: no adapter here, and that is not laziness. Without one the two paths are the same
+    /// arithmetic on the same bytes and this is an equality, which is the strongest thing it could
+    /// be. With one they differ by the INT8 the exchange carries a block's input in, and
+    /// `sensitivity_makes_a_whole_step_useless_as_a_comparison` beside this shows that a
+    /// difference that small does not stay small. A threshold here would measure the model and not
+    /// the code. What the adapted path is worth is asserted where it can be, one layer at a time.
+    #[test]
+    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
+    fn one_rank_runs_a_whole_step_as_a_whole_one_does() {
+        let Some(mut dit) = checkpoint(false) else {
+            return;
+        };
+        // The exchange carries a block's input as INT8. A step that is not shared runs its
+        // activations at whatever road it is on, so only the INT8 road is the same arithmetic.
+        dit.set_linear_precision(crate::LinearPrecision::Int8)
+            .unwrap();
+
+        let c = dit.config.clone();
+        let inputs = sample_inputs(&c);
 
         let whole = dit.forward(&inputs, &[], None).unwrap();
         let tokens = PackedLayout::for_inputs(&inputs).len();
@@ -819,11 +870,7 @@ mod tests {
                 "{name}: worst {worst:.6} of {largest:.6}, {:.3}%",
                 100.0 * worst / largest.max(f32::MIN_POSITIVE)
             );
-            // NOTE: this asserts nothing yet. Without a LoRA the two paths agree bit for bit, and
-            // with one they do not, while the one layer an exchanged input reaches agrees bit for
-            // bit either way. Until that is understood, a threshold here would only be a guess at
-            // how wrong is acceptable, and the answer is that none of it is.
-            let _ = (worst, largest);
+            assert_eq!(worst, 0.0, "{name}: {worst} of a largest of {largest}");
         }
     }
 
@@ -836,7 +883,7 @@ mod tests {
     #[test]
     #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
     fn one_rank_attends_a_block_as_a_whole_one_does() {
-        let Some(dit) = checkpoint() else {
+        let Some(dit) = checkpoint(true) else {
             return;
         };
 
