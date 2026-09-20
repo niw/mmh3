@@ -5,7 +5,7 @@
 use mmh3_core::safetensors::SafeTensors;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::shard;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::shard::Shard;
 use mmh3_core::tensor::Tensor;
 #[cfg(feature = "cuda")]
@@ -1480,7 +1480,7 @@ fn memory_bytes() -> u64 {
 
 /// One rank's socket to another: every peer for the leader, the leader alone for a worker, since
 /// the barriers go through it and the workers never talk to each other over TCP.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 struct Socket<'a> {
     reader: &'a mut BufReader<TcpStream>,
     writer: &'a mut BufWriter<TcpStream>,
@@ -1488,12 +1488,14 @@ struct Socket<'a> {
 
 /// What one rank brings to a shared-out run: its socket to the leader or, for the leader, to each
 /// worker, and the connection the payloads travel over.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Peer<'a> {
     pub rank: usize,
     reader: &'a mut BufReader<TcpStream>,
     writer: &'a mut BufWriter<TcpStream>,
-    /// The connection to this peer, where the path between the two machines has one.
+    /// The connection to this peer, where the path between the two machines has one and this
+    /// backend can use it.
+    #[cfg(feature = "cuda")]
     link: Option<&'a Rdma>,
 }
 
@@ -1570,10 +1572,7 @@ impl Computed {
 
 /// What a block addresses a region by on Metal: the memory itself, since a Metal buffer belongs
 /// to the context that made it and a host pointer is not one.
-// NOTE: nothing calls this yet. `Exchanger` and the transport around it are still CUDA's, so the
-// Metal half of the seam compiles and is reached by nobody. The allow goes when they are un-gated.
 #[cfg(feature = "metal")]
-#[allow(dead_code)]
 type BlockMemory = mmh3_metal::shard::Memory;
 
 /// Where a rank's blocks compute, beside the host memory its peers write into.
@@ -1585,11 +1584,9 @@ type BlockMemory = mmh3_metal::shard::Memory;
 /// open is what holds it up rather than a convenience.
 #[cfg(feature = "metal")]
 #[derive(Default)]
-#[allow(dead_code)]
 struct Computed(HashMap<shard::Region, mmh3_metal::shard::Memory>);
 
 #[cfg(feature = "metal")]
-#[allow(dead_code)]
 impl Computed {
     fn make(&mut self, region: shard::Region, bytes: usize) -> Result<(), Box<dyn Error>> {
         let device = mmh3_metal::Device::shared()?;
@@ -1646,13 +1643,15 @@ impl Computed {
 /// The leader is rank 0 and holds a socket to every other rank. A worker holds one to the leader,
 /// so a barrier is a message to the leader and one back, and the addresses of the connections
 /// between two workers pass through it as well.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Exchanger<'a> {
     rank: usize,
     ranks: usize,
     sockets: HashMap<usize, Socket<'a>>,
     /// One connection per peer whose path has one, over which this rank writes into their memory.
-    /// A peer with none is written to over the socket instead.
+    /// A peer with none is written to over the socket instead, which is every peer on a backend
+    /// with no transport of its own.
+    #[cfg(feature = "cuda")]
     links: HashMap<usize, LinkOf<'a>>,
     /// The memory a peer's writes land in.
     regions: HashMap<shard::Region, Held>,
@@ -1667,16 +1666,18 @@ pub struct Exchanger<'a> {
 /// Memory a step exchanges through. Where this machine has a device to register it with, a peer
 /// writes into it from its own machine and nothing passes through the socket. Where it has not,
 /// which is every machine without a RoCE port, it is a plain buffer a peer fills down the socket.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 enum Held {
+    #[cfg(feature = "cuda")]
     Registered(Region),
     Plain(Vec<u8>),
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Held {
     fn bytes(&self) -> usize {
         match self {
+            #[cfg(feature = "cuda")]
             Held::Registered(region) => region.bytes(),
             Held::Plain(buffer) => buffer.len(),
         }
@@ -1684,6 +1685,7 @@ impl Held {
 
     fn as_slice(&self) -> &[u8] {
         match self {
+            #[cfg(feature = "cuda")]
             Held::Registered(region) => region.as_slice(),
             Held::Plain(buffer) => buffer,
         }
@@ -1691,6 +1693,7 @@ impl Held {
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
         match self {
+            #[cfg(feature = "cuda")]
             Held::Registered(region) => region.as_mut_slice(),
             Held::Plain(buffer) => buffer,
         }
@@ -1699,6 +1702,7 @@ impl Held {
     /// Where a peer writes it from its own machine, and nothing when only the socket reaches it.
     fn remote(&self) -> (u64, Vec<u32>) {
         match self {
+            #[cfg(feature = "cuda")]
             Held::Registered(region) => (region.address(), region.remote_keys().to_vec()),
             Held::Plain(_) => (0, Vec::new()),
         }
@@ -1707,7 +1711,7 @@ impl Held {
 
 /// One write a rank owes a peer it has no connection to, kept until the barrier sends it. The
 /// bytes stay where they are until then: the region they come from does not change in between.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 struct Queued {
     from: shard::Region,
     offset: usize,
@@ -1733,7 +1737,7 @@ impl LinkOf<'_> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl<'a> Exchanger<'a> {
     /// Stands a run up: the ranks that cannot reach each other over TCP swap the addresses of their
     /// connections through the leader, then every rank registers its regions and the leader passes
@@ -1749,8 +1753,13 @@ impl<'a> Exchanger<'a> {
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
         let mut sockets = HashMap::new();
+        #[cfg(feature = "cuda")]
         let mut links = HashMap::new();
         for peer in peers {
+            #[cfg(feature = "cuda")]
+            if let Some(link) = peer.link {
+                links.insert(peer.rank, LinkOf::Held(link));
+            }
             sockets.insert(
                 peer.rank,
                 Socket {
@@ -1758,27 +1767,45 @@ impl<'a> Exchanger<'a> {
                     writer: peer.writer,
                 },
             );
-            if let Some(link) = peer.link {
-                links.insert(peer.rank, LinkOf::Held(link));
-            }
         }
         let mut exchanger = Exchanger {
             rank,
             ranks,
             sockets,
+            #[cfg(feature = "cuda")]
             links,
             regions: HashMap::new(),
             pending: HashMap::new(),
             computed: Computed::default(),
             peers: HashMap::new(),
         };
+        #[cfg(feature = "cuda")]
         exchanger.link_peers()?;
         exchanger.register(shard, tokens, hidden, gated, algorithms)?;
         Ok(exchanger)
     }
 
+    /// The connection this rank writes into `peer`'s memory over, or nothing when the two have
+    /// only a socket between them and the bytes wait for a barrier instead.
+    #[cfg(feature = "cuda")]
+    fn link_to(
+        &self,
+        peer: usize,
+        into: shard::Region,
+        remote: &worker::RemoteRegion,
+    ) -> Result<Option<&Rdma>, shard::ExchangeError> {
+        match self.links.get(&peer) {
+            Some(_) if remote.keys.is_empty() => Err(exchange_error(format!(
+                "rank {peer} has a connection here but named no address for {into:?}"
+            ))),
+            Some(link) => Ok(Some(link.link())),
+            None => Ok(None),
+        }
+    }
+
     /// Opens a connection to every rank this one has no socket to, and connects it to the other
     /// end through the leader. With two ranks there is nothing to do.
+    #[cfg(feature = "cuda")]
     fn link_peers(&mut self) -> Result<(), Box<dyn Error>> {
         // A machine with no port opens no connection to anyone: its exchanges go down the socket,
         // and a peer that has a port cannot use one it has nothing to pair with.
@@ -1884,15 +1911,19 @@ impl<'a> Exchanger<'a> {
         // A machine with a port registers its memory, so a peer writes into it from its own
         // machine. One without gets plain buffers and its peers write down the socket: the table
         // carries no address for them, which is how a peer knows which way to send.
+        #[cfg(feature = "cuda")]
         let device = rdma_device();
         let mut table = Vec::new();
         for (region, bytes) in shard::regions(shard, tokens, hidden, gated) {
             // A region a block computes in gets a device buffer beside it, and the two are kept in
             // step by `publish` on the way out and by the copy that follows a read on the way in.
+            #[cfg(feature = "cuda")]
             let held = match device {
                 Some(device) => Held::Registered(device.register(vec![0u8; bytes])?),
                 None => Held::Plain(vec![0u8; bytes]),
             };
+            #[cfg(not(feature = "cuda"))]
+            let held = Held::Plain(vec![0u8; bytes]);
             let (kind, peer) = region.code();
             let (address, keys) = held.remote();
             table.push(worker::RemoteRegion {
@@ -2004,7 +2035,7 @@ fn exchange_error(message: String) -> shard::ExchangeError {
     shard::ExchangeError(message)
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Exchanger<'_> {
     /// Sends what every peer with no connection is owed and takes in what it owes this rank. The
     /// lower rank of a pair sends first and the higher takes first, since two ranks that both
@@ -2013,12 +2044,11 @@ impl Exchanger<'_> {
     /// Both ends of a pair decide this the same way: a rank with no port registers nothing, so it
     /// names no address, so neither side has a connection to the other and both queue.
     fn exchange_pending(&mut self) -> Result<(), shard::ExchangeError> {
-        let mut peers: Vec<usize> = self
-            .sockets
-            .keys()
-            .copied()
-            .filter(|peer| !self.links.contains_key(peer))
-            .collect();
+        let mut peers: Vec<usize> = self.sockets.keys().copied().collect();
+        // A peer this rank can write into the memory of is owed nothing here. There are no such
+        // peers on a backend with no transport of its own, where every write is already queued.
+        #[cfg(feature = "cuda")]
+        peers.retain(|peer| !self.links.contains_key(peer));
         peers.sort_unstable();
         for peer in peers {
             if self.rank < peer {
@@ -2133,7 +2163,7 @@ impl Exchanger<'_> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl shard::Exchange for Exchanger<'_> {
     type Memory = BlockMemory;
 
@@ -2238,48 +2268,40 @@ impl shard::Exchange for Exchanger<'_> {
         // A peer that named an address is written to from here. One that named none has no port,
         // so the bytes go down the socket, and they wait for the barrier that sends them: two
         // ranks writing to each other at once would fill both sockets and stop.
-        let link = match self.links.get(&peer) {
-            Some(_) if remote.keys.is_empty() => {
+        #[cfg(feature = "cuda")]
+        if let Some(link) = self.link_to(peer, into, &remote)? {
+            let held = self
+                .regions
+                .get(&from)
+                .ok_or_else(|| exchange_error(format!("no {from:?} was registered")))?;
+            let Held::Registered(held) = held else {
                 return Err(exchange_error(format!(
-                    "rank {peer} has a connection here but named no address for {into:?}"
+                    "{from:?} is not memory a connection can send"
                 )));
-            }
-            Some(link) => Some(link.link()),
-            None => None,
-        };
-        let Some(link) = link else {
-            if !self.sockets.contains_key(&peer) {
-                return Err(exchange_error(format!(
-                    "rank {peer} has neither a connection here nor a socket"
-                )));
-            }
-            self.pending.entry(peer).or_default().push(Queued {
-                from,
+            };
+            held.write_out(
+                link,
                 offset,
-                into,
-                peer_offset,
+                remote.address + peer_offset as u64,
+                &remote.keys,
                 bytes,
-            });
+                EXCHANGE_TIMEOUT,
+            )
+            .map_err(|error| exchange_error(format!("writing {into:?} of rank {peer}: {error}")))?;
             return Ok(());
-        };
-        let held = self
-            .regions
-            .get(&from)
-            .ok_or_else(|| exchange_error(format!("no {from:?} was registered")))?;
-        let Held::Registered(held) = held else {
+        }
+        if !self.sockets.contains_key(&peer) {
             return Err(exchange_error(format!(
-                "{from:?} is not memory a connection can send"
+                "rank {peer} has neither a connection here nor a socket"
             )));
-        };
-        held.write_out(
-            link,
+        }
+        self.pending.entry(peer).or_default().push(Queued {
+            from,
             offset,
-            remote.address + peer_offset as u64,
-            &remote.keys,
+            into,
+            peer_offset,
             bytes,
-            EXCHANGE_TIMEOUT,
-        )
-        .map_err(|error| exchange_error(format!("writing {into:?} of rank {peer}: {error}")))?;
+        });
         Ok(())
     }
 
@@ -2316,7 +2338,7 @@ impl shard::Exchange for Exchanger<'_> {
     }
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Exchanger<'_> {
     /// An ordinary message over the same socket the barriers use, so that a whole run goes through
     /// one exchanger and the regions are registered once rather than once a step.
