@@ -16,6 +16,15 @@ pub const CAPABILITY_DIT_SHARD: u32 = 1 << 3;
 pub const TRANSPORT_TCP: u32 = 1 << 0;
 pub const TRANSPORT_RDMA: u32 = 1 << 1;
 
+/// What the machines of one run have to agree on: the messages, their fields and the order two
+/// ranks send in. It goes up whenever any of those changes, and a rank that meets another number
+/// refuses the connection.
+///
+/// A checkpoint is matched by digest and a protocol is not, which is why this exists: a pair that
+/// disagrees about the wire does not fail, it waits, and two ranks each waiting for the other to
+/// speak look exactly like a slow machine.
+pub const PROTOCOL: u32 = 1;
+
 pub const BACKEND_CUDA: u8 = 1;
 pub const BACKEND_METAL: u8 = 2;
 
@@ -280,10 +289,14 @@ pub struct Hello {
     pub token: String,
     /// Where this side's reliable connection waits, when it has one.
     pub rdma: RdmaAddresses,
+    /// What this side speaks, see `PROTOCOL`. Zero from a build made before this was sent.
+    pub protocol: u32,
 }
 
 #[derive(Clone, Debug)]
 pub struct Welcome {
+    /// What this side speaks, see `PROTOCOL`. Zero from a build made before this was sent.
+    pub protocol: u32,
     pub backend: u8,
     pub device: String,
     pub memory_bytes: u64,
@@ -978,15 +991,22 @@ impl Hello {
         let mut encoder = Encoder::default();
         encoder.string(&self.leader).string(&self.token);
         encode_rdma(&mut encoder, &self.rdma);
+        // Last, so a build that does not know about it reads everything before it and ignores
+        // this, which is what turns a version difference into a refusal instead of a hang.
+        encoder.u32(self.protocol);
         encoder.finish()
     }
 
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let mut decoder = Decoder::new(bytes);
+        let leader = decoder.string()?;
+        let token = decoder.string()?;
+        let rdma = decode_rdma(&mut decoder)?;
         Ok(Hello {
-            leader: decoder.string()?,
-            token: decoder.string()?,
-            rdma: decode_rdma(&mut decoder)?,
+            leader,
+            token,
+            rdma,
+            protocol: decoder.u32().unwrap_or(0),
         })
     }
 }
@@ -1016,6 +1036,7 @@ impl Welcome {
             encoder.string(&checkpoint.role).u64(checkpoint.digest);
         }
         encode_rdma(&mut encoder, &self.rdma);
+        encoder.u32(self.protocol);
         encoder.finish()
     }
 
@@ -1043,6 +1064,7 @@ impl Welcome {
         }
         let rdma = decode_rdma(&mut decoder)?;
         Ok(Welcome {
+            protocol: decoder.u32().unwrap_or(0),
             backend,
             device,
             memory_bytes,
@@ -1231,9 +1253,30 @@ pub fn receive(reader: &mut impl Read, limit: u64) -> io::Result<(Header, Vec<u8
 mod tests {
     use super::*;
 
+    /// A machine built before the protocol was named says nothing about it, and both sides have to
+    /// read that as zero rather than as a broken message: a refusal with a reason is the point, and
+    /// a decode error would say nothing about why the two cannot talk.
+    #[test]
+    fn a_handshake_without_a_protocol_reads_as_none() {
+        let hello = Hello {
+            leader: "spark".to_owned(),
+            token: "secret".to_owned(),
+            rdma: None,
+            protocol: PROTOCOL,
+        };
+        let encoded = hello.encode();
+        let older = &encoded[..encoded.len() - 4];
+        let decoded = Hello::decode(older).unwrap();
+        assert_eq!(decoded.protocol, 0);
+        assert_eq!(decoded.leader, hello.leader);
+        assert_eq!(decoded.token, hello.token);
+        assert_eq!(Hello::decode(&encoded).unwrap().protocol, PROTOCOL);
+    }
+
     #[test]
     fn headers_and_descriptors_survive_a_round_trip() {
         let welcome = Welcome {
+            protocol: PROTOCOL,
             backend: BACKEND_CUDA,
             device: "NVIDIA GB10".to_owned(),
             memory_bytes: 128 << 30,
@@ -1255,6 +1298,7 @@ mod tests {
         assert_eq!(header.kind, Kind::Welcome);
         assert_eq!(header.request, 7);
         let decoded = Welcome::decode(&body).unwrap();
+        assert_eq!(decoded.protocol, PROTOCOL);
         assert_eq!(decoded.device, welcome.device);
         assert_eq!(decoded.capabilities, welcome.capabilities);
         assert_eq!(decoded.speed.unwrap().gemm_tops, 181.6);

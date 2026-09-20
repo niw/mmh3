@@ -379,6 +379,7 @@ impl Worker {
             reader: BufReader::with_capacity(STREAM_BUFFER, stream.try_clone()?),
             writer: BufWriter::with_capacity(STREAM_BUFFER, stream),
             welcome: Welcome {
+                protocol: 0,
                 backend: 0,
                 device: String::new(),
                 memory_bytes: 0,
@@ -399,9 +400,13 @@ impl Worker {
             leader: hostname(),
             token: token.to_owned(),
             rdma: offered.as_ref().map(|(_, addresses)| addresses.clone()),
+            protocol: worker::PROTOCOL,
         };
         let body = worker.call(Kind::Hello, &hello.encode(), &[])?;
         worker.welcome = Welcome::decode(&body.1)?;
+        if worker.welcome.protocol != worker::PROTOCOL {
+            return Err(describe_protocol(worker.welcome.protocol, &worker.address).into());
+        }
         worker.rdma = match (offered, worker.welcome.rdma.clone()) {
             (Some((connection, _)), Some(peer)) => join_rdma(connection, &peer),
             _ => None,
@@ -1076,6 +1081,13 @@ fn session(
                     reply(&mut writer, Kind::Error, message, &[])?;
                     return Err("a leader offered the wrong token".into());
                 }
+                // Said here as well as by the leader, so that an older leader, which would take
+                // this side's answer for one of its own and wait at the first exchange, is told.
+                if hello.protocol != worker::PROTOCOL {
+                    let message = describe_protocol(hello.protocol, &hello.leader);
+                    reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
+                    return Err(message.into());
+                }
                 // A leader that offers a reliable connection gets this side's, and the bulk of
                 // every later reply goes that way instead of down the socket.
                 let offered = hello
@@ -1084,6 +1096,7 @@ fn session(
                     .filter(|_| !bare)
                     .and_then(|_| open_rdma());
                 let welcome = Welcome {
+                    protocol: worker::PROTOCOL,
                     backend: BACKEND,
                     device: device_name(),
                     memory_bytes: memory_bytes(),
@@ -1453,6 +1466,19 @@ fn decode_video(
         request.chunk,
         decoder.decode_chunk(&latent, request.chunk as usize)?,
     ))
+}
+
+/// What to say to a machine that speaks a different protocol. Both ends say it, since only one of
+/// them may be new enough to know it should, and the one that does may be either. Both machines
+/// are named rather than one of them being "this one": the message is read on the other end as
+/// often as on this one.
+fn describe_protocol(theirs: u32, who: &str) -> String {
+    let (me, mine) = (hostname(), worker::PROTOCOL);
+    let newer = if theirs > mine { who } else { me.as_str() };
+    format!(
+        "{who} speaks protocol {theirs} and {me} speaks {mine}, so they cannot share a run. \
+         Build both from the same commit; {newer} has the newer one."
+    )
 }
 
 fn device_name() -> String {
