@@ -506,9 +506,16 @@ impl MetalDit {
                 }
                 let rows = shard.own_tokens();
                 // The text rows are refined once, at the front of the sequence, so they fall to
-                // rank 0 alone.
-                if shard.rank > 0 && rows.start < layout.segment(SegmentKind::Text).end {
-                    return Err(Error("the text rows must fall to rank 0 alone".into()));
+                // the first rank that carries anything. That is rank 0 while every rank takes a
+                // share, and is not once a rank keeps its number and stops taking one.
+                let first = shard.tokens.iter().position(|taken| !taken.is_empty());
+                if !rows.is_empty()
+                    && Some(shard.rank) != first
+                    && rows.start < layout.segment(SegmentKind::Text).end
+                {
+                    return Err(Error(
+                        "the text rows must fall to the first rank that carries any".into(),
+                    ));
                 }
                 rows
             }
@@ -912,6 +919,63 @@ mod tests {
         assert!(
             worst <= largest * 0.02,
             "worst {worst} of a largest of {largest}"
+        );
+    }
+
+    /// The text is refined once and lives at the front, so the rank that carries the front of the
+    /// sequence is the one that may hold it. That is rank 0 while every rank takes a share, and
+    /// stops being rank 0 the moment a rank keeps its number and takes none — which is what a
+    /// leader that orchestrates rather than computes does.
+    #[test]
+    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
+    fn the_text_rows_fall_to_the_first_rank_that_carries_any() {
+        let Some(dit) = checkpoint(false) else {
+            return;
+        };
+        let c = dit.config.clone();
+        let inputs = sample_inputs(&c);
+        let tokens = PackedLayout::for_inputs(&inputs).len();
+        let text = PackedLayout::for_inputs(&inputs).segment(SegmentKind::Text);
+        let cut = |ranks: Vec<std::ops::Range<usize>>, rank: usize| Shard {
+            rank,
+            tokens: ranks,
+            heads: (0..2)
+                .map(|r| r * c.heads / 2..(r + 1) * c.heads / 2)
+                .collect(),
+        };
+        let run = |shard: &Shard| {
+            let device = dit.weights.device.clone();
+            let mut exchange = crate::shard::WholeExchange::new(&device);
+            dit.forward_shard(&inputs, None, shard, &mut exchange)
+                .err()
+                .map(|error| error.0)
+        };
+
+        // NOTE: these shards are refused for other reasons too — one exchange cannot serve two
+        // ranks — so what is asserted is whether THIS rule fired, not whether the step ran.
+        const REFUSED: &str = "the text rows must fall to the first rank that carries any";
+        let refused_for_text = |shard: &Shard| run(shard).as_deref() == Some(REFUSED);
+
+        // Two ranks, both carrying. The text is at the front, so it is rank 0's alone.
+        assert!(
+            !refused_for_text(&cut(vec![0..text.end + 1, text.end + 1..tokens], 1)),
+            "rank 1 starts past the text and should not be refused for holding it"
+        );
+        assert!(
+            refused_for_text(&cut(vec![0..1, 1..tokens], 1)),
+            "rank 1 reaching into the text should be refused"
+        );
+
+        // A rank that keeps its number and carries nothing. The front moves to rank 1, and rank 1
+        // holding the text becomes correct rather than an error.
+        assert!(
+            !refused_for_text(&cut(vec![0..0, 0..tokens], 1)),
+            "rank 1 is the first rank that carries anything, so the text is its own"
+        );
+        // And rank 0 is no longer privileged by its number: carrying nothing, it carries no text.
+        assert!(
+            !refused_for_text(&cut(vec![0..0, 0..tokens], 0)),
+            "a rank with no rows holds no text rows"
         );
     }
 
