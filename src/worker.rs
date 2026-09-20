@@ -1786,7 +1786,6 @@ impl<'a> Exchanger<'a> {
             computed: Computed::default(),
             peers: HashMap::new(),
         };
-        #[cfg(feature = "cuda")]
         exchanger.link_peers()?;
         exchanger.register(shard, tokens, hidden, gated, algorithms)?;
         Ok(exchanger)
@@ -1810,38 +1809,56 @@ impl<'a> Exchanger<'a> {
         }
     }
 
-    /// Opens a connection to every rank this one has no socket to, and connects it to the other
-    /// end through the leader. With two ranks there is nothing to do.
+    /// Connections this rank offers the ranks it has no socket to, which is a worker and another
+    /// worker. A machine with no port offers none: its exchanges go down the socket, and a peer
+    /// that has a port cannot use one it has nothing to pair with.
     #[cfg(feature = "cuda")]
-    fn link_peers(&mut self) -> Result<(), Box<dyn Error>> {
-        // A machine with no port opens no connection to anyone: its exchanges go down the socket,
-        // and a peer that has a port cannot use one it has nothing to pair with.
+    fn open_links(&mut self) -> Result<Vec<(usize, Rdma)>, Box<dyn Error>> {
         let Some(device) = rdma_device() else {
-            return Ok(());
+            return Ok(Vec::new());
         };
         let mut opened = Vec::new();
-        let mut mine = Vec::new();
         for peer in 0..self.ranks {
             // A rank this one has a socket to is reached by the connection the session opened, if
             // it opened one, and by that socket otherwise. Only the ranks with neither need one
-            // made here, which is a worker and another worker.
+            // made here.
             if peer == self.rank
                 || self.links.contains_key(&peer)
                 || self.sockets.contains_key(&peer)
             {
                 continue;
             }
-            let link = device.link()?;
-            mine.push(worker::PeerLink {
-                peer: peer as u32,
-                addresses: link
-                    .addresses()?
-                    .into_iter()
-                    .map(|address| address.to_bytes())
-                    .collect(),
-            });
-            opened.push((peer, link));
+            opened.push((peer, device.link()?));
         }
+        Ok(opened)
+    }
+
+    /// Swaps the addresses of the connections between ranks that have no socket to each other,
+    /// through the leader.
+    ///
+    /// Every rank takes part, whether or not it has anything to offer. The others are waiting for
+    /// its answer, and a rank that stayed silent here because it has no port, or because its
+    /// backend has no transport of its own, would leave the leader reading the next message of
+    /// the session as this one.
+    fn link_peers(&mut self) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "cuda")]
+        let opened = self.open_links()?;
+        #[cfg(feature = "cuda")]
+        let mine: Vec<worker::PeerLink> = opened
+            .iter()
+            .map(|(peer, link)| {
+                Ok(worker::PeerLink {
+                    peer: *peer as u32,
+                    addresses: link
+                        .addresses()?
+                        .into_iter()
+                        .map(|address| address.to_bytes())
+                        .collect(),
+                })
+            })
+            .collect::<Result<_, Box<dyn Error>>>()?;
+        #[cfg(not(feature = "cuda"))]
+        let mine: Vec<worker::PeerLink> = Vec::new();
         if self.rank > 0 {
             // A worker offers the leader what it made for the other workers and takes back what
             // they made for it.
@@ -1853,23 +1870,26 @@ impl<'a> Exchanger<'a> {
             )?;
             let (header, body) = self.receive(0)?;
             self.expect(header, Kind::SessionLinks, &body)?;
-            let theirs = worker::PeerLink::decode_all(&body)?;
-            for (peer, link) in opened {
-                let addresses: Option<Vec<mmh3_rdma::Address>> = theirs
-                    .iter()
-                    .find(|entry| entry.peer as usize == peer)
-                    .and_then(|entry| {
-                        entry
-                            .addresses
-                            .iter()
-                            .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
-                            .collect()
-                    });
-                let addresses = addresses.ok_or_else(|| {
-                    format!("rank {peer} offered no connection and has no socket here either")
-                })?;
-                link.connect(&addresses)?;
-                self.links.insert(peer, LinkOf::Opened(link));
+            #[cfg(feature = "cuda")]
+            {
+                let theirs = worker::PeerLink::decode_all(&body)?;
+                for (peer, link) in opened {
+                    let addresses: Option<Vec<mmh3_rdma::Address>> = theirs
+                        .iter()
+                        .find(|entry| entry.peer as usize == peer)
+                        .and_then(|entry| {
+                            entry
+                                .addresses
+                                .iter()
+                                .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
+                                .collect()
+                        });
+                    let addresses = addresses.ok_or_else(|| {
+                        format!("rank {peer} offered no connection and has no socket here either")
+                    })?;
+                    link.connect(&addresses)?;
+                    self.links.insert(peer, LinkOf::Opened(link));
+                }
             }
             return Ok(());
         }
