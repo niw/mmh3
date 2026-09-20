@@ -595,17 +595,17 @@ pub fn sample(
             )?,
             Some(Sharing::Alone(exchange, shard)) => {
                 let began = Instant::now();
-                let mut context = mmh3_cuda::shard::ShardContext {
-                    shard: shard.clone(),
+                let (part, timing) = crate::worker::share_a_step(
+                    &dit,
+                    &inputs,
+                    step_sparse.as_ref(),
+                    shard,
                     exchange,
-                    timing: Default::default(),
-                };
-                let outputs = dit.forward_shard(&inputs, step_sparse.as_ref(), &mut context)?;
-                println!(
-                    "  {}",
-                    crate::worker::describe_timing(&context.timing, began.elapsed())
-                );
-                let part = outputs.part.ok_or("a shared step returned no rows")?;
+                    || began.elapsed(),
+                )?;
+                if !timing.is_empty() {
+                    println!("  {timing}");
+                }
                 dit.assemble_velocity(&inputs, step_sparse.as_ref(), &[part])?
             }
             None => dit.forward(&inputs, &[], step_sparse.as_ref())?,

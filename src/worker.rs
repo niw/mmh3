@@ -2761,17 +2761,17 @@ fn adopt_algorithms(_open: &OpenSession) -> usize {
 
 /// This rank's share of one step, and whatever it can say about where the time went.
 #[cfg(feature = "cuda")]
-fn share_a_step(
+pub fn share_a_step(
     dit: &Dit,
     inputs: &DitInputs,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     shard: &Shard,
-    exchanger: &mut Exchanger<'_>,
+    exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
     elapsed: impl Fn() -> Duration,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
     let mut context = mmh3_cuda::shard::ShardContext {
         shard: shard.clone(),
-        exchange: exchanger,
+        exchange,
         timing: Default::default(),
     };
     let outputs = dit.forward_shard(inputs, sparse, &mut context)?;
@@ -2781,19 +2781,19 @@ fn share_a_step(
 }
 
 #[cfg(feature = "metal")]
-fn share_a_step(
+pub fn share_a_step(
     dit: &Dit,
     inputs: &DitInputs,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     shard: &Shard,
-    exchanger: &mut Exchanger<'_>,
+    exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
     _elapsed: impl Fn() -> Duration,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
     // NOTE: nothing said about the time. This backend measures none of the parts, and a line of
     // zeros reads as a measurement. It belongs here when a second rank makes the numbers mean
     // something.
     Ok((
-        dit.forward_shard(inputs, sparse, shard, exchanger)?,
+        dit.forward_shard(inputs, sparse, shard, exchange)?,
         String::new(),
     ))
 }
@@ -3253,14 +3253,10 @@ pub fn step_shard(
         exchanger.send_to(peer, Kind::StepShard, &descriptor.encode(), &latents)?;
     }
 
-    let mut context = mmh3_cuda::shard::ShardContext {
-        shard: shard.clone(),
-        exchange: exchanger,
-        timing: Default::default(),
-    };
-    let outputs = dit.forward_shard(inputs, sparse, &mut context)?;
-    let timing = context.timing;
-    let mut parts = vec![outputs.part.ok_or("a shared step returned no rows")?];
+    // The same call a worker makes for its own share: one rank implementation, reached from the
+    // machine handing the work out as well as from the machines taking it.
+    let (mine, timing) = share_a_step(dit, inputs, sparse, shard, exchanger, || started.elapsed())?;
+    let mut parts = vec![mine];
     for peer in 1..shard.ranks() {
         let (header, body) = exchanger.receive_from(peer)?;
         if header.kind != Kind::VelocityPart {
@@ -3283,7 +3279,9 @@ pub fn step_shard(
             audio: floats[split..].to_vec(),
         });
     }
-    println!("  {}", describe_timing(&timing, started.elapsed()));
+    if !timing.is_empty() {
+        println!("  {timing}");
+    }
     Ok(dit.assemble_velocity(inputs, sparse, &parts)?)
 }
 
