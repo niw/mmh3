@@ -119,6 +119,29 @@ impl Memory {
         Ok(out)
     }
 
+    /// A region of `bytes` zeroed bytes, which is what a transport hands a rank.
+    pub fn zeroed(device: &Device, bytes: usize) -> Result<Self> {
+        Ok(Self {
+            device: device.clone(),
+            buffer: device.alloc(bytes, Some(&vec![0u8; bytes]))?,
+            bytes,
+        })
+    }
+
+    /// Moves `bytes` from `source`, `offset` bytes in, to `into` bytes into this one, which is
+    /// what a write to a peer does once the bytes are on this machine.
+    pub fn copy_from(&self, source: &Self, offset: usize, into: usize, bytes: usize) -> Result<()> {
+        source.check_bytes(offset, bytes)?;
+        self.check_bytes(into, bytes)?;
+        self.device.run(
+            "copy_bytes",
+            &[&source.buffer, &self.buffer],
+            &[bytes as u32, offset as u32, into as u32],
+            bytes,
+            false,
+        )
+    }
+
     pub(crate) fn buffer(&self) -> &Buffer {
         &self.buffer
     }
@@ -626,5 +649,116 @@ mod tests {
         assert!(pack(&source, TENSORS, HEADS, 4..HEADS + 1, DIM).is_err());
         assert!(pack(&source, TENSORS, HEADS, 3..3, DIM).is_err());
         assert!(pack(&source, TENSORS, HEADS + 1, 0..HEADS, DIM).is_err());
+    }
+}
+
+/// Two ranks in one process, sharing this machine's memory instead of a wire.
+///
+/// It exists to run the branches a single rank never enters: the writes to a peer, the
+/// `Received(peer)` regions and the offsets each rank addresses the others' rows by. Every region
+/// is kept per rank, as two machines would keep them, and a write copies between two ranks' own
+/// memory rather than reaching into one shared buffer, so an offset that is wrong is still wrong
+/// here.
+///
+/// What it cannot model is time. One thread runs one rank at a time, so a barrier cannot wait for
+/// a rank that has not been called yet; the caller sequences the ranks instead, and the barrier is
+/// where that sequencing has to hold. A transport that deadlocks on the wire will not deadlock
+/// here, which is the one class of fault this does not cover.
+#[cfg(test)]
+pub(crate) struct PairExchange {
+    device: Device,
+    rank: usize,
+    ranks: usize,
+    regions: std::rc::Rc<std::cell::RefCell<HashMap<(usize, Region), Memory>>>,
+}
+
+#[cfg(test)]
+impl PairExchange {
+    pub fn pair(device: &Device, ranks: usize) -> Vec<Self> {
+        let regions = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
+        (0..ranks)
+            .map(|rank| Self {
+                device: device.clone(),
+                rank,
+                ranks,
+                regions: regions.clone(),
+            })
+            .collect()
+    }
+
+    fn held(&self, rank: usize, region: Region, bytes: usize) -> Result<Memory> {
+        let mut regions = self.regions.borrow_mut();
+        let entry = regions.entry((rank, region));
+        use std::collections::hash_map::Entry;
+        Ok(match entry {
+            Entry::Occupied(held) if held.get().bytes() >= bytes => held.get().clone(),
+            Entry::Occupied(mut held) => {
+                let made = Memory::zeroed(&self.device, bytes)?;
+                held.insert(made.clone());
+                made
+            }
+            Entry::Vacant(empty) => empty.insert(Memory::zeroed(&self.device, bytes)?).clone(),
+        })
+    }
+}
+
+#[cfg(test)]
+impl mmh3_core::shard::Exchange for PairExchange {
+    type Memory = Memory;
+
+    fn rank(&self) -> usize {
+        self.rank
+    }
+
+    fn ranks(&self) -> usize {
+        self.ranks
+    }
+
+    fn region(
+        &mut self,
+        region: Region,
+        bytes: usize,
+    ) -> std::result::Result<Memory, ExchangeError> {
+        self.held(self.rank, region, bytes)
+            .map_err(|error| ExchangeError(error.0))
+    }
+
+    fn write(
+        &mut self,
+        peer: usize,
+        from: Region,
+        offset: usize,
+        into: Region,
+        peer_offset: usize,
+        bytes: usize,
+    ) -> std::result::Result<(), ExchangeError> {
+        let fail = |error: Error| ExchangeError(error.0);
+        let source = self.held(self.rank, from, offset + bytes).map_err(fail)?;
+        let destination = self.held(peer, into, peer_offset + bytes).map_err(fail)?;
+        destination
+            .copy_from(&source, offset, peer_offset, bytes)
+            .map_err(fail)
+    }
+
+    fn publish(
+        &mut self,
+        _region: Region,
+        _offset: usize,
+        _bytes: usize,
+    ) -> std::result::Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    fn receive(
+        &mut self,
+        _region: Region,
+        _offset: usize,
+        _bytes: usize,
+    ) -> std::result::Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    fn barrier(&mut self) -> std::result::Result<(), ExchangeError> {
+        Ok(())
     }
 }

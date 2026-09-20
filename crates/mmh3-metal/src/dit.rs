@@ -827,6 +827,105 @@ mod tests {
         );
     }
 
+    /// Two ranks against one, which is the first time the branches a single rank never enters do
+    /// anything: the writes to a peer, the `Received(peer)` regions, and the offsets each rank
+    /// addresses the others' rows by.
+    ///
+    /// NOTE: one thread runs one rank at a time, so a rank reaching a barrier cannot wait for one
+    /// that has not been called yet. The sweep is run twice and the second is read: everything
+    /// here depends only on the rows the ranks publish, which are fixed, so the second sweep sees
+    /// what two machines would have seen at the first. What this cannot show is a transport that
+    /// would deadlock, since nothing here ever waits.
+    #[test]
+    #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
+    fn two_ranks_attend_a_block_as_one_rank_does() {
+        let Some(mut dit) = checkpoint(true) else {
+            return;
+        };
+        dit.set_linear_precision(crate::LinearPrecision::Int8)
+            .unwrap();
+
+        let (c, device) = (dit.config.clone(), dit.weights.device.clone());
+        let tokens = 64;
+        let x = Array::from_f32(
+            &device,
+            tokens,
+            c.hidden,
+            &(0..tokens * c.hidden)
+                .map(|i| ((i * 31) % 251) as f32 / 251.0 - 0.5)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+
+        let alone = Shard::even(0, 1, tokens, c.heads, 1);
+        let mut one = crate::shard::WholeExchange::new(&device);
+        let whole = dit
+            .sharded_attention(&x, "blocks.0", None, &alone, &mut one)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+
+        let shards: Vec<Shard> = (0..2)
+            .map(|r| Shard::even(r, 2, tokens, c.heads, 1))
+            .collect();
+        let mut exchanges = crate::shard::PairExchange::pair(&device, 2);
+        let mut parts = vec![Vec::new(), Vec::new()];
+        // Driven until it stops moving rather than a fixed number of times. How many sweeps it
+        // takes is a property of the order one thread happens to call the ranks in, not of the
+        // code under test, and a number here would be one nobody could justify. Three is what it
+        // takes today; the assertion is that it settles at all.
+        let mut sweeps = 0;
+        loop {
+            let previous = parts.clone();
+            for rank in 0..2 {
+                let rows = shards[rank].own_tokens();
+                let mine = x.slice(rows.start, rows.len(), 0, c.hidden).unwrap();
+                parts[rank] = dit
+                    .sharded_attention(&mine, "blocks.0", None, &shards[rank], &mut exchanges[rank])
+                    .unwrap()
+                    .to_f32()
+                    .unwrap();
+            }
+            sweeps += 1;
+            if sweeps > 1 && parts == previous {
+                break;
+            }
+            assert!(sweeps < 8, "the ranks never settled");
+        }
+        eprintln!("settled after {sweeps} sweeps");
+
+        let together: Vec<f32> = parts.concat();
+        assert_eq!(together.len(), whole.len());
+        let largest = whole.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        for rank in 0..2 {
+            let rows = shards[rank].own_tokens();
+            let want = &whole[rows.start * c.hidden..rows.end * c.hidden];
+            let found = &parts[rank];
+            let bad = found
+                .iter()
+                .zip(want.iter())
+                .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+            eprintln!(
+                "rank {rank}: worst {bad:.6} of {largest:.6}, {:.3}%",
+                100.0 * bad / largest
+            );
+        }
+        let worst = together
+            .iter()
+            .zip(whole.iter())
+            .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+        eprintln!(
+            "two ranks against one: worst {worst:.6} of {largest:.6}, {:.3}%",
+            100.0 * worst / largest
+        );
+        // Two ranks put each other's shares through the bf16 the exchange carries them in, where
+        // one rank keeps its own in FP32. That rounding is the whole of the difference.
+        assert!(
+            worst <= largest * 0.02,
+            "worst {worst} of a largest of {largest}"
+        );
+    }
+
     /// A whole step through the sharded path, one rank sharing with nobody, against the same step
     /// through the ordinary one. This is every block rather than one, so it is where a mistake in
     /// the rows a rank carries or in the tables sliced to them would show, which attending a
