@@ -1,5 +1,3 @@
-mod generate;
-
 use std::error::Error;
 use std::process::ExitCode;
 
@@ -57,7 +55,7 @@ answered and then failed ends the run.";
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
-        Some("generate") => generate::run(&arguments[1..]),
+        Some("generate") => mmh3::generate::run(&arguments[1..], USAGE),
         #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("worker") => mmh3::worker::serve(&arguments[1..]),
 

@@ -10,6 +10,7 @@ pub mod cli;
 pub mod output;
 pub mod pictures;
 
+pub mod generate;
 pub mod generation;
 #[cfg(feature = "metal")]
 pub mod metal;

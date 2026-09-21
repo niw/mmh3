@@ -1,10 +1,13 @@
-//! Text-to-video generation with a synchronized soundtrack.
+//! Text-to-video generation with a synchronized soundtrack, written to a file.
+//!
+//! The command and the server both arrive here with the same arguments, since a form field and a
+//! command-line option stand for the same thing and turning one into the other is all the server
+//! does with them. What they generate is therefore the same run.
 
-use crate::USAGE;
-use mmh3::cli::{parse_options, split_ffmpeg_arguments};
-use mmh3::generation::{FLAGS, OPTIONS, Settings, sample};
+use crate::cli::{parse_options, split_ffmpeg_arguments};
+use crate::generation::{FLAGS, OPTIONS, Settings, sample};
 #[cfg(any(feature = "cuda", feature = "metal"))]
-use mmh3::models::{AUDIO_VAE_FILE, option_path, video_vae_path};
+use crate::models::{AUDIO_VAE_FILE, option_path, video_vae_path};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::safetensors::SafeTensors;
 #[cfg(any(feature = "cuda", not(feature = "metal")))]
@@ -14,8 +17,9 @@ use std::error::Error;
 use std::path::Path;
 
 /// Generates video and audio, then passes the decoded media to the selected output backend.
+/// `usage` is what an argument this does not understand is answered with.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Error>> {
     use mmh3_core::generation::FPS;
     #[cfg(feature = "cuda")]
     use mmh3_cuda::audio_vae::{CudaAudioDecoder as AudioDecoder, SAMPLE_RATE};
@@ -37,11 +41,11 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         arguments,
         &[OPTIONS, &["out", "audio-vae"]].concat(),
         FLAGS,
-        USAGE,
+        usage,
     )?;
     #[cfg(feature = "cuda")]
-    mmh3::models::load_algorithm_cache();
-    let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
+    crate::models::load_algorithm_cache();
+    let video_path = Path::new(options.get("out").ok_or(usage)?).to_path_buf();
     let settings = Settings::parse(&options, arguments)?;
     let spec = MediaSpec {
         width: settings.shape.width,
@@ -51,16 +55,16 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         sample_rate: SAMPLE_RATE,
         channels: 2,
     };
-    let mut output = mmh3::output::prepare(ffmpeg_arguments, spec, &video_path)?;
+    let mut output = crate::output::prepare(ffmpeg_arguments, spec, &video_path)?;
     let (video, audio) = sample(&options, &settings)?;
 
     // The audio goes to a worker on a connection of its own, since a worker finishes its share of
     // the video before this machine finishes blending its own and is idle until then.
     #[cfg(feature = "cuda")]
-    let remote_audio = mmh3::worker::RemoteAudio::start(
+    let remote_audio = crate::worker::RemoteAudio::start(
         settings.workers_owned(CAPABILITY_DECODE_AUDIO),
         settings.token.clone(),
-        mmh3::worker::AUDIO_VAE_ROLE,
+        crate::worker::AUDIO_VAE_ROLE,
         &audio,
     );
 
@@ -76,9 +80,9 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     // Chunks of the decode go to whichever machines answer, and this one walks the rest while
     // they work. A chunk that does not come back is decoded here.
-    let mut remote = mmh3::worker::RemoteCanvases::start(
-        mmh3::worker::connect_all(&chunks_out, &settings.token),
-        mmh3::worker::VIDEO_VAE_ROLE,
+    let mut remote = crate::worker::RemoteCanvases::start(
+        crate::worker::connect_all(&chunks_out, &settings.token),
+        crate::worker::VIDEO_VAE_ROLE,
         &video,
         decoder.plan(&video)?.chunks,
         DEFAULT_TILE_SIZE,
@@ -148,8 +152,8 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 /// The same generation on a machine with no device of its own: the prompt, the steps, the decode
 /// and the soundtrack all happen on the workers, and this process holds the plan and the file.
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
-pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    use mmh3::worker::{AUDIO_VAE_ROLE, RemoteAudio, VIDEO_VAE_ROLE, decode_whole_on_worker};
+pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Error>> {
+    use crate::worker::{AUDIO_VAE_ROLE, RemoteAudio, VIDEO_VAE_ROLE, decode_whole_on_worker};
     use mmh3_core::audio::SAMPLE_RATE;
     use mmh3_core::generation::FPS;
     use mmh3_output::MediaSpec;
@@ -160,9 +164,9 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         arguments,
         &[OPTIONS, &["out", "audio-vae"]].concat(),
         FLAGS,
-        USAGE,
+        usage,
     )?;
-    let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
+    let video_path = Path::new(options.get("out").ok_or(usage)?).to_path_buf();
     let settings = Settings::parse(&options, arguments)?;
     if settings.workers.is_empty() {
         return Err("this build runs nothing of its own: name a worker with --worker".into());
@@ -175,7 +179,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         sample_rate: SAMPLE_RATE,
         channels: 2,
     };
-    let mut output = mmh3::output::prepare(ffmpeg_arguments, spec, &video_path)?;
+    let mut output = crate::output::prepare(ffmpeg_arguments, spec, &video_path)?;
     let (video, audio) = sample(&options, &settings)?;
 
     // The audio goes on a connection of its own while the video decodes, as it does anywhere else.
