@@ -3416,15 +3416,16 @@ impl Drop for Coordinator<'_> {
 }
 
 /// One step of a shared-out run from the machine handing it out: send the latents to every rank,
-/// take back the rows each carried, and put them together. It runs no block of its own.
+/// take back the rows each carried, and put them together. It runs no block of its own and holds
+/// no weights: the shape is all a machine needs to assemble a step it did not compute.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn step_shard(
     coordinator: &mut Coordinator<'_>,
-    dit: &Dit,
+    config: &mmh3_core::dit::config::DitConfig,
     inputs: &mmh3_core::dit::inputs::DitInputs,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     step: usize,
-) -> Result<DitStep, Box<dyn Error>> {
+) -> Result<shard::Velocity, Box<dyn Error>> {
     let descriptor = worker::StepShard {
         step: step as u32,
         sigma: inputs.sigma,
@@ -3460,7 +3461,7 @@ pub fn step_shard(
             audio: floats[split..].to_vec(),
         });
     }
-    Ok(dit.assemble_velocity(inputs, sparse, &parts)?)
+    Ok(shard::assemble_velocity(config, inputs, sparse, &parts)?)
 }
 
 /// Where a shared-out step went, which is what decides whether sharing one is worth it at all.

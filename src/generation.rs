@@ -419,13 +419,20 @@ pub fn sample(
         let context = encode().map_err(|error| error.to_string())?;
         Ok((context, context_modalities))
     };
+    // A run that hands every step to its workers needs the DiT's shape and none of the weights
+    // behind it. Opening a checkpoint maps the file, so this costs the header pages and nothing.
+    let (config, gated) = dit_shape(options, dit_file)?;
+    let hands_out = !prepared_workers.is_empty();
     // The DiT waits on nothing the prompt makes, and reading it is mostly reading, so it goes
     // while the encoder has the device.
     #[cfg(feature = "cuda")]
-    let (context, context_modalities, dit) =
+    let (context, context_modalities, mut dit) =
         std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
             let encoded = scope.spawn(encode_context);
-            let dit = load_dit(options, "dit", dit_file)?;
+            let dit = match hands_out {
+                true => None,
+                false => Some(load_dit(options, "dit", dit_file)?),
+            };
             match encoded.join() {
                 Ok(Ok((context, modalities))) => Ok((context, modalities, dit)),
                 Ok(Err(error)) => Err(error.into()),
@@ -433,10 +440,14 @@ pub fn sample(
             }
         })?;
     #[cfg(not(feature = "cuda"))]
-    let (context, context_modalities, dit) = {
+    let (context, context_modalities, mut dit) = {
         let (context, modalities) =
             encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
-        (context, modalities, load_dit(options, "dit", dit_file)?)
+        let dit = match hands_out {
+            true => None,
+            false => Some(load_dit(options, "dit", dit_file)?),
+        };
+        (context, modalities, dit)
     };
     if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
@@ -519,13 +530,13 @@ pub fn sample(
         context.shape[0]
     );
 
-    let sparse = sparse_attention(options, dit.has_vsa_gates())?;
+    let sparse = sparse_attention(options, gated)?;
     let schedule = &settings.schedule;
     // A machine that can take a share of every step, and a run whose shape one can be cut out of.
     let mut target = shard_target(
         settings,
         options,
-        &dit,
+        &config,
         sparse.as_ref(),
         &context,
         &context_modalities,
@@ -554,11 +565,22 @@ pub fn sample(
                 }
             }
         }
-        // `--shard-dit 1` runs the same path with nothing to carry anywhere, which tells the cost
-        // of the machinery apart from the cost of the link.
-        None => alone_shard(
+        None => None,
+    };
+    // A run that meant to hand every step out and could not takes the steps itself, which is the
+    // fallback everything else a worker does already has. It pays the load it had skipped.
+    if dit.is_none() && !matches!(sharing, Some(Sharing::With(_))) {
+        dit = Some(load_dit(options, "dit", dit_file)?);
+    }
+    let dit = dit;
+    // `--shard-dit 1` runs the same path with nothing to carry anywhere, which tells the cost of
+    // the machinery apart from the cost of the link.
+    if sharing.is_none()
+        && let Some(dit) = &dit
+    {
+        sharing = alone_shard(
             options,
-            &dit,
+            &config,
             &context,
             &video,
             &audio,
@@ -566,10 +588,13 @@ pub fn sample(
             &references,
             settings,
         )
-        .map(|shard| Sharing::Alone(sole_exchange(&dit), shard)),
-    };
+        .map(|shard| Sharing::Alone(sole_exchange(dit), shard));
+    }
     #[cfg(feature = "metal")]
-    let prepared = dit.prepare_text(&context)?;
+    let prepared = match &dit {
+        Some(dit) => Some(dit.prepare_text(&context)?),
+        None => None,
+    };
     for step in 0..steps {
         let started = Instant::now();
         let inputs = DitInputs {
@@ -584,17 +609,28 @@ pub fn sample(
             shift_audio: settings.shift_audio,
         };
         let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
-        let outputs = match &mut sharing {
+        // The velocity of this step and, where a whole one ran here, what Sol-Attn routed.
+        let (velocity, routed) = match &mut sharing {
             // Every rank runs the same step over its own rows, and the exchanges inside the blocks
             // keep the attention whole. A rank that fails takes the run with it: there is no
             // halfway through a step to fall back from.
             Some(Sharing::With(coordinator)) => {
-                crate::worker::step_shard(coordinator, &dit, &inputs, step_sparse.as_ref(), step)?
+                let velocity = crate::worker::step_shard(
+                    coordinator,
+                    &config,
+                    &inputs,
+                    step_sparse.as_ref(),
+                    step,
+                )?;
+                (velocity, None)
             }
             Some(Sharing::Alone(exchange, shard)) => {
+                let dit = dit
+                    .as_ref()
+                    .ok_or("a step to take here and no DiT to take it")?;
                 let began = Instant::now();
                 let (part, timing) = crate::worker::share_a_step(
-                    &dit,
+                    dit,
                     &inputs,
                     step_sparse.as_ref(),
                     shard,
@@ -604,34 +640,42 @@ pub fn sample(
                 if !timing.is_empty() {
                     println!("  {timing}");
                 }
-                dit.assemble_velocity(&inputs, step_sparse.as_ref(), &[part])?
+                let outputs = dit.assemble_velocity(&inputs, step_sparse.as_ref(), &[part])?;
+                (whole_velocity(&outputs), outputs.routed_fraction)
             }
             // A run that shares a step with nobody takes the whole one, which on Metal goes
             // through the text this run refined once rather than through the DiT directly.
             None => {
                 #[cfg(feature = "cuda")]
-                {
+                let outputs = {
+                    let dit = dit
+                        .as_ref()
+                        .ok_or("a step to take here and no DiT to take it")?;
                     dit.forward(&inputs, &[], step_sparse.as_ref())?
-                }
+                };
                 #[cfg(feature = "metal")]
-                {
+                let outputs = {
+                    let prepared = prepared
+                        .as_ref()
+                        .ok_or("a step to take here and no DiT to take it")?;
                     prepared.forward(&inputs, &[], step_sparse.as_ref())?
-                }
+                };
+                (whole_velocity(&outputs), outputs.routed_fraction)
             }
         };
         euler_step(
             &mut video.data,
-            &outputs.video,
+            &velocity.video,
             schedule.video[step],
             schedule.video[step + 1],
         );
         euler_step(
             &mut audio.data,
-            &outputs.audio,
+            &velocity.audio,
             schedule.audio[step],
             schedule.audio[step + 1],
         );
-        let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
+        let routing = routed.map_or(String::new(), |fraction| {
             format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
         });
         println!(
@@ -808,6 +852,41 @@ fn encode_pictures(
     Ok(latents)
 }
 
+/// The velocity a whole step answered with, in the words a shared one answers in, so that the
+/// step loop reads one thing whichever way the step was taken.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn whole_velocity(outputs: &crate::worker::DitStep) -> mmh3_core::shard::Velocity {
+    mmh3_core::shard::Velocity {
+        video: outputs.video.clone(),
+        audio: outputs.audio.clone(),
+    }
+}
+
+/// The DiT's shape and whether it carries VSA gates, from the checkpoint headers alone. A patch
+/// may add the gates, so the patch's header is read beside the DiT's: the shape a leader hands out
+/// has to be the shape its workers will load, adapters and all.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn dit_shape(
+    options: &HashMap<&str, &str>,
+    dit_file: &str,
+) -> Result<(mmh3_core::dit::config::DitConfig, bool), Box<dyn Error>> {
+    use mmh3_core::dit::config::DitConfig;
+    use mmh3_core::safetensors::SafeTensors;
+
+    let path = crate::models::option_path(options, "dit", dit_file)?;
+    let file = SafeTensors::open(std::path::Path::new(&path))?;
+    let config = DitConfig::of(&file, "").map_err(|error| format!("reading {path}: {error}"))?;
+    let mut gated = DitConfig::gated(&file, "");
+    for name in ["patch", "lora"] {
+        if let Some(path) = crate::models::model_file(options, name, &["patches", "loras"])?
+            && let Ok(file) = SafeTensors::open(std::path::Path::new(&path))
+        {
+            gated = gated || DitConfig::gated(&file, "");
+        }
+    }
+    Ok((config, gated))
+}
+
 /// A worker that will take a share of every step, ready to open. Held apart from the exchange
 /// because the exchange borrows it for the whole run.
 #[cfg(any(feature = "cuda", feature = "metal"))]
@@ -877,7 +956,7 @@ fn prepare_workers(
 fn shard_target(
     settings: &Settings,
     options: &HashMap<&str, &str>,
-    dit: &crate::worker::Dit,
+    config: &mmh3_core::dit::config::DitConfig,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     context: &Tensor,
     context_modalities: &[mmh3_core::dit::timestep::Modality],
@@ -1027,10 +1106,10 @@ fn shard_target(
             say("tokens by", &products),
             say("heads by", &attentions)
         );
-        Shard::weighted(0, &products, &attentions, tokens, dit.config().heads, 1)
+        Shard::weighted(0, &products, &attentions, tokens, config.heads, 1)
     } else {
         println!("every machine takes the same share, since none of them measures itself");
-        Shard::even(0, ranks, tokens, dit.config().heads, 1)
+        Shard::even(0, ranks, tokens, config.heads, 1)
     };
     let spans: Vec<mmh3_core::worker::ShardSpan> = shard
         .tokens
@@ -1058,7 +1137,7 @@ fn shard_target(
             shard: spans.clone(),
             algorithm_key: algorithm_key.clone(),
             algorithms: algorithms.clone(),
-            precision: attention_precision(dit),
+            precision: attention_precision(options),
         })
     };
     let open: Option<Vec<OpenSession>> = (0..ranks).map(open).collect();
@@ -1156,17 +1235,19 @@ fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
     (String::new(), Vec::new())
 }
 
-/// How a session says this leader attends, which only one backend offers a choice about.
+/// How a session says this run attends, which only one backend offers a choice about. It comes
+/// from the option rather than from a loaded DiT, since a leader that hands every step out has
+/// none to ask.
 #[cfg(feature = "cuda")]
-fn attention_precision(dit: &crate::worker::Dit) -> u8 {
-    match dit.attention_precision() {
-        mmh3_cuda::attention::AttentionPrecision::Int8Fp8 => 1,
+fn attention_precision(options: &HashMap<&str, &str>) -> u8 {
+    match options.get("attention-precision").copied() {
+        Some("int8-fp8") => 1,
         _ => 0,
     }
 }
 
 #[cfg(feature = "metal")]
-fn attention_precision(_dit: &crate::worker::Dit) -> u8 {
+fn attention_precision(_options: &HashMap<&str, &str>) -> u8 {
     0
 }
 
@@ -1176,7 +1257,7 @@ fn attention_precision(_dit: &crate::worker::Dit) -> u8 {
 #[allow(clippy::too_many_arguments)]
 fn alone_shard(
     options: &HashMap<&str, &str>,
-    dit: &crate::worker::Dit,
+    config: &mmh3_core::dit::config::DitConfig,
     context: &Tensor,
     video: &Tensor,
     audio: &Tensor,
@@ -1203,11 +1284,5 @@ fn alone_shard(
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     println!("sharing every step with nobody, {tokens} tokens in one piece");
-    Some(mmh3_core::shard::Shard::even(
-        0,
-        1,
-        tokens,
-        dit.config().heads,
-        1,
-    ))
+    Some(mmh3_core::shard::Shard::even(0, 1, tokens, config.heads, 1))
 }
