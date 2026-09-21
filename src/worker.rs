@@ -2754,6 +2754,34 @@ fn set_attention_precision(_dit: &mut Dit, precision: u8) -> Result<(), Box<dyn 
     Ok(())
 }
 
+/// The attention a shared run asks for, which one backend cannot always give it. A rank answers
+/// this when the session opens rather than when a step reaches it: a rank that refuses a session
+/// costs the leader a machine, and one that fails inside a step takes the whole run with it.
+#[cfg(feature = "cuda")]
+fn accept_sparse_attention(
+    _dit: &Dit,
+    _sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+) -> Result<(), Box<dyn Error>> {
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+fn accept_sparse_attention(
+    dit: &Dit,
+    sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
+) -> Result<(), Box<dyn Error>> {
+    if sparse.is_some() {
+        return Err("this build attends densely, and this run asks for sparse attention".into());
+    }
+    // NOTE: the gates are a property of the checkpoint rather than of the run, so a leader that
+    // names dense attention still hands out a DiT this backend cannot run. Every FastH3 patch
+    // carries them.
+    if dit.has_vsa_gates() {
+        return Err("this build cannot run a DiT that carries VSA gate projections".into());
+    }
+    Ok(())
+}
+
 /// One of the leader's LoRAs or patches, in its own order.
 #[cfg(feature = "cuda")]
 fn add_adapter(
@@ -2964,6 +2992,7 @@ fn serve_shard(
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     let sparse = sparse_attention(&open.sparse);
+    accept_sparse_attention(&dit, sparse.as_ref())?;
     // The cuts the leader worked out, since it is the only rank that knows what every machine can
     // do. An empty table is an even share, which is what a leader that measured nothing sends.
     let shard = if open.shard.is_empty() {
