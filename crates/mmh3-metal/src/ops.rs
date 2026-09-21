@@ -114,7 +114,8 @@ impl Array {
     }
 
     pub fn linear(&self, weight: &Self) -> Result<Self> {
-        if self.cols != weight.cols || !std::rc::Rc::ptr_eq(&self.device().0, &weight.device().0) {
+        if self.cols != weight.cols || !std::sync::Arc::ptr_eq(&self.device().0, &weight.device().0)
+        {
             return Err(Error::new("matrix product shapes or devices differ".into()));
         }
 
@@ -160,7 +161,7 @@ impl Array {
         dtype: DType,
         slab_rows: usize,
     ) -> Result<Self> {
-        if !std::rc::Rc::ptr_eq(&self.device().0, &weight.0.device.0)
+        if !std::sync::Arc::ptr_eq(&self.device().0, &weight.0.device.0)
             || outputs
                 .checked_mul(self.cols)
                 .and_then(|n| n.checked_mul(dtype.size_in_bytes()))
@@ -214,7 +215,7 @@ impl Array {
         outputs: usize,
         precision: LinearPrecision,
     ) -> Result<Self> {
-        if !std::rc::Rc::ptr_eq(&self.device().0, &weight.0.device.0)
+        if !std::sync::Arc::ptr_eq(&self.device().0, &weight.0.device.0)
             || outputs.checked_mul(self.cols) != Some(weight.0.bytes)
         {
             return Err(Error::new("packed matrix shape or device mismatch".into()));

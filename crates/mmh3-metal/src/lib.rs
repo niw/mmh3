@@ -1,5 +1,6 @@
 //! Apple GPU inference with MPS dense products and MPP packed low-precision products.
-//! Buffers and queues are thread-local. Bounded batches complete at host reads or explicit waits.
+//! One device serves the whole process, one thread at a time, and a buffer belongs to it rather
+//! than to a thread. Bounded batches complete at host reads or explicit waits.
 #![cfg(target_os = "macos")]
 
 pub mod audio_vae;
@@ -15,19 +16,32 @@ use std::{
     ffi::{CStr, CString, c_char, c_void},
     fmt,
     ptr::NonNull,
-    rc::Rc,
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 /// Something a call here could not do, and what it says for itself.
 #[derive(Debug)]
 pub struct Error {
     pub message: String,
+    out_of_memory: bool,
 }
 
 impl Error {
     /// A failure whose only answer is to report it.
     pub fn new(message: String) -> Self {
-        Self { message }
+        Self {
+            message,
+            out_of_memory: false,
+        }
+    }
+
+    /// Whether this is the device saying it has no memory left, which a caller holding memory it
+    /// could let go of can do something about, unlike every other way a call here fails.
+    pub fn is_out_of_memory(&self) -> bool {
+        self.out_of_memory
     }
 }
 
@@ -71,6 +85,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 unsafe extern "C" {
     fn mmh3_metal_error() -> *const c_char;
+    fn mmh3_metal_out_of_memory() -> bool;
     fn mmh3_metal_create(source: *const c_char, tensor_source: *const c_char) -> *mut c_void;
     fn mmh3_metal_supports_tensor_ops(context: *mut c_void) -> bool;
     fn mmh3_metal_destroy(context: *mut c_void);
@@ -79,6 +94,7 @@ unsafe extern "C" {
     fn mmh3_metal_alloc(context: *mut c_void, bytes: usize, data: *const c_void) -> *mut c_void;
     fn mmh3_metal_free(context: *mut c_void, buffer: *mut c_void);
     fn mmh3_metal_stats(context: *mut c_void, output: *mut u64);
+    fn mmh3_metal_memory_info(output: *mut u64) -> i32;
     fn mmh3_metal_read(buffer: *mut c_void, output: *mut c_void, bytes: usize);
     fn mmh3_metal_dispatch(
         context: *mut c_void,
@@ -106,12 +122,48 @@ unsafe extern "C" {
 }
 
 fn native_error() -> Error {
-    // SAFETY: the native runtime returns a thread-local, NUL-terminated error string.
-    Error::new(
-        unsafe { CStr::from_ptr(mmh3_metal_error()) }
+    // SAFETY: the native runtime returns a thread-local, NUL-terminated error string and the
+    // reason beside it, both of the failure this thread has just had.
+    Error {
+        message: unsafe { CStr::from_ptr(mmh3_metal_error()) }
             .to_string_lossy()
             .into_owned(),
-    )
+        out_of_memory: unsafe { mmh3_metal_out_of_memory() },
+    }
+}
+
+/// Bytes in live allocations of this process.
+///
+/// NOTE: a buffer this process has let go of is not always a buffer the device has back. The
+/// runtime keeps a small pool of them to hand out again, and what that pool holds is counted here
+/// as free, since a buffer of the same size is served from it without asking the device at all.
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+/// The most this process will hold, or zero for as much as the device will give.
+static LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// What a Metal device leaves this process and what it recommends one process fill, in bytes.
+///
+/// NOTE: the recommendation is not the memory the machine has. It is what one process may hold
+/// before the system starts taking memory back from it, which on a Mac is most of the memory but
+/// not all of it. What it leaves is that less what this process has already taken, so what other
+/// programs on the same Mac hold is not counted against it.
+pub fn memory_info() -> Result<(usize, usize)> {
+    let mut values = [0; 2];
+    // SAFETY: the native function writes exactly two counters and retains no pointer.
+    check(unsafe { mmh3_metal_memory_info(values.as_mut_ptr()) })?;
+    let [working_set, allocated] = values.map(|value| value as usize);
+    Ok((working_set.saturating_sub(allocated), working_set))
+}
+
+/// Bytes in live allocations of this process.
+pub fn allocated_bytes() -> usize {
+    ALLOCATED.load(Ordering::Relaxed)
+}
+
+/// Holds this process to `bytes`, beyond which an allocation fails as it would on a device that
+/// small. Zero lifts the limit.
+pub fn set_allocation_limit(bytes: usize) {
+    LIMIT.store(bytes, Ordering::Relaxed);
 }
 
 fn check(status: i32) -> Result<()> {
@@ -123,6 +175,14 @@ fn check(status: i32) -> Result<()> {
 }
 
 struct Context(NonNull<c_void>);
+
+// SAFETY: the native context takes its own lock for the whole of every call that touches it, so
+// two threads calling here make two calls one after the other rather than one call twice. Nothing
+// it holds — the queue, the compiled pipelines, the batch being encoded — is reached except
+// through those calls, and the pointer means the same on whichever thread holds it.
+unsafe impl Send for Context {}
+unsafe impl Sync for Context {}
+
 impl Drop for Context {
     fn drop(&mut self) {
         // SAFETY: this is the last owner of the context returned by create.
@@ -131,7 +191,7 @@ impl Drop for Context {
 }
 
 #[derive(Clone)]
-pub struct Device(Rc<Context>);
+pub struct Device(Arc<Context>);
 #[derive(Debug, Clone, Copy)]
 pub struct DeviceStats {
     pub command_buffers: u64,
@@ -166,27 +226,21 @@ impl Device {
         check(unsafe { mmh3_metal_synchronize(self.0.0.as_ptr()) })
     }
 
-    /// The device this thread computes on, made on the first ask and kept.
+    /// The device this process computes on, made on the first ask and kept.
     ///
     /// A buffer belongs to the context that made it and no other context may read it, so memory a
     /// block computes in and memory an exchange hands round have to come from one device. Making
-    /// a second one also pays to compile the kernels again, which is not free.
+    /// a second one also pays to compile the kernels again, which is not free. One device for the
+    /// process is also what lets a model outlive the thread that read it, so a machine asked for
+    /// the same checkpoint twice reads it once.
     pub fn shared() -> Result<Self> {
-        thread_local! {
-            static SHARED: std::cell::RefCell<Option<Device>> =
-                const { std::cell::RefCell::new(None) };
-        }
+        static SHARED: Mutex<Option<Device>> = Mutex::new(None);
 
-        SHARED.with(|shared| {
-            let mut shared = shared.borrow_mut();
-            match shared.as_ref() {
-                Some(device) => Ok(device.clone()),
-                None => {
-                    let device = Self::new()?;
-                    Ok(shared.insert(device).clone())
-                }
-            }
-        })
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        match shared.as_ref() {
+            Some(device) => Ok(device.clone()),
+            None => Ok(shared.insert(Self::new()?).clone()),
+        }
     }
 
     pub fn new() -> Result<Self> {
@@ -196,7 +250,7 @@ impl Device {
         let pointer =
             NonNull::new(unsafe { mmh3_metal_create(source.as_ptr(), tensor_source.as_ptr()) })
                 .ok_or_else(native_error)?;
-        Ok(Self(Rc::new(Context(pointer))))
+        Ok(Self(Arc::new(Context(pointer))))
     }
 
     pub fn name(&self) -> String {
@@ -213,6 +267,16 @@ impl Device {
             ));
         }
 
+        match LIMIT.load(Ordering::Relaxed) {
+            0 => {}
+            limit if ALLOCATED.load(Ordering::Relaxed) + bytes > limit => {
+                return Err(Error {
+                    message: format!("{bytes} bytes would take this process past its limit"),
+                    out_of_memory: true,
+                });
+            }
+            _ => {}
+        }
         // SAFETY: optional data covers bytes, and the native call copies it before returning.
         let pointer = NonNull::new(unsafe {
             mmh3_metal_alloc(
@@ -222,7 +286,8 @@ impl Device {
             )
         })
         .ok_or_else(native_error)?;
-        Ok(Buffer(Rc::new(Allocation {
+        ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
+        Ok(Buffer(Arc::new(Allocation {
             pointer,
             bytes,
             device: self.clone(),
@@ -241,7 +306,7 @@ impl Device {
             return Ok(());
         }
 
-        if buffers.iter().any(|b| !Rc::ptr_eq(&self.0, &b.0.device.0)) {
+        if buffers.iter().any(|b| !Arc::ptr_eq(&self.0, &b.0.device.0)) {
             return Err(Error::new(
                 "Metal buffers belong to different devices".into(),
             ));
@@ -274,15 +339,25 @@ struct Allocation {
     device: Device,
 }
 
+// SAFETY: a Metal buffer belongs to the context that made it rather than to a thread, and every
+// call that encodes work over one, or frees it, goes through that context. So a buffer means the
+// same on whichever thread reads it, and a model built from buffers can be kept in one place and
+// used from the thread that asks for it. Two threads using one model at the same time would still
+// be two runs over one set of scratch buffers, which is what the table that hands models out
+// prevents by handing one out at a time.
+unsafe impl Send for Allocation {}
+unsafe impl Sync for Allocation {}
+
 impl Drop for Allocation {
     fn drop(&mut self) {
+        ALLOCATED.fetch_sub(self.bytes, Ordering::Relaxed);
         // SAFETY: this is the final Rust buffer owner. Pending commands retain the Metal buffer.
         unsafe { mmh3_metal_free(self.device.0.0.as_ptr(), self.pointer.as_ptr()) }
     }
 }
 
 #[derive(Clone)]
-pub(crate) struct Buffer(Rc<Allocation>);
+pub(crate) struct Buffer(Arc<Allocation>);
 impl Buffer {
     /// Copies `bytes` of `source`, `from` bytes in, to `into` bytes into this one.
     pub(crate) fn copy_range(
@@ -332,5 +407,20 @@ impl Buffer {
         }
 
         Ok(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Device;
+
+    /// Memory no device has is the one failure a caller can answer by letting go of something.
+    #[test]
+    fn an_impossible_allocation_says_it_ran_out_of_memory() {
+        let device = Device::new().unwrap();
+        let Err(error) = device.alloc(1 << 48, None) else {
+            panic!("a device found 256 TB");
+        };
+        assert!(error.is_out_of_memory(), "{error}");
     }
 }

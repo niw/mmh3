@@ -2,9 +2,12 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 
-// Rust keeps each context on one thread. Command buffers retain their inputs until completion.
-// Host reads and foreign-queue exports synchronize; batches are bounded by work and allocation.
+// One context serves every thread of the process, one thread at a time: its lock is taken for the
+// whole of every call that touches it, since its queue, its pipelines and its batch are one of
+// each. Command buffers retain their inputs until completion. Host reads and foreign-queue exports
+// synchronize; batches are bounded by work and allocation.
 private final class Context {
+    let lock = NSLock()
     let device: MTLDevice
     let queue: MTLCommandQueue
     let library: MTLLibrary
@@ -117,9 +120,11 @@ private enum BridgeError: Error {
 
 private final class ErrorMessage {
     let pointer: UnsafeMutablePointer<CChar>
+    let outOfMemory: Bool
 
-    init(_ message: String) {
+    init(_ message: String, outOfMemory: Bool) {
         pointer = strdup(message)!
+        self.outOfMemory = outOfMemory
     }
 
     deinit {
@@ -127,13 +132,24 @@ private final class ErrorMessage {
     }
 }
 
-private func fail(_ error: Error) -> Int32 {
-    Thread.current.threadDictionary["mmh3.metal.error"] = ErrorMessage(String(describing: error))
+private func fail(_ error: Error, outOfMemory: Bool = false) -> Int32 {
+    Thread.current.threadDictionary["mmh3.metal.error"] = ErrorMessage(
+        String(describing: error), outOfMemory: outOfMemory
+    )
     return -1
 }
 
 private func context(_ pointer: UnsafeMutableRawPointer) -> Context {
     Unmanaged<Context>.fromOpaque(pointer).takeUnretainedValue()
+}
+
+/// Runs `body` with this context to itself. The lock is not recursive, so it is taken here at the
+/// edge and nowhere inside: a call that synchronizes on its way already holds it.
+private func locked<T>(_ pointer: UnsafeMutableRawPointer, _ body: (Context) -> T) -> T {
+    let ctx = context(pointer)
+    ctx.lock.lock()
+    defer { ctx.lock.unlock() }
+    return body(ctx)
 }
 
 private func buffer(_ pointer: UnsafeMutableRawPointer) -> MTLBuffer {
@@ -153,6 +169,13 @@ func metalError() -> UnsafePointer<CChar>? {
     (Thread.current.threadDictionary["mmh3.metal.error"] as? ErrorMessage).map {
         UnsafePointer($0.pointer)
     }
+}
+
+/// Whether the last failure on this thread was the device having no memory left, which a caller
+/// holding memory it could let go of can do something about.
+@_cdecl("mmh3_metal_out_of_memory")
+func metalOutOfMemory() -> Bool {
+    (Thread.current.threadDictionary["mmh3.metal.error"] as? ErrorMessage)?.outOfMemory ?? false
 }
 
 @_cdecl("mmh3_metal_create")
@@ -185,22 +208,41 @@ func metalName(_ pointer: UnsafeMutableRawPointer) -> UnsafePointer<CChar> {
 @_cdecl("mmh3_metal_synchronize")
 func metalSynchronize(_ pointer: UnsafeMutableRawPointer) -> Int32 {
     autoreleasepool {
-        do {
-            try context(pointer).synchronize()
-            return 0
-        } catch {
-            return fail(error)
+        locked(pointer) { ctx in
+            do {
+                try ctx.synchronize()
+                return 0
+            } catch {
+                return fail(error)
+            }
         }
+    }
+}
+
+/// What one process may fill of this device and what it has filled, which is what a caller asking
+/// whether another checkpoint fits has to go on. It takes no context: the numbers belong to the
+/// device, and every context here computes on the system default one.
+@_cdecl("mmh3_metal_memory_info")
+func metalMemoryInfo(_ output: UnsafeMutablePointer<UInt64>) -> Int32 {
+    autoreleasepool {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return fail(BridgeError.message("No Metal GPU is available"))
+        }
+
+        output[0] = device.recommendedMaxWorkingSetSize
+        output[1] = UInt64(device.currentAllocatedSize)
+        return 0
     }
 }
 
 @_cdecl("mmh3_metal_stats")
 func metalStats(_ pointer: UnsafeMutableRawPointer, _ output: UnsafeMutablePointer<UInt64>) {
-    let ctx = context(pointer)
-    output[0] = ctx.submissions
-    output[1] = ctx.allocations
-    output[2] = ctx.reuses
-    output[3] = ctx.peakBytes
+    locked(pointer) { ctx in
+        output[0] = ctx.submissions
+        output[1] = ctx.allocations
+        output[2] = ctx.reuses
+        output[3] = ctx.peakBytes
+    }
 }
 
 @_cdecl("mmh3_metal_alloc")
@@ -208,49 +250,54 @@ func metalAlloc(_ pointer: UnsafeMutableRawPointer, _ bytes: Int, _ data: Unsafe
     -> UnsafeMutableRawPointer?
 {
     autoreleasepool {
-        let ctx = context(pointer)
-        do {
-            if let error = ctx.executionError {
-                throw error
-            }
+        locked(pointer) { ctx in
+            do {
+                if let error = ctx.executionError {
+                    throw error
+                }
 
-            if ctx.pending != nil, ctx.allocatedSinceSync + bytes > 256 * 1024 * 1024 {
-                try ctx.synchronize()
-            }
-        } catch {
-            _ = fail(error)
-            return nil
-        }
-
-        let result: MTLBuffer
-        if let index = ctx.reusable.lastIndex(where: { $0.length == bytes }) {
-            result = ctx.reusable.remove(at: index)
-            ctx.pooledBytes -= bytes
-            ctx.reuses += 1
-        } else {
-            guard let allocated = ctx.device.makeBuffer(length: bytes, options: .storageModeShared) else {
-                _ = fail(BridgeError.message("Metal buffer allocation failed (\(bytes) bytes)"))
+                if ctx.pending != nil, ctx.allocatedSinceSync + bytes > 256 * 1024 * 1024 {
+                    try ctx.synchronize()
+                }
+            } catch {
+                _ = fail(error)
                 return nil
             }
 
-            result = allocated
-            ctx.allocations += 1
-            ctx.peakBytes = max(ctx.peakBytes, UInt64(ctx.device.currentAllocatedSize))
-        }
+            let result: MTLBuffer
+            if let index = ctx.reusable.lastIndex(where: { $0.length == bytes }) {
+                result = ctx.reusable.remove(at: index)
+                ctx.pooledBytes -= bytes
+                ctx.reuses += 1
+            } else {
+                guard let allocated = ctx.device.makeBuffer(length: bytes, options: .storageModeShared)
+                else {
+                    _ = fail(
+                        BridgeError.message("Metal buffer allocation failed (\(bytes) bytes)"),
+                        outOfMemory: true
+                    )
+                    return nil
+                }
 
-        ctx.allocatedSinceSync += bytes
-        if let data {
-            result.contents().copyMemory(from: data, byteCount: bytes)
-        }
+                result = allocated
+                ctx.allocations += 1
+                ctx.peakBytes = max(ctx.peakBytes, UInt64(ctx.device.currentAllocatedSize))
+            }
 
-        return Unmanaged.passRetained(result as AnyObject).toOpaque()
+            ctx.allocatedSinceSync += bytes
+            if let data {
+                result.contents().copyMemory(from: data, byteCount: bytes)
+            }
+
+            return Unmanaged.passRetained(result as AnyObject).toOpaque()
+        }
     }
 }
 
 @_cdecl("mmh3_metal_free")
 func metalFree(_ ctx: UnsafeMutableRawPointer, _ pointer: UnsafeMutableRawPointer) {
     let allocation = Unmanaged<AnyObject>.fromOpaque(pointer).takeRetainedValue() as! MTLBuffer
-    context(ctx).recycle(allocation)
+    locked(ctx) { $0.recycle(allocation) }
 }
 
 @_cdecl("mmh3_metal_read")
@@ -265,72 +312,73 @@ func metalDispatch(
     _ parameters: UnsafeRawPointer, _ bytes: Int, _ threads: Int, _ groupSize: Int, _ groups: Bool
 ) -> Int32 {
     autoreleasepool {
-        do {
-            let ctx = context(pointer)
-            let key = String(cString: name)
-            let pipeline: MTLComputePipelineState
-            if let cached = ctx.pipelines[key] {
-                pipeline = cached
-            } else {
-                var library = ctx.library
-                if key.hasPrefix("mpp_") {
-                    guard #available(macOS 26.0, *), ctx.device.supportsFamily(.apple7) else {
-                        throw BridgeError.message("MPP TensorOps requires macOS 26 and an Apple silicon GPU")
+        locked(pointer) { ctx in
+            do {
+                let key = String(cString: name)
+                let pipeline: MTLComputePipelineState
+                if let cached = ctx.pipelines[key] {
+                    pipeline = cached
+                } else {
+                    var library = ctx.library
+                    if key.hasPrefix("mpp_") {
+                        guard #available(macOS 26.0, *), ctx.device.supportsFamily(.apple7) else {
+                            throw BridgeError.message("MPP TensorOps requires macOS 26 and an Apple silicon GPU")
+                        }
+
+                        if ctx.tensorLibrary == nil {
+                            let options = MTLCompileOptions()
+                            options.languageVersion = .version4_0
+                            options.mathMode = .safe
+                            ctx.tensorLibrary = try ctx.device.makeLibrary(
+                                source: ctx.tensorSource, options: options
+                            )
+                        }
+
+                        library = ctx.tensorLibrary!
                     }
 
-                    if ctx.tensorLibrary == nil {
-                        let options = MTLCompileOptions()
-                        options.languageVersion = .version4_0
-                        options.mathMode = .safe
-                        ctx.tensorLibrary = try ctx.device.makeLibrary(
-                            source: ctx.tensorSource, options: options
-                        )
+                    guard let function = library.makeFunction(name: key) else {
+                        throw BridgeError.message("Missing Metal kernel: \(key)")
                     }
 
-                    library = ctx.tensorLibrary!
+                    pipeline = try ctx.device.makeComputePipelineState(function: function)
+                    ctx.pipelines[key] = pipeline
                 }
 
-                guard let function = library.makeFunction(name: key) else {
-                    throw BridgeError.message("Missing Metal kernel: \(key)")
+                guard
+                    !(key.hasPrefix("attention_") || key.hasPrefix("mpp_"))
+                    || pipeline.threadExecutionWidth == 32
+                else {
+                    throw BridgeError.message("Tiled attention requires 32-thread SIMD groups")
                 }
 
-                pipeline = try ctx.device.makeComputePipelineState(function: function)
-                ctx.pipelines[key] = pipeline
-            }
+                let command = try ctx.command()
+                guard groupSize <= pipeline.maxTotalThreadsPerThreadgroup,
+                      let encoder = command.makeComputeCommandEncoder()
+                else {
+                    throw BridgeError.message("Could not create Metal compute command")
+                }
 
-            guard
-                !(key.hasPrefix("attention_") || key.hasPrefix("mpp_"))
-                || pipeline.threadExecutionWidth == 32
-            else {
-                throw BridgeError.message("Tiled attention requires 32-thread SIMD groups")
-            }
+                encoder.setComputePipelineState(pipeline)
+                for i in 0 ..< count {
+                    encoder.setBuffer(buffer(buffers[i]), offset: 0, index: i)
+                }
 
-            let command = try ctx.command()
-            guard groupSize <= pipeline.maxTotalThreadsPerThreadgroup,
-                  let encoder = command.makeComputeCommandEncoder()
-            else {
-                throw BridgeError.message("Could not create Metal compute command")
-            }
+                encoder.setBytes(parameters, length: bytes, index: count)
+                let grid = MTLSize(width: threads, height: 1, depth: 1)
+                let group = MTLSize(width: groupSize, height: 1, depth: 1)
+                if groups {
+                    encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
+                } else {
+                    encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
+                }
 
-            encoder.setComputePipelineState(pipeline)
-            for i in 0 ..< count {
-                encoder.setBuffer(buffer(buffers[i]), offset: 0, index: i)
+                encoder.endEncoding()
+                try ctx.encoded()
+                return 0
+            } catch {
+                return fail(error)
             }
-
-            encoder.setBytes(parameters, length: bytes, index: count)
-            let grid = MTLSize(width: threads, height: 1, depth: 1)
-            let group = MTLSize(width: groupSize, height: 1, depth: 1)
-            if groups {
-                encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: group)
-            } else {
-                encoder.dispatchThreads(grid, threadsPerThreadgroup: group)
-            }
-
-            encoder.endEncoding()
-            try ctx.encoded()
-            return 0
-        } catch {
-            return fail(error)
         }
     }
 }
@@ -342,49 +390,50 @@ func metalMatmul(
     _ stride: Int, _ offset: Int, _ halfInputs: Bool
 ) -> Int32 {
     autoreleasepool {
-        do {
-            let ctx = context(pointer)
-            let elementBytes = halfInputs ? 2 : 4
-            let inputType: MPSDataType = halfInputs ? .float16 : .float32
-            let left = MPSMatrix(
-                buffer: buffer(a),
-                descriptor: MPSMatrixDescriptor(
-                    rows: m, columns: k, rowBytes: k * elementBytes, dataType: inputType
+        locked(pointer) { ctx in
+            do {
+                let elementBytes = halfInputs ? 2 : 4
+                let inputType: MPSDataType = halfInputs ? .float16 : .float32
+                let left = MPSMatrix(
+                    buffer: buffer(a),
+                    descriptor: MPSMatrixDescriptor(
+                        rows: m, columns: k, rowBytes: k * elementBytes, dataType: inputType
+                    )
                 )
-            )
-            let right = MPSMatrix(
-                buffer: buffer(b),
-                descriptor: MPSMatrixDescriptor(
-                    rows: n, columns: k, rowBytes: k * elementBytes, dataType: inputType
+                let right = MPSMatrix(
+                    buffer: buffer(b),
+                    descriptor: MPSMatrixDescriptor(
+                        rows: n, columns: k, rowBytes: k * elementBytes, dataType: inputType
+                    )
                 )
-            )
-            let result = MPSMatrix(
-                buffer: buffer(c), offset: offset * 4,
-                descriptor: MPSMatrixDescriptor(
-                    rows: m, columns: n, rowBytes: stride * 4, dataType: .float32
+                let result = MPSMatrix(
+                    buffer: buffer(c), offset: offset * 4,
+                    descriptor: MPSMatrixDescriptor(
+                        rows: m, columns: n, rowBytes: stride * 4, dataType: .float32
+                    )
                 )
-            )
-            let key = "\(m)/\(n)/\(k)/\(halfInputs)"
-            let multiply: MPSMatrixMultiplication
+                let key = "\(m)/\(n)/\(k)/\(halfInputs)"
+                let multiply: MPSMatrixMultiplication
 
-            if let cached = ctx.products[key] {
-                multiply = cached
-            } else {
-                multiply = MPSMatrixMultiplication(
-                    device: ctx.device, transposeLeft: false, transposeRight: true,
-                    resultRows: m, resultColumns: n, interiorColumns: k, alpha: 1, beta: 0
+                if let cached = ctx.products[key] {
+                    multiply = cached
+                } else {
+                    multiply = MPSMatrixMultiplication(
+                        device: ctx.device, transposeLeft: false, transposeRight: true,
+                        resultRows: m, resultColumns: n, interiorColumns: k, alpha: 1, beta: 0
+                    )
+                    ctx.products[key] = multiply
+                }
+
+                let command = try ctx.command()
+                multiply.encode(
+                    commandBuffer: command, leftMatrix: left, rightMatrix: right, resultMatrix: result
                 )
-                ctx.products[key] = multiply
+                try ctx.encoded()
+                return 0
+            } catch {
+                return fail(error)
             }
-
-            let command = try ctx.command()
-            multiply.encode(
-                commandBuffer: command, leftMatrix: left, rightMatrix: right, resultMatrix: result
-            )
-            try ctx.encoded()
-            return 0
-        } catch {
-            return fail(error)
         }
     }
 }
