@@ -524,23 +524,17 @@ pub fn sample(
     );
     let mut sharing = match &mut target {
         Some(target) => {
-            let shard = target.shard.clone();
             let algorithms = target
                 .open
                 .first()
                 .map_or(0, |open| open.algorithms.len() as u32);
-            match crate::worker::open_shard(
+            match crate::worker::Coordinator::open(
                 &mut target.workers,
                 &target.open,
                 &target.payload,
-                &shard,
-                target.tokens,
-                dit.config().hidden,
-                target.gated,
                 algorithms,
-                &settings.token,
             ) {
-                Ok(exchanger) => Some(Sharing::With(Box::new(exchanger), shard)),
+                Ok(coordinator) => Some(Sharing::With(Box::new(coordinator))),
                 Err(error) => {
                     eprintln!("warning: opening a shared run: {error}");
                     None
@@ -581,14 +575,9 @@ pub fn sample(
             // Every rank runs the same step over its own rows, and the exchanges inside the blocks
             // keep the attention whole. A rank that fails takes the run with it: there is no
             // halfway through a step to fall back from.
-            Some(Sharing::With(exchanger, shard)) => crate::worker::step_shard(
-                exchanger,
-                &dit,
-                &inputs,
-                step_sparse.as_ref(),
-                shard,
-                step,
-            )?,
+            Some(Sharing::With(coordinator)) => {
+                crate::worker::step_shard(coordinator, &dit, &inputs, step_sparse.as_ref(), step)?
+            }
             Some(Sharing::Alone(exchange, shard)) => {
                 let began = Instant::now();
                 let (part, timing) = crate::worker::share_a_step(
@@ -811,9 +800,6 @@ fn encode_pictures(
 #[cfg(any(feature = "cuda", feature = "metal"))]
 struct ShardTarget {
     workers: Vec<crate::worker::Worker>,
-    shard: mmh3_core::shard::Shard,
-    tokens: usize,
-    gated: bool,
     open: Vec<mmh3_core::worker::OpenSession>,
     payload: Vec<u8>,
 }
@@ -831,8 +817,8 @@ fn prepare_workers(
     use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint};
 
     let ranks =
-        crate::cli::option_number(options, "shard-dit", settings.workers.len() + 1).unwrap_or(0);
-    if ranks < 2 || settings.workers.is_empty() {
+        crate::cli::option_number(options, "shard-dit", settings.workers.len()).unwrap_or(0);
+    if ranks < 1 || settings.workers.is_empty() {
         return Vec::new();
     }
     let Ok(path) = crate::models::option_path(options, "dit", dit_file) else {
@@ -850,7 +836,7 @@ fn prepare_workers(
     };
     let mut workers = Vec::new();
     for address in &settings.workers {
-        if workers.len() + 1 >= ranks {
+        if workers.len() >= ranks {
             break;
         }
         let mut worker = match Worker::connect(address, &settings.token) {
@@ -898,11 +884,12 @@ fn shard_target(
     // not worth a second machine. Sharing every step is worth 35%, so it is what `--worker` does
     // unless `--shard-dit 0` says otherwise.
     let asked = options.contains_key("shard-dit");
-    // Without `--shard-dit`, every worker that can take a share does: naming a machine is what
+    // Without `--shard-dit`, every worker that can take a rank does: naming a machine is what
     // asks for it. With it, the number is a cap on the ranks rather than a promise of them.
-    let ranks = crate::cli::option_number(options, "shard-dit", settings.workers.len() + 1).ok()?;
-    if ranks < 2 {
-        // Zero keeps the DiT here. One shares a step with nobody, which `alone_shard` handles.
+    let ranks = crate::cli::option_number(options, "shard-dit", settings.workers.len()).ok()?;
+    if ranks < 1 {
+        // Zero keeps the DiT here. With no worker to fill a rank, `alone_shard` runs the same
+        // path on this machine, which tells the cost of the machinery apart from the wire.
         return None;
     }
     if settings.workers.is_empty() {
@@ -935,19 +922,18 @@ fn shard_target(
 
     // The workers `prepare_workers` reached, which are already reading this DiT.
     let mut workers = workers;
-    workers.truncate(ranks.saturating_sub(1));
-    // What each machine says it can do, this one included.
-    let mine = crate::worker::measure_speed();
-    let mut measured: Vec<Option<mmh3_core::worker::Speed>> = std::iter::once(mine)
-        .chain(workers.iter().map(|worker| worker.speed()))
-        .collect();
+    workers.truncate(ranks);
+    // What each rank says it can do. This machine is not one of them: it hands the work out and
+    // puts the answers together, and runs no block of its own.
+    let mut measured: Vec<Option<mmh3_core::worker::Speed>> =
+        workers.iter().map(|worker| worker.speed()).collect();
     // A machine that says nothing cannot be given a share in proportion to it. Where some
     // measured and some did not, the ones that did not take no share of a step rather than an
     // equal one on no evidence: a share too large for a machine holds every other rank at every
     // barrier of every block. They are still asked for a prompt and for chunks. Where none
     // measured, which is a cluster whose backend cannot measure itself, the shares stay even,
     // since machines that all say nothing are most likely alike.
-    if mine.is_some() && measured.iter().any(Option::is_none) {
+    if measured.iter().any(Option::is_some) && measured.iter().any(Option::is_none) {
         let refused: Vec<&str> = workers
             .iter()
             .filter(|worker| worker.speed().is_none())
@@ -959,10 +945,7 @@ fn shard_target(
                 refused.join(", ")
             );
         }
-        let mut keep = measured[1..]
-            .iter()
-            .map(Option::is_some)
-            .collect::<Vec<bool>>();
+        let mut keep = measured.iter().map(Option::is_some).collect::<Vec<bool>>();
         keep.reverse();
         workers.retain(|_| keep.pop().unwrap_or(false));
         measured.retain(Option::is_some);
@@ -975,7 +958,7 @@ fn shard_target(
     }
     // A rank that cannot be filled is one the run does without: the ranks are what the machines
     // that answered add up to, not what `--shard-dit` asked for.
-    let ranks = workers.len() + 1;
+    let ranks = workers.len();
     let inputs = DitInputs {
         video: video.clone(),
         audio: audio.clone(),
@@ -1013,7 +996,7 @@ fn shard_target(
             },
         )
         .collect();
-    let shard = if measured.iter().all(Option::is_some) && ranks > 1 {
+    let shard = if measured.iter().all(Option::is_some) && ranks > 0 {
         let say = |what: &str, weights: &[f64]| {
             format!(
                 "{what} {}",
@@ -1063,10 +1046,10 @@ fn shard_target(
             precision: attention_precision(dit),
         })
     };
-    let open: Option<Vec<OpenSession>> = (1..ranks).map(open).collect();
+    let open: Option<Vec<OpenSession>> = (0..ranks).map(open).collect();
     let open = open?;
     println!(
-        "{} takes a share of every step, {tokens} tokens split {ranks} ways",
+        "{} takes every step, {tokens} tokens split {ranks} ways",
         workers
             .iter()
             .map(|worker| worker.address.as_str())
@@ -1074,10 +1057,7 @@ fn shard_target(
             .join(", ")
     );
     Some(ShardTarget {
-        shard: shard.clone(),
         workers,
-        tokens,
-        gated: dit.has_vsa_gates(),
         open,
         payload: session_payload(context, context_modalities, keyframes, references),
     })
@@ -1127,7 +1107,9 @@ fn session_adapters(
 /// nobody at all so that the machinery can be timed on its own.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 enum Sharing<'a> {
-    With(Box<crate::worker::Exchanger<'a>>, mmh3_core::shard::Shard),
+    /// Every step goes to the workers and this machine only puts the parts back together, so it
+    /// holds no exchange and no cut of its own.
+    With(Box<crate::worker::Coordinator<'a>>),
     Alone(crate::worker::SoleExchange, mmh3_core::shard::Shard),
 }
 

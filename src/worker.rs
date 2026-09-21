@@ -1241,8 +1241,6 @@ fn session(
                 if let Err(error) = serve_shard(
                     &mut reader,
                     &mut writer,
-                    #[cfg(feature = "cuda")]
-                    rdma.as_ref(),
                     models,
                     &open,
                     &body[payload..],
@@ -1596,10 +1594,6 @@ pub struct Peer<'a> {
     pub host: String,
     reader: &'a mut BufReader<TcpStream>,
     writer: &'a mut BufWriter<TcpStream>,
-    /// The connection to this peer, where the path between the two machines has one and this
-    /// backend can use it.
-    #[cfg(feature = "cuda")]
-    link: Option<&'a Rdma>,
 }
 
 /// What a block addresses a region by: a pointer where this backend reaches its memory by one.
@@ -1743,30 +1737,28 @@ impl Computed {
 /// once before the first block because registering hundreds of megabytes costs far more than
 /// moving them.
 ///
-/// The leader is rank 0 and holds a socket to every other rank. A worker holds one to the leader,
-/// so a barrier is a message to the leader and one back, and the addresses of the connections
-/// between two workers pass through it as well.
+/// The ranks are the workers and nothing else. The leader is not one of them: it relays the
+/// rendezvous, hands out the steps and takes the parts back, over the socket every rank holds to
+/// it, and joins no barrier. Every pair of ranks reaches every other directly.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Exchanger<'a> {
     rank: usize,
     ranks: usize,
+    /// The socket to the machine handing the work out, which carries the rendezvous and the steps
+    /// and never a payload a peer owes this rank.
+    leader: Socket<'a>,
     sockets: HashMap<usize, Socket<'a>>,
     /// One connection per peer whose path has one, over which this rank writes into their memory.
     /// A peer with none is written to over the socket instead, which is every peer on a backend
     /// with no transport of its own.
     #[cfg(feature = "cuda")]
-    links: HashMap<usize, LinkOf<'a>>,
+    links: HashMap<usize, Rdma>,
     /// The memory a peer's writes land in.
     regions: HashMap<shard::Region, Held>,
-    /// The backend each peer runs, which decides whether its choices are comparable with this
-    /// rank's at all.
-    backends: HashMap<usize, u8>,
     /// Where this rank's session waits for the peers that dial it.
     listener: Option<TcpListener>,
     /// Where every rank listens, as the leader worked it out and passed it round.
     listens: Vec<worker::PeerListen>,
-    /// The host this rank reached each peer at, which the leader passes on.
-    hosts: HashMap<usize, String>,
     /// What a peer has to offer before this rank will talk to it.
     token: String,
     /// What a peer with no connection is owed, until the barrier that sends it.
@@ -1834,23 +1826,6 @@ struct Queued {
     bytes: usize,
 }
 
-/// A connection this rank already had, or one it opened for a peer it has no socket to.
-#[cfg(feature = "cuda")]
-enum LinkOf<'a> {
-    Held(&'a Rdma),
-    Opened(Rdma),
-}
-
-#[cfg(feature = "cuda")]
-impl LinkOf<'_> {
-    fn link(&self) -> &Rdma {
-        match self {
-            LinkOf::Held(link) => link,
-            LinkOf::Opened(link) => link,
-        }
-    }
-}
-
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl<'a> Exchanger<'a> {
     /// Stands a run up: the ranks that cannot reach each other over TCP swap the addresses of their
@@ -1862,44 +1837,29 @@ impl<'a> Exchanger<'a> {
         tokens: usize,
         hidden: usize,
         gated: bool,
-        peers: Vec<Peer<'a>>,
+        leader_reader: &'a mut BufReader<TcpStream>,
+        leader_writer: &'a mut BufWriter<TcpStream>,
         algorithms: u32,
         token: &str,
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
-        let mut sockets = HashMap::new();
-        let mut backends = HashMap::new();
-        let mut hosts = HashMap::new();
-        #[cfg(feature = "cuda")]
-        let mut links = HashMap::new();
-        for peer in peers {
-            backends.insert(peer.rank, peer.backend);
-            hosts.insert(peer.rank, peer.host);
-            #[cfg(feature = "cuda")]
-            if let Some(link) = peer.link {
-                links.insert(peer.rank, LinkOf::Held(link));
-            }
-            sockets.insert(
-                peer.rank,
-                Socket::Session {
-                    reader: peer.reader,
-                    writer: peer.writer,
-                },
-            );
-        }
         let mut exchanger = Exchanger {
             rank,
             ranks,
-            sockets,
+            leader: Socket::Session {
+                reader: leader_reader,
+                writer: leader_writer,
+            },
+            // A rank holds a socket to the leader and to nothing else when a session opens. The
+            // sockets to the other ranks are dialled once the rendezvous has said where they wait.
+            sockets: HashMap::new(),
             #[cfg(feature = "cuda")]
-            links,
+            links: HashMap::new(),
             regions: HashMap::new(),
-            backends,
             // A rank the leader reaches is a rank its peers may have to dial, so every one of
             // them waits on a port of its own for the length of the session.
             listener: TcpListener::bind("0.0.0.0:0").ok(),
             listens: Vec::new(),
-            hosts,
             token: token.to_owned(),
             pending: HashMap::new(),
             computed: Computed::default(),
@@ -1924,7 +1884,7 @@ impl<'a> Exchanger<'a> {
             Some(_) if remote.keys.is_empty() => Err(exchange_error(format!(
                 "rank {peer} has a connection here but named no address for {into:?}"
             ))),
-            Some(link) => Ok(Some(link.link())),
+            Some(link) => Ok(Some(link)),
             None => Ok(None),
         }
     }
@@ -1979,76 +1939,43 @@ impl<'a> Exchanger<'a> {
             .collect::<Result<_, Box<dyn Error>>>()?;
         #[cfg(not(feature = "cuda"))]
         let mine: Vec<worker::PeerLink> = Vec::new();
-        if self.rank > 0 {
-            // A worker offers the leader what it made for the other workers and takes back what
-            // they made for it.
-            self.send(
-                0,
-                Kind::SessionLinks,
-                &worker::PeerLink::encode_all(&mine),
-                &[],
-            )?;
-            let (header, body) = self.receive(0)?;
-            self.expect(header, Kind::SessionLinks, &body)?;
-            #[cfg(feature = "cuda")]
-            {
-                let theirs = worker::PeerLink::decode_all(&body)?;
-                for (peer, link) in opened {
-                    let addresses: Option<Vec<mmh3_rdma::Address>> = theirs
-                        .iter()
-                        .find(|entry| entry.peer as usize == peer)
-                        .and_then(|entry| {
-                            entry
-                                .addresses
-                                .iter()
-                                .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
-                                .collect()
-                        });
-                    // A peer that offered nothing has no transport of its own, so the connection
-                    // made for it is dropped and the pair uses the socket they dial instead.
-                    let Some(addresses) = addresses else {
-                        continue;
-                    };
-                    link.connect(&addresses)?;
-                    self.links.insert(peer, LinkOf::Opened(link));
-                }
+        // Every rank offers the leader what it made for the other ranks and takes back what they
+        // made for it. The leader opens no connection of its own: it only passes the addresses on.
+        self.send_leader(
+            Kind::SessionLinks,
+            &worker::PeerLink::encode_all(&mine),
+            &[],
+        )?;
+        let (header, body) = self.receive_leader()?;
+        self.expect(header, Kind::SessionLinks, &body)?;
+        #[cfg(feature = "cuda")]
+        {
+            let theirs = worker::PeerLink::decode_all(&body)?;
+            for (peer, link) in opened {
+                let addresses: Option<Vec<mmh3_rdma::Address>> = theirs
+                    .iter()
+                    .find(|entry| entry.peer as usize == peer)
+                    .and_then(|entry| {
+                        entry
+                            .addresses
+                            .iter()
+                            .map(|bytes| mmh3_rdma::Address::from_bytes(bytes))
+                            .collect()
+                    });
+                // A peer that offered nothing has no transport of its own, so the connection made
+                // for it is dropped and the pair uses the socket they dial instead.
+                let Some(addresses) = addresses else {
+                    continue;
+                };
+                link.connect(&addresses)?;
+                self.links.insert(peer, link);
             }
-            return Ok(());
-        }
-        // The leader has a socket to every rank, so it opens no connection of its own here and
-        // only passes the addresses on: what rank k made for rank l goes to rank l.
-        let mut offered: Vec<(usize, Vec<worker::PeerLink>)> = Vec::new();
-        for peer in 1..self.ranks {
-            let (header, body) = self.receive(peer)?;
-            self.expect(header, Kind::SessionLinks, &body)?;
-            offered.push((peer, worker::PeerLink::decode_all(&body)?));
-        }
-        for peer in 1..self.ranks {
-            let theirs: Vec<worker::PeerLink> = offered
-                .iter()
-                .filter(|(owner, _)| *owner != peer)
-                .filter_map(|(owner, links)| {
-                    links
-                        .iter()
-                        .find(|entry| entry.peer as usize == peer)
-                        .map(|entry| worker::PeerLink {
-                            peer: *owner as u32,
-                            addresses: entry.addresses.clone(),
-                        })
-                })
-                .collect();
-            self.send(
-                peer,
-                Kind::SessionLinks,
-                &worker::PeerLink::encode_all(&theirs),
-                &[],
-            )?;
         }
         Ok(())
     }
 
-    /// Registers every region a step will use and passes the table of them round. `algorithms` is
-    /// how many cuBLASLt choices this rank took from the leader, or sent as the leader.
+    /// Registers every region a step will use and takes back the table of every rank's, which the
+    /// leader puts together. `algorithms` is how many cuBLASLt choices this rank took from it.
     fn register(
         &mut self,
         shard: &Shard,
@@ -2091,64 +2018,19 @@ impl<'a> Exchanger<'a> {
             .as_ref()
             .and_then(|listener| listener.local_addr().ok())
             .map_or(0, |address| address.port() as u32);
-        let whole = if self.rank > 0 {
-            self.send(
-                0,
-                Kind::SessionReady,
-                &worker::SessionReady {
-                    algorithms,
-                    listen_port,
-                    regions: table,
-                }
-                .encode(),
-                &[],
-            )?;
-            let (header, body) = self.receive(0)?;
-            self.expect(header, Kind::SessionReady, &body)?;
-            worker::SessionTable::decode(&body)?
-        } else {
-            // The leader collects every rank's table and sends the whole of it back, so that a
-            // rank looks an entry up by its owner rather than counting on the lists lining up.
-            let mut whole = worker::SessionTable {
-                listens: Vec::new(),
+        self.send_leader(
+            Kind::SessionReady,
+            &worker::SessionReady {
+                algorithms,
+                listen_port,
                 regions: table,
-            };
-            for peer in 1..self.ranks {
-                let (header, body) = self.receive(peer)?;
-                self.expect(header, Kind::SessionReady, &body)?;
-                let ready = worker::SessionReady::decode(&body)?;
-                // The host is the one this rank reached the peer at: a machine behind more than
-                // one interface cannot say which of them its peers should use, and the leader
-                // already knows one that works.
-                if ready.listen_port > 0
-                    && let Some(host) = self.hosts.get(&peer)
-                {
-                    whole.listens.push(worker::PeerListen {
-                        rank: peer as u32,
-                        address: format!("{host}:{}", ready.listen_port),
-                    });
-                }
-                // A CUDA rank that took none of them times its own candidates, so the two may
-                // choose differently and the run is then only what these machines together
-                // produce. A rank on another backend never had them to take, which is ordinary
-                // and says nothing: warning there would make a Mac warn on every run.
-                if ready.algorithms == 0
-                    && algorithms > 0
-                    && self.backends.get(&peer) == Some(&worker::BACKEND_CUDA)
-                {
-                    println!(
-                        "rank {peer} took none of the {algorithms} cuBLASLt algorithms, so it \
-                         chooses its own"
-                    );
-                }
-                whole.regions.extend(ready.regions);
             }
-            let encoded = whole.encode();
-            for peer in 1..self.ranks {
-                self.send(peer, Kind::SessionReady, &encoded, &[])?;
-            }
-            whole
-        };
+            .encode(),
+            &[],
+        )?;
+        let (header, body) = self.receive_leader()?;
+        self.expect(header, Kind::SessionReady, &body)?;
+        let whole = worker::SessionTable::decode(&body)?;
         self.listens = whole.listens.clone();
         for entry in whole.regions {
             if entry.owner as usize == self.rank {
@@ -2159,6 +2041,20 @@ impl<'a> Exchanger<'a> {
             }
         }
         Ok(())
+    }
+
+    pub fn send_leader(
+        &mut self,
+        kind: Kind,
+        descriptor: &[u8],
+        payload: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        worker::send(self.leader.writer(), kind, 0, descriptor, payload)?;
+        Ok(())
+    }
+
+    pub fn receive_leader(&mut self) -> Result<(worker::Header, Vec<u8>), Box<dyn Error>> {
+        Ok(worker::receive(self.leader.reader(), BODY_LIMIT)?)
     }
 
     fn socket(&mut self, peer: usize) -> Result<&mut Socket<'a>, Box<dyn Error>> {
@@ -2895,7 +2791,6 @@ fn prepare_dit(models: &Path, checkpoint: &worker::Checkpoint) -> Option<(u64, D
 fn serve_shard(
     reader: &mut BufReader<TcpStream>,
     writer: &mut BufWriter<TcpStream>,
-    #[cfg(feature = "cuda")] connection: Option<&Rdma>,
     models: &Path,
     open: &OpenSession,
     payload: &[u8],
@@ -3029,26 +2924,16 @@ fn serve_shard(
     // candidates while the wire and the other ranks have its device. A key of its own that the
     // leader's does not match, which is what another GPU or another backend has, leaves them.
     let algorithms = adopt_algorithms(open);
-    // A worker's only socket is the one the leader opened, so the leader is its only peer here and
-    // the connections to the other ranks come out of the rendezvous.
-    let peers = vec![Peer {
-        rank: 0,
-        // A worker never compares its choices with the leader's, so it does not need to be told
-        // which backend the leader runs. Only the leader reads this, about its workers.
-        backend: 0,
-        // Only the leader tells anyone where to dial, so what a worker holds here is never read.
-        host: String::new(),
-        reader,
-        writer,
-        #[cfg(feature = "cuda")]
-        link: connection,
-    }];
+    // A rank's only socket when a session opens is the one the leader opened. The leader is not a
+    // rank, so it is a channel of its own here, and the sockets to the other ranks come out of the
+    // rendezvous it relays.
     let mut exchanger = Exchanger::open(
         &shard,
         tokens,
         dit.config().hidden,
         gated,
-        peers,
+        reader,
+        writer,
         algorithms as u32,
         token,
     )?;
@@ -3061,7 +2946,7 @@ fn serve_shard(
     );
 
     loop {
-        let (header, body) = exchanger.receive_from(0)?;
+        let (header, body) = exchanger.receive_leader()?;
         match header.kind {
             Kind::CloseSession => return Ok(()),
             Kind::StepShard => {}
@@ -3110,65 +2995,186 @@ fn serve_shard(
         for value in part.video.iter().chain(&part.audio) {
             body.extend_from_slice(&value.to_le_bytes());
         }
-        exchanger.send_to(0, Kind::VelocityPart, &descriptor.encode(), &body)?;
+        exchanger.send_leader(Kind::VelocityPart, &descriptor.encode(), &body)?;
     }
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl Worker {
     /// This worker as a rank of a shared-out run, with the session opened on it. Nothing else may
-    /// use the worker while the exchanger lives, since from here on the ranks barrier and read
-    /// each other rather than trading requests.
+    /// use the worker while the coordinator lives, since from here on it answers steps rather than
+    /// requests. It carries no connection: the payloads go between the ranks and never through the
+    /// machine handing the work out.
     pub fn as_peer<'a>(
         &'a mut self,
         rank: usize,
         open: &OpenSession,
         payload: &[u8],
     ) -> Result<Peer<'a>, Box<dyn Error>> {
-        let Worker {
-            reader,
-            writer,
-            #[cfg(feature = "cuda")]
-            rdma,
-            ..
-        } = self;
-        #[cfg(feature = "cuda")]
-        let link = rdma.as_ref();
+        let (backend, host) = (self.welcome.backend, host_of(&self.address));
+        let Worker { reader, writer, .. } = self;
         worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
         Ok(Peer {
             rank,
-            backend: self.welcome.backend,
-            host: host_of(&self.address),
+            backend,
+            host,
             reader,
             writer,
-            #[cfg(feature = "cuda")]
-            link,
         })
     }
 }
 
-/// Opens a run on every worker and stands the leader's side of it up. The workers take ranks 1
-/// upwards in the order they are given, which is the order `OpenSession` named them.
+/// The machine handing the work out. It holds a socket to every rank, relays the rendezvous
+/// between them, hands out each step and takes the parts back. It registers no region, joins no
+/// barrier and runs no block: the ranks are the workers, and this is not one of them.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub fn open_shard<'a>(
-    workers: &'a mut [Worker],
-    opens: &[OpenSession],
-    payload: &[u8],
-    shard: &Shard,
-    tokens: usize,
-    hidden: usize,
-    gated: bool,
-    algorithms: u32,
-    token: &str,
-) -> Result<Exchanger<'a>, Box<dyn Error>> {
-    let mut peers = Vec::with_capacity(workers.len());
-    for (index, worker) in workers.iter_mut().enumerate() {
-        let open = opens
-            .get(index)
-            .ok_or("a worker was given no session to open")?;
-        peers.push(worker.as_peer(index + 1, open, payload)?);
+pub struct Coordinator<'a> {
+    peers: Vec<Peer<'a>>,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl<'a> Coordinator<'a> {
+    /// Opens a run on every worker and relays the rendezvous. The workers take ranks 0 upwards in
+    /// the order they are given, which is the order `OpenSession` named them.
+    pub fn open(
+        workers: &'a mut [Worker],
+        opens: &[OpenSession],
+        payload: &[u8],
+        algorithms: u32,
+    ) -> Result<Self, Box<dyn Error>> {
+        let mut peers = Vec::with_capacity(workers.len());
+        for (index, worker) in workers.iter_mut().enumerate() {
+            let open = opens
+                .get(index)
+                .ok_or("a worker was given no session to open")?;
+            peers.push(worker.as_peer(index, open, payload)?);
+        }
+        let mut coordinator = Coordinator { peers };
+        coordinator.relay_links()?;
+        coordinator.relay_regions(algorithms)?;
+        Ok(coordinator)
     }
-    Exchanger::open(shard, tokens, hidden, gated, peers, algorithms, token)
+
+    pub fn ranks(&self) -> usize {
+        self.peers.len()
+    }
+
+    /// What rank k opened for rank l goes to rank l. This machine opens none of its own: no rank
+    /// writes into it.
+    fn relay_links(&mut self) -> Result<(), Box<dyn Error>> {
+        let mut offered: Vec<(usize, Vec<worker::PeerLink>)> = Vec::new();
+        for rank in 0..self.ranks() {
+            let (header, body) = self.receive(rank)?;
+            self.expect(header, Kind::SessionLinks, &body)?;
+            offered.push((rank, worker::PeerLink::decode_all(&body)?));
+        }
+        for rank in 0..self.ranks() {
+            let theirs: Vec<worker::PeerLink> = offered
+                .iter()
+                .filter(|(owner, _)| *owner != rank)
+                .filter_map(|(owner, links)| {
+                    links
+                        .iter()
+                        .find(|entry| entry.peer as usize == rank)
+                        .map(|entry| worker::PeerLink {
+                            peer: *owner as u32,
+                            addresses: entry.addresses.clone(),
+                        })
+                })
+                .collect();
+            self.send(
+                rank,
+                Kind::SessionLinks,
+                &worker::PeerLink::encode_all(&theirs),
+                &[],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Collects every rank's regions and sends the whole table back, so that a rank looks an entry
+    /// up by its owner rather than counting on the lists lining up.
+    fn relay_regions(&mut self, algorithms: u32) -> Result<(), Box<dyn Error>> {
+        let mut whole = worker::SessionTable {
+            listens: Vec::new(),
+            regions: Vec::new(),
+        };
+        for rank in 0..self.ranks() {
+            let (header, body) = self.receive(rank)?;
+            self.expect(header, Kind::SessionReady, &body)?;
+            let ready = worker::SessionReady::decode(&body)?;
+            // The host is the one this machine reached the rank at: a machine behind more than one
+            // interface cannot say which of them its peers should use, and this one already knows
+            // an address that works.
+            if ready.listen_port > 0 {
+                whole.listens.push(worker::PeerListen {
+                    rank: rank as u32,
+                    address: format!("{}:{}", self.peers[rank].host, ready.listen_port),
+                });
+            }
+            // A CUDA rank that took none of them times its own candidates, so the two may choose
+            // differently and the run is then only what these machines together produce. A rank on
+            // another backend never had them to take, which is ordinary and says nothing: warning
+            // there would make a Mac warn on every run.
+            if ready.algorithms == 0
+                && algorithms > 0
+                && self.peers[rank].backend == worker::BACKEND_CUDA
+            {
+                println!(
+                    "rank {rank} took none of the {algorithms} cuBLASLt algorithms, so it \
+                     chooses its own"
+                );
+            }
+            whole.regions.extend(ready.regions);
+        }
+        let encoded = whole.encode();
+        for rank in 0..self.ranks() {
+            self.send(rank, Kind::SessionReady, &encoded, &[])?;
+        }
+        Ok(())
+    }
+
+    pub fn send(
+        &mut self,
+        rank: usize,
+        kind: Kind,
+        descriptor: &[u8],
+        payload: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        let peer = self
+            .peers
+            .get_mut(rank)
+            .ok_or_else(|| format!("this run has no rank {rank}"))?;
+        worker::send(peer.writer, kind, 0, descriptor, payload)?;
+        Ok(())
+    }
+
+    pub fn receive(&mut self, rank: usize) -> Result<(worker::Header, Vec<u8>), Box<dyn Error>> {
+        let peer = self
+            .peers
+            .get_mut(rank)
+            .ok_or_else(|| format!("this run has no rank {rank}"))?;
+        Ok(worker::receive(peer.reader, BODY_LIMIT)?)
+    }
+
+    fn expect(
+        &self,
+        header: worker::Header,
+        kind: Kind,
+        body: &[u8],
+    ) -> Result<(), Box<dyn Error>> {
+        if header.kind == Kind::Error {
+            return Err(format!(
+                "a rank refused a session: {}",
+                String::from_utf8_lossy(body)
+            )
+            .into());
+        }
+        if header.kind != kind {
+            return Err(format!("a rank answered a session with {:?}", header.kind).into());
+        }
+        Ok(())
+    }
 }
 
 /// The block-sparse attention of a run, as a session carries it. Every rank has to choose the same
@@ -3301,18 +3307,16 @@ pub fn session_payload(
     payload
 }
 
-/// One step of a shared-out run from the leader's side: hand out the latents, take this rank's
-/// share, and collect what the others ended with.
+/// One step of a shared-out run from the machine handing it out: send the latents to every rank,
+/// take back the rows each carried, and put them together. It runs no block of its own.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn step_shard(
-    exchanger: &mut Exchanger<'_>,
+    coordinator: &mut Coordinator<'_>,
     dit: &Dit,
     inputs: &mmh3_core::dit::inputs::DitInputs,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
-    shard: &Shard,
     step: usize,
 ) -> Result<DitStep, Box<dyn Error>> {
-    let started = Instant::now();
     let descriptor = worker::StepShard {
         step: step as u32,
         sigma: inputs.sigma,
@@ -3321,18 +3325,15 @@ pub fn step_shard(
     for value in inputs.video.data.iter().chain(&inputs.audio.data) {
         latents.extend_from_slice(&value.to_le_bytes());
     }
-    for peer in 1..shard.ranks() {
-        exchanger.send_to(peer, Kind::StepShard, &descriptor.encode(), &latents)?;
+    for rank in 0..coordinator.ranks() {
+        coordinator.send(rank, Kind::StepShard, &descriptor.encode(), &latents)?;
     }
 
-    // The same call a worker makes for its own share: one rank implementation, reached from the
-    // machine handing the work out as well as from the machines taking it.
-    let (mine, timing) = share_a_step(dit, inputs, sparse, shard, exchanger, || started.elapsed())?;
-    let mut parts = vec![mine];
-    for peer in 1..shard.ranks() {
-        let (header, body) = exchanger.receive_from(peer)?;
+    let mut parts = Vec::with_capacity(coordinator.ranks());
+    for rank in 0..coordinator.ranks() {
+        let (header, body) = coordinator.receive(rank)?;
         if header.kind != Kind::VelocityPart {
-            return Err(format!("rank {peer} answered a step with {:?}", header.kind).into());
+            return Err(format!("rank {rank} answered a step with {:?}", header.kind).into());
         }
         let part = worker::VelocityPart::decode(&body)?;
         let values = &body[worker::VelocityPart::BYTES..];
@@ -3350,9 +3351,6 @@ pub fn step_shard(
             video: floats[..split].to_vec(),
             audio: floats[split..].to_vec(),
         });
-    }
-    if !timing.is_empty() {
-        println!("  {timing}");
     }
     Ok(dit.assemble_velocity(inputs, sparse, &parts)?)
 }

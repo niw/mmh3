@@ -16,14 +16,14 @@ pub const CAPABILITY_DIT_SHARD: u32 = 1 << 3;
 pub const TRANSPORT_TCP: u32 = 1 << 0;
 pub const TRANSPORT_RDMA: u32 = 1 << 1;
 
-/// What the machines of one run have to agree on: the messages, their fields and the order two
-/// ranks send in. It goes up whenever any of those changes, and a rank that meets another number
-/// refuses the connection.
+/// What the machines of one run have to agree on: the messages, their fields, the order two ranks
+/// send in, and who counts as a rank at all. It goes up whenever any of those changes, and a rank
+/// that meets another number refuses the connection.
 ///
 /// A checkpoint is matched by digest and a protocol is not, which is why this exists: a pair that
 /// disagrees about the wire does not fail, it waits, and two ranks each waiting for the other to
 /// speak look exactly like a slow machine.
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
 
 pub const BACKEND_CUDA: u8 = 1;
 pub const BACKEND_METAL: u8 = 2;
