@@ -5,7 +5,7 @@ mod inspect;
 mod bench;
 #[cfg(feature = "cuda")]
 mod check;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 mod device;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 mod latent;
@@ -44,7 +44,7 @@ const USAGE: &str = "usage:
                     [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
                     [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X]
                     [--sparse-start X] [--vsa-sparsity X]
-                    [--worker HOST[:PORT]]... [--shard-dit N] [--token FILE]
+                    [--worker HOST[:PORT]]... [--shard-dit N] [--token FILE] [--vram-budget GB]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
@@ -57,10 +57,8 @@ fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
         Some("inspect") => inspect::run(&arguments[1..]),
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("device") => device::run(),
-        #[cfg(feature = "metal")]
-        Some("device") => mmh3_metal::Device::new().map(|device| println!("Metal: {}", device.name())).map_err(Into::into),
         #[cfg(feature = "cuda")]
         Some("bench") => bench::run(&arguments[1..]),
         #[cfg(feature = "cuda")]

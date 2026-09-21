@@ -1,9 +1,12 @@
-//! CUDA device information.
+//! What the device this build computes on says about itself.
 
-use crate::format::{format_bytes, format_count};
+use crate::format::format_bytes;
 use std::error::Error;
 
+#[cfg(feature = "cuda")]
 pub(crate) fn run() -> Result<(), Box<dyn Error>> {
+    use crate::format::format_count;
+
     let count = mmh3_cuda::device_count()?;
     for device in 0..count {
         let info = mmh3_cuda::device_info(device)?;
@@ -36,6 +39,23 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
         "memory    {} free of {}",
         format_bytes(free_bytes),
         format_bytes(total_bytes)
+    );
+    Ok(())
+}
+
+/// What a Metal device answers, which is less than a driver says and the same question at the end:
+/// the memory is what one process may hold less what this one holds, so what other programs have
+/// taken is counted as free.
+#[cfg(feature = "metal")]
+pub(crate) fn run() -> Result<(), Box<dyn Error>> {
+    let device = mmh3_metal::Device::new()?;
+    println!("device: {}", device.name());
+    println!("  tensor operations       {}", device.supports_tensor_ops());
+    let (free_bytes, recommended_bytes) = mmh3_metal::memory_info()?;
+    println!(
+        "memory    {} free of the {} one process may hold",
+        format_bytes(free_bytes),
+        format_bytes(recommended_bytes)
     );
     Ok(())
 }
