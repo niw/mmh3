@@ -78,7 +78,7 @@ fn median(trials: usize, mut work: impl FnMut() -> Result<()>, device: &Device) 
 
     times.sort_by(f64::total_cmp);
     let median = times[times.len() / 2];
-    if !(median > 0.0) {
+    if median.is_nan() || median <= 0.0 {
         return Err(Error("a measurement that took no time".into()));
     }
     Ok(median)

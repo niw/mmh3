@@ -176,7 +176,7 @@ impl Memory {
     /// An offset into a region is a byte offset, and a bf16 value straddling the end of one would
     /// read a neighbour's memory rather than fail, so the extent is checked before the kernel.
     fn check(&self, offset: usize, bytes: usize) -> Result<()> {
-        if offset % 2 != 0 {
+        if !offset.is_multiple_of(2) {
             return Err(Error(format!("a bf16 run at an odd offset {offset}")));
         }
         self.check_bytes(offset, bytes)

@@ -501,8 +501,10 @@ impl MetalVideoDecoder {
         }
 
         let values: Vec<f32> = bytes
-            .chunks_exact(4)
-            .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|value| f32::from_le_bytes(*value))
             .collect();
         Array::from_f32(&self.weights.device, 3, columns, &values).ok()
     }
