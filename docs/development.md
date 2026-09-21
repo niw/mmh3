@@ -9,8 +9,8 @@
   [FastH3](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree) 4-step
   model with its video sparse attention (VSA), as a patch on the base DiT.
 - Optional INT8/FP8 attention in the DiT, with FP32 softmax and accumulation.
-- Kernels fused for H3's shapes, such as the normalization and quantization of each layer input in
-  one pass, and SwiGLU and LoRA inside the INT8 GEMM.
+- Kernels fused for MiniMax H3's shapes, such as the normalization and quantization of each layer
+  input in one pass, and SwiGLU and LoRA inside the INT8 GEMM.
 - Experimental NVFP4 linear layers on cuBLASLt's block-scaled FP4 GEMM, requantized from the INT8
   weights at load time, with LoRAs as extra GEMM columns.
 - LoRAs such as the [MiniMax-H3 Turbo LoRA](https://huggingface.co/lightx2v/Minimax-h3-Turbo) for
@@ -32,7 +32,7 @@
   reference and the media writers.
 - `crates/mmh3-cuda`: the CUDA kernels (`kernels/*.cu`) and the Rust code that runs the models with
   them.
-- `crates/mmh3-metal`: the experimental Metal backend, with a Swift resource/MPS bridge and
+- `crates/mmh3-metal`: the Metal backend, with a Swift resource/MPS bridge and
   `kernels/*.metal`. See [Metal](metal.md) for usage and supported options.
 - `crates/mmh3-cpu`: an FP32 CPU reference of the DiT for tests.
 - `crates/mmh3-output`: portable encoder interfaces, AAC encoding, MP4/WebM muxing and ffmpeg CLI

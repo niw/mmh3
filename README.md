@@ -1,19 +1,25 @@
 # mmh3
 
-mmh3 is an inference engine dedicated to [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3),
-which generates video with a synchronized stereo soundtrack from text. It is written in Rust with
-CUDA C++ kernels and runs without PyTorch or ComfyUI: the tokenizer, the
-Qwen3-VL text encoder, the diffusion transformer, the sampler and both VAE decoders are implemented
-in this repository and tuned for H3's shapes. It loads the ComfyUI checkpoints from
-[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3). It saves MP4 directly with
-NVENC or VideoToolbox H.264 video and CPU-encoded AAC audio, or WebM with VP9 and Opus. Both formats work
-without an ffmpeg installation.
+mmh3 is an inference engine dedicated to
+[MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), written in Rust with CUDA and Metal
+kernels and running without PyTorch or ComfyUI. The tokenizer, the Qwen3-VL text encoder, the
+diffusion transformer, the sampler and both VAE decoders are written in this repository and tuned
+for MiniMax H3's shapes. It reads the ComfyUI checkpoints from
+[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3), and writes MP4 with NVENC or
+VideoToolbox H.264 and AAC, or WebM with VP9 and Opus, without an ffmpeg installation.
 
-An experimental [Metal backend for macOS](docs/metal.md) uses a Swift bridge, MPS and Metal kernels.
+It runs on one machine or [distributed across several](docs/distributed.md) running `mmh3 worker`,
+splitting every diffusion step between them over RDMA where there is a path for it and ordinary
+sockets where there is not. The machine that hands the work out runs none of it, so it needs no GPU
+of its own.
+
+The backends are [CUDA](docs/cuda.md) on Linux and [Metal](docs/metal.md) on macOS, the second
+through a Swift bridge and MPS beside its own kernels. Each page says what that backend needs.
 
 ## Getting started
 
-With the [requirements](#requirements) installed, run these commands from the repository directory:
+With what your backend needs installed, [CUDA](docs/cuda.md) or [Metal](docs/metal.md), run these
+commands from the repository directory:
 
 ```sh
 make
@@ -50,32 +56,12 @@ See [Usage](docs/usage.md) for the other settings.
   tested yet.
 - Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
-- Experimental Metal text-to-video support. See [Metal](docs/metal.md) for its current limits.
+- Metal text-to-video support on macOS. See [Metal](docs/metal.md) for its current limits.
+- [Distributed generation](docs/distributed.md) works on both backends and between them, and from a
+  machine with neither. Shares follow what each machine measures itself to do. Between two DGX
+  Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark rather
+  than taking one itself generates about twenty-five times faster than it does alone.
 - Not yet: an HTTP server.
-
-## Requirements
-
-These requirements are for CUDA. See [Metal](docs/metal.md) for macOS.
-
-- Linux with an NVIDIA Blackwell GPU (developed on aarch64).
-- The CUDA toolkit with `nvcc` and cuBLASLt (developed with CUDA 13.0).
-- Rust with edition 2024 support (developed with 1.98).
-- The Hugging Face CLI (`hf`) to download the models, for example installed with
-  `uv tool install huggingface_hub`.
-- A C/C++ toolchain for the CUDA kernels and NVENC adapter.
-- With the optional `webm` feature, CMake for the bundled Opus encoder, plus
-  `curl`, `tar`, and `sha256sum` (Linux). The VP9 binding downloads
-  a versioned libvpx static library and verifies its checksum during the build. This needs
-  network access to GitHub Releases. Its Linux prebuilt libraries support Ubuntu 22.04/24.04,
-  x86-64 and aarch64. A separate runtime libvpx installation is not needed.
-- Native MP4 requires the `mp4` feature, H.264 NVENC and a driver supporting NVENC API 12.2.
-  The driver is loaded at runtime. No separately installed Video Codec SDK is required. GPUs
-  without NVENC can use WebM or ffmpeg output with a build without `mp4`.
-- About 55 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
-  21 GB of weights plus activations.
-
-ffmpeg is optional: install it only to use the explicit `--ffmpeg` output path. Developers
-running the output integration tests also need ffmpeg and ffprobe as independent decoders.
 
 ## Documentation
 

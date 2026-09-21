@@ -33,8 +33,8 @@ make generate \
 - `--ffmpeg [ARGS...]` (default off): Use an installed ffmpeg instead. All following arguments
   belong to ffmpeg.
 - `--prompt TEXT`, `--prompt-file FILE`: The prompt, raw text without a chat template.
-- `--width N`, `--height N` (default 1344, 768): Canvas size, multiples of 32. H3 is trained with a
-  768-pixel short edge.
+- `--width N`, `--height N` (default 1344, 768): Canvas size, multiples of 32. MiniMax H3 is
+  trained with a 768-pixel short edge.
 - `--frames N` (default 124): Frame count at 24 fps, rounded up to the next 17n + 5.
 - `--first-frame FILE`, `--last-frame FILE` (default none): PNG or JPEG pictures the video starts
   from and ends on. Without `--width` and `--height` the first picture sets the canvas. See
@@ -74,11 +74,20 @@ make generate \
 - `--linear-precision int8|nvfp4` (default `int8`): `nvfp4` runs the video rows of the DiT blocks'
   linear layers in NVFP4, which takes about a quarter off each step and loses some detail.
   Experimental, see [NVFP4 linear layers](nvfp4.md).
+- `--worker HOST[:PORT]` (default none, port 7833): Spread the run across another machine running
+  `mmh3 worker`, repeated for several. It encodes the prompt, decodes chunks of the video and
+  audio, and takes a share of every DiT step. See [Distributed generation](distributed.md).
+- `--shard-dit N` (default: every worker that can take a rank): Share every step across at most N
+  workers. This machine hands the step out and puts the parts back together rather than running
+  one, so it lends itself a worker to keep its own GPU in the run, counted last after the ones
+  `--worker` names. `--shard-dit 0` keeps the DiT here and lends nothing.
+- `--token FILE` (default none): A shared secret sent to every worker, which refuses a leader whose
+  token does not match its own.
 
 ## Prompts
 
-H3 follows long, structured prompts well, with the picture, the sound and the music described
-separately, one section per line:
+MiniMax H3 follows long, structured prompts well, with the picture, the sound and the music
+described separately, one section per line:
 
 ```text
 integrated_multimodal_description: [Shot 1] Cinematic, wide shot, slow push-in. At golden hour on a rugged coastline, huge waves crash against dark cliffs and throw white spray high into the air. A white lighthouse stands on the headland as its beam begins to sweep.

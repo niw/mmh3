@@ -100,8 +100,8 @@ unless `--width` and `--height` say otherwise, as the references do not set it. 
 - The DiT sees these latents as rows after the text, each on a latent grid of its own and on one
   unit of the time axis of its own, and never denoises them. The target video starts on the time
   axis after them.
-- A sound gets its `<Audio j>: ` label in the prompt and nothing more, since H3 has no audio tower.
-  The labels follow the pictures, the order of the official presentation.
+- A sound gets its `<Audio j>: ` label in the prompt and nothing more, since MiniMax H3 has no
+  audio tower. The labels follow the pictures, the order of the official presentation.
 - The audio VAE's encoder turns a sound into 40 latent frames per second, the posterior mean with
   no noise mixed in. Those rows sit after the pictures, two per latent frame for the stereo
   channels, on as many units of the time axis as the sound has frames, and they are never

@@ -1,13 +1,22 @@
-# Metal on macOS (experimental)
+# Metal on macOS
 
 The `metal` backend runs text-to-video generation on Apple silicon, using the same model
 checkpoints as the CUDA backend. MP4 output uses VideoToolbox for H.264 video and AAC audio.
 External encoding through ffmpeg is optional.
 
-## Build and run
+## Requirements
 
-Use an Apple silicon Mac with macOS 15 or later, Xcode 26+ command-line tools and Rust with
-edition 2024 support. See [Models](models.md) for the required checkpoints.
+- An Apple silicon Mac with macOS 15 or later.
+- Xcode 26 or later command-line tools, for the Swift bridge.
+- Rust with edition 2024 support.
+- About 55 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
+  21 GB of weights plus activations. See [Models](models.md) for the checkpoints.
+
+MP4 output needs nothing further, since VideoToolbox is part of the system. ffmpeg is optional and
+only for the explicit `--ffmpeg` path. A machine that only hands work out to others needs none of
+this. See [Distributed generation](distributed.md).
+
+## Build and run
 
 On macOS, the Makefile selects Metal automatically:
 

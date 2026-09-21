@@ -31,7 +31,8 @@ with both `--lora-mode` values.
   find the scales of their inputs in a pass of their own, and every GEMM shape tries cuBLASLt's
   candidates once. mmh3 keeps the chosen candidates in
   `$XDG_CACHE_HOME/mmh3/cublaslt-nvfp4-algorithms.txt` (`~/.cache/mmh3` by default) for later runs
-  with the same shapes, cuBLASLt version and GPU, which saves about 1 s of it.
+  with the same shapes, cuBLASLt version and GPU, which saves about 1 s of it. The GEMMs that are
+  not NVFP4 keep theirs beside it, in `cublaslt-matmul-algorithms.txt`.
 
 ## Speed
 
