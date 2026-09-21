@@ -119,7 +119,18 @@ impl Settings {
         arguments: &[String],
     ) -> Result<Self, Box<dyn Error>> {
         #[cfg(feature = "metal")]
-        crate::metal::validate_options(options)?;
+        {
+            crate::metal::validate_options(options)?;
+            // A run with no worker to hand a step to runs every one here, so what this machine
+            // cannot run it can refuse now rather than after encoding a prompt. A run that means
+            // to hand them out is judged by `load_dit`, which is reached only if it ends up
+            // running them here after all.
+            let hands_out = !option_values(arguments, "worker").is_empty()
+                && option_number(options, "shard-dit", 1).unwrap_or(1) > 0;
+            if !hands_out {
+                crate::metal::validate_step_options(options)?;
+            }
+        }
         let shift_video = option_float(options, "shift-video", 12.0)?;
         let shift_audio = option_float(options, "shift-audio", 3.0)?;
         let schedule = match options.get("schedule").copied().unwrap_or("uniform") {
