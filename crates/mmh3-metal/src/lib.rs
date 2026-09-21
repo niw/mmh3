@@ -271,6 +271,26 @@ impl Drop for Allocation {
 #[derive(Clone)]
 pub(crate) struct Buffer(Rc<Allocation>);
 impl Buffer {
+    /// Copies `bytes` of `source`, `from` bytes in, to `into` bytes into this one.
+    pub(crate) fn copy_range(
+        &self,
+        source: &Buffer,
+        from: usize,
+        into: usize,
+        bytes: usize,
+    ) -> Result<()> {
+        if from + bytes > source.0.bytes || into + bytes > self.0.bytes {
+            return Err(Error("a copy outside a buffer".into()));
+        }
+        self.0.device.run(
+            "copy_bytes",
+            &[source, self],
+            &[bytes as u32, from as u32, into as u32],
+            bytes,
+            false,
+        )
+    }
+
     /// The bytes this buffer holds, which is how a region reaches the host memory a peer reads.
     pub(crate) fn to_bytes(&self) -> Result<Vec<u8>> {
         self.0.device.synchronize()?;

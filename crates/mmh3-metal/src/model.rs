@@ -246,12 +246,19 @@ impl Weights {
     /// `linear` for an input another rank has already rotated and quantized, which is how a
     /// block's input crosses the wire. Neither is done again: the rotation is in the bytes, and
     /// quantizing a second time would not give them back.
+    ///
+    /// `keep` names ranges of the weight's output rows, laid out in the order given, and an empty
+    /// one is the whole weight. A rank that attends a few of a block's heads needs a few of its
+    /// projection's outputs, and the rest would be computed and then dropped. That waste does not
+    /// shrink as a rank's share shrinks, so at one head out of fifty-six it is nearly the whole
+    /// product.
     pub fn linear_quantized(
         &self,
         input: &crate::Buffer,
         scales: &Array,
         rows: usize,
         name: &str,
+        keep: &[std::ops::Range<usize>],
     ) -> Result<Array> {
         let key = format!("{name}.weight");
         let w = self
@@ -264,21 +271,36 @@ impl Weights {
             )));
         }
         let cols = w.shape[1..].iter().product::<usize>();
+        let outputs = w.shape[0];
+        let kept: usize = keep.iter().map(|range| range.len()).sum();
+        if keep.iter().any(|range| range.end > outputs) {
+            return Err(Error(format!("{name}: outputs outside the weight")));
+        }
+
+        let taken = if keep.is_empty() {
+            None
+        } else {
+            Some(gather_rows(&self.device, &w.buffer, cols, keep)?)
+        };
+        let (weight, outputs) = match &taken {
+            Some(buffer) => (buffer, kept),
+            None => (&w.buffer, outputs),
+        };
         let mut result = Array::linear_quantized(
             &self.device,
             input,
             scales,
-            &w.buffer,
+            weight,
             rows,
             cols,
-            w.shape[0],
+            outputs,
             self.linear_precision,
         )?
-        .mul(&self.vector(&format!("{name}.weight_scale"))?)?;
+        .mul(&self.kept_vector(&format!("{name}.weight_scale"), keep)?)?;
 
         let bias = format!("{name}.bias");
         if self.contains(&bias) {
-            result = result.add(&self.vector(&bias)?)?;
+            result = result.add(&self.kept_vector(&bias, keep)?)?;
         }
 
         // A LoRA's down projection runs on the rows this rank was handed, so the rows suffice.
@@ -286,15 +308,50 @@ impl Weights {
         // two rotated sides is the product of the unrotated pair.
         if let Some(adapter) = self.adapters.get(name) {
             let rotated = Array::from_quantized(&self.device, input, scales, rows, cols)?;
+            // The up projection answers one column per output, so it is cut the same way.
+            let up = self.kept_up(&adapter.up, keep)?;
             result = result.add(
                 &rotated
                     .linear(&adapter.down.rotate()?)?
-                    .linear(&adapter.up)?
+                    .linear(&up)?
                     .unary(0, adapter.scale)?,
             )?;
         }
 
         Ok(result)
+    }
+
+    /// `vector`, cut to `keep` the way the weight beside it was. An empty `keep` is the whole of
+    /// it, which is the answer `vector` gives.
+    fn kept_vector(&self, name: &str, keep: &[std::ops::Range<usize>]) -> Result<Array> {
+        let whole = self.vector(name)?;
+        if keep.is_empty() {
+            return Ok(whole);
+        }
+        let kept: usize = keep.iter().map(|range| range.len()).sum();
+        let out = Array::empty(&self.device, 1, kept)?;
+        let mut written = 0;
+        for range in keep {
+            out.buffer
+                .copy_range(&whole.buffer, range.start * 4, written * 4, range.len() * 4)?;
+            written += range.len();
+        }
+        Ok(out)
+    }
+
+    /// An adapter's up projection cut to `keep`. It answers one row per output, the same way the
+    /// weight does, so the same contiguous gather serves.
+    fn kept_up(&self, up: &Array, keep: &[std::ops::Range<usize>]) -> Result<Array> {
+        if keep.is_empty() {
+            return Ok(up.clone());
+        }
+        let kept: usize = keep.iter().map(|range| range.len()).sum();
+        let buffer = gather_rows(&self.device, &up.buffer, up.cols * 4, keep)?;
+        Ok(Array {
+            buffer,
+            rows: kept,
+            cols: up.cols,
+        })
     }
 
     pub fn norm(&self, x: &Array, name: &str, epsilon: f32) -> Result<Array> {
@@ -520,4 +577,27 @@ mod tests {
             }
         }
     }
+}
+
+/// `keep`, ranges of `source`'s rows of `row_bytes` each, copied out end to end. The rows of one
+/// range are contiguous, so this is one copy per range rather than one per row.
+fn gather_rows(
+    device: &crate::Device,
+    source: &crate::Buffer,
+    row_bytes: usize,
+    keep: &[std::ops::Range<usize>],
+) -> Result<crate::Buffer> {
+    let kept: usize = keep.iter().map(|range| range.len()).sum();
+    let out = device.alloc(kept * row_bytes, None)?;
+    let mut written = 0;
+    for range in keep {
+        out.copy_range(
+            source,
+            range.start * row_bytes,
+            written * row_bytes,
+            range.len() * row_bytes,
+        )?;
+        written += range.len();
+    }
+    Ok(out)
 }

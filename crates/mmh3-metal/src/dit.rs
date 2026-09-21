@@ -151,13 +151,23 @@ impl MetalDit {
         own_heads: std::ops::Range<usize>,
     ) -> Result<Array> {
         let c = &self.config;
-        let qkv = self.weights.linear_quantized(
+        // The three tensors sit side by side in the projection's outputs, so this rank's heads are
+        // three runs of rows rather than one. Taking them here is what `pack` used to do after the
+        // whole product had been computed and all but these thrown away.
+        let whole = c.heads * c.head_dim;
+        let keep: Vec<_> = (0..3)
+            .map(|tensor| {
+                tensor * whole + own_heads.start * c.head_dim
+                    ..tensor * whole + own_heads.end * c.head_dim
+            })
+            .collect();
+        self.weights.linear_quantized(
             input.buffer(),
             scales,
             tokens,
             &format!("{prefix}.attn.qkv_proj"),
-        )?;
-        crate::shard::pack(&qkv, 3, c.heads, own_heads, c.head_dim)
+            &keep,
+        )
     }
 
     /// One rank's share of a block's attention.
@@ -851,7 +861,7 @@ mod tests {
         let scales = region.write_quantized(0, &x).unwrap();
         let there = dit
             .weights
-            .linear_quantized(region.buffer(), &scales, tokens, name)
+            .linear_quantized(region.buffer(), &scales, tokens, name, &[])
             .unwrap()
             .to_f32()
             .unwrap();
@@ -1266,6 +1276,60 @@ mod tests {
     ///
     /// The tiny fixture cannot reach this path — ConvRot wants a multiple of 256 features and its
     /// weights are FP32, not INT8 — so this runs against a real checkpoint when one is there.
+
+    /// The narrow projection has to agree with taking the whole one apart, because that is what it
+    /// replaced. A rank reading the wrong rows of the weight would still produce numbers of the
+    /// right shape, and only a comparison against the old answer says they are the right ones.
+    #[test]
+    fn a_rank_projects_the_heads_it_attends_and_no_others() {
+        let Some(dit) = checkpoint(false) else {
+            return;
+        };
+        let c = dit.config.clone();
+        let device = dit.weights.device.clone();
+        let tokens = 64;
+        let values: Vec<f32> = (0..tokens * c.hidden)
+            .map(|i| ((i * 29) % 197) as f32 / 197.0 - 0.5)
+            .collect();
+        let x = Array::from_f32(&device, tokens, c.hidden, &values).unwrap();
+        let input = crate::shard::Memory::zeroed(&device, tokens * c.hidden).unwrap();
+        let scales = input.write_quantized(0, &x).unwrap();
+
+        let whole = dit
+            .weights
+            .linear_quantized(
+                input.buffer(),
+                &scales,
+                tokens,
+                "blocks.0.attn.qkv_proj",
+                &[],
+            )
+            .unwrap();
+
+        for own in [0..1, 3..7, 0..c.heads] {
+            let want = crate::shard::pack(&whole, 3, c.heads, own.clone(), c.head_dim)
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            let got = dit
+                .project_exchanged_inputs("blocks.0", &input, &scales, tokens, own.clone())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+
+            assert_eq!(got.len(), want.len(), "heads {own:?}");
+            let largest = want.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            let worst = got
+                .iter()
+                .zip(want.iter())
+                .fold(0.0f32, |m, (&a, &b)| m.max((a - b).abs()));
+            assert!(
+                worst <= largest * 1e-5,
+                "heads {own:?}: off by {worst} against {largest}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
     fn one_rank_attends_a_block_as_a_whole_one_does() {
