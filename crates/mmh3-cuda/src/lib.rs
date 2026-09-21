@@ -20,6 +20,7 @@ pub mod vision;
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::fmt;
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // Device buffers hold f32 and other values in the GPU's little-endian byte order, which host slices
 // share.
@@ -198,6 +199,24 @@ pub unsafe fn download(destination: &mut [u8], source: *const c_void) -> Result<
     })
 }
 
+/// Bytes in live device allocations. Everything a model and its work allocate comes through
+/// `DeviceBuffer`, so this is what this process is holding, which the device does not say: what it
+/// reports free is what every program on the GPU has left between them.
+static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+/// The most this process will hold, or zero for as much as the device will give.
+static LIMIT: AtomicUsize = AtomicUsize::new(0);
+
+/// Bytes in live device allocations.
+pub fn allocated_bytes() -> usize {
+    ALLOCATED.load(Ordering::Relaxed)
+}
+
+/// Holds this process to `bytes`, beyond which an allocation fails as it would on a device that
+/// small. Zero lifts the limit.
+pub fn set_allocation_limit(bytes: usize) {
+    LIMIT.store(bytes, Ordering::Relaxed);
+}
+
 /// An owned device allocation.
 pub struct DeviceBuffer {
     pointer: *mut c_void,
@@ -216,9 +235,20 @@ unsafe impl Sync for DeviceBuffer {}
 
 impl DeviceBuffer {
     pub fn new(bytes: usize) -> Result<Self, CudaError> {
+        match LIMIT.load(Ordering::Relaxed) {
+            0 => {}
+            limit if ALLOCATED.load(Ordering::Relaxed) + bytes > limit => {
+                return Err(CudaError {
+                    code: OUT_OF_MEMORY,
+                    message: format!("{bytes} bytes would take this process past its limit"),
+                });
+            }
+            _ => {}
+        }
         let mut pointer = ptr::null_mut();
         // SAFETY: pointer is a valid out pointer.
         check(unsafe { mmh3_cuda_malloc(&mut pointer, bytes) })?;
+        ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
         Ok(Self { pointer, bytes })
     }
 
@@ -336,6 +366,7 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
+        ALLOCATED.fetch_sub(self.bytes, Ordering::Relaxed);
         // SAFETY: pointer came from cudaMalloc and is freed once.
         unsafe {
             mmh3_cuda_free(self.pointer);

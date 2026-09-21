@@ -1080,12 +1080,20 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use crate::cli::parse_options;
     use crate::models::models_directory;
 
-    const USAGE: &str = "usage: mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--transport auto|socket] | mmh3 worker --probe HOST[:PORT]";
+    const USAGE: &str = "usage: mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--transport auto|socket] [--vram-budget GB] | mmh3 worker --probe HOST[:PORT]";
     let options = parse_options(
         arguments,
-        &["listen", "models", "token", "probe", "transport"],
+        &[
+            "listen",
+            "models",
+            "token",
+            "probe",
+            "transport",
+            "vram-budget",
+        ],
         USAGE,
     )?;
+    crate::resident::take_budget(&options)?;
     // `--transport socket` keeps this machine's port to itself, so that a leader with one
     // exchanges over the socket as it would with a machine that has none. It is how the socket
     // path is tried between two machines that both have ports.

@@ -59,6 +59,7 @@ pub const OPTIONS: &[&str] = &[
     "sparse-tau",
     "sparse-start",
     "vsa-sparsity",
+    "vram-budget",
 ];
 
 /// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
@@ -118,6 +119,8 @@ impl Settings {
         options: &HashMap<&str, &str>,
         arguments: &[String],
     ) -> Result<Self, Box<dyn Error>> {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        crate::resident::take_budget(options)?;
         #[cfg(feature = "metal")]
         {
             crate::metal::validate_options(options)?;

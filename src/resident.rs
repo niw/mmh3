@@ -10,6 +10,7 @@
 //! not the only one that gets to use it.
 
 use mmh3_core::safetensors::SafeTensors;
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::time::Instant;
@@ -265,6 +266,22 @@ fn load<T, E: Into<Box<dyn Error>>>(
         started.elapsed().as_secs_f64()
     );
     Ok(model)
+}
+
+/// Takes `--vram-budget GB`, which holds this process to that much of the device and fails an
+/// allocation past it as a device that small would. It is how a machine with memory to spare
+/// answers for one without.
+pub fn take_budget(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
+    let gigabytes = crate::cli::option_float(options, "vram-budget", 0.0)?;
+    if gigabytes < 0.0 {
+        return Err("--vram-budget must not be negative".into());
+    }
+    let budget = (f64::from(gigabytes) * (1u64 << 30) as f64) as usize;
+    #[cfg(feature = "cuda")]
+    mmh3_cuda::set_allocation_limit(budget);
+    #[cfg(feature = "metal")]
+    mmh3_metal::set_allocation_limit(budget);
+    Ok(())
 }
 
 /// Whether an error is the device saying it has no memory left, which a caller holding models it
