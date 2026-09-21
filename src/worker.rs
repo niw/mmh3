@@ -58,8 +58,12 @@ type TextEncoder = mmh3_metal::text_encoder::MetalTextEncoder;
 type Resident = Option<(u64, TextEncoder)>;
 #[cfg(feature = "cuda")]
 type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
+#[cfg(feature = "cuda")]
+use mmh3_cuda::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
 #[cfg(feature = "metal")]
 type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
+#[cfg(feature = "metal")]
+use mmh3_metal::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
 /// The DiT a rank runs its share of a step on.
 #[cfg(feature = "cuda")]
 pub(crate) type Dit = mmh3_cuda::dit::CudaDit;
@@ -518,7 +522,6 @@ impl Worker {
         Ok(((2.0 * bytes as f64 / seconds) / 1e9, false))
     }
 
-    /// The prompt's text states, encoded wherever the text encoder lives.
     /// This worker as a rank of a shared-out run, with the session opened on it. Nothing else may
     /// use the worker while the coordinator lives, since from here on it answers steps rather than
     /// requests. It carries no connection: the payloads go between the ranks and never through the
@@ -541,6 +544,7 @@ impl Worker {
         })
     }
 
+    /// The prompt's text states, encoded wherever the text encoder lives.
     pub fn encode_text(&mut self, role: &str, ids: &[u32]) -> Result<Tensor, Box<dyn Error>> {
         let checkpoint = self
             .checkpoint(role)
@@ -613,6 +617,57 @@ impl Worker {
                 .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
                 .collect(),
         ))
+    }
+
+    /// The whole video, decoded and blended over there, in the form an encoder takes here. A
+    /// machine with no device of its own cannot blend the chunks, so it asks for the video.
+    pub fn decode_whole(
+        &mut self,
+        role: &str,
+        latent: &Tensor,
+        tile_size: usize,
+        tile_overlap: usize,
+    ) -> Result<mmh3_core::media::Yuv420, Box<dyn Error>> {
+        let checkpoint = self
+            .checkpoint(role)
+            .ok_or_else(|| format!("{} has no {role}", self.address))?
+            .clone();
+        let &[channels, frames, height, width] = latent.shape.as_slice() else {
+            return Err(format!("latent shape {:?} is not four dimensions", latent.shape).into());
+        };
+        let request = DecodeVideo {
+            checkpoint,
+            chunk: 0,
+            tile_size: tile_size as u32,
+            tile_overlap: tile_overlap as u32,
+            shape: [channels as u32, frames as u32, height as u32, width as u32],
+        };
+        let payload: Vec<u8> = latent
+            .data
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        let (header, body) = self.call(Kind::DecodeWhole, &request.encode(), &payload)?;
+        if header.kind != Kind::Frames {
+            return Err(format!("{} answered a video with {:?}", self.address, header.kind).into());
+        }
+        let described = worker::Frames::decode(&body)?;
+        let data = body[worker::Frames::BYTES..].to_vec();
+        let (frames, height, width) = (
+            described.frames as usize,
+            described.height as usize,
+            described.width as usize,
+        );
+        let wanted = frames * mmh3_core::media::Yuv420::frame_bytes(height, width);
+        if data.len() != wanted {
+            return Err(format!("{} sent {} bytes of video", self.address, data.len()).into());
+        }
+        Ok(mmh3_core::media::Yuv420 {
+            frames,
+            height,
+            width,
+            data,
+        })
     }
 
     pub fn decode_chunk(
@@ -866,6 +921,34 @@ pub struct RemoteCanvases {
     receiver: Receiver<(usize, Result<Vec<u8>, String>)>,
     delegated: Vec<usize>,
     arrived: HashMap<usize, Vec<u8>>,
+}
+
+/// Asks the first worker that can for the whole video, decoded and blended over there. A machine
+/// with no device of its own cannot blend the chunks, so it asks for the video rather than its
+/// pieces, and lets the worker choose the tiles it will decode with.
+pub fn decode_whole_on_worker(
+    addresses: &[String],
+    token: &str,
+    role: &str,
+    latent: &Tensor,
+) -> Option<mmh3_core::media::Yuv420> {
+    for address in addresses {
+        let mut worker = match Worker::connect(address, token) {
+            Ok(worker) => worker,
+            Err(error) => {
+                eprintln!("warning: worker {address}: {error}");
+                continue;
+            }
+        };
+        if !worker.serves(CAPABILITY_DECODE_VIDEO) || worker.checkpoint(role).is_none() {
+            continue;
+        }
+        match worker.decode_whole(role, latent, 0, 0) {
+            Ok(frames) => return Some(frames),
+            Err(error) => eprintln!("warning: worker {address}: {error}"),
+        }
+    }
+    None
 }
 
 /// A run's audio decoded on a worker while this machine decodes the video. The workers finish
@@ -1420,6 +1503,23 @@ fn session(
                     }
                 }
             }
+            Kind::DecodeWhole => {
+                let started = Instant::now();
+                match decode_whole(checkpoints, &body, &mut decoder) {
+                    Ok((frames, payload)) => {
+                        println!(
+                            "decoded {} frames in {:.1} s, {} MiB back",
+                            frames.frames,
+                            started.elapsed().as_secs_f64(),
+                            payload.len() >> 20
+                        );
+                        reply(&mut writer, Kind::Frames, &frames.encode(), &payload)?;
+                    }
+                    Err(error) => {
+                        reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
+                    }
+                }
+            }
             other => {
                 let message = format!("a worker does not serve {other:?}");
                 reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
@@ -1518,11 +1618,13 @@ fn decode_audio(
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
-fn decode_video(
+/// The decoder a request names, loaded if it is not the resident one, and the latent that follows.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decode_request(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
     resident: &mut ResidentDecoder,
-) -> Result<(u32, Vec<u8>), Box<dyn Error>> {
+) -> Result<(DecodeVideo, Tensor), Box<dyn Error>> {
     let (request, descriptor_bytes) = DecodeVideo::decode(body)?;
     let (checkpoint, path) = checkpoints
         .iter()
@@ -1532,7 +1634,16 @@ fn decode_video(
                     || request.checkpoint.digest == checkpoint.digest)
         })
         .ok_or_else(|| format!("no checkpoint for {}", request.checkpoint.role))?;
-    let (tile_size, tile_overlap) = (request.tile_size as usize, request.tile_overlap as usize);
+    // A leader with no decoder of its own has no basis for these, and says so by asking for
+    // nothing. The machine that will run the decode is the one that knows what its tiles want.
+    let tile_size = match request.tile_size {
+        0 => DEFAULT_TILE_SIZE,
+        size => size as usize,
+    };
+    let tile_overlap = match request.tile_overlap {
+        0 => DEFAULT_TILE_OVERLAP_MIN,
+        overlap => overlap as usize,
+    };
     if resident
         .as_ref()
         .map(|(digest, size, overlap, _)| (*digest, *size, *overlap))
@@ -1569,11 +1680,52 @@ fn decode_video(
             .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
             .collect(),
     );
+    Ok((request, latent))
+}
+
+/// One chunk's canvas, for a machine that blends the chunks itself.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decode_video(
+    checkpoints: &[(Checkpoint, PathBuf)],
+    body: &[u8],
+    resident: &mut ResidentDecoder,
+) -> Result<(u32, Vec<u8>), Box<dyn Error>> {
+    let (request, latent) = decode_request(checkpoints, body, resident)?;
     let decoder = &resident.as_ref().expect("just loaded").3;
     Ok((
         request.chunk,
         decoder.decode_chunk(&latent, request.chunk as usize)?,
     ))
+}
+
+/// The whole video, blended, in the form an encoder takes without a device. A machine that cannot
+/// blend asks for this instead of the chunks: the blending happens where the chunks already are.
+#[cfg(feature = "cuda")]
+fn decode_whole(
+    checkpoints: &[(Checkpoint, PathBuf)],
+    body: &[u8],
+    resident: &mut ResidentDecoder,
+) -> Result<(worker::Frames, Vec<u8>), Box<dyn Error>> {
+    let (_, latent) = decode_request(checkpoints, body, resident)?;
+    let decoder = &resident.as_ref().expect("just loaded").3;
+    let frames = decoder.decode_yuv420(&latent)?;
+    Ok((
+        worker::Frames {
+            frames: frames.frames as u32,
+            height: frames.height as u32,
+            width: frames.width as u32,
+        },
+        frames.data,
+    ))
+}
+
+#[cfg(feature = "metal")]
+fn decode_whole(
+    _checkpoints: &[(Checkpoint, PathBuf)],
+    _body: &[u8],
+    _resident: &mut ResidentDecoder,
+) -> Result<(worker::Frames, Vec<u8>), Box<dyn Error>> {
+    Err("this build decodes chunks for another machine but not whole videos".into())
 }
 
 /// What to say to a machine that speaks a different protocol. Both ends say it, since only one of

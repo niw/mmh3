@@ -1,4 +1,3 @@
-#[cfg(any(feature = "cuda", feature = "metal"))]
 mod generate;
 
 use std::error::Error;
@@ -50,14 +49,10 @@ machine does itself.";
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
-        #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("generate") => generate::run(&arguments[1..]),
         #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("worker") => mmh3::worker::serve(&arguments[1..]),
-        #[cfg(not(any(feature = "cuda", feature = "metal")))]
-        Some("generate") => {
-            Err("this build has no GPU backend. Rebuild with --features cuda on Linux or --features metal on macOS".into())
-        }
+
         _ => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);

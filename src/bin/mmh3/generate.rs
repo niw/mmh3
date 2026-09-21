@@ -3,12 +3,15 @@
 use crate::USAGE;
 use mmh3::cli::{parse_options, split_ffmpeg_arguments};
 use mmh3::generation::{OPTIONS, Settings, sample};
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3::models::{AUDIO_VAE_FILE, option_path, video_vae_path};
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::safetensors::SafeTensors;
 use std::error::Error;
 use std::path::Path;
 
 /// Generates video and audio, then passes the decoded media to the selected output backend.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::generation::FPS;
     #[cfg(feature = "cuda")]
@@ -122,6 +125,70 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     };
     let started = Instant::now();
+    output.write_audio(waveform)?;
+    output.finish()?;
+    println!(
+        "wrote {} in {:.1} s",
+        video_path.display(),
+        started.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
+/// The same generation on a machine with no device of its own: the prompt, the steps, the decode
+/// and the soundtrack all happen on the workers, and this process holds the plan and the file.
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    use mmh3::worker::{AUDIO_VAE_ROLE, RemoteAudio, VIDEO_VAE_ROLE, decode_whole_on_worker};
+    use mmh3_core::audio::SAMPLE_RATE;
+    use mmh3_core::generation::FPS;
+    use mmh3_output::MediaSpec;
+    use std::time::Instant;
+
+    let (arguments, ffmpeg_arguments) = split_ffmpeg_arguments(arguments);
+    let options = parse_options(arguments, &[OPTIONS, &["out", "audio-vae"]].concat(), USAGE)?;
+    let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
+    let settings = Settings::parse(&options, arguments)?;
+    if settings.workers.is_empty() {
+        return Err("this build runs nothing of its own: name a worker with --worker".into());
+    }
+    let spec = MediaSpec {
+        width: settings.shape.width,
+        height: settings.shape.height,
+        frames: settings.shape.frames,
+        fps: FPS,
+        sample_rate: SAMPLE_RATE,
+        channels: 2,
+    };
+    let mut output = mmh3::output::prepare(ffmpeg_arguments, spec, &video_path)?;
+    let (video, audio) = sample(&options, &settings)?;
+
+    // The audio goes on a connection of its own while the video decodes, as it does anywhere else.
+    let remote_audio = RemoteAudio::start(
+        settings.workers.clone(),
+        settings.token.clone(),
+        AUDIO_VAE_ROLE,
+        &audio,
+    );
+
+    let started = Instant::now();
+    let frames = decode_whole_on_worker(&settings.workers, &settings.token, VIDEO_VAE_ROLE, &video)
+        .ok_or("no worker decoded the video: name one that holds the video VAE with --worker")?;
+    println!(
+        "took {} frames from a worker in {:.1} s",
+        frames.frames,
+        started.elapsed().as_secs_f64()
+    );
+    output.write_host_video(frames)?;
+
+    let started = Instant::now();
+    let waveform = remote_audio
+        .take()
+        .ok_or("no worker decoded the audio: name one that holds the audio VAE with --worker")?;
+    println!(
+        "took the audio from a worker in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
     output.write_audio(waveform)?;
     output.finish()?;
     println!(

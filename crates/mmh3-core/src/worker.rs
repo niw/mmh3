@@ -23,7 +23,7 @@ pub const TRANSPORT_RDMA: u32 = 1 << 1;
 /// A checkpoint is matched by digest and a protocol is not, which is why this exists: a pair that
 /// disagrees about the wire does not fail, it waits, and two ranks each waiting for the other to
 /// speak look exactly like a slow machine.
-pub const PROTOCOL: u32 = 2;
+pub const PROTOCOL: u32 = 3;
 
 pub const BACKEND_CUDA: u8 = 1;
 pub const BACKEND_METAL: u8 = 2;
@@ -56,6 +56,10 @@ pub enum Kind {
     ShardWrite = 23,
     /// One rank announcing itself on a socket it dialed to a peer of the same run.
     JoinShard = 24,
+    /// A whole video for one worker to decode and blend, for a machine that cannot blend.
+    DecodeWhole = 25,
+    /// The frames `DecodeWhole` answers with, in the form an encoder takes them.
+    Frames = 26,
 }
 
 impl Kind {
@@ -85,6 +89,8 @@ impl Kind {
             22 => Kind::Samples,
             23 => Kind::ShardWrite,
             24 => Kind::JoinShard,
+            25 => Kind::DecodeWhole,
+            26 => Kind::Frames,
             _ => return None,
         })
     }
@@ -333,6 +339,37 @@ pub struct DecodeVideo {
     pub tile_overlap: u32,
     /// `[channels, frames, height, width]` of the latent that follows as FP32.
     pub shape: [u32; 4],
+}
+
+/// The frames a whole decode answers with, as 4:2:0 planes an encoder takes without a device.
+/// A machine that hands out every chunk still blends them itself; one that cannot blend asks for
+/// the video rather than its pieces, and the worker that decodes it blends it too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Frames {
+    pub frames: u32,
+    pub height: u32,
+    pub width: u32,
+}
+
+impl Frames {
+    pub const BYTES: usize = 12;
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut encoder = Encoder::default();
+        encoder.u32(self.frames);
+        encoder.u32(self.height);
+        encoder.u32(self.width);
+        encoder.finish()
+    }
+
+    pub fn decode(bytes: &[u8]) -> io::Result<Self> {
+        let mut decoder = Decoder::new(bytes);
+        Ok(Frames {
+            frames: decoder.u32()?,
+            height: decoder.u32()?,
+            width: decoder.u32()?,
+        })
+    }
 }
 
 /// A run's audio latent for a worker to decode while the leader decodes the video. It is small
