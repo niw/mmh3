@@ -40,9 +40,9 @@ For a full invocation, use whole-argument {video}, {audio}, and {out} placeholde
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
 directory has it.
 --shard-dit N splits every DiT step across at most N workers, Ulysses style. This machine runs no block of a
-shared step: it hands the step out and puts the parts back together, so N counts the machines that do the work.
-Without it every worker that can take a rank does, which is what naming one asks for. --shard-dit 0 keeps the
-DiT here.
+shared step: it hands the step out and puts the parts back together, and lends itself a worker so that its own
+GPU still takes a rank. That one is counted last, after the ones --worker names. Without the option every
+worker that can take a rank does, which is what naming one asks for. --shard-dit 0 keeps the DiT here.
 --worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
 encoder encodes the prompt, so this machine never loads it. Anything a worker cannot do, or fails at, this
 machine does itself.";

@@ -225,6 +225,25 @@ impl Settings {
                 picture.resize(reference_width, reference_height)
             })
             .collect();
+        let token = match options.get("token") {
+            Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
+            None => String::new(),
+        };
+        let mut workers: Vec<String> = option_values(arguments, "worker")
+            .iter()
+            .map(|address| (*address).to_owned())
+            .collect();
+        // A run that shares its steps hands every one of them to a worker, so a machine with a
+        // backend lends itself one rather than sitting out its own run. It goes last, so that
+        // `--shard-dit N` still means the first N machines named.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        if !workers.is_empty()
+            && option_number(options, "shard-dit", 1).unwrap_or(1) > 0
+            && let Some(models) = crate::models::models_directory(options)
+            && let Some(address) = crate::worker::worker_here(&models, &token)
+        {
+            workers.push(address);
+        }
         Ok(Settings {
             shape,
             keyframes,
@@ -236,14 +255,8 @@ impl Settings {
             seed: option_number(options, "seed", 0)? as u64,
             shift_video,
             shift_audio,
-            workers: option_values(arguments, "worker")
-                .iter()
-                .map(|address| (*address).to_owned())
-                .collect(),
-            token: match options.get("token") {
-                Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
-                None => String::new(),
-            },
+            workers,
+            token,
         })
     }
 }

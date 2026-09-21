@@ -1019,6 +1019,44 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let models = models_directory(&options)
         .ok_or("pass a models directory with --models DIR or MMH3_MODELS")?;
 
+    let listener = TcpListener::bind(&listen)?;
+    println!("serving {} on {listen}", models.display());
+    serve_on(listener, models, token, bare, true)
+}
+
+/// A worker on this machine, for a run that shares its steps out. The machine handing the work
+/// out runs no block, so without this its own GPU sits out every step it hands to somebody else.
+/// It is an ordinary rank: it waits on loopback, takes the session the coordinator opens like any
+/// other worker, and nothing in the run knows the difference.
+///
+/// The socket is bound here rather than by the worker, so the port is known without asking and
+/// nobody else can take it in between.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+pub fn worker_here(models: &Path, token: &str) -> Option<String> {
+    let listener = TcpListener::bind("127.0.0.1:0").ok()?;
+    let address = listener.local_addr().ok()?.to_string();
+    let (models, token) = (models.to_path_buf(), token.to_owned());
+    std::thread::Builder::new()
+        .name("worker".to_owned())
+        .spawn(move || {
+            if let Err(error) = serve_on(listener, models, token, false, false) {
+                eprintln!("warning: the worker on this machine ended: {error}");
+            }
+        })
+        .ok()?;
+    Some(address)
+}
+
+/// The serving itself, on a socket somebody else bound. `serve` binds the one `--listen` names,
+/// and a run that lends this machine a rank binds one on loopback and keeps it to itself.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn serve_on(
+    listener: TcpListener,
+    models: PathBuf,
+    token: String,
+    bare: bool,
+    announce: bool,
+) -> Result<(), Box<dyn Error>> {
     let checkpoints: Vec<(Checkpoint, PathBuf)> = ROLES
         .iter()
         .filter_map(|(role, _)| {
@@ -1033,26 +1071,30 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             ))
         })
         .collect();
+    // A worker lent to a run on this machine says none of this: the run it belongs to has loaded
+    // the same cache and is about to print the same numbers under its own name.
     #[cfg(feature = "cuda")]
-    crate::models::load_algorithm_cache();
-    let speed = measure_speed();
-    println!("serving {} on {listen}", models.display());
-    if let Some(speed) = speed {
-        println!(
-            "  {:.1} TOPS at a block's GEMM, {:.1} at its attention, {:.1} GB/s copying",
-            speed.gemm_tops, speed.attention_tops, speed.bandwidth_gbytes
-        );
+    if announce {
+        crate::models::load_algorithm_cache();
     }
-    for (checkpoint, path) in &checkpoints {
-        println!(
-            "  {} {:016x} {}",
-            checkpoint.role,
-            checkpoint.digest,
-            path.display()
-        );
+    let speed = measure_speed();
+    if announce {
+        if let Some(speed) = speed {
+            println!(
+                "  {:.1} TOPS at a block's GEMM, {:.1} at its attention, {:.1} GB/s copying",
+                speed.gemm_tops, speed.attention_tops, speed.bandwidth_gbytes
+            );
+        }
+        for (checkpoint, path) in &checkpoints {
+            println!(
+                "  {} {:016x} {}",
+                checkpoint.role,
+                checkpoint.digest,
+                path.display()
+            );
+        }
     }
 
-    let listener = TcpListener::bind(&listen)?;
     for stream in listener.incoming() {
         let stream = match stream {
             Ok(stream) => stream,
@@ -3094,7 +3136,25 @@ impl<'a> Coordinator<'a> {
 
     /// Collects every rank's regions and sends the whole table back, so that a rank looks an entry
     /// up by its owner rather than counting on the lists lining up.
+    ///
+    /// NOTE: an address is only an address from somewhere. The host here is the one this machine
+    /// reached a rank at, which is the right answer for a rank on another machine and the wrong
+    /// one for a rank on this one: "127.0.0.1" names the reader rather than the rank. So a rank
+    /// this machine reached over loopback is named to each recipient by the address this machine
+    /// wears on its own socket to that recipient, and the table goes out once per rank rather
+    /// than once for all of them.
     fn relay_regions(&mut self, algorithms: u32) -> Result<(), Box<dyn Error>> {
+        let mut here = Vec::with_capacity(self.ranks());
+        let mut ports = vec![0u32; self.ranks()];
+        for rank in 0..self.ranks() {
+            let socket = self.peers[rank].reader.get_ref();
+            here.push(
+                socket
+                    .peer_addr()
+                    .map(|address| address.ip().is_loopback())
+                    .unwrap_or(false),
+            );
+        }
         let mut whole = worker::SessionTable {
             listens: Vec::new(),
             regions: Vec::new(),
@@ -3103,10 +3163,8 @@ impl<'a> Coordinator<'a> {
             let (header, body) = self.receive(rank)?;
             self.expect(header, Kind::SessionReady, &body)?;
             let ready = worker::SessionReady::decode(&body)?;
-            // The host is the one this machine reached the rank at: a machine behind more than one
-            // interface cannot say which of them its peers should use, and this one already knows
-            // an address that works.
-            if ready.listen_port > 0 {
+            ports[rank] = ready.listen_port;
+            if ready.listen_port > 0 && !here[rank] {
                 whole.listens.push(worker::PeerListen {
                     rank: rank as u32,
                     address: format!("{}:{}", self.peers[rank].host, ready.listen_port),
@@ -3127,9 +3185,26 @@ impl<'a> Coordinator<'a> {
             }
             whole.regions.extend(ready.regions);
         }
-        let encoded = whole.encode();
         for rank in 0..self.ranks() {
-            self.send(rank, Kind::SessionReady, &encoded, &[])?;
+            // What this machine's own address is depends on who is asking, so the ranks it holds
+            // are named again for every recipient.
+            let mut theirs = whole.clone();
+            let mine = self.peers[rank]
+                .reader
+                .get_ref()
+                .local_addr()
+                .map(|address| address.ip().to_string());
+            if let Ok(mine) = mine {
+                for (peer, port) in ports.iter().enumerate() {
+                    if *port > 0 && here[peer] && peer != rank {
+                        theirs.listens.push(worker::PeerListen {
+                            rank: peer as u32,
+                            address: format!("{mine}:{port}"),
+                        });
+                    }
+                }
+            }
+            self.send(rank, Kind::SessionReady, &theirs.encode(), &[])?;
         }
         Ok(())
     }
@@ -3305,6 +3380,17 @@ pub fn session_payload(
         }
     }
     payload
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl Drop for Coordinator<'_> {
+    fn drop(&mut self) {
+        // A rank whose socket simply goes away reads a closed one and reports a fault. The run is
+        // over and nothing is wrong, so every rank is told that rather than shown it.
+        for rank in 0..self.ranks() {
+            let _ = self.send(rank, Kind::CloseSession, &[], &[]);
+        }
+    }
 }
 
 /// One step of a shared-out run from the machine handing it out: send the latents to every rank,
