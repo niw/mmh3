@@ -452,23 +452,9 @@ pub fn sample(
     let (config, gated) = dit_shape(options, dit_file)?;
     #[cfg(any(feature = "cuda", feature = "metal"))]
     let hands_out = !prepared_workers.is_empty();
-    // The DiT waits on nothing the prompt makes, and reading it is mostly reading, so it goes
-    // while the encoder has the device.
-    #[cfg(feature = "cuda")]
-    let (context, context_modalities, mut dit) =
-        std::thread::scope(|scope| -> Result<_, Box<dyn Error>> {
-            let encoded = scope.spawn(encode_context);
-            let dit = match hands_out {
-                true => None,
-                false => Some(load_dit(options, "dit", dit_file)?),
-            };
-            match encoded.join() {
-                Ok(Ok((context, modalities))) => Ok((context, modalities, dit)),
-                Ok(Err(error)) => Err(error.into()),
-                Err(_) => Err("encoding the prompt panicked".into()),
-            }
-        })?;
-    #[cfg(feature = "metal")]
+    // The prompt is encoded before the DiT is read, so the text encoder is gone by the time the
+    // DiT arrives and the device holds one checkpoint at a time.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let (context, context_modalities, mut dit) = {
         let (context, modalities) =
             encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
