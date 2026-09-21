@@ -10,6 +10,12 @@
 //! cuts, the names of the regions and the codes those names cross the wire as. So it lives here,
 //! where there is one of each.
 
+use crate::dit::config::DitConfig;
+use crate::dit::inputs::DitInputs;
+use crate::dit::latent::{unpack_audio, unpatchify_video};
+use crate::dit::layout::{PackedLayout, SegmentKind};
+use crate::dit::sparse::{SparseAttention, SparseMethod};
+use crate::dit::vsa::VsaPlan;
 use std::fmt;
 use std::ops::Range;
 use std::time::Duration;
@@ -34,6 +40,103 @@ pub struct VelocityRows {
     pub rows: Range<usize>,
     pub video: Vec<f32>,
     pub audio: Vec<f32>,
+}
+
+/// The velocity of one step as the sampler takes it, which is what the parts of a shared-out step
+/// come back together into.
+#[derive(Clone, Debug)]
+pub struct Velocity {
+    pub video: Vec<f32>,
+    pub audio: Vec<f32>,
+}
+
+/// What the parts of a step could not be put back together into. A backend turns this into
+/// whatever its own calls answer with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AssembleError(pub String);
+
+impl fmt::Display for AssembleError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AssembleError {}
+
+/// Puts the parts of a shared-out step back together. The parts may arrive in any order and have
+/// to cover the sequence once, and this is where the projections a rank answers with become the
+/// velocity: the negation happens once, here, which is what a rank must not do to its own rows.
+///
+/// It reads the config and the layout and touches no weights, so the rank that assembles need not
+/// be one that ran a block.
+pub fn assemble_velocity(
+    config: &DitConfig,
+    inputs: &DitInputs,
+    sparse: Option<&SparseAttention>,
+    parts: &[VelocityRows],
+) -> Result<Velocity, AssembleError> {
+    let layout = PackedLayout::for_inputs(inputs);
+    let plan = sparse
+        .filter(|settings| layout.len() >= settings.min_tokens)
+        .and_then(|settings| match settings.method {
+            SparseMethod::Vsa { .. } => Some(VsaPlan::for_layout(&layout)),
+            _ => None,
+        });
+    let gather = |kind: SegmentKind,
+                  width: usize,
+                  take: &dyn Fn(&VelocityRows) -> &Vec<f32>|
+     -> Result<Vec<f32>, AssembleError> {
+        let segment = layout.segment(kind);
+        let mut values = vec![0.0f32; segment.len() * width];
+        let mut covered = 0;
+        for part in parts {
+            let first = segment.start.max(part.rows.start);
+            let last = segment.end.min(part.rows.end);
+            if first >= last {
+                continue;
+            }
+            let rows = take(part);
+            if rows.len() != (last - first) * width {
+                return Err(AssembleError(format!(
+                    "a part of {} values for {} rows",
+                    rows.len(),
+                    last - first
+                )));
+            }
+            values[(first - segment.start) * width..(last - segment.start) * width]
+                .copy_from_slice(rows);
+            covered += last - first;
+        }
+        // A cut that leaves a gap would otherwise assemble zeros and look like a picture that
+        // simply did not diffuse there, which is a long way from where the cut is.
+        if covered != segment.len() {
+            return Err(AssembleError(format!(
+                "the parts cover {covered} of {} rows",
+                segment.len()
+            )));
+        }
+        Ok(values)
+    };
+
+    let mut video = gather(SegmentKind::Video, config.video_patch_features(), &|part| {
+        &part.video
+    })?;
+    if let Some(plan) = &plan {
+        video = plan.restore_video(&video, config.video_patch_features());
+    }
+    let audio = gather(SegmentKind::Audio, config.audio_channels, &|part| {
+        &part.audio
+    })?;
+    Ok(Velocity {
+        video: unpatchify_video(&video, &inputs.video.shape)
+            .into_iter()
+            .map(|value| -value)
+            .collect(),
+        audio: unpack_audio(&audio, &inputs.audio.shape)
+            .into_iter()
+            .map(|value| -value)
+            .collect(),
+    })
 }
 
 /// What a transport could not do, in its own words. A backend turns this into whatever its own

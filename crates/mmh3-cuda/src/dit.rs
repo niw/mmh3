@@ -2370,72 +2370,20 @@ impl CudaDit {
     }
 
     /// Puts the parts of a shared-out step back together, which only the rank that answers to the
-    /// caller needs to do. The parts may arrive in any order and must cover the sequence once.
+    /// caller needs to do. It runs on the config alone, so mmh3-core holds it and this is where a
+    /// backend's own output type goes round it.
     pub fn assemble_velocity(
         &self,
         inputs: &DitInputs,
         sparse: Option<&SparseAttention>,
         parts: &[VelocityRows],
     ) -> Result<DitOutputs, Error> {
-        let config = &self.config;
-        let layout = PackedLayout::for_inputs(inputs);
-        let (video, audio) = (
-            layout.segment(SegmentKind::Video),
-            layout.segment(SegmentKind::Audio),
-        );
-        let plan = sparse
-            .filter(|settings| layout.len() >= settings.min_tokens)
-            .and_then(|settings| match settings.method {
-                SparseMethod::Vsa { .. } => Some(VsaPlan::for_layout(&layout)),
-                _ => None,
-            });
-        let gather = |segment: mmh3_core::dit::layout::Segment,
-                      width: usize,
-                      take: &dyn Fn(&VelocityRows) -> &Vec<f32>|
-         -> Result<Vec<f32>, Error> {
-            let mut values = vec![0.0f32; segment.len() * width];
-            let mut covered = 0;
-            for part in parts {
-                let first = segment.start.max(part.rows.start);
-                let last = segment.end.min(part.rows.end);
-                if first >= last {
-                    continue;
-                }
-                let rows = take(part);
-                if rows.len() != (last - first) * width {
-                    return Err(Error::Model(format!(
-                        "a part of {} values for {} rows",
-                        rows.len(),
-                        last - first
-                    )));
-                }
-                values[(first - segment.start) * width..(last - segment.start) * width]
-                    .copy_from_slice(rows);
-                covered += last - first;
-            }
-            if covered != segment.len() {
-                return Err(Error::Model(format!(
-                    "the parts cover {covered} of {} rows",
-                    segment.len()
-                )));
-            }
-            Ok(values)
-        };
-        let mut video_velocity = gather(video, config.video_patch_features(), &|part| &part.video)?;
-        if let Some(plan) = &plan {
-            video_velocity = plan.restore_video(&video_velocity, config.video_patch_features());
-        }
-        let audio_velocity = gather(audio, config.audio_channels, &|part| &part.audio)?;
+        let velocity = mmh3_core::shard::assemble_velocity(&self.config, inputs, sparse, parts)
+            .map_err(|error| Error::Model(error.0))?;
         Ok(DitOutputs {
             blocks: Vec::new(),
-            video: unpatchify_video(&video_velocity, &inputs.video.shape)
-                .into_iter()
-                .map(|value| -value)
-                .collect(),
-            audio: unpack_audio(&audio_velocity, &inputs.audio.shape)
-                .into_iter()
-                .map(|value| -value)
-                .collect(),
+            video: velocity.video,
+            audio: velocity.audio,
             routed_fraction: None,
             part: None,
         })

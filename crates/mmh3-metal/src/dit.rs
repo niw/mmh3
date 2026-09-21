@@ -502,76 +502,22 @@ impl MetalDit {
     ///
     /// It reads the config and the layout and nothing else — no weights, no device — so a leader
     /// can put a step together without holding a DiT it never runs.
+    /// Puts the parts of a shared-out step back together, which only the rank that answers to the
+    /// caller needs to do. It runs on the config alone, so mmh3-core holds it and this is where a
+    /// backend's own output type goes round it.
     pub fn assemble_velocity(
         &self,
         inputs: &DitInputs,
         sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
         parts: &[VelocityRows],
     ) -> Result<DitOutput> {
-        // A VSA run hands back rows in the order the attention wanted rather than the order the
-        // video does, and this backend has nothing to put them back with. Refusing beats
-        // assembling rows whose order nothing here can account for.
-        if sparse.is_some() {
-            return Err(Error(
-                "Metal currently supports dense attention without VSA gates".into(),
-            ));
-        }
-
-        let c = &self.config;
-        let layout = PackedLayout::for_inputs(inputs);
-        let gather = |kind: SegmentKind,
-                      width: usize,
-                      take: &dyn Fn(&VelocityRows) -> &Vec<f32>|
-         -> Result<Vec<f32>> {
-            let segment = layout.segment(kind);
-            let mut values = vec![0.0f32; segment.len() * width];
-            let mut covered = 0;
-            for part in parts {
-                let first = segment.start.max(part.rows.start);
-                let last = segment.end.min(part.rows.end);
-                if first >= last {
-                    continue;
-                }
-
-                let rows = take(part);
-                if rows.len() != (last - first) * width {
-                    return Err(Error(format!(
-                        "a part of {} values for {} rows",
-                        rows.len(),
-                        last - first
-                    )));
-                }
-                values[(first - segment.start) * width..(last - segment.start) * width]
-                    .copy_from_slice(rows);
-                covered += last - first;
-            }
-
-            // A cut that leaves a gap would otherwise assemble zeros and look like a picture that
-            // simply did not diffuse there, which is a long way from where the cut is.
-            if covered != segment.len() {
-                return Err(Error(format!(
-                    "the parts cover {covered} of {} rows",
-                    segment.len()
-                )));
-            }
-            Ok(values)
-        };
-
-        let video = gather(SegmentKind::Video, c.video_patch_features(), &|part| {
-            &part.video
-        })?;
-        let audio = gather(SegmentKind::Audio, c.audio_channels, &|part| &part.audio)?;
+        let velocity = mmh3_core::shard::assemble_velocity(&self.config, inputs, sparse, parts)
+            .map_err(|error| Error(error.0))?;
         Ok(DitOutput {
             text_states: Vec::new(),
             blocks: Vec::new(),
-            video: unpatchify_video(&video, &inputs.video.shape)
-                .into_iter()
-                .map(|value| -value)
-                .collect(),
-            audio: unpack_audio(&audio, &inputs.audio.shape)
-                .into_iter()
-                .map(|value| -value)
-                .collect(),
+            video: velocity.video,
+            audio: velocity.audio,
             routed_fraction: None,
         })
     }
