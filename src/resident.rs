@@ -379,14 +379,23 @@ impl Table {
 }
 
 /// The models of this process, made on the first ask.
-fn locked() -> std::sync::MutexGuard<'static, Models> {
-    use std::sync::{Mutex, OnceLock, PoisonError};
+fn shared() -> &'static std::sync::Mutex<Models> {
+    use std::sync::{Mutex, OnceLock};
 
     static MODELS: OnceLock<Mutex<Models>> = OnceLock::new();
-    MODELS
-        .get_or_init(|| Mutex::new(Models::new()))
+    MODELS.get_or_init(|| Mutex::new(Models::new()))
+}
+
+fn locked() -> std::sync::MutexGuard<'static, Models> {
+    shared()
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// What this machine is holding on to, for a caller that only means to say so and must not wait.
+/// None means a request has the models, which is itself an answer: the machine is busy.
+pub fn kept() -> Option<Vec<&'static str>> {
+    shared().try_lock().ok().map(|models| models.kept())
 }
 
 /// Lets go of every model after `idle` without a request, so that a machine nothing is asking

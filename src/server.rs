@@ -153,7 +153,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         })?;
 
     let application = Router::new()
-        .route("/v1/generations", post(create))
+        .route("/v1/generations", post(create).get(list))
+        .route("/v1/status", get(status))
         .route("/v1/generations/{id}", get(describe))
         .route("/v1/generations/{id}/video", get(video))
         .with_state(server);
@@ -297,6 +298,78 @@ async fn create(
         Json(described),
     )
         .into_response())
+}
+
+/// Every generation this server has been asked for, the most recent first.
+async fn list(State(server): State<Arc<Server>>) -> Response {
+    let jobs = server.jobs.lock().expect("the jobs");
+    let mut described: Vec<(SystemTime, serde_json::Value)> = jobs
+        .iter()
+        .map(|(id, job)| (job.queued, job.describe(id)))
+        .collect();
+    described.sort_by(|(one, _), (other, _)| other.cmp(one));
+    let generations: Vec<serde_json::Value> =
+        described.into_iter().map(|(_, value)| value).collect();
+    Json(json!({ "generations": generations })).into_response()
+}
+
+/// What this machine is doing and what it is holding, for a client deciding whether to ask it for
+/// anything.
+async fn status(State(server): State<Arc<Server>>) -> Response {
+    let (generating, queued, generations) = {
+        let jobs = server.jobs.lock().expect("the jobs");
+        let generating = jobs
+            .iter()
+            .find(|(_, job)| job.state == Stage::Running)
+            .map(|(id, _)| id.clone());
+        let queued = jobs
+            .values()
+            .filter(|job| job.state == Stage::Queued)
+            .count();
+        (generating, queued, jobs.len())
+    };
+    Json(json!({
+        "generating": generating,
+        "queued": queued,
+        "generations": generations,
+        // None rather than an empty list: a generation has the models, and saying it holds
+        // nothing would be saying something else.
+        "models": kept(),
+        "memory": memory().map(|(free, total)| json!({ "free": free, "total": total })),
+    }))
+    .into_response()
+}
+
+/// What this machine is holding on to, or None while a generation has the models or on a build
+/// that holds none of its own.
+fn kept() -> Option<Vec<&'static str>> {
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    {
+        crate::resident::kept()
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        None
+    }
+}
+
+/// What the device says it has left and what it has in all, or None on a build with neither
+/// backend, which has no device to ask.
+fn memory() -> Option<(u64, u64)> {
+    #[cfg(feature = "cuda")]
+    {
+        let (free, total) = mmh3_cuda::memory_info().ok()?;
+        Some((free as u64, total as u64))
+    }
+    #[cfg(feature = "metal")]
+    {
+        let (free, total) = mmh3_metal::memory_info().ok()?;
+        Some((free as u64, total as u64))
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        None
+    }
 }
 
 /// What a generation is doing.
