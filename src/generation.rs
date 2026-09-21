@@ -930,7 +930,9 @@ fn dit_shape(
         if let Some(path) = crate::models::model_file(options, name, &["patches", "loras"])?
             && let Ok(file) = SafeTensors::open(std::path::Path::new(&path))
         {
-            gated = gated || DitConfig::gated(&file, "");
+            // A patch names the DiT's tensors under the prefix the backends strip as they apply
+            // one, so its gates are only there.
+            gated = gated || DitConfig::gated(&file, "diffusion_model.");
         }
     }
     Ok((config, gated))
