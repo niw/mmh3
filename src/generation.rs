@@ -4,11 +4,13 @@
 
 use crate::audio::load_audio;
 use crate::cli::{option_float, option_number, option_values};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::models::load_dit;
 #[cfg(feature = "cuda")]
 use crate::models::{AUDIO_VAE_FILE, save_algorithm_cache, video_vae_path};
-use crate::models::{
-    DIT_FILE, REFERENCE_DIT_FILE, TEXT_ENCODER_FILE, load_dit, option_path, sparse_attention,
-};
+use crate::models::{DIT_FILE, REFERENCE_DIT_FILE, sparse_attention};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::models::{TEXT_ENCODER_FILE, option_path};
 use crate::pictures::load_picture;
 use crate::video::{ReferenceClip, block_seconds};
 #[cfg(feature = "cuda")]
@@ -200,7 +202,7 @@ impl Settings {
             .into_iter()
             .map(|path| load_clip(Path::new(path), shape.frames))
             .collect::<Result<Vec<_>, _>>()?;
-        #[cfg(feature = "metal")]
+        #[cfg(not(feature = "cuda"))]
         let clips: Vec<ReferenceClip> = Vec::new();
         // The first picture stretches to the canvas and the other covers it, as the reference
         // pipeline fits them.
@@ -229,6 +231,7 @@ impl Settings {
             Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
             None => String::new(),
         };
+        #[allow(unused_mut)]
         let mut workers: Vec<String> = option_values(arguments, "worker")
             .iter()
             .map(|address| (*address).to_owned())
@@ -351,9 +354,21 @@ pub fn sample(
                         );
                         context
                     } else {
+                        // The prompt is the one thing a machine that runs no block still cannot do
+                        // for itself, so a build with no backend asks for a worker by name.
+                        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                        return Err(
+                            "this build encodes no prompt of its own: name a worker that \
+                                    holds the text encoder with --worker"
+                                .into(),
+                        );
+                        #[cfg(any(feature = "cuda", feature = "metal"))]
                         let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
+                        #[cfg(any(feature = "cuda", feature = "metal"))]
                         let file = SafeTensors::open(Path::new(&path))?;
+                        #[cfg(any(feature = "cuda", feature = "metal"))]
                         let encoder = TextEncoder::load(&file)?;
+                        #[cfg(any(feature = "cuda", feature = "metal"))]
                         let context = if prompt_references.is_empty() {
                             let ids = Tokenizer::h3().encode(&prompt);
                             encoder.encode(&ids, &[])?.context
@@ -390,6 +405,7 @@ pub fn sample(
                                 encoder.encode_prompt(&prompt, &embeddings, &[])?.context
                             }
                         };
+                        #[cfg(any(feature = "cuda", feature = "metal"))]
                         println!(
                             "encoded {} prompt tokens with {} pictures, {} clips and {} sounds in {:.1} s",
                             context.shape[0],
@@ -398,6 +414,7 @@ pub fn sample(
                             settings.sounds.len(),
                             started.elapsed().as_secs_f64()
                         );
+                        #[cfg(any(feature = "cuda", feature = "metal"))]
                         context
                     }
                 }
@@ -422,6 +439,7 @@ pub fn sample(
     // A run that hands every step to its workers needs the DiT's shape and none of the weights
     // behind it. Opening a checkpoint maps the file, so this costs the header pages and nothing.
     let (config, gated) = dit_shape(options, dit_file)?;
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let hands_out = !prepared_workers.is_empty();
     // The DiT waits on nothing the prompt makes, and reading it is mostly reading, so it goes
     // while the encoder has the device.
@@ -439,7 +457,7 @@ pub fn sample(
                 Err(_) => Err("encoding the prompt panicked".into()),
             }
         })?;
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(feature = "metal")]
     let (context, context_modalities, mut dit) = {
         let (context, modalities) =
             encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
@@ -449,20 +467,29 @@ pub fn sample(
         };
         (context, modalities, dit)
     };
+    // A build with no backend never holds a DiT. `Infallible` says so in the type: there is no
+    // value this could be, which is what makes every arm that would use one unreachable here.
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    let (context, context_modalities, _dit) = {
+        let (context, modalities) =
+            encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
+        let _dit: Option<std::convert::Infallible> = None;
+        (context, modalities, _dit)
+    };
     if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
     }
     #[cfg(feature = "cuda")]
     let latents = encode_pictures(options, settings.seed, &pictures)?;
-    #[cfg(feature = "metal")]
+    #[cfg(not(feature = "cuda"))]
     let latents: Vec<Tensor> = Vec::new();
     #[cfg(feature = "cuda")]
     let clip_latents = encode_clips(options, settings.seed, &settings.clips)?;
-    #[cfg(feature = "metal")]
+    #[cfg(not(feature = "cuda"))]
     let clip_latents: Vec<Tensor> = Vec::new();
     #[cfg(feature = "cuda")]
     let sound_latents = encode_sounds(options, &settings.sounds)?;
-    #[cfg(feature = "metal")]
+    #[cfg(not(feature = "cuda"))]
     let sound_latents: Vec<Tensor> = Vec::new();
     #[cfg(feature = "cuda")]
     let soundtrack_latents = encode_sounds(
@@ -473,7 +500,7 @@ pub fn sample(
             .filter_map(|clip| clip.sound.clone())
             .collect::<Vec<_>>(),
     )?;
-    #[cfg(feature = "metal")]
+    #[cfg(not(feature = "cuda"))]
     let soundtrack_latents: Vec<Tensor> = Vec::new();
 
     let (keyframes, references) = if !has_references {
@@ -569,12 +596,17 @@ pub fn sample(
     };
     // A run that meant to hand every step out and could not takes the steps itself, which is the
     // fallback everything else a worker does already has. It pays the load it had skipped.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     if dit.is_none() && !matches!(sharing, Some(Sharing::With(_))) {
         dit = Some(load_dit(options, "dit", dit_file)?);
     }
+    // Nothing may load a DiT past this point: a run that was going to has done it by now.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    #[allow(unused_variables)]
     let dit = dit;
     // `--shard-dit 1` runs the same path with nothing to carry anywhere, which tells the cost of
     // the machinery apart from the cost of the link.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     if sharing.is_none()
         && let Some(dit) = &dit
     {
@@ -610,7 +642,7 @@ pub fn sample(
         };
         let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
         // The velocity of this step and, where a whole one ran here, what Sol-Attn routed.
-        let (velocity, routed) = match &mut sharing {
+        let (velocity, routed): (mmh3_core::shard::Velocity, Option<f64>) = match &mut sharing {
             // Every rank runs the same step over its own rows, and the exchanges inside the blocks
             // keep the attention whole. A rank that fails takes the run with it: there is no
             // halfway through a step to fall back from.
@@ -624,6 +656,7 @@ pub fn sample(
                 )?;
                 (velocity, None)
             }
+            #[cfg(any(feature = "cuda", feature = "metal"))]
             Some(Sharing::Alone(exchange, shard)) => {
                 let dit = dit
                     .as_ref()
@@ -646,21 +679,30 @@ pub fn sample(
             // A run that shares a step with nobody takes the whole one, which on Metal goes
             // through the text this run refined once rather than through the DiT directly.
             None => {
-                #[cfg(feature = "cuda")]
-                let outputs = {
-                    let dit = dit
-                        .as_ref()
-                        .ok_or("a step to take here and no DiT to take it")?;
-                    dit.forward(&inputs, &[], step_sparse.as_ref())?
-                };
-                #[cfg(feature = "metal")]
-                let outputs = {
-                    let prepared = prepared
-                        .as_ref()
-                        .ok_or("a step to take here and no DiT to take it")?;
-                    prepared.forward(&inputs, &[], step_sparse.as_ref())?
-                };
-                (whole_velocity(&outputs), outputs.routed_fraction)
+                #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                {
+                    return Err(
+                        "this build runs no step of its own: name a worker with --worker".into(),
+                    );
+                }
+                #[cfg(any(feature = "cuda", feature = "metal"))]
+                {
+                    #[cfg(feature = "cuda")]
+                    let outputs = {
+                        let dit = dit
+                            .as_ref()
+                            .ok_or("a step to take here and no DiT to take it")?;
+                        dit.forward(&inputs, &[], step_sparse.as_ref())?
+                    };
+                    #[cfg(feature = "metal")]
+                    let outputs = {
+                        let prepared = prepared
+                            .as_ref()
+                            .ok_or("a step to take here and no DiT to take it")?;
+                        prepared.forward(&inputs, &[], step_sparse.as_ref())?
+                    };
+                    (whole_velocity(&outputs), outputs.routed_fraction)
+                }
             }
         };
         euler_step(
@@ -862,7 +904,6 @@ fn whole_velocity(outputs: &crate::worker::DitStep) -> mmh3_core::shard::Velocit
 /// The DiT's shape and whether it carries VSA gates, from the checkpoint headers alone. A patch
 /// may add the gates, so the patch's header is read beside the DiT's: the shape a leader hands out
 /// has to be the shape its workers will load, adapters and all.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 fn dit_shape(
     options: &HashMap<&str, &str>,
     dit_file: &str,
@@ -886,7 +927,6 @@ fn dit_shape(
 
 /// A worker that will take a share of every step, ready to open. Held apart from the exchange
 /// because the exchange borrows it for the whole run.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 struct ShardTarget {
     workers: Vec<crate::worker::Worker>,
     open: Vec<mmh3_core::worker::OpenSession>,
@@ -896,7 +936,6 @@ struct ShardTarget {
 /// Connects to the workers a shared-out run would use and names the DiT it will share, so that
 /// they read it while this machine still has a prompt to encode. The connections are the ones the
 /// session opens on, since what a worker reads early is only there for the connection it came on.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 fn prepare_workers(
     settings: &Settings,
     options: &HashMap<&str, &str>,
@@ -948,7 +987,6 @@ fn prepare_workers(
 }
 
 /// The first worker that can take a share of the DiT, or `None` to keep the whole step here.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 #[allow(clippy::too_many_arguments)]
 fn shard_target(
     settings: &Settings,
@@ -1156,7 +1194,6 @@ fn shard_target(
 
 /// The LoRAs and patches of `--patch` and `--lora`, as a session names them: by the digest of the
 /// file, since the machines name the files differently.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 fn session_adapters(
     options: &HashMap<&str, &str>,
 ) -> Result<Vec<mmh3_core::worker::Adapter>, Box<dyn Error>> {
@@ -1196,11 +1233,12 @@ fn session_adapters(
 
 /// How a step is shared out, which is either with another machine or, for `--shard-dit 1`, with
 /// nobody at all so that the machinery can be timed on its own.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 enum Sharing<'a> {
     /// Every step goes to the workers and this machine only puts the parts back together, so it
     /// holds no exchange and no cut of its own.
     With(Box<crate::worker::Coordinator<'a>>),
+    /// The same path with one rank and nothing to carry anywhere, which needs a backend here.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     Alone(crate::worker::SoleExchange, mmh3_core::shard::Shard),
 }
 
@@ -1227,7 +1265,7 @@ fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
     )
 }
 
-#[cfg(feature = "metal")]
+#[cfg(not(feature = "cuda"))]
 fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
     (String::new(), Vec::new())
 }
@@ -1243,14 +1281,14 @@ fn attention_precision(options: &HashMap<&str, &str>) -> u8 {
     }
 }
 
-#[cfg(feature = "metal")]
+#[cfg(not(feature = "cuda"))]
 fn attention_precision(_options: &HashMap<&str, &str>) -> u8 {
     0
 }
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
 /// The shard of a run that shares a step with nobody. One rank covers the whole sequence and every
 /// head, so the result is the whole step's, and what is left is the gathers and the waits.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 #[allow(clippy::too_many_arguments)]
 fn alone_shard(
     options: &HashMap<&str, &str>,

@@ -5,22 +5,25 @@
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::safetensors::SafeTensors;
-#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::shard;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::shard::Shard;
 use mmh3_core::tensor::Tensor;
-#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::worker::OpenSession;
 use mmh3_core::worker::{
-    self, CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD,
-    CAPABILITY_ENCODE_TEXT, Canvas, Checkpoint, DecodeAudio, DecodeVideo, EncodeText, Header,
-    Hello, Kind, Samples, TRANSPORT_TCP, TextStates, Welcome,
+    self, CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD, Canvas,
+    Checkpoint, DecodeAudio, DecodeVideo, EncodeText, Header, Hello, Kind, Samples, TextStates,
+    Welcome,
 };
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use mmh3_core::worker::{CAPABILITY_ENCODE_TEXT, TRANSPORT_TCP};
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::{BufReader, BufWriter};
-use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use std::net::TcpListener;
+use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, channel};
@@ -84,6 +87,7 @@ type ResidentAudio = Option<(u64, AudioDecoder)>;
 
 /// Checkpoints a worker offers, as `(role, path inside the models directory)`. Roles name what a
 /// file is for, since the file names differ between machines.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const ROLES: &[(&str, &str)] = &[
     (
         "text_encoder.h3.int8_convrot",
@@ -174,6 +178,7 @@ pub fn digest(file: &SafeTensors) -> u64 {
     hash
 }
 
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn resolve(models: &Path, role: &str) -> Option<PathBuf> {
     let file = ROLES
         .iter()
@@ -514,6 +519,28 @@ impl Worker {
     }
 
     /// The prompt's text states, encoded wherever the text encoder lives.
+    /// This worker as a rank of a shared-out run, with the session opened on it. Nothing else may
+    /// use the worker while the coordinator lives, since from here on it answers steps rather than
+    /// requests. It carries no connection: the payloads go between the ranks and never through the
+    /// machine handing the work out.
+    pub fn as_peer<'a>(
+        &'a mut self,
+        rank: usize,
+        open: &OpenSession,
+        payload: &[u8],
+    ) -> Result<Peer<'a>, Box<dyn Error>> {
+        let (backend, host) = (self.welcome.backend, host_of(&self.address));
+        let Worker { reader, writer, .. } = self;
+        worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
+        Ok(Peer {
+            rank,
+            backend,
+            host,
+            reader,
+            writer,
+        })
+    }
+
     pub fn encode_text(&mut self, role: &str, ids: &[u32]) -> Result<Tensor, Box<dyn Error>> {
         let checkpoint = self
             .checkpoint(role)
@@ -806,6 +833,7 @@ fn probe(address: &str, token: &str) -> Result<(), Box<dyn Error>> {
 /// One DiT step's worth of Ulysses traffic, to see whether the link carries a shard before anything
 /// is built on it. Each layer exchanges twice, and the rendezvous happens as often as the payload,
 /// which a single large read does not show.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn exchange(worker: &mut Worker) -> Result<(), Box<dyn Error>> {
     // A 768p step: 31k tokens of 56 heads by 128 in bf16, halved by token and by head. The first
     // leg carries q, k and v, the second carries the attention output.
@@ -1563,7 +1591,6 @@ fn describe_protocol(theirs: u32, who: &str) -> String {
 
 /// The host part of `address`. It is what the OTHER ranks dial, not what the leader reached this
 /// one at, and the two are the same for every machine except the one the leader is running on.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 fn host_of(address: &str) -> String {
     match address.rsplit_once(':') {
         Some((host, _)) => host.to_owned(),
@@ -1580,11 +1607,17 @@ fn device_name() -> String {
     {
         "Apple GPU".to_owned()
     }
+    // A machine that hands every piece of work out has nothing here to name.
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    {
+        "none".to_owned()
+    }
 }
 
 /// What this machine has, which is what `Welcome` reports beside the device. Every platform has to
 /// answer the same question or the number means something different depending on who sent it, so
 /// this is the host's memory on both and not the device's working set on one of them.
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn memory_bytes() -> u64 {
     #[cfg(target_os = "linux")]
     {
@@ -1649,7 +1682,6 @@ impl Socket<'_> {
 
 /// What one rank brings to a shared-out run: its socket to the leader or, for the leader, to each
 /// worker, and the connection the payloads travel over.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Peer<'a> {
     pub rank: usize,
     /// Which backend this peer runs, as `Welcome` named it.
@@ -3064,39 +3096,15 @@ fn serve_shard(
 }
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
-impl Worker {
-    /// This worker as a rank of a shared-out run, with the session opened on it. Nothing else may
-    /// use the worker while the coordinator lives, since from here on it answers steps rather than
-    /// requests. It carries no connection: the payloads go between the ranks and never through the
-    /// machine handing the work out.
-    pub fn as_peer<'a>(
-        &'a mut self,
-        rank: usize,
-        open: &OpenSession,
-        payload: &[u8],
-    ) -> Result<Peer<'a>, Box<dyn Error>> {
-        let (backend, host) = (self.welcome.backend, host_of(&self.address));
-        let Worker { reader, writer, .. } = self;
-        worker::send(writer, Kind::OpenSession, 0, &open.encode(), payload)?;
-        Ok(Peer {
-            rank,
-            backend,
-            host,
-            reader,
-            writer,
-        })
-    }
-}
+impl Worker {}
 
 /// The machine handing the work out. It holds a socket to every rank, relays the rendezvous
 /// between them, hands out each step and takes the parts back. It registers no region, joins no
 /// barrier and runs no block: the ranks are the workers, and this is not one of them.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub struct Coordinator<'a> {
     peers: Vec<Peer<'a>>,
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
 impl<'a> Coordinator<'a> {
     /// Opens a run on every worker and relays the rendezvous. The workers take ranks 0 upwards in
     /// the order they are given, which is the order `OpenSession` named them.
@@ -3276,7 +3284,6 @@ impl<'a> Coordinator<'a> {
 
 /// The block-sparse attention of a run, as a session carries it. Every rank has to choose the same
 /// attention on the same steps, so what crosses the wire is the schedule and not one step of it.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn sparse_settings(
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
 ) -> worker::SparseSettings {
@@ -3320,7 +3327,6 @@ pub fn sparse_attention(
 }
 
 /// A latent's shape as a session names it, or zeroes when there is none.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 fn condition_shape<const N: usize>(latent: Option<&Tensor>) -> [u32; N] {
     let mut shape = [0u32; N];
     if let Some(latent) = latent {
@@ -3333,7 +3339,6 @@ fn condition_shape<const N: usize>(latent: Option<&Tensor>) -> [u32; N] {
 
 /// The keyframes and references of a run as a session names them, in the order their latents follow
 /// the context in the payload.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn session_conditions(
     keyframes: &[mmh3_core::dit::inputs::Keyframe],
     references: &[mmh3_core::dit::inputs::Reference],
@@ -3366,7 +3371,6 @@ pub fn session_conditions(
 
 /// The context, its modalities and the conditions' latents, as a session carries them. The
 /// conditions follow in the order `session_conditions` lists them, video before audio.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn session_payload(
     context: &Tensor,
     modalities: &[mmh3_core::dit::timestep::Modality],
@@ -3404,7 +3408,6 @@ pub fn session_payload(
     payload
 }
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Drop for Coordinator<'_> {
     fn drop(&mut self) {
         // A rank whose socket simply goes away reads a closed one and reports a fault. The run is
@@ -3418,7 +3421,6 @@ impl Drop for Coordinator<'_> {
 /// One step of a shared-out run from the machine handing it out: send the latents to every rank,
 /// take back the rows each carried, and put them together. It runs no block of its own and holds
 /// no weights: the shape is all a machine needs to assemble a step it did not compute.
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn step_shard(
     coordinator: &mut Coordinator<'_>,
     config: &mmh3_core::dit::config::DitConfig,

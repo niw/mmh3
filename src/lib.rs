@@ -10,13 +10,9 @@ pub mod cli;
 pub mod output;
 pub mod pictures;
 
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod generation;
 #[cfg(feature = "metal")]
 pub mod metal;
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod models;
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod video;
-#[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod worker;
