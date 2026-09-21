@@ -321,9 +321,15 @@ fn measure_now() -> Option<worker::Speed> {
         gemm_operations_per_second(&device, mmh3_metal::LinearPrecision::MpsFp16, m, n, k, 10)
             .ok()?;
     let copy = memory_copy_bytes_per_second(&device, 1 << 28, 5).ok()?;
+
+    // The other half of a block, and the half a token cut does not shrink, measured at the same
+    // shape and counted by the same function as CUDA counts it by.
+    let (tokens, heads) = (ATTENTION_TOKENS, 1);
+    let milliseconds = mmh3_metal::bench::attention_milliseconds(&device, tokens, heads, 5).ok()?;
     Some(worker::Speed {
         gemm_tops: (operations / 1e12) as f32,
         bandwidth_gbytes: (copy / 1e9) as f32,
+        attention_tops: (attention_operations(tokens, heads) / (milliseconds * 1e-3) / 1e12) as f32,
     })
 }
 

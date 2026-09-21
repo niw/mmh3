@@ -83,3 +83,34 @@ fn median(trials: usize, mut work: impl FnMut() -> Result<()>, device: &Device) 
     }
     Ok(median)
 }
+
+/// Milliseconds per dense attention call over `tokens` tokens and `heads` heads of dimension 128,
+/// the same thing the CUDA benchmark answers with. The caller counts the operations, so that both
+/// backends count them the same way and the two numbers can be compared.
+pub fn attention_milliseconds(
+    device: &Device,
+    tokens: usize,
+    heads: usize,
+    trials: usize,
+) -> Result<f64> {
+    let width = heads * mmh3_core::shard::HEAD_DIM;
+    let fill = |seed: usize| -> Vec<f32> {
+        (0..tokens * width)
+            .map(|i| ((i * seed) % 97) as f32 / 97.0 - 0.5)
+            .collect()
+    };
+    let query = Array::from_f32(device, tokens, width, &fill(31))?;
+    let key = Array::from_f32(device, tokens, width, &fill(17))?;
+    let value = Array::from_f32(device, tokens, width, &fill(53))?;
+
+    let seconds = median(
+        trials,
+        || {
+            let attended = query.attention(&key, &value, heads, heads, false)?;
+            std::hint::black_box(&attended);
+            Ok(())
+        },
+        device,
+    )?;
+    Ok(seconds * 1e3)
+}
