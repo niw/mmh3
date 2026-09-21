@@ -75,6 +75,16 @@ pub struct CudaError {
     pub message: String,
 }
 
+/// `cudaErrorMemoryAllocation`, which a caller holding memory it could let go of can do something
+/// about, unlike every other way a call here fails.
+pub const OUT_OF_MEMORY: i32 = 2;
+
+impl CudaError {
+    pub fn is_out_of_memory(&self) -> bool {
+        self.code == OUT_OF_MEMORY
+    }
+}
+
 impl fmt::Display for CudaError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "CUDA error {}: {}", self.code, self.message)
@@ -193,6 +203,16 @@ pub struct DeviceBuffer {
     pointer: *mut c_void,
     bytes: usize,
 }
+
+// SAFETY: a device address belongs to the context of the process rather than to a thread, and
+// every kernel and copy here is submitted to the legacy default stream, which orders the work of
+// all threads against each other. So a buffer means the same thing on whichever thread reads it,
+// and a model built from buffers can be kept in one place and used from the thread that asks for
+// it. Two threads using one model at the same time would still be two runs over one set of
+// scratch buffers, which is what the table that hands models out prevents by handing one out at a
+// time.
+unsafe impl Send for DeviceBuffer {}
+unsafe impl Sync for DeviceBuffer {}
 
 impl DeviceBuffer {
     pub fn new(bytes: usize) -> Result<Self, CudaError> {

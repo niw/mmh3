@@ -3,6 +3,8 @@
 //! role and confirm them by digest.
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::resident::{Dit, DitKey, Models, VideoDecoderKey};
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::dit::inputs::DitInputs;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::shard;
@@ -50,25 +52,9 @@ const BACKEND: u8 = worker::BACKEND_CUDA;
 const BACKEND: u8 = worker::BACKEND_METAL;
 
 #[cfg(feature = "cuda")]
-type TextEncoder = mmh3_cuda::text_encoder::CudaTextEncoder;
-#[cfg(feature = "metal")]
-type TextEncoder = mmh3_metal::text_encoder::MetalTextEncoder;
-/// The checkpoint a session has loaded, kept for the rest of it.
-#[cfg(any(feature = "cuda", feature = "metal"))]
-type Resident = Option<(u64, TextEncoder)>;
-#[cfg(feature = "cuda")]
-type VideoDecoder = mmh3_cuda::vae::CudaVideoDecoder;
-#[cfg(feature = "cuda")]
 use mmh3_cuda::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
 #[cfg(feature = "metal")]
-type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
-#[cfg(feature = "metal")]
 use mmh3_metal::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
-/// The DiT a rank runs its share of a step on.
-#[cfg(feature = "cuda")]
-pub(crate) type Dit = mmh3_cuda::dit::CudaDit;
-#[cfg(feature = "metal")]
-pub(crate) type Dit = mmh3_metal::dit::MetalDit;
 /// What a whole step answers with, which a leader reads once it has assembled the parts.
 #[cfg(feature = "cuda")]
 pub(crate) type DitStep = mmh3_cuda::dit::DitOutputs;
@@ -79,15 +65,6 @@ pub(crate) type DitStep = mmh3_metal::dit::DitOutput;
 pub(crate) type SoleExchange = mmh3_cuda::shard::WholeExchange;
 #[cfg(feature = "metal")]
 pub(crate) type SoleExchange = mmh3_metal::shard::WholeExchange;
-/// A decoder and the tile geometry it was built for, which a request may change.
-#[cfg(any(feature = "cuda", feature = "metal"))]
-type ResidentDecoder = Option<(u64, usize, usize, VideoDecoder)>;
-#[cfg(feature = "cuda")]
-type AudioDecoder = mmh3_cuda::audio_vae::CudaAudioDecoder;
-#[cfg(feature = "metal")]
-type AudioDecoder = mmh3_metal::audio_vae::MetalAudioDecoder;
-#[cfg(any(feature = "cuda", feature = "metal"))]
-type ResidentAudio = Option<(u64, AudioDecoder)>;
 
 /// Checkpoints a worker offers, as `(role, path inside the models directory)`. Roles name what a
 /// file is for, since the file names differ between machines.
@@ -1243,13 +1220,11 @@ fn session(
     stream.set_nodelay(true)?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER, stream.try_clone()?);
     let mut writer = BufWriter::with_capacity(STREAM_BUFFER, stream);
-    // The text encoder and the video decoder load on their first request and stay for the session.
-    let mut encoder: Resident = None;
-    let mut decoder: ResidentDecoder = None;
-    let mut audio: ResidentAudio = None;
-    // A DiT read before it was asked for, which `PrepareCheckpoint` starts while the leader is
-    // still encoding its prompt.
-    let mut prepared: Option<(u64, Dit)> = None;
+    // Where this session takes its models from. They outlive it, so a leader that comes back
+    // finds what the one before it read still loaded. Each request borrows them into a binding of
+    // its own and lets go of them before it answers, since answering is a write down a socket and
+    // the machine has other sessions that could be computing meanwhile.
+    let mut table = crate::resident::Table::new();
     #[cfg(feature = "cuda")]
     let mut rdma: Option<Rdma> = None;
     #[cfg(feature = "cuda")]
@@ -1361,7 +1336,9 @@ fn session(
             },
             Kind::EncodeText => {
                 let request = EncodeText::decode(&body)?;
-                match encode_text(checkpoints, &request, &mut encoder) {
+                let encoded = encode_text(checkpoints, &request, &mut table.borrow());
+                table.let_go_if_out_of_memory(&encoded);
+                match encoded {
                     Ok(context) => {
                         let states = TextStates {
                             tokens: context.shape[0],
@@ -1385,28 +1362,37 @@ fn session(
                 // A notification rather than a request: the leader has a prompt to encode and does
                 // not wait for the read, which is the whole point of sending it early.
                 match worker::Checkpoint::decode(&body) {
-                    Ok(checkpoint) => prepared = prepare_dit(models, &checkpoint),
+                    Ok(checkpoint) => prepare_dit(&mut table.borrow(), models, &checkpoint),
                     Err(error) => eprintln!("warning: a prepared checkpoint: {error}"),
                 }
             }
             Kind::OpenSession => {
+                // A shared run holds the models for as long as it lasts, which is the one time
+                // this machine has nothing to spare for another session anyway.
                 let (open, payload) = OpenSession::decode(&body)?;
-                if let Err(error) = serve_shard(
-                    &mut reader,
-                    &mut writer,
-                    models,
-                    &open,
-                    &body[payload..],
-                    prepared.take(),
-                    token,
-                ) {
+                let mut kept = table.borrow();
+                let served = session_dit(&mut kept, models, &open).and_then(|dit| {
+                    serve_shard(
+                        &mut reader,
+                        &mut writer,
+                        dit,
+                        &open,
+                        &body[payload..],
+                        token,
+                    )
+                });
+                drop(kept);
+                table.let_go_if_out_of_memory(&served);
+                if let Err(error) = served {
                     reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?;
                     return Err(error);
                 }
             }
             Kind::DecodeAudio => {
                 let started = Instant::now();
-                match decode_audio(checkpoints, &body, &mut audio) {
+                let decoded = decode_audio(checkpoints, &body, &mut table.borrow());
+                table.let_go_if_out_of_memory(&decoded);
+                match decoded {
                     Ok(waveform) => {
                         let shape = waveform.shape.iter().map(|&extent| extent as u32).collect();
                         let payload: Vec<u8> = waveform
@@ -1432,7 +1418,9 @@ fn session(
             }
             Kind::DecodeVideo => {
                 let started = Instant::now();
-                match decode_video(checkpoints, &body, &mut decoder) {
+                let decoded = decode_video(checkpoints, &body, &mut table.borrow());
+                table.let_go_if_out_of_memory(&decoded);
+                match decoded {
                     Ok((chunk, payload)) => {
                         let megabytes = payload.len() >> 20;
                         // A reliable connection has the leader read the canvas out of this side's
@@ -1505,7 +1493,9 @@ fn session(
             }
             Kind::DecodeWhole => {
                 let started = Instant::now();
-                match decode_whole(checkpoints, &body, &mut decoder) {
+                let decoded = decode_whole(checkpoints, &body, &mut table.borrow());
+                table.let_go_if_out_of_memory(&decoded);
+                match decoded {
                     Ok((frames, payload)) => {
                         println!(
                             "decoded {} frames in {:.1} s, {} MiB back",
@@ -1528,36 +1518,48 @@ fn session(
     }
 }
 
+/// The checkpoint this worker offers for what a request names: the role, and the digest too when
+/// the request gives one.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn offered_checkpoint<'a>(
+    checkpoints: &'a [(Checkpoint, PathBuf)],
+    wanted: &Checkpoint,
+) -> Result<&'a (Checkpoint, PathBuf), Box<dyn Error>> {
+    checkpoints
+        .iter()
+        .find(|(checkpoint, _)| {
+            checkpoint.role == wanted.role
+                && (wanted.digest == 0 || wanted.digest == checkpoint.digest)
+        })
+        .ok_or_else(|| format!("no checkpoint for {} {:016x}", wanted.role, wanted.digest).into())
+}
+
+/// The latent that follows a request's descriptor, read as the shape the descriptor gives.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn latent_of(shape: &[u32], values: &[u8]) -> Result<Tensor, Box<dyn Error>> {
+    let shape: Vec<usize> = shape.iter().map(|&extent| extent as usize).collect();
+    let expected = shape.iter().product::<usize>() * 4;
+    if values.len() != expected {
+        return Err(format!("a latent of {} bytes, not {expected}", values.len()).into());
+    }
+    Ok(Tensor::new(
+        shape,
+        values
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .collect(),
+    ))
+}
+
+/// Encodes a leader's prompt with the text encoder it names.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn encode_text(
     checkpoints: &[(Checkpoint, PathBuf)],
     request: &EncodeText,
-    resident: &mut Resident,
+    models: &mut Models,
 ) -> Result<Tensor, Box<dyn Error>> {
-    let (checkpoint, path) = checkpoints
-        .iter()
-        .find(|(checkpoint, _)| {
-            checkpoint.role == request.checkpoint.role
-                && (request.checkpoint.digest == 0
-                    || request.checkpoint.digest == checkpoint.digest)
-        })
-        .ok_or_else(|| {
-            format!(
-                "no checkpoint for {} {:016x}",
-                request.checkpoint.role, request.checkpoint.digest
-            )
-        })?;
-    if resident.as_ref().map(|(digest, _)| *digest) != Some(checkpoint.digest) {
-        let started = Instant::now();
-        let file = SafeTensors::open(path)?;
-        *resident = Some((checkpoint.digest, TextEncoder::load(&file)?));
-        println!(
-            "loaded {} in {:.1} s",
-            path.display(),
-            started.elapsed().as_secs_f64()
-        );
-    }
-    let encoder = &resident.as_ref().expect("just loaded").1;
+    let (checkpoint, path) = offered_checkpoint(checkpoints, &request.checkpoint)?;
+    let encoder = models.text_encoder(path, checkpoint.digest)?;
     let started = Instant::now();
     let context = encoder.encode(&request.ids, &[])?.context;
     println!(
@@ -1568,72 +1570,31 @@ fn encode_text(
     Ok(context)
 }
 
-/// Decodes one chunk of a video for a leader, loading the video VAE if this session has not.
-/// Decodes a run's audio latent, keeping the VAE for the rest of the session. The latent and the
-/// waveform are a megabyte or so, so they go down the socket rather than over the wire.
+/// Decodes a run's audio latent. The latent and the waveform are a megabyte or so, so they go
+/// down the socket rather than over the wire.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn decode_audio(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
-    resident: &mut ResidentAudio,
+    models: &mut Models,
 ) -> Result<Tensor, Box<dyn Error>> {
     let (request, descriptor_bytes) = DecodeAudio::decode(body)?;
-    let (checkpoint, path) = checkpoints
-        .iter()
-        .find(|(checkpoint, _)| {
-            checkpoint.role == request.checkpoint.role
-                && (request.checkpoint.digest == 0
-                    || request.checkpoint.digest == checkpoint.digest)
-        })
-        .ok_or_else(|| format!("no checkpoint for {}", request.checkpoint.role))?;
-    if resident.as_ref().map(|(digest, _)| *digest) != Some(checkpoint.digest) {
-        let started = Instant::now();
-        let file = SafeTensors::open(path)?;
-        *resident = Some((checkpoint.digest, AudioDecoder::load(&file, "")?));
-        println!(
-            "loaded {} in {:.1} s",
-            path.display(),
-            started.elapsed().as_secs_f64()
-        );
-    }
-    let shape: Vec<usize> = request
-        .shape
-        .iter()
-        .map(|&extent| extent as usize)
-        .collect();
-    let values = &body[descriptor_bytes..];
-    let expected = shape.iter().product::<usize>() * 4;
-    if values.len() != expected {
-        return Err(format!("a latent of {} bytes, not {expected}", values.len()).into());
-    }
-    let latent = Tensor::new(
-        shape,
-        values
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect(),
-    );
-    let decoder = &resident.as_ref().expect("just loaded").1;
+    let (checkpoint, path) = offered_checkpoint(checkpoints, &request.checkpoint)?;
+    let latent = latent_of(&request.shape, &body[descriptor_bytes..])?;
+    let decoder = models.audio_decoder(path, checkpoint.digest)?;
     Ok(decoder.decode(&latent)?)
 }
 
+/// What a video decode asks for: the request itself, the latent that follows it, and the decoder
+/// to run it through, named rather than built so that the caller takes it from the models it
+/// keeps.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-/// The decoder a request names, loaded if it is not the resident one, and the latent that follows.
-#[cfg(any(feature = "cuda", feature = "metal"))]
-fn decode_request(
-    checkpoints: &[(Checkpoint, PathBuf)],
+fn decode_request<'a>(
+    checkpoints: &'a [(Checkpoint, PathBuf)],
     body: &[u8],
-    resident: &mut ResidentDecoder,
-) -> Result<(DecodeVideo, Tensor), Box<dyn Error>> {
+) -> Result<(DecodeVideo, Tensor, &'a Path, VideoDecoderKey), Box<dyn Error>> {
     let (request, descriptor_bytes) = DecodeVideo::decode(body)?;
-    let (checkpoint, path) = checkpoints
-        .iter()
-        .find(|(checkpoint, _)| {
-            checkpoint.role == request.checkpoint.role
-                && (request.checkpoint.digest == 0
-                    || request.checkpoint.digest == checkpoint.digest)
-        })
-        .ok_or_else(|| format!("no checkpoint for {}", request.checkpoint.role))?;
+    let (checkpoint, path) = offered_checkpoint(checkpoints, &request.checkpoint)?;
     // A leader with no decoder of its own has no basis for these, and says so by asking for
     // nothing. The machine that will run the decode is the one that knows what its tiles want.
     let tile_size = match request.tile_size {
@@ -1644,43 +1605,13 @@ fn decode_request(
         0 => DEFAULT_TILE_OVERLAP_MIN,
         overlap => overlap as usize,
     };
-    if resident
-        .as_ref()
-        .map(|(digest, size, overlap, _)| (*digest, *size, *overlap))
-        != Some((checkpoint.digest, tile_size, tile_overlap))
-    {
-        let started = Instant::now();
-        let file = SafeTensors::open(path)?;
-        *resident = Some((
-            checkpoint.digest,
-            tile_size,
-            tile_overlap,
-            VideoDecoder::load(&file, "", tile_size, tile_overlap)?,
-        ));
-        println!(
-            "loaded {} in {:.1} s",
-            path.display(),
-            started.elapsed().as_secs_f64()
-        );
-    }
-    let shape: Vec<usize> = request
-        .shape
-        .iter()
-        .map(|&extent| extent as usize)
-        .collect();
-    let values = &body[descriptor_bytes..];
-    let expected = shape.iter().product::<usize>() * 4;
-    if values.len() != expected {
-        return Err(format!("a latent of {} bytes, not {expected}", values.len()).into());
-    }
-    let latent = Tensor::new(
-        shape,
-        values
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
-            .collect(),
-    );
-    Ok((request, latent))
+    let latent = latent_of(&request.shape, &body[descriptor_bytes..])?;
+    Ok((
+        request,
+        latent,
+        path.as_path(),
+        (checkpoint.digest, tile_size, tile_overlap),
+    ))
 }
 
 /// One chunk's canvas, for a machine that blends the chunks itself.
@@ -1688,10 +1619,10 @@ fn decode_request(
 fn decode_video(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
-    resident: &mut ResidentDecoder,
+    models: &mut Models,
 ) -> Result<(u32, Vec<u8>), Box<dyn Error>> {
-    let (request, latent) = decode_request(checkpoints, body, resident)?;
-    let decoder = &resident.as_ref().expect("just loaded").3;
+    let (request, latent, path, key) = decode_request(checkpoints, body)?;
+    let decoder = models.video_decoder(path, key)?;
     Ok((
         request.chunk,
         decoder.decode_chunk(&latent, request.chunk as usize)?,
@@ -1704,10 +1635,10 @@ fn decode_video(
 fn decode_whole(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
-    resident: &mut ResidentDecoder,
+    models: &mut Models,
 ) -> Result<(worker::Frames, Vec<u8>), Box<dyn Error>> {
-    let (_, latent) = decode_request(checkpoints, body, resident)?;
-    let decoder = &resident.as_ref().expect("just loaded").3;
+    let (_, latent, path, key) = decode_request(checkpoints, body)?;
+    let decoder = models.video_decoder(path, key)?;
     let frames = decoder.decode_yuv420(&latent)?;
     Ok((
         worker::Frames {
@@ -3001,49 +2932,85 @@ pub fn share_a_step(
     Ok((part, timing))
 }
 
-/// Reads the DiT a run is about to share, so that it is here when the session opens rather than
-/// after it. The leader sends this while it still has its prompt to encode.
+/// What a session asks its DiT to be.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-fn prepare_dit(models: &Path, checkpoint: &worker::Checkpoint) -> Option<(u64, Dit)> {
-    let path = find_checkpoint(models, checkpoint.digest, &["diffusion_models"])?;
+fn dit_key(open: &OpenSession) -> DitKey {
+    DitKey {
+        checkpoint: open.checkpoint.digest,
+        adapters: open
+            .adapters
+            .iter()
+            .map(|adapter| (adapter.digest, adapter.strength.to_bits(), adapter.mode))
+            .collect(),
+    }
+}
+
+/// Reads a DiT into the table, letting go of the one it replaces first so that the memory that one
+/// held is memory this read may use.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn read_dit(kept: &mut Models, path: &Path) -> Result<Dit, Box<dyn Error>> {
+    let file = SafeTensors::open(path)?;
+    kept.take_dit();
+    kept.read(|| Dit::load(&file, ""))
+}
+
+/// Reads the DiT a run is about to share, so that it is here when the session opens rather than
+/// after it. The leader sends this while it still has its prompt to encode, and a machine that
+/// already holds that DiT has nothing to read.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn prepare_dit(kept: &mut Models, models: &Path, checkpoint: &worker::Checkpoint) {
+    if kept
+        .dit_key()
+        .is_some_and(|key| key.checkpoint == checkpoint.digest)
+    {
+        return;
+    }
+    let Some(path) = find_checkpoint(models, checkpoint.digest, &["diffusion_models"]) else {
+        return;
+    };
     let started = Instant::now();
-    let file = SafeTensors::open(&path).ok()?;
-    match Dit::load(&file, "") {
+    match read_dit(kept, &path) {
         Ok(dit) => {
             println!(
                 "read {} in {:.1} s before it was asked for",
                 path.display(),
                 started.elapsed().as_secs_f64()
             );
-            Some((checkpoint.digest, dit))
+            kept.keep_dit(
+                DitKey {
+                    checkpoint: checkpoint.digest,
+                    adapters: Vec::new(),
+                },
+                dit,
+            );
         }
-        Err(error) => {
-            eprintln!("warning: reading {} early: {error}", path.display());
-            None
-        }
+        Err(error) => eprintln!("warning: reading {} early: {error}", path.display()),
     }
 }
 
-/// A rank that is not the leader, running its share of every step until the leader closes the
-/// session. It holds the DiT and the registered regions for the whole run.
+/// The DiT a session opens with. Adapters only ever add, so a kept DiT from the same checkpoint
+/// whose adapters begin this session's is the one it wants once it has taken the rest, which is
+/// how the DiT read before the session opened is the DiT the session runs.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-fn serve_shard(
-    reader: &mut BufReader<TcpStream>,
-    writer: &mut BufWriter<TcpStream>,
+fn session_dit<'a>(
+    kept: &'a mut Models,
     models: &Path,
     open: &OpenSession,
-    payload: &[u8],
-    prepared: Option<(u64, Dit)>,
-    token: &str,
-) -> Result<(), Box<dyn Error>> {
-    use mmh3_core::dit::layout::PackedLayout;
-    use mmh3_core::dit::timestep::Modality;
-
-    // The DiT `PrepareCheckpoint` read while the leader was encoding, when it is the one this
-    // session asks for.
-    let mut dit = match prepared {
-        Some((digest, dit)) if digest == open.checkpoint.digest => dit,
-        _ => {
+) -> Result<&'a mut Dit, Box<dyn Error>> {
+    let wanted = dit_key(open);
+    let taken = kept.take_dit();
+    let reusable = matches!(
+        &taken,
+        Some((key, _))
+            if key.checkpoint == wanted.checkpoint && wanted.adapters.starts_with(&key.adapters)
+    );
+    let (mut dit, applied) = match reusable {
+        true => {
+            let (key, dit) = taken.expect("a key matched one");
+            let applied = key.adapters.len();
+            (dit, applied)
+        }
+        false => {
             let path = find_checkpoint(models, open.checkpoint.digest, &["diffusion_models"])
                 .ok_or_else(|| {
                     format!(
@@ -3051,19 +3018,20 @@ fn serve_shard(
                         open.checkpoint.digest
                     )
                 })?;
+            drop(taken);
             let started = Instant::now();
-            let dit = Dit::load(&SafeTensors::open(&path)?, "")?;
+            let dit = read_dit(kept, &path)?;
             println!(
                 "loaded {} in {:.1} s",
                 path.display(),
                 started.elapsed().as_secs_f64()
             );
-            dit
+            (dit, 0)
         }
     };
     set_attention_precision(&mut dit, open.precision)?;
     // The leader's LoRAs and patches, in the order it added them, since they do not commute.
-    for adapter in &open.adapters {
+    for adapter in &open.adapters[applied..] {
         let path =
             find_checkpoint(models, adapter.digest, &["loras", "patches"]).ok_or_else(|| {
                 format!(
@@ -3080,6 +3048,22 @@ fn serve_shard(
             started.elapsed().as_secs_f64()
         );
     }
+    Ok(kept.keep_dit(wanted, dit))
+}
+
+/// A rank that is not the leader, running its share of every step until the leader closes the
+/// session. It holds the DiT and the registered regions for the whole run.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn serve_shard(
+    reader: &mut BufReader<TcpStream>,
+    writer: &mut BufWriter<TcpStream>,
+    dit: &Dit,
+    open: &OpenSession,
+    payload: &[u8],
+    token: &str,
+) -> Result<(), Box<dyn Error>> {
+    use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_core::dit::timestep::Modality;
 
     let shape = |dimensions: &[u32]| -> Vec<usize> {
         dimensions.iter().map(|value| *value as usize).collect()
@@ -3126,7 +3110,7 @@ fn serve_shard(
     };
     let tokens = PackedLayout::for_inputs(&inputs).len();
     let sparse = sparse_attention(&open.sparse);
-    accept_sparse_attention(&dit, sparse.as_ref())?;
+    accept_sparse_attention(dit, sparse.as_ref())?;
     // The cuts the leader worked out, since it is the only rank that knows what every machine can
     // do. An empty table is an even share, which is what a leader that measured nothing sends.
     let shard = if open.shard.is_empty() {

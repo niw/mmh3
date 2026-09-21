@@ -1244,12 +1244,12 @@ enum Sharing<'a> {
 /// The exchange a rank uses when it shares with nobody. One backend's is made from the device it
 /// computes on and the other's needs nothing, so the difference lives here rather than at the use.
 #[cfg(feature = "cuda")]
-fn sole_exchange(_dit: &crate::worker::Dit) -> crate::worker::SoleExchange {
+fn sole_exchange(_dit: &crate::resident::Dit) -> crate::worker::SoleExchange {
     crate::worker::SoleExchange::new()
 }
 
 #[cfg(feature = "metal")]
-fn sole_exchange(dit: &crate::worker::Dit) -> crate::worker::SoleExchange {
+fn sole_exchange(dit: &crate::resident::Dit) -> crate::worker::SoleExchange {
     crate::worker::SoleExchange::new(dit.device())
 }
 

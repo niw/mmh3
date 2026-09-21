@@ -65,6 +65,14 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+impl Error {
+    /// Whether this is the device saying it has no memory left, which a caller holding models it
+    /// could let go of can do something about.
+    pub fn is_out_of_memory(&self) -> bool {
+        matches!(self, Error::Cuda(error) if error.is_out_of_memory())
+    }
+}
+
 impl From<mmh3_core::shard::ExchangeError> for Error {
     fn from(error: mmh3_core::shard::ExchangeError) -> Self {
         Error::Model(error.0)
