@@ -54,17 +54,21 @@ fn tools_inspects_a_checkpoint() {
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
 #[test]
 fn gpu_commands_explain_the_missing_backend() {
-    for (binary, command) in [
-        (MMH3, "generate"),
-        (TOOLS, "device"),
-        (TOOLS, "bench"),
-        (TOOLS, "check"),
-        (TOOLS, "latent"),
-    ] {
-        let output = run(binary, &[command]);
+    for command in ["device", "bench", "check", "latent"] {
+        let output = run(TOOLS, &[command]);
         assert_eq!(output.status.code(), Some(1));
         assert!(String::from_utf8_lossy(&output.stderr).contains("Rebuild with --features cuda"));
     }
+}
+
+/// A build with no backend generates by handing the whole run out, so what it lacks is a machine
+/// to hand it to rather than a backend of its own.
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
+#[test]
+fn generation_without_a_backend_asks_for_a_worker() {
+    let output = run(MMH3, &["generate", "--out", "out.mp4", "--prompt", "a cat"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--worker"));
 }
 
 #[cfg(feature = "cuda")]
