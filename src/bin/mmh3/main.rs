@@ -4,7 +4,7 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--vram-budget GB]
+  mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--vram-budget GB] [--idle-unload SECONDS]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
                 [--reference-audio FILE]... [--reference-video FILE]...
@@ -44,6 +44,8 @@ GPU still takes a rank. That one is counted last, after the ones --worker names.
 worker that can take a rank does, which is what naming one asks for. --shard-dit 0 keeps the DiT here.
 --vram-budget GB holds a run to that much device memory, failing an allocation past it as a device that small
 would. A worker lets go of the model it has used least whenever an allocation finds no memory left.
+--idle-unload SECONDS lets a worker go of every model it holds after that long with nothing to do, so that a
+machine nobody is generating on is a machine with its memory back. Without it a worker holds what it loaded.
 --worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
 encoder encodes the prompt, so this machine never loads it. Anything a worker cannot do, or fails at, this
 machine does itself.";

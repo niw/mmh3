@@ -13,7 +13,7 @@ use mmh3_core::safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
 pub type TextEncoder = mmh3_cuda::text_encoder::CudaTextEncoder;
@@ -97,6 +97,8 @@ pub struct Models {
     dit: Slot<DitKey, Dit>,
     /// Counts the uses, so that the least recent one is the smallest.
     tick: u64,
+    /// When a model was last asked for, for letting go of them all after a quiet while.
+    touched: Option<Instant>,
 }
 
 impl Default for Models {
@@ -113,6 +115,7 @@ impl Models {
             audio_decoder: Slot::new(),
             dit: Slot::new(),
             tick: 0,
+            touched: None,
         }
     }
 
@@ -193,7 +196,13 @@ impl Models {
     /// Counts one use, and says which one it is.
     fn touch(&mut self) -> u64 {
         self.tick += 1;
+        self.touched = Some(Instant::now());
         self.tick
+    }
+
+    /// How long since a model was last asked for, or None while none has been.
+    fn idle_for(&self) -> Option<Duration> {
+        self.touched.map(|touched| touched.elapsed())
     }
 
     /// Lets go of every model, and says how many there were.
@@ -202,6 +211,7 @@ impl Models {
         while self.release_oldest().is_some() {
             released += 1;
         }
+        self.touched = None;
         released
     }
 
@@ -353,4 +363,34 @@ fn locked() -> std::sync::MutexGuard<'static, Models> {
         .get_or_init(|| Mutex::new(Models::new()))
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Lets go of every model after `idle` without a request, so that a machine nothing is asking
+/// anything of is a machine with its memory back.
+pub fn release_when_idle(idle: Duration) {
+    // Looking oftener than this would wake a machine that is doing nothing, and seldomer would
+    // hold the memory well past the quiet that was asked for.
+    let interval = (idle / 4).clamp(Duration::from_secs(1), Duration::from_secs(60));
+    let watch = move || {
+        loop {
+            std::thread::sleep(interval);
+            let mut models = locked();
+            if models.idle_for().is_some_and(|quiet| quiet >= idle) {
+                match models.release_all() {
+                    0 => {}
+                    released => println!(
+                        "let go of {} after {} s with nothing to do",
+                        counted(released),
+                        idle.as_secs()
+                    ),
+                }
+            }
+        }
+    };
+    if let Err(error) = std::thread::Builder::new()
+        .name("idle".to_owned())
+        .spawn(watch)
+    {
+        eprintln!("warning: nothing will watch for idle memory: {error}");
+    }
 }

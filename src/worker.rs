@@ -1077,10 +1077,10 @@ impl RemoteCanvases {
 /// `mmh3 worker --listen ADDR [--models DIR] [--token FILE]`, which serves until it is stopped.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    use crate::cli::parse_options;
+    use crate::cli::{option_number, parse_options};
     use crate::models::models_directory;
 
-    const USAGE: &str = "usage: mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--transport auto|socket] [--vram-budget GB] | mmh3 worker --probe HOST[:PORT]";
+    const USAGE: &str = "usage: mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--transport auto|socket] [--vram-budget GB] [--idle-unload SECONDS] | mmh3 worker --probe HOST[:PORT]";
     let options = parse_options(
         arguments,
         &[
@@ -1090,10 +1090,15 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "probe",
             "transport",
             "vram-budget",
+            "idle-unload",
         ],
         USAGE,
     )?;
     crate::resident::take_budget(&options)?;
+    match option_number(&options, "idle-unload", 0)? {
+        0 => {}
+        seconds => crate::resident::release_when_idle(Duration::from_secs(seconds as u64)),
+    }
     // `--transport socket` keeps this machine's port to itself, so that a leader with one
     // exchanges over the socket as it would with a machine that has none. It is how the socket
     // path is tried between two machines that both have ports.
