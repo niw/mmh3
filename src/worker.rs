@@ -1700,7 +1700,7 @@ fn decode_video(
 
 /// The whole video, blended, in the form an encoder takes without a device. A machine that cannot
 /// blend asks for this instead of the chunks: the blending happens where the chunks already are.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn decode_whole(
     checkpoints: &[(Checkpoint, PathBuf)],
     body: &[u8],
@@ -1717,15 +1717,6 @@ fn decode_whole(
         },
         frames.data,
     ))
-}
-
-#[cfg(feature = "metal")]
-fn decode_whole(
-    _checkpoints: &[(Checkpoint, PathBuf)],
-    _body: &[u8],
-    _resident: &mut ResidentDecoder,
-) -> Result<(worker::Frames, Vec<u8>), Box<dyn Error>> {
-    Err("this build decodes chunks for another machine but not whole videos".into())
 }
 
 /// What to say to a machine that speaks a different protocol. Both ends say it, since only one of

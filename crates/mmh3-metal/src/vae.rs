@@ -1,6 +1,7 @@
 //! Video VAE decoding, unpatchification and spatial/temporal blending on Metal.
 use crate::{Error, Result, model::Weights, ops::Array};
 use mmh3_core::{
+    media::Yuv420,
     safetensors::SafeTensors,
     tensor::Tensor,
     vae::{TemporalPlan, TileAxis, rope_angles, split_tiles},
@@ -223,6 +224,17 @@ impl MetalVideoDecoder {
             pixels: frames.to_pixels()?,
             first_tile,
         })
+    }
+
+    /// The whole video as YUV 4:2:0, which is what a machine with no device of its own asks for.
+    /// It cannot blend the chunks, so the blending happens here, where they already are.
+    ///
+    /// The conversion runs on the host rather than on the device, unlike the CUDA one. It costs a
+    /// pass over the pixels once per video, against a kernel that does not exist yet, and what
+    /// goes back on the wire is an eighth of what the pixels are either way.
+    pub fn decode_yuv420(&self, latent: &Tensor) -> Result<Yuv420> {
+        let pixels = self.decode_device(latent)?.to_pixels()?;
+        Yuv420::from_pixels(&pixels).map_err(|error| Error(error.to_string()))
     }
 
     pub fn decode_device(&self, latent: &Tensor) -> Result<MetalVideoFrames> {

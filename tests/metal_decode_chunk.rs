@@ -2,6 +2,7 @@
 //! The per-chunk canvas a leader hands to another machine: its size, its bounds, and its agreement
 //! with the whole decode it is a part of.
 use mmh3_core::{
+    media::Yuv420,
     safetensors::{SafeTensors, write_f32},
     tensor::Tensor,
     vae::TemporalPlan,
@@ -202,4 +203,29 @@ fn the_plan_describes_the_canvases_a_leader_hands_round() {
         plan.canvas_values() * 4,
         decoder.decode_chunk(&latent, 0).unwrap().len()
     );
+}
+
+/// What a machine with no device of its own asks for covers the whole video rather than a chunk of
+/// it, and arrives as the planes an encoder takes. A decode wired to a chunk would answer with the
+/// right kind of thing and the wrong amount of it, which the length is what catches.
+#[test]
+fn the_whole_video_comes_back_as_the_planes_an_encoder_takes() {
+    let directory = tempfile::tempdir().unwrap();
+    let decoder = decoder(directory.path());
+    let latent_frames = 12;
+    assert!(
+        TemporalPlan::new(latent_frames).chunks > 1,
+        "this latent should span several chunks, so that a chunk is not the whole"
+    );
+    let latent = sample_latent(latent_frames);
+
+    let [_, frames, height, width] = decoder.decode_device(&latent).unwrap().shape();
+    let yuv = decoder.decode_yuv420(&latent).unwrap();
+
+    assert_eq!(
+        (yuv.frames, yuv.height, yuv.width),
+        (frames, height, width),
+        "the planes should cover what the pixels do"
+    );
+    assert_eq!(yuv.data.len(), frames * Yuv420::frame_bytes(height, width));
 }
