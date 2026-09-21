@@ -88,7 +88,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         decoder.decode_stream_with(&video, &mut |chunk| remote.take(chunk), |frames| {
             output
                 .write_metal_video_chunk(frames)
-                .map_err(|e| mmh3_metal::Error(e.to_string()))
+                .map_err(|e| mmh3_metal::Error::new(e.to_string()))
         })?;
         drop(decoder);
     } else {

@@ -125,7 +125,7 @@ fn matches_comfyui_golden_decode() {
     let error = decoder
         .decode_stream(&latent, |_| {
             calls += 1;
-            Err(mmh3_metal::Error("stop output".into()))
+            Err(mmh3_metal::Error::new("stop output".into()))
         })
         .unwrap_err();
     assert_eq!(calls, 1);

@@ -18,11 +18,22 @@ use std::{
     rc::Rc,
 };
 
+/// Something a call here could not do, and what it says for itself.
 #[derive(Debug)]
-pub struct Error(pub String);
+pub struct Error {
+    pub message: String,
+}
+
+impl Error {
+    /// A failure whose only answer is to report it.
+    pub fn new(message: String) -> Self {
+        Self { message }
+    }
+}
+
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -30,13 +41,13 @@ impl std::error::Error for Error {}
 
 impl From<String> for Error {
     fn from(value: String) -> Self {
-        Self(value)
+        Self::new(value)
     }
 }
 
 impl From<std::io::Error> for Error {
     fn from(value: std::io::Error) -> Self {
-        Self(value.to_string())
+        Self::new(value.to_string())
     }
 }
 
@@ -96,7 +107,7 @@ unsafe extern "C" {
 
 fn native_error() -> Error {
     // SAFETY: the native runtime returns a thread-local, NUL-terminated error string.
-    Error(
+    Error::new(
         unsafe { CStr::from_ptr(mmh3_metal_error()) }
             .to_string_lossy()
             .into_owned(),
@@ -197,7 +208,7 @@ impl Device {
 
     pub(crate) fn alloc(&self, bytes: usize, data: Option<&[u8]>) -> Result<Buffer> {
         if bytes == 0 || data.is_some_and(|data| data.len() != bytes) {
-            return Err(Error(
+            return Err(Error::new(
                 "Metal buffers must have a nonzero, matching size".into(),
             ));
         }
@@ -231,7 +242,9 @@ impl Device {
         }
 
         if buffers.iter().any(|b| !Rc::ptr_eq(&self.0, &b.0.device.0)) {
-            return Err(Error("Metal buffers belong to different devices".into()));
+            return Err(Error::new(
+                "Metal buffers belong to different devices".into(),
+            ));
         }
 
         let group_size = if name.starts_with("mpp_") { 128 } else { 256 };
@@ -280,7 +293,7 @@ impl Buffer {
         bytes: usize,
     ) -> Result<()> {
         if from + bytes > source.0.bytes || into + bytes > self.0.bytes {
-            return Err(Error("a copy outside a buffer".into()));
+            return Err(Error::new("a copy outside a buffer".into()));
         }
         self.0.device.run(
             "copy_bytes",

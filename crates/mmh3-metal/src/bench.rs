@@ -41,7 +41,7 @@ pub fn gemm_operations_per_second(
 pub fn memory_copy_bytes_per_second(device: &Device, bytes: usize, trials: usize) -> Result<f64> {
     let values = bytes / 4;
     if values == 0 {
-        return Err(Error("a copy of no bytes".into()));
+        return Err(Error::new("a copy of no bytes".into()));
     }
 
     let source = Array::zeros(device, 1, values)?;
@@ -79,7 +79,7 @@ fn median(trials: usize, mut work: impl FnMut() -> Result<()>, device: &Device) 
     times.sort_by(f64::total_cmp);
     let median = times[times.len() / 2];
     if median.is_nan() || median <= 0.0 {
-        return Err(Error("a measurement that took no time".into()));
+        return Err(Error::new("a measurement that took no time".into()));
     }
     Ok(median)
 }

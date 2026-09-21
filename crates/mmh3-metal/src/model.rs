@@ -50,13 +50,15 @@ impl Weights {
 
             if name.ends_with(".comfy_quant") {
                 let text =
-                    std::str::from_utf8(file.data(info)).map_err(|e| Error(e.to_string()))?;
-                let value = json::parse(text).map_err(|e| Error(e.to_string()))?;
+                    std::str::from_utf8(file.data(info)).map_err(|e| Error::new(e.to_string()))?;
+                let value = json::parse(text).map_err(|e| Error::new(e.to_string()))?;
                 if value.get("format").and_then(json::Value::as_str) != Some("int8_tensorwise")
                     || value.get("convrot").and_then(json::Value::as_bool) != Some(true)
                     || value.get("convrot_groupsize").and_then(json::Value::as_u64) != Some(256)
                 {
-                    return Err(Error(format!("{name}: unsupported quantization {text}")));
+                    return Err(Error::new(format!(
+                        "{name}: unsupported quantization {text}"
+                    )));
                 }
 
                 continue;
@@ -64,7 +66,7 @@ impl Weights {
 
             dtype_code(info.dtype)?;
             if info.element_count() == 0 {
-                return Err(Error(format!("empty weight {name}")));
+                return Err(Error::new(format!("empty weight {name}")));
             }
 
             tensors.insert(
@@ -81,7 +83,7 @@ impl Weights {
             if weight.dtype == DType::I8 {
                 let layer = name
                     .strip_suffix(".weight")
-                    .ok_or_else(|| Error(format!("unexpected INT8 tensor {name}")))?;
+                    .ok_or_else(|| Error::new(format!("unexpected INT8 tensor {name}")))?;
                 if file.get(&format!("{prefix}{layer}.comfy_quant")).is_none()
                     || weight.shape.len() != 2
                     || !weight.shape[1].is_multiple_of(256)
@@ -92,7 +94,7 @@ impl Weights {
                                 || s.shape.iter().product::<usize>() != weight.shape[0]
                         })
                 {
-                    return Err(Error(format!(
+                    return Err(Error::new(format!(
                         "{name}: expected per-output INT8 ConvRot scales and metadata"
                     )));
                 }
@@ -158,9 +160,9 @@ impl Weights {
         let w = self
             .tensors
             .get(name)
-            .ok_or_else(|| Error(format!("missing tensor {name}")))?;
+            .ok_or_else(|| Error::new(format!("missing tensor {name}")))?;
         if w.shape.len() != 2 || ids.is_empty() || ids.iter().any(|&i| i as usize >= w.shape[0]) {
-            return Err(Error("invalid embedding indices".into()));
+            return Err(Error::new("invalid embedding indices".into()));
         }
 
         let bytes: Vec<u8> = ids.iter().flat_map(|id| id.to_ne_bytes()).collect();
@@ -180,14 +182,14 @@ impl Weights {
         self.tensors
             .get(name)
             .map(|w| w.shape.clone())
-            .ok_or_else(|| Error(format!("missing tensor {name}")))
+            .ok_or_else(|| Error::new(format!("missing tensor {name}")))
     }
 
     pub fn array(&self, name: &str) -> Result<Array> {
         let w = self
             .tensors
             .get(name)
-            .ok_or_else(|| Error(format!("missing tensor {name}")))?;
+            .ok_or_else(|| Error::new(format!("missing tensor {name}")))?;
         let rows = if w.shape.len() >= 2 { w.shape[0] } else { 1 };
         let count = w.shape.iter().product::<usize>();
         convert(&self.device, &w.buffer, rows, count / rows, w.dtype)
@@ -207,9 +209,9 @@ impl Weights {
         let w = self
             .tensors
             .get(&key)
-            .ok_or_else(|| Error(format!("missing tensor {key}")))?;
+            .ok_or_else(|| Error::new(format!("missing tensor {key}")))?;
         if w.shape.len() < 2 || w.shape[1..].iter().product::<usize>() != x.cols {
-            return Err(Error(format!("{name}: linear input shape mismatch")));
+            return Err(Error::new(format!("{name}: linear input shape mismatch")));
         }
 
         let mut result = if w.dtype == DType::I8 {
@@ -264,9 +266,9 @@ impl Weights {
         let w = self
             .tensors
             .get(&key)
-            .ok_or_else(|| Error(format!("missing tensor {key}")))?;
+            .ok_or_else(|| Error::new(format!("missing tensor {key}")))?;
         if w.dtype != DType::I8 {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "{name}: an exchanged input reaches INT8 layers only"
             )));
         }
@@ -274,7 +276,7 @@ impl Weights {
         let outputs = w.shape[0];
         let kept: usize = keep.iter().map(|range| range.len()).sum();
         if keep.iter().any(|range| range.end > outputs) {
-            return Err(Error(format!("{name}: outputs outside the weight")));
+            return Err(Error::new(format!("{name}: outputs outside the weight")));
         }
 
         let taken = if keep.is_empty() {
@@ -370,14 +372,14 @@ impl Weights {
 
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize> {
         if !strength.is_finite() {
-            return Err(Error("LoRA strength must be finite".into()));
+            return Err(Error::new("LoRA strength must be finite".into()));
         }
 
         let mut adapters = Vec::new();
         const PREFIX: &str = "diffusion_model.";
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(PREFIX) else {
-                return Err(Error(format!("unsupported LoRA tensor {}", info.name)));
+                return Err(Error::new(format!("unsupported LoRA tensor {}", info.name)));
             };
 
             if name.ends_with(".lora_B.weight") || name.ends_with(".alpha") {
@@ -385,16 +387,16 @@ impl Weights {
             }
 
             let Some(layer) = name.strip_suffix(".lora_A.weight") else {
-                return Err(Error("Metal supports adapter LoRAs. Replacement-weight patches are not supported yet".into()));
+                return Err(Error::new("Metal supports adapter LoRAs. Replacement-weight patches are not supported yet".into()));
             };
 
             let load = |name: &str| -> Result<Tensor> {
                 Tensor::load(
                     file,
                     file.get(name)
-                        .ok_or_else(|| Error(format!("missing LoRA tensor {name}")))?,
+                        .ok_or_else(|| Error::new(format!("missing LoRA tensor {name}")))?,
                 )
-                .map_err(Error)
+                .map_err(Error::new)
             };
 
             let down = load(&info.name)?;
@@ -410,11 +412,11 @@ impl Weights {
                 || alpha.data.len() != 1
                 || !alpha.data[0].is_finite()
             {
-                return Err(Error(format!("LoRA does not fit {layer}")));
+                return Err(Error::new(format!("LoRA does not fit {layer}")));
             }
 
             if self.adapters.contains_key(layer) {
-                return Err(Error(format!("{layer} already has a LoRA")));
+                return Err(Error::new(format!("{layer} already has a LoRA")));
             }
 
             adapters.push((
@@ -428,7 +430,7 @@ impl Weights {
         }
 
         if adapters.is_empty() {
-            return Err(Error("no supported LoRA layers found".into()));
+            return Err(Error::new("no supported LoRA layers found".into()));
         }
 
         let count = adapters.len();

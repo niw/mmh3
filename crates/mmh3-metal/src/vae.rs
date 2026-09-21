@@ -55,13 +55,15 @@ impl MetalVideoFrames {
     /// Upload a chunk whose first frame has the given global output index.
     pub fn from_pixels_at(device: &crate::Device, pixels: &Tensor, start: usize) -> Result<Self> {
         let &[3, frames, height, width] = pixels.shape.as_slice() else {
-            return Err(Error("pixels must be [3, frames, height, width]".into()));
+            return Err(Error::new(
+                "pixels must be [3, frames, height, width]".into(),
+            ));
         };
 
         let columns = frames
             .checked_mul(height)
             .and_then(|n| n.checked_mul(width))
-            .ok_or_else(|| Error("video dimensions overflow".into()))?;
+            .ok_or_else(|| Error::new("video dimensions overflow".into()))?;
         if start.checked_add(frames).is_none()
             || [frames, height, width].contains(&0)
             || height % 2 != 0
@@ -71,7 +73,7 @@ impl MetalVideoFrames {
                 .iter()
                 .any(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
         {
-            return Err(Error(
+            return Err(Error::new(
                 "video needs positive even dimensions and finite RGB in [0, 1]".into(),
             ));
         }
@@ -105,7 +107,7 @@ impl MetalVideoDecoder {
             || !overlap.is_multiple_of(16)
             || overlap >= tile_size
         {
-            return Err(Error(
+            return Err(Error::new(
                 "VAE tile size and overlap must be multiples of 16, with overlap below tile size"
                     .into(),
             ));
@@ -128,7 +130,7 @@ impl MetalVideoDecoder {
             || layers == 0
             || weights.shape("decoder.proj_out.weight")?[0] != 3072
         {
-            return Err(Error("unsupported video decoder configuration".into()));
+            return Err(Error::new("unsupported video decoder configuration".into()));
         }
 
         Ok(Self {
@@ -234,7 +236,7 @@ impl MetalVideoDecoder {
     /// goes back on the wire is an eighth of what the pixels are either way.
     pub fn decode_yuv420(&self, latent: &Tensor) -> Result<Yuv420> {
         let pixels = self.decode_device(latent)?.to_pixels()?;
-        Yuv420::from_pixels(&pixels).map_err(|error| Error(error.to_string()))
+        Yuv420::from_pixels(&pixels).map_err(|error| Error::new(error.to_string()))
     }
 
     pub fn decode_device(&self, latent: &Tensor) -> Result<MetalVideoFrames> {
@@ -292,7 +294,7 @@ impl MetalVideoDecoder {
     pub fn decode_chunk(&self, latent: &Tensor, chunk: usize) -> Result<Vec<u8>> {
         let geometry = self.geometry(latent)?;
         if chunk >= geometry.chunks {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "chunk {chunk} of a latent with {} chunks",
                 geometry.chunks
             )));
@@ -347,20 +349,20 @@ impl MetalVideoDecoder {
             )
         })?;
         Ok((
-            output.ok_or_else(|| Error("decoder produced no frames".into()))?,
+            output.ok_or_else(|| Error::new("decoder produced no frames".into()))?,
             first,
         ))
     }
 
     fn geometry(&self, latent: &Tensor) -> Result<Geometry> {
         let &[channels, latent_frames, lh, lw] = latent.shape.as_slice() else {
-            return Err(Error(
+            return Err(Error::new(
                 "video latent must be [channels, frames, height, width]".into(),
             ));
         };
 
         if channels != self.channels || [latent_frames, lh, lw].contains(&0) {
-            return Err(Error("invalid video latent dimensions".into()));
+            return Err(Error::new("invalid video latent dimensions".into()));
         }
 
         let (height, width) = (lh * 16, lw * 16);

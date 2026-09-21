@@ -19,9 +19,9 @@ impl RowMap {
         let maximum = *rows
             .iter()
             .max()
-            .ok_or_else(|| Error("empty row map".into()))?;
+            .ok_or_else(|| Error::new("empty row map".into()))?;
         if maximum > u32::MAX as usize {
-            return Err(Error("row index too large".into()));
+            return Err(Error::new("row index too large".into()));
         }
 
         let bytes: Vec<_> = rows
@@ -40,9 +40,9 @@ fn size(rows: usize, cols: usize) -> Result<usize> {
     let n = rows
         .checked_mul(cols)
         .filter(|&n| n > 0 && n <= u32::MAX as usize)
-        .ok_or_else(|| Error("Metal array shape is empty or too large".into()))?;
+        .ok_or_else(|| Error::new("Metal array shape is empty or too large".into()))?;
     n.checked_mul(4)
-        .ok_or_else(|| Error("Metal allocation size overflow".into()))
+        .ok_or_else(|| Error::new("Metal allocation size overflow".into()))
 }
 
 impl Array {
@@ -53,7 +53,7 @@ impl Array {
     pub fn from_f32(device: &Device, rows: usize, cols: usize, data: &[f32]) -> Result<Self> {
         let bytes = size(rows, cols)?;
         if data.len() != bytes / 4 {
-            return Err(Error("array data does not match its shape".into()));
+            return Err(Error::new("array data does not match its shape".into()));
         }
 
         // SAFETY: every f32 consists of four initialized bytes, read only during allocation.
@@ -103,7 +103,7 @@ impl Array {
 
     pub(crate) fn reshape(&self, rows: usize, cols: usize) -> Result<Self> {
         if size(rows, cols)? / 4 != self.len() {
-            return Err(Error("reshape changes the number of values".into()));
+            return Err(Error::new("reshape changes the number of values".into()));
         }
 
         Ok(Self {
@@ -115,7 +115,7 @@ impl Array {
 
     pub fn linear(&self, weight: &Self) -> Result<Self> {
         if self.cols != weight.cols || !std::rc::Rc::ptr_eq(&self.device().0, &weight.device().0) {
-            return Err(Error("matrix product shapes or devices differ".into()));
+            return Err(Error::new("matrix product shapes or devices differ".into()));
         }
 
         let out = Self::empty(self.device(), self.rows, weight.rows)?;
@@ -167,7 +167,7 @@ impl Array {
                 != Some(weight.0.bytes)
             || slab_rows == 0
         {
-            return Err(Error("packed matrix shape or device mismatch".into()));
+            return Err(Error::new("packed matrix shape or device mismatch".into()));
         }
 
         size(outputs, self.cols)?;
@@ -217,7 +217,7 @@ impl Array {
         if !std::rc::Rc::ptr_eq(&self.device().0, &weight.0.device.0)
             || outputs.checked_mul(self.cols) != Some(weight.0.bytes)
         {
-            return Err(Error("packed matrix shape or device mismatch".into()));
+            return Err(Error::new("packed matrix shape or device mismatch".into()));
         }
 
         size(outputs, self.cols)?;
@@ -280,7 +280,7 @@ impl Array {
             || scales.cols != 1
             || outputs.checked_mul(cols) != Some(weight.0.bytes)
         {
-            return Err(Error("quantized input shape mismatch".into()));
+            return Err(Error::new("quantized input shape mismatch".into()));
         }
 
         // The packed roads take the INT8 values as they are: a value in [-127, 127] is exact as a
@@ -323,7 +323,7 @@ impl Array {
     ) -> Result<Self> {
         let values = size(rows, cols)? / 4;
         if input.0.bytes < values || scales.rows != rows || scales.cols != 1 {
-            return Err(Error("quantized input shape mismatch".into()));
+            return Err(Error::new("quantized input shape mismatch".into()));
         }
 
         let restored = Self::empty(device, rows, cols)?;
@@ -415,7 +415,7 @@ impl Array {
 
     fn binary(&self, rhs: &Self, operation: u32) -> Result<Self> {
         if rhs.cols != self.cols || !(rhs.rows == 1 || rhs.rows == self.rows) {
-            return Err(Error("incompatible elementwise shapes".into()));
+            return Err(Error::new("incompatible elementwise shapes".into()));
         }
 
         let out = Self::empty(self.device(), self.rows, self.cols)?;
@@ -445,7 +445,7 @@ impl Array {
         if row.checked_add(rows).is_none_or(|end| end > self.rows)
             || col.checked_add(cols).is_none_or(|end| end > self.cols)
         {
-            return Err(Error("slice is outside the array".into()));
+            return Err(Error::new("slice is outside the array".into()));
         }
 
         let out = Self::empty(self.device(), rows, cols)?;
@@ -468,16 +468,16 @@ impl Array {
     pub fn concat(parts: &[Self], columns: bool) -> Result<Self> {
         let first = parts
             .first()
-            .ok_or_else(|| Error("cannot concatenate no arrays".into()))?;
+            .ok_or_else(|| Error::new("cannot concatenate no arrays".into()))?;
         let (rows, cols) = if columns {
             if parts.iter().any(|p| p.rows != first.rows) {
-                return Err(Error("concat row mismatch".into()));
+                return Err(Error::new("concat row mismatch".into()));
             }
 
             (first.rows, parts.iter().map(|p| p.cols).sum())
         } else {
             if parts.iter().any(|p| p.cols != first.cols) {
-                return Err(Error("concat column mismatch".into()));
+                return Err(Error::new("concat column mismatch".into()));
             }
 
             (parts.iter().map(|p| p.rows).sum(), first.cols)
@@ -512,7 +512,9 @@ impl Array {
     /// RMS normalization, or LayerNorm when center is true.
     pub fn norm(&self, weight: &Self, epsilon: f32, center: bool) -> Result<Self> {
         if weight.len() != self.cols {
-            return Err(Error("normalization weight has the wrong width".into()));
+            return Err(Error::new(
+                "normalization weight has the wrong width".into(),
+            ));
         }
 
         let out = Self::empty(self.device(), self.rows, self.cols)?;
@@ -532,7 +534,7 @@ impl Array {
             || angles.rows != self.rows
             || angles.cols * 2 > self.cols / heads
         {
-            return Err(Error("invalid rotary embedding shape".into()));
+            return Err(Error::new("invalid rotary embedding shape".into()));
         }
 
         let out = Self::empty(self.device(), self.rows, self.cols)?;
@@ -570,7 +572,7 @@ impl Array {
             || key.cols != kv_heads * (self.cols / heads)
             || (causal && self.rows != key.rows)
         {
-            return Err(Error("unsupported attention layout".into()));
+            return Err(Error::new("unsupported attention layout".into()));
         }
 
         let out = Self::empty(self.device(), self.rows, self.cols)?;
@@ -596,7 +598,7 @@ impl Array {
 
     pub fn swiglu(&self) -> Result<Self> {
         if !self.cols.is_multiple_of(2) {
-            return Err(Error("SwiGLU requires two equal halves".into()));
+            return Err(Error::new("SwiGLU requires two equal halves".into()));
         }
 
         self.slice(0, self.rows, 0, self.cols / 2)?
@@ -639,7 +641,7 @@ impl Array {
             || b >= m.cols / self.cols
             || delta.is_some_and(|d| d.shape() != self.shape())
         {
-            return Err(Error("invalid modulation shapes".into()));
+            return Err(Error::new("invalid modulation shapes".into()));
         }
 
         let out = Self::empty(self.device(), self.rows, self.cols)?;
@@ -668,7 +670,9 @@ impl Array {
 
     pub(crate) fn rotate(&self) -> Result<Self> {
         if !self.cols.is_multiple_of(256) {
-            return Err(Error("ConvRot requires a multiple of 256 features".into()));
+            return Err(Error::new(
+                "ConvRot requires a multiple of 256 features".into(),
+            ));
         }
 
         let out = Self::empty(self.device(), self.rows, self.cols)?;
@@ -688,7 +692,9 @@ pub(crate) fn dtype_code(dtype: DType) -> Result<u32> {
         DType::F16 => Ok(1),
         DType::BF16 => Ok(2),
         DType::I8 => Ok(3),
-        _ => Err(Error(format!("unsupported Metal tensor dtype {dtype}"))),
+        _ => Err(Error::new(format!(
+            "unsupported Metal tensor dtype {dtype}"
+        ))),
     }
 }
 pub(crate) fn convert(
@@ -700,7 +706,9 @@ pub(crate) fn convert(
 ) -> Result<Array> {
     let count = size(rows, cols)? / 4;
     if count.checked_mul(dtype.size_in_bytes()) != Some(buffer.0.bytes) {
-        return Err(Error("weight shape does not match its allocation".into()));
+        return Err(Error::new(
+            "weight shape does not match its allocation".into(),
+        ));
     }
 
     if dtype == DType::F32 {

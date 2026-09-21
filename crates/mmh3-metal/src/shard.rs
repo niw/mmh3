@@ -48,7 +48,7 @@ impl Memory {
     pub fn read_bf16(&self, offset: usize, rows: usize, cols: usize) -> Result<Array> {
         let count = rows
             .checked_mul(cols)
-            .ok_or_else(|| Error("a read that overflows".into()))?;
+            .ok_or_else(|| Error::new("a read that overflows".into()))?;
         self.check(offset, count * 2)?;
         let values = Array::empty(&self.device, rows, cols)?;
         self.device.run(
@@ -69,7 +69,7 @@ impl Memory {
         let [rows, cols] = values.shape();
         let count = values.len();
         if offset.checked_add(count).is_none_or(|end| end > self.bytes) {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "{count} bytes at {offset} of a region of {}",
                 self.bytes
             )));
@@ -177,14 +177,14 @@ impl Memory {
     /// read a neighbour's memory rather than fail, so the extent is checked before the kernel.
     fn check(&self, offset: usize, bytes: usize) -> Result<()> {
         if !offset.is_multiple_of(2) {
-            return Err(Error(format!("a bf16 run at an odd offset {offset}")));
+            return Err(Error::new(format!("a bf16 run at an odd offset {offset}")));
         }
         self.check_bytes(offset, bytes)
     }
 
     fn check_bytes(&self, offset: usize, bytes: usize) -> Result<()> {
         if offset.checked_add(bytes).is_none_or(|end| end > self.bytes) {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "{bytes} bytes at {offset} of a region of {}",
                 self.bytes
             )));
@@ -206,7 +206,7 @@ pub fn pack(
     let [tokens, columns] = source.shape();
     let span = check(tensors, heads, &own_heads, dim)?;
     if columns != tensors * heads * dim {
-        return Err(Error(format!(
+        return Err(Error::new(format!(
             "a source of {columns} columns, not {}",
             tensors * heads * dim
         )));
@@ -243,13 +243,13 @@ pub fn unpack(
     let span = check(1, heads, &own_heads, dim)?;
     let ([tokens, columns], [rows, width]) = (part.shape(), output.shape());
     if columns != span * dim {
-        return Err(Error(format!(
+        return Err(Error::new(format!(
             "a share of {columns} columns, not {}",
             span * dim
         )));
     }
     if rows != tokens || width != heads * dim {
-        return Err(Error(format!(
+        return Err(Error::new(format!(
             "an output of [{rows}, {width}], not [{tokens}, {}]",
             heads * dim
         )));
@@ -273,10 +273,12 @@ pub fn unpack(
 /// The width of a rank's share of the heads, once the split is known to be one.
 fn check(tensors: usize, heads: usize, own_heads: &Range<usize>, dim: usize) -> Result<usize> {
     if tensors == 0 || heads == 0 || dim == 0 {
-        return Err(Error("a share of no tensors, heads or dimensions".into()));
+        return Err(Error::new(
+            "a share of no tensors, heads or dimensions".into(),
+        ));
     }
     if own_heads.start >= own_heads.end || own_heads.end > heads {
-        return Err(Error(format!(
+        return Err(Error::new(format!(
             "heads {}..{} of {heads}",
             own_heads.start, own_heads.end
         )));
@@ -747,7 +749,7 @@ impl mmh3_core::shard::Exchange for PairExchange {
         bytes: usize,
     ) -> std::result::Result<Memory, ExchangeError> {
         self.held(self.rank, region, bytes)
-            .map_err(|error| ExchangeError(error.0))
+            .map_err(|error| ExchangeError(error.message))
     }
 
     fn write(
@@ -759,7 +761,7 @@ impl mmh3_core::shard::Exchange for PairExchange {
         peer_offset: usize,
         bytes: usize,
     ) -> std::result::Result<(), ExchangeError> {
-        let fail = |error: Error| ExchangeError(error.0);
+        let fail = |error: Error| ExchangeError(error.message);
         let source = self.held(self.rank, from, offset + bytes).map_err(fail)?;
         let destination = self.held(peer, into, peer_offset + bytes).map_err(fail)?;
         destination

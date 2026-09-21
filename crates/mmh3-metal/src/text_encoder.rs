@@ -25,7 +25,7 @@ impl MetalTextEncoder {
             .take_while(|i| weights.contains(&format!("layers.{i}.input_layernorm.weight")))
             .count();
         if heads == 0 || kv_heads == 0 || !heads.is_multiple_of(kv_heads) || layers == 0 {
-            return Err(Error("unsupported text encoder configuration".into()));
+            return Err(Error::new("unsupported text encoder configuration".into()));
         }
 
         Ok(Self {
@@ -41,7 +41,7 @@ impl MetalTextEncoder {
         let w = &self.weights;
         let vocabulary = w.shape("embed_tokens.weight")?[0];
         if ids.is_empty() || ids.iter().any(|&id| id as usize >= vocabulary) {
-            return Err(Error("invalid prompt token ids".into()));
+            return Err(Error::new("invalid prompt token ids".into()));
         }
 
         let mut hidden = w.embedding("embed_tokens.weight", ids)?;

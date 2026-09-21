@@ -21,7 +21,7 @@ use std::time::Instant;
 
 /// A transport's failure in this backend's terms, since a block reports one error type.
 fn shard_error(error: ExchangeError) -> Error {
-    Error(error.0)
+    Error::new(error.0)
 }
 
 pub struct MetalDit {
@@ -48,7 +48,9 @@ impl PreparedText<'_> {
         sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
     ) -> Result<DitOutput> {
         if inputs.context != *self.source {
-            return Err(Error("prepared text does not match the context".into()));
+            return Err(Error::new(
+                "prepared text does not match the context".into(),
+            ));
         }
 
         self.model
@@ -85,7 +87,7 @@ impl MetalDit {
             crate::LinearPrecision::Fp16 | crate::LinearPrecision::Int8
         ) && !self.device().supports_tensor_ops()
         {
-            return Err(crate::Error(
+            return Err(crate::Error::new(
                 "low-precision Metal products require macOS 26 and Apple silicon".into(),
             ));
         }
@@ -190,7 +192,7 @@ impl MetalDit {
         let (rows, own) = (shard.own_tokens(), shard.own_heads());
         let own_inner = own.len() * c.head_dim;
         if normalized.shape() != [rows.len(), c.hidden] {
-            return Err(Error(format!(
+            return Err(Error::new(format!(
                 "this rank carries {:?}, not [{}, {}]",
                 normalized.shape(),
                 rows.len(),
@@ -441,7 +443,7 @@ impl MetalDit {
         let c = &self.config;
         let w = &self.weights;
         if context.shape.len() != 2 || context.shape[0] == 0 || context.shape[1] != c.text_dim {
-            return Err(Error("context does not match the model".into()));
+            return Err(Error::new("context does not match the model".into()));
         }
 
         let uploaded = Array::from_f32(&w.device, context.shape[0], c.text_dim, &context.data)?;
@@ -512,7 +514,7 @@ impl MetalDit {
         parts: &[VelocityRows],
     ) -> Result<DitOutput> {
         let velocity = mmh3_core::shard::assemble_velocity(&self.config, inputs, sparse, parts)
-            .map_err(|error| Error(error.0))?;
+            .map_err(|error| Error::new(error.0))?;
         Ok(DitOutput {
             text_states: Vec::new(),
             blocks: Vec::new(),
@@ -532,7 +534,7 @@ impl MetalDit {
         mut shard: Option<&mut ShardContext>,
     ) -> Result<DitOutput> {
         if sparse.is_some() || self.has_vsa_gates() {
-            return Err(Error(
+            return Err(Error::new(
                 "Metal currently supports dense attention without VSA gates".into(),
             ));
         }
@@ -553,7 +555,7 @@ impl MetalDit {
             || !inputs.sigma.is_finite()
             || !(0.0..=1.0).contains(&inputs.sigma)
         {
-            return Err(Error("DiT inputs do not match the model".into()));
+            return Err(Error::new("DiT inputs do not match the model".into()));
         }
 
         let w = &self.weights;
@@ -576,10 +578,10 @@ impl MetalDit {
                 if shard.tokens.iter().map(|rows| rows.len()).sum::<usize>() != tokens
                     || shard.heads.iter().map(|heads| heads.len()).sum::<usize>() != c.heads
                 {
-                    return Err(Error("a shard that does not cover the step".into()));
+                    return Err(Error::new("a shard that does not cover the step".into()));
                 }
                 if !capture.is_empty() {
-                    return Err(Error("a sharded step cannot capture blocks".into()));
+                    return Err(Error::new("a sharded step cannot capture blocks".into()));
                 }
                 // A rank exchanges the quantized block input, which only an INT8 projection has.
                 if let Some(layer) = (0..c.layers).find(|layer| {
@@ -587,7 +589,7 @@ impl MetalDit {
                         .weights
                         .is_int8(&format!("blocks.{layer}.attn.qkv_proj"))
                 }) {
-                    return Err(Error(format!(
+                    return Err(Error::new(format!(
                         "a sharded step needs INT8 attention projections, and block {layer} has none"
                     )));
                 }
@@ -600,7 +602,7 @@ impl MetalDit {
                     && Some(shard.rank) != first
                     && rows.start < layout.segment(SegmentKind::Text).end
                 {
-                    return Err(Error(
+                    return Err(Error::new(
                         "the text rows must fall to the first rank that carries any".into(),
                     ));
                 }
@@ -1126,7 +1128,7 @@ mod tests {
             };
             dit.forward_shard(&inputs, None, &mut context)
                 .err()
-                .map(|error| error.0)
+                .map(|error| error.message)
         };
 
         // NOTE: these shards are refused for other reasons too — one exchange cannot serve two

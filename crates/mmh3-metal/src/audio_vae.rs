@@ -26,11 +26,11 @@ impl MetalAudioDecoder {
         let w = &self.weights;
         let shape = w.shape(&format!("{name}.weight"))?;
         let &[_, inputs, kernel] = shape.as_slice() else {
-            return Err(Error(format!("{name}: invalid convolution shape")));
+            return Err(Error::new(format!("{name}: invalid convolution shape")));
         };
 
         if x.cols != inputs || length == 0 || !x.rows.is_multiple_of(length) {
-            return Err(Error("convolution input shape mismatch".into()));
+            return Err(Error::new("convolution input shape mismatch".into()));
         }
 
         let columns = if kernel == 1 {
@@ -72,11 +72,11 @@ impl MetalAudioDecoder {
         let w = &self.weights;
         let shape = w.shape(&format!("{name}.weight"))?;
         let &[inputs, outputs, kernel] = shape.as_slice() else {
-            return Err(Error("invalid transposed convolution shape".into()));
+            return Err(Error::new("invalid transposed convolution shape".into()));
         };
 
         if inputs != x.cols || kernel != expected_kernel {
-            return Err(Error("invalid vocoder upsample configuration".into()));
+            return Err(Error::new("invalid vocoder upsample configuration".into()));
         }
 
         let product = x.linear(
@@ -107,7 +107,7 @@ impl MetalAudioDecoder {
         let alpha = w.host(&format!("{name}.act.alpha"))?.data;
         let beta = w.host(&format!("{name}.act.beta"))?.data;
         if alpha.len() != x.cols || beta.len() != x.cols {
-            return Err(Error("invalid SnakeBeta parameters".into()));
+            return Err(Error::new("invalid SnakeBeta parameters".into()));
         }
 
         let parameters: Vec<_> = alpha
@@ -120,7 +120,7 @@ impl MetalAudioDecoder {
         let down = w.vector(&format!("{name}.downsample.lowpass.filter"))?;
 
         if up.len() != 12 || down.len() != 12 {
-            return Err(Error("SnakeBeta requires 12-tap filters".into()));
+            return Err(Error::new("SnakeBeta requires 12-tap filters".into()));
         }
 
         let out = Array::empty(&w.device, x.rows, x.cols)?;
@@ -142,13 +142,13 @@ impl MetalAudioDecoder {
 
     pub fn decode(&self, latent: &Tensor) -> Result<Tensor> {
         let &[channels, sequences, frames] = latent.shape.as_slice() else {
-            return Err(Error(
+            return Err(Error::new(
                 "audio latent must be [channels, sequences, frames]".into(),
             ));
         };
 
         if channels != self.channels || frames == 0 || sequences == 0 {
-            return Err(Error("invalid audio latent shape".into()));
+            return Err(Error::new("invalid audio latent shape".into()));
         }
 
         let w = &self.weights;
