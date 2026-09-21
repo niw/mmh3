@@ -9,8 +9,13 @@ External encoding through ffmpeg is optional.
 - An Apple silicon Mac with macOS 15 or later.
 - Xcode 26 or later command-line tools, for the Swift bridge.
 - Rust with edition 2024 support.
-- About 55 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
+- About 55 GB of disk for the models. A run loads one model at a time. The largest is the DiT, with
   21 GB of weights plus activations. See [Models](models.md) for the checkpoints.
+
+A worker is the exception: it keeps what it has read for the runs that follow, so a Mac serving one
+holds several models at once and lets go of the one it used least when the device has no memory
+left. `--vram-budget GB` holds it to less than the device would give, and `--idle-unload SECONDS`
+gives the memory back when nothing is asking.
 
 MP4 output needs nothing further, since VideoToolbox is part of the system. ffmpeg is optional and
 only for the explicit `--ffmpeg` path. A machine that only hands work out to others needs none of

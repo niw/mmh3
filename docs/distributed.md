@@ -22,7 +22,10 @@ target/release/mmh3 worker --models /path/to/models
 ```
 
 It listens on `0.0.0.0:7833`, stays idle until asked, and loads a checkpoint on the first request
-that needs it. Then on the machine the user runs:
+that needs it. It keeps what it has loaded for the runs that follow, and lets go of the checkpoint
+it has used least when the device has no memory left for the next one, so a second run against the
+same worker finds the models already there. `--idle-unload SECONDS` gives the memory back on a machine
+that is also somebody's desktop. Then on the machine the user runs:
 
 ```sh
 target/release/mmh3 generate --out out.mp4 --prompt "..." \
@@ -212,6 +215,9 @@ On the worker:
 - `--models DIR`: The models directory, or `MMH3_MODELS`.
 - `--token FILE`: A shared secret, matched against the leader's.
 - `--transport auto|socket` (default `auto`): `socket` keeps this machine's RoCE port to itself.
+- `--vram-budget GB` (default: as much as the device gives): Hold the worker to that much device
+  memory, failing an allocation past it as a device that small would.
+- `--idle-unload SECONDS` (default off): Let go of every model after that long with nothing to do.
 - `--probe HOST[:PORT]`: Report on another worker instead of serving.
 
 On the leader:
@@ -221,6 +227,7 @@ On the leader:
   counting the one this machine lends itself, which comes after the ones `--worker` names.
   `--shard-dit 0` keeps the DiT here and lends nothing.
 - `--token FILE`: The shared secret.
+- `--vram-budget GB`: As on the worker, for what this machine reads itself.
 
 ## Security
 

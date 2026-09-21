@@ -83,6 +83,11 @@ make generate \
   `--worker` names. `--shard-dit 0` keeps the DiT here and lends nothing.
 - `--token FILE` (default none): A shared secret sent to every worker, which refuses a leader whose
   token does not match its own.
+- `--vram-budget GB` (default: as much as the device gives): Hold the run to that much device
+  memory, failing an allocation past it as a device that small would. It is a limit on this run
+  rather than on the GPU, so what another program on the same device holds is not counted against
+  it. A run reads the 27 GB text encoder and the DiT one after the other whatever the budget says,
+  so the encoder is gone before the DiT arrives.
 
 ## Prompts
 
