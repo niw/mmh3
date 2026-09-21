@@ -59,6 +59,8 @@ struct Job {
     state: Stage,
     /// What the generation was told, in the form the command would have been told it.
     arguments: Vec<String>,
+    /// Where this job's uploads and its video live.
+    directory: PathBuf,
     /// Where this job's video was written.
     video: PathBuf,
     /// Why it failed, for a client that asks after it did.
@@ -70,11 +72,17 @@ struct Job {
 
 impl Job {
     fn describe(&self, id: &str) -> serde_json::Value {
+        // Only the generation that is running is the one the steps belong to.
+        let progress = (self.state == Stage::Running)
+            .then(crate::generation::progress)
+            .flatten();
         json!({
             "id": id,
             "state": self.state.name(),
             "queued": self.queued.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             "seconds": self.seconds,
+            "step": progress.map(|progress| progress.step),
+            "steps": progress.map(|progress| progress.steps),
             "error": self.failure,
         })
     }
@@ -155,7 +163,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let application = Router::new()
         .route("/v1/generations", post(create).get(list))
         .route("/v1/status", get(status))
-        .route("/v1/generations/{id}", get(describe))
+        .route("/v1/generations/{id}", get(describe).delete(forget))
         .route("/v1/generations/{id}/video", get(video))
         .with_state(server);
 
@@ -202,6 +210,7 @@ fn generate(server: &Server, id: &str) {
         job.arguments.clone()
     };
     println!("generation {id} begins");
+    crate::generation::starting();
     let generated = crate::generate::run(&arguments, USAGE);
     let mut jobs = server.jobs.lock().expect("the jobs");
     let Some(job) = jobs.get_mut(id) else {
@@ -277,6 +286,7 @@ async fn create(
     let job = Job {
         state: Stage::Queued,
         arguments,
+        directory,
         video,
         failure: None,
         queued: SystemTime::now(),
@@ -298,6 +308,29 @@ async fn create(
         Json(described),
     )
         .into_response())
+}
+
+/// Takes a generation away, with whatever it wrote. A generation that is running is left alone:
+/// stopping one half way is not something this can do yet, and throwing away what it is about to
+/// write while it writes is worse than waiting.
+async fn forget(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Response, Failure> {
+    let directory = {
+        let mut jobs = server.jobs.lock().expect("the jobs");
+        match jobs.get(&id).ok_or_else(Failure::unknown)?.state {
+            Stage::Running => return Err(Failure::gone("that generation is running")),
+            _ => jobs.remove(&id).expect("just looked").directory,
+        }
+    };
+    // A job that never wrote anything has nothing here, which is not a failure to remove it.
+    if let Err(error) = tokio::fs::remove_dir_all(&directory).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error.into());
+    }
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Every generation this server has been asked for, the most recent first.

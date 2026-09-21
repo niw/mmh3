@@ -111,6 +111,39 @@ fn units(text: &str) -> Result<u32, Box<dyn Error>> {
         })
 }
 
+/// How far the generation running here has got, and how long its last step took.
+#[derive(Clone, Copy, Debug)]
+pub struct Progress {
+    pub step: usize,
+    pub steps: usize,
+    pub seconds: f64,
+}
+
+/// What the run here has reached. There is one device and so one run at a time, which is what
+/// makes one of these enough to say where it is.
+static PROGRESS: std::sync::Mutex<Option<Progress>> = std::sync::Mutex::new(None);
+
+/// Where the generation running here has got to, or None before one has taken a step.
+pub fn progress() -> Option<Progress> {
+    *PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn reached(progress: Progress) {
+    *PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);
+}
+
+/// Forgets where the run before this one had got to, so that a run is not reported at a step it
+/// has not taken.
+pub fn starting() {
+    *PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
 /// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
 /// as the reference pipeline fixes it.
 #[cfg(feature = "cuda")]
@@ -773,6 +806,11 @@ pub fn sample(
             schedule.video[step],
             started.elapsed().as_secs_f64()
         );
+        reached(Progress {
+            step: step + 1,
+            steps,
+            seconds: started.elapsed().as_secs_f64(),
+        });
     }
     #[cfg(feature = "cuda")]
     save_algorithm_cache();
