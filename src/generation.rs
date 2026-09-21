@@ -906,7 +906,9 @@ fn shard_target(
         return None;
     }
     if settings.workers.is_empty() {
-        if asked {
+        // One rank is the path with nobody to carry anything to, which `alone_shard` picks up, so
+        // saying the DiT stays here would be answered two lines later by a shared step.
+        if asked && ranks != 1 {
             println!("sharing a step needs a worker, so the DiT stays here");
         }
         return None;
