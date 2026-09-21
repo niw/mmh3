@@ -342,7 +342,7 @@ pub struct DecodeVideo {
 }
 
 /// The frames a whole decode answers with, as 4:2:0 planes an encoder takes without a device.
-/// A machine that hands out every chunk still blends them itself; one that cannot blend asks for
+/// A machine that hands out every chunk still blends them itself. One that cannot blend asks for
 /// the video rather than its pieces, and the worker that decodes it blends it too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Frames {

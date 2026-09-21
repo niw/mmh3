@@ -414,7 +414,7 @@ pub struct Worker {
 
 impl Worker {
     /// Connects and exchanges the handshake. The caller decides what to do with a worker that
-    /// cannot serve what it wants; nothing here falls back on its own.
+    /// cannot serve what it wants, since nothing here falls back on its own.
     pub fn connect(address: &str, token: &str) -> Result<Self, Box<dyn Error>> {
         let address = self::address(address);
         let target = address
