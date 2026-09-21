@@ -2,6 +2,8 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
+  mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--worker HOST[:PORT]]... [--local-worker]
+              [--vram-budget GB] [--idle-unload SECONDS]
   mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--vram-budget GB] [--idle-unload SECONDS]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
@@ -58,6 +60,8 @@ fn main() -> ExitCode {
         Some("generate") => mmh3::generate::run(&arguments[1..], USAGE),
         #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("worker") => mmh3::worker::serve(&arguments[1..]),
+        #[cfg(feature = "server")]
+        Some("server") => mmh3::server::serve(&arguments[1..]),
 
         _ => {
             eprintln!("{USAGE}");

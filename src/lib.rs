@@ -17,5 +17,7 @@ pub mod metal;
 pub mod models;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub mod resident;
+#[cfg(feature = "server")]
+pub mod server;
 pub mod video;
 pub mod worker;
