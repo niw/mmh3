@@ -690,15 +690,12 @@ pub fn sample(
     Ok((video, audio))
 }
 
-/// A build that opens no session with a worker encodes every prompt here.
-#[cfg(not(feature = "cuda"))]
-fn encode_on_worker(_settings: &Settings, _ids: &[u32]) -> Option<Tensor> {
-    None
-}
-
 /// Asks the first worker that holds the text encoder, or returns `None` so the caller encodes here.
 /// A worker that fails is reported and skipped: a generation never depends on one.
-#[cfg(feature = "cuda")]
+///
+/// Nothing in this is a backend's. It asked on one of them only because the client it uses was
+/// that backend's once, and a machine with the smaller memory is the one that most wants the text
+/// encoder to load somewhere else.
 fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
     use crate::worker::{TEXT_ENCODER_ROLE as ROLE, Worker};
     use mmh3_core::worker::CAPABILITY_ENCODE_TEXT;
