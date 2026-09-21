@@ -1582,15 +1582,37 @@ fn device_name() -> String {
     }
 }
 
+/// What this machine has, which is what `Welcome` reports beside the device. Every platform has to
+/// answer the same question or the number means something different depending on who sent it, so
+/// this is the host's memory on both and not the device's working set on one of them.
 fn memory_bytes() -> u64 {
-    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
-        return 0;
-    };
-    text.lines()
-        .find_map(|line| line.strip_prefix("MemTotal:"))
-        .and_then(|value| value.split_whitespace().next())
-        .and_then(|value| value.parse::<u64>().ok())
-        .map_or(0, |kibibytes| kibibytes * 1024)
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+            return 0;
+        };
+        text.lines()
+            .find_map(|line| line.strip_prefix("MemTotal:"))
+            .and_then(|value| value.split_whitespace().next())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(0, |kibibytes| kibibytes * 1024)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // There is no /proc here and `hw.memsize` is what reads it, which costs one process once
+        // when a worker starts rather than a dependency for one number.
+        std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        0
+    }
 }
 
 /// One rank's socket to another. The leader arrives holding the session's socket to each worker,
