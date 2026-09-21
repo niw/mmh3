@@ -37,18 +37,21 @@ const USAGE: &str = "usage:
   mmh3-tools check text-encoder --golden <file.safetensors> [--models DIR] [--weights FILE]
   mmh3-tools latent (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <latents.safetensors>
                     [--models DIR] [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE]
-                    [--reference FILE]... [--steps N | --schedule taomate] [--seed N]
+                    [--reference FILE]... [--reference-audio FILE]... [--reference-video FILE]...
+                    [--steps N | --schedule taomate] [--seed N]
                     [--shift-video X] [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--video-vae FILE]
-                    [--patch FILE] [--lora FILE]
+                    [--audio-vae FILE] [--patch FILE] [--lora FILE]
                     [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
                     [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X]
                     [--sparse-start X] [--vsa-sparsity X]
+                    [--worker HOST[:PORT]]... [--shard-dit N] [--token FILE]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
 Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.
-latent samples like the generate command of mmh3, with the same defaults, and writes the final video and audio
-latents without decoding them.";
+latent samples like the generate command of mmh3, with the same defaults and the same options, and writes the
+final video and audio latents without decoding them. It borrows workers as generate does, which is how a run's
+sampling is compared apart from its decoding and its encoding.";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
