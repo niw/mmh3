@@ -994,22 +994,23 @@ impl RemoteCanvases {
             .collect();
         let (sender, receiver) = channel();
         let mut delegated = Vec::new();
-        if workers.is_empty() || chunks < 2 {
+        if workers.is_empty() {
             return RemoteCanvases {
                 receiver,
                 delegated,
                 arrived: HashMap::new(),
             };
         }
-        // One share each, the leader included. The leader keeps the first chunks and the workers
-        // take the last ones, so this machine walks its own share while theirs is still coming and
-        // never waits at the start. The remainder stays here: a worker's chunk has to cross the
-        // wire and be blended in after it lands, and giving it the extra one costs 1.5 s.
-        let shares = workers.len() + 1;
+        // Every chunk goes out, evenly. This machine puts the canvases together and encodes them,
+        // and the weights that made them are read by whoever decoded and by nobody else, which is
+        // what lets a leader hold no model at all. Its own GPU is not idle for it: a run that
+        // hands its steps out lends this machine a worker, and that worker takes a share here like
+        // any other.
+        let count = workers.len();
         let latent = Arc::new(latent.clone());
-        let mut first = chunks.div_ceil(shares);
-        for mut worker in workers {
-            let share = (chunks - first).div_ceil(shares - 1).min(chunks - first);
+        let mut first = 0;
+        for (index, mut worker) in workers.into_iter().enumerate() {
+            let share = (chunks - first).div_ceil(count - index);
             let mine: Vec<usize> = (first..first + share).collect();
             first += share;
             if mine.is_empty() {

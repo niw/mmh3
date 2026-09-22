@@ -58,12 +58,13 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let path = video_vae_path(&options)?;
-    let decoder = VideoDecoder::load(
-        &SafeTensors::open(Path::new(&path))?,
-        "",
-        DEFAULT_TILE_SIZE,
-        DEFAULT_TILE_OVERLAP_MIN,
-    )?;
+    let file = SafeTensors::open(Path::new(&path))?;
+    // A run with workers hands every chunk out and only puts the canvases together, so it reads
+    // the weights that made them only if one never arrives.
+    let decoder = match settings.workers.is_empty() {
+        true => VideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?,
+        false => VideoDecoder::to_assemble(&file, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?,
+    };
     // Chunks of the decode go to whichever machines answer, and this one walks the rest while
     // they work. A chunk that does not come back is decoded here.
     let mut remote = mmh3::worker::RemoteCanvases::start(
