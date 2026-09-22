@@ -518,6 +518,7 @@ name = "mmh3"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "image",
  "mmh3-core",
  "mmh3-cuda",

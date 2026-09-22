@@ -11,16 +11,18 @@
 use crate::cli::parse_options;
 use axum::extract::{Multipart, Path, State};
 use axum::http::{StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use futures_util::stream::{Stream, unfold};
 use serde_json::json;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::PathBuf;
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::AsyncWriteExt;
 
 /// Where a server waits when it is not told.
@@ -30,6 +32,10 @@ const DEFAULT_LISTEN: &str = "127.0.0.1:8833";
 const FIELD_BYTES: u64 = 1 << 20;
 /// The most an uploaded file may hold. A reference clip is the largest thing a request carries.
 const FILE_BYTES: u64 = 4 << 30;
+/// How often a stream of events looks to see whether the generation it watches has moved. A step
+/// is seconds long, so this is often enough to see every one of them and seldom enough to cost
+/// nothing between them.
+const WATCH: Duration = Duration::from_millis(250);
 
 const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--worker HOST[:PORT]]... \
                      [--local-worker] [--token FILE] [--vram-budget GB] [--idle-unload SECONDS]";
@@ -164,6 +170,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .route("/v1/generations", post(create).get(list))
         .route("/v1/status", get(status))
         .route("/v1/generations/{id}", get(describe).delete(forget))
+        .route("/v1/generations/{id}/events", get(events))
         .route("/v1/generations/{id}/video", get(video))
         .with_state(server);
 
@@ -413,6 +420,63 @@ async fn describe(
     let jobs = server.jobs.lock().expect("the jobs");
     let job = jobs.get(&id).ok_or_else(Failure::unknown)?;
     Ok(Json(job.describe(&id)).into_response())
+}
+
+/// What a client watching one generation is watching.
+struct Watch {
+    server: Arc<Server>,
+    id: String,
+    /// The last thing said, so that nothing is said twice.
+    said: Option<serde_json::Value>,
+    ended: bool,
+}
+
+/// A generation as it happens, so that a client watches rather than asks again and again. The
+/// first event says where the generation is now, every one after it says what changed, and the
+/// stream ends when the generation does.
+async fn events(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, Failure> {
+    // A generation nobody has is answered now, where a client can read the answer, rather than
+    // inside a stream that would open and say nothing.
+    server
+        .jobs
+        .lock()
+        .expect("the jobs")
+        .contains_key(&id)
+        .then_some(())
+        .ok_or_else(Failure::unknown)?;
+    let watch = Watch {
+        server,
+        id,
+        said: None,
+        ended: false,
+    };
+    let events = unfold(watch, |mut watch| async move {
+        if watch.ended {
+            return None;
+        }
+        loop {
+            let described = {
+                let jobs = watch.server.jobs.lock().expect("the jobs");
+                jobs.get(&watch.id)
+                    .map(|job| (job.state, job.describe(&watch.id)))
+            };
+            // The generation was taken away while somebody watched it, so there is nothing more
+            // to say about it.
+            let Some((state, described)) = described else {
+                return None;
+            };
+            if watch.said.as_ref() != Some(&described) {
+                watch.ended = matches!(state, Stage::Done | Stage::Failed);
+                watch.said = Some(described.clone());
+                return Some((Ok(Event::default().data(described.to_string())), watch));
+            }
+            tokio::time::sleep(WATCH).await;
+        }
+    });
+    Ok(Sse::new(events).keep_alive(KeepAlive::default()))
 }
 
 /// The video a generation wrote, once it has written one.

@@ -8,19 +8,21 @@ publish = false
 
 [features]
 webm = ["mmh3-output/webm"]
-server = ["dep:axum", "dep:tokio", "dep:serde_json"]
+server = ["dep:axum", "dep:futures-util", "dep:tokio", "dep:serde_json"]
 cuda = ["dep:mmh3-cuda", "dep:mmh3-input-nvdec", "dep:mmh3-rdma"]
 metal = ["dep:mmh3-metal", "dep:mmh3-output-videotoolbox", "mmh3-output/mp4", "mmh3-output-videotoolbox/metal"]
 mp4 = ["cuda", "dep:mmh3-output-nvenc", "mmh3-output/mp4"]
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"], optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true }
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "net",
     "sync",
     "fs",
     "io-util",
+    "time",
 ], optional = true }
 serde_json = { version = "1", optional = true }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
