@@ -29,11 +29,17 @@ that is also somebody's desktop. Then on the machine the user runs:
 
 ```sh
 target/release/mmh3 generate --out out.mp4 --prompt "..." \
-  --worker other-machine.local
+  --local-worker --worker other-machine.local
 ```
 
 Repeat `--worker` for several. `--worker HOST` uses port 7833, and `--worker HOST:PORT` names
-another.
+another. `--local-worker` starts one in this process, so that this machine's GPU takes part as a
+worker rather than as the leader. Leave it out and this machine is the leader and nothing else,
+which reads no model at all.
+
+`--local-worker` is not `--worker localhost`. The first starts a worker inside this process, which
+shares the models it holds with the run. The second connects to a worker somebody else started,
+which holds a second copy of everything it reads.
 
 To see what a worker offers before running a generation:
 
@@ -75,10 +81,9 @@ small. Ranks trade directly with each other rather than through the leader.
 parts back together, and runs no block: the machines that do the work are the workers, and nothing
 else.
 
-So a run that shares its steps **lends this machine a rank of its own**. A worker starts here on
-loopback, takes a session like any other, and nothing in the run knows the difference, so naming
-one machine still splits a step in two. It goes last in the list, so `--shard-dit N` still means
-the first N machines named, and `--shard-dit 0` starts none.
+So `--local-worker` **lends this machine a rank of its own**. A worker starts here on loopback,
+takes a session like any other, and nothing in the run knows the difference, so one `--worker` and
+a `--local-worker` split a step in two.
 
 **A leader reads no weights at all.** For the DiT it takes the shape from the checkpoint header,
 which costs the header pages and nothing, and assembles the parts from that. For the video VAE it
@@ -95,6 +100,29 @@ itself nothing, and the prompt, every step, the video and the soundtrack happen 
 while this process holds the plan, the schedule and the file. Blending a decode is the one thing
 such a machine cannot do, so it asks for the video rather than its chunks and the worker that
 decodes it blends it too. Either backend can be the machine on the other end.
+
+## Choosing what each machine does
+
+A machine named with nothing after it may be asked for anything it serves, which is what naming one
+asks for. `--worker-units` after it narrows that to the units given, out of `steps`, `prompt`,
+`video` and `audio`. They are the same four a worker announces in the handshake and `--probe`
+prints.
+
+```sh
+# Both machines do everything they can. Every step is split in two.
+mmh3 generate --local-worker --worker spark.local --out out.mp4 --prompt "..."
+
+# The steps stay here, which is what a link too slow to carry them wants. The prompt and the
+# decode still go out.
+mmh3 generate --worker spark.local --worker-units prompt,video,audio --out out.mp4 --prompt "..."
+
+# This machine only encodes and writes the file. It reads no model at all.
+mmh3 generate --worker spark.local --out out.mp4 --prompt "..."
+```
+
+Every step goes to the machines allowed `steps`, in the order they were given, which is the order
+their ranks are numbered in. Where none of them is allowed steps, every step runs here and this
+machine reads the DiT for it. What no machine is asked for, the leader does itself.
 
 ## Choosing how much each machine takes
 
@@ -239,9 +267,11 @@ On the worker:
 On the leader:
 
 - `--worker HOST[:PORT]`: Name a machine to spread the run across, repeated for several.
-- `--shard-dit N` (default: every worker that can): Share every step across at most N workers,
-  counting the one this machine lends itself, which comes after the ones `--worker` names.
-  `--shard-dit 0` keeps the DiT here and lends nothing.
+- `--local-worker`: Start a worker in this process, so that this machine's GPU takes part as a
+  worker. Without it this machine is the leader and nothing else.
+- `--worker-units UNITS`: What the `--worker` or `--local-worker` before it may be asked for, out
+  of `steps`, `prompt`, `video` and `audio`, separated by commas. Without it a machine may be
+  asked for anything it serves.
 - `--token FILE`: The shared secret.
 - `--vram-budget GB`: As on the worker, for what this machine reads itself.
 

@@ -75,12 +75,14 @@ make generate \
   linear layers in NVFP4, which takes about a quarter off each step and loses some detail.
   Experimental, see [NVFP4 linear layers](nvfp4.md).
 - `--worker HOST[:PORT]` (default none, port 7833): Spread the run across another machine running
-  `mmh3 worker`, repeated for several. It encodes the prompt, decodes chunks of the video and
-  audio, and takes a share of every DiT step. See [Distributed generation](distributed.md).
-- `--shard-dit N` (default: every worker that can take a rank): Share every step across at most N
-  workers. This machine hands the step out and puts the parts back together rather than running
-  one, so it lends itself a worker to keep its own GPU in the run, counted last after the ones
-  `--worker` names. `--shard-dit 0` keeps the DiT here and lends nothing.
+  `mmh3 worker`, repeated for several. It may encode the prompt, decode chunks of the video and the
+  soundtrack, and take a share of every DiT step. See [Distributed generation](distributed.md).
+- `--local-worker` (default off): Start a worker in this process, so that this machine's GPU takes
+  part as a worker rather than as the leader. Without it, a run with workers is the leader and
+  nothing else, and reads no model at all.
+- `--worker-units UNITS` (default: everything the machine serves): What the `--worker` or
+  `--local-worker` before it may be asked for, out of `steps`, `prompt`, `video` and `audio`,
+  separated by commas.
 - `--token FILE` (default none): A shared secret sent to every worker, which refuses a leader whose
   token does not match its own.
 - `--vram-budget GB` (default: as much as the device gives): Hold the run to that much device
