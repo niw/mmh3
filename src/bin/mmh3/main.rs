@@ -47,8 +47,9 @@ would. A worker lets go of the model it has used least whenever an allocation fi
 --idle-unload SECONDS lets a worker go of every model it holds after that long with nothing to do, so that a
 machine nobody is generating on is a machine with its memory back. Without it a worker holds what it loaded.
 --worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
-encoder encodes the prompt, so this machine never loads it. Anything a worker cannot do, or fails at, this
-machine does itself.";
+encoder encodes the prompt, so this machine never loads it. A run with workers reads no model at all: it hands
+every step and every chunk of the decode out, and puts what comes back together. What no worker offers, this
+machine does itself. What a worker answered for and then failed at ends the run.";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();

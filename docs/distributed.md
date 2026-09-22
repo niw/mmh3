@@ -55,10 +55,12 @@ can actually do.
 states, so the leader never loads those 27 GB. This matters more on a 64 GB Mac than on a machine
 that had the memory anyway.
 
-**The video and the audio.** The leader splits a decode by temporal chunk and asks each worker for a
-range of them. The chunks are still asked for in order and the temporal tail still carries from one
-to the next, so the seams are what a single machine produces. A canvas that comes back the wrong
-length for the latent is refused and that chunk decodes locally.
+**The video and the audio.** The leader splits a decode by temporal chunk and hands every chunk
+out, evenly between the workers. The chunks are still asked for in order and the temporal tail
+still carries from one to the next, so the seams are what a single machine produces. What the
+leader does is put the canvases together and encode them, which wants the plan and the buffers and
+none of the weights that made them. A canvas that comes back the wrong length for the latent is
+refused and that chunk decodes locally.
 
 **A DiT step.** This is the one that needs a session and a fast link. The sequence is split across
 the ranks, Ulysses style: everything in a block except attention works a token at a time and needs
@@ -78,9 +80,15 @@ loopback, takes a session like any other, and nothing in the run knows the diffe
 one machine still splits a step in two. It goes last in the list, so `--shard-dit N` still means
 the first N machines named, and `--shard-dit 0` starts none.
 
-It also never reads the DiT's weights: it takes the shape from the checkpoint header, which costs
-the header pages and nothing, and assembles the parts from that. The 21 GB is read by the ranks
-that run the blocks and by nobody else.
+**A leader reads no weights at all.** For the DiT it takes the shape from the checkpoint header,
+which costs the header pages and nothing, and assembles the parts from that. For the video VAE it
+takes the tiling plan from the header the same way, and putting the canvases together needs no
+weight either. A worker holding the text encoder spares it those 27 GB, and one that decodes the
+soundtrack the rest. So what a leader holds is the plan, the schedule, the noise, the canvas
+buffers and the file, and the models are read by the machines that compute with them.
+
+A run with no worker is not a leader: it reads what it needs and generates by itself, which is what
+`mmh3 generate` does on one machine.
 
 **So a machine with no GPU at all can run `mmh3 generate`**, built with neither backend. It lends
 itself nothing, and the prompt, every step, the video and the soundtrack happen on the workers
@@ -156,14 +164,22 @@ the clock shows, since the wall time of the same run moved only from 53 s to 51 
 Between two DGX Sparks at 200 GbE, splitting a 768p step takes about a third off a run. A worker
 that only encodes the prompt and decodes chunks saves 9% of the same run.
 
-## What falls back
+## What falls back, and what does not
 
-Anything a worker cannot do, or fails at, the leader does itself. A worker that times out,
-disconnects or answers with an error is dropped and its share is redone locally, so a generation
-gets slower rather than failing. The leader says so once per worker.
+**What nobody offers, the leader does.** A worker that cannot be reached, that does not serve a
+capability, or that holds no checkpoint for it is passed over, and the leader reads what it needs
+and does that piece itself. Naming a worker is asking, not telling.
 
-A build with no backend has nowhere to fall back to, so it says which option would have avoided
-what it reached instead of answering with an empty tensor.
+**What somebody drops ends the run.** A worker that answered the handshake and then timed out,
+disconnected or returned an error stops the generation, and the run names the machine and the
+reason. It is not worked around. A rank that fails during the steps already ends a run, since
+there is no halfway through a step to fall back from, so falling back elsewhere only ever covered
+the short stretches either side of them, at the price of a leader that had to be able to do
+everything. A canvas that arrives and does not fit the latent is a different thing: it was
+answered, it cannot be used, and that chunk decodes locally.
+
+A build with no backend has nothing to fall back to at all, so it says which option would have
+avoided what it reached instead of answering with an empty tensor.
 
 A run refuses to share a step, and keeps the DiT locally, when no worker offers `dit_shard`, when
 the DiT file cannot be read, when an adapter this run uses cannot be found on a worker, or when a
