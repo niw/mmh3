@@ -4,9 +4,9 @@ MODELS = models
 OUT = out.mp4
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
-FEATURES = metal
+FEATURES = metal,server
 else
-FEATURES = cuda,mp4
+FEATURES = cuda,mp4,server
 endif
 SEED = 1
 export PROMPT = A woman in a yellow raincoat opens a clear umbrella on a neon-lit Tokyo street at night. Rain patters on the umbrella, with distant traffic and soft piano music.
