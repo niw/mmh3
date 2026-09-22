@@ -31,7 +31,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 #[cfg(feature = "cuda")]
 fn check_shard(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     const USAGE: &str = "usage: mmh3-tools check shard [--tokens N] [--heads N] [--dim N]";
-    let options = parse_options(arguments, &["tokens", "heads", "dim"], USAGE)?;
+    let options = parse_options(arguments, &["tokens", "heads", "dim"], &[], USAGE)?;
     // NOTE: the default passes the 8192-block grid cap, which is where a gather without a grid
     // stride would start leaving values behind.
     let tokens = option_number(&options, "tokens", 2731)?;
@@ -254,6 +254,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "vsa-sparsity",
             "shard",
         ],
+        &[],
         USAGE,
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
@@ -439,6 +440,7 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "sparse-start",
             "vsa-sparsity",
         ],
+        &[],
         USAGE,
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
@@ -523,6 +525,7 @@ fn check_keyframes(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(
         arguments,
         &["golden", "models", "weights", "reference"],
+        &[],
         USAGE,
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
@@ -595,7 +598,12 @@ fn check_clips(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights", "file"], USAGE)?;
+    let options = parse_options(
+        arguments,
+        &["golden", "models", "weights", "file"],
+        &[],
+        USAGE,
+    )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;
     let clips = GoldenFile::open(golden, "clips.safetensors")?;
@@ -671,7 +679,7 @@ fn check_sounds(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::audio_encoder::CudaAudioEncoder;
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights"], USAGE)?;
+    let options = parse_options(arguments, &["golden", "models", "weights"], &[], USAGE)?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", AUDIO_VAE_FILE)?;
     // A golden directory may hold standalone sounds, the soundtracks of its clips, or both.
@@ -753,6 +761,7 @@ fn check_video_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "reference-tile-size",
             "reference-tile-overlap",
         ],
+        &[],
         USAGE,
     )?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
@@ -842,7 +851,7 @@ fn check_audio_vae(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::audio_vae::CudaAudioDecoder;
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights"], USAGE)?;
+    let options = parse_options(arguments, &["golden", "models", "weights"], &[], USAGE)?;
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let weights_path = option_path(&options, "weights", AUDIO_VAE_FILE)?;
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
@@ -906,7 +915,7 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::text_encoder::CudaTextEncoder;
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights"], USAGE)?;
+    let options = parse_options(arguments, &["golden", "models", "weights"], &[], USAGE)?;
     let golden = GoldenFile(SafeTensors::open(Path::new(
         options.get("golden").ok_or(USAGE)?,
     ))?);

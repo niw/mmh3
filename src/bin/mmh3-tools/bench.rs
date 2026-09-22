@@ -29,7 +29,7 @@ const DIT_BLOCK_COUNT: usize = 50;
 fn bench_gemm(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::bench::{GemmKind, gemm};
 
-    let options = parse_options(arguments, &["tokens", "iterations", "kinds"], USAGE)?;
+    let options = parse_options(arguments, &["tokens", "iterations", "kinds"], &[], USAGE)?;
     let tokens = option_number(&options, "tokens", 38_710)?;
     let iterations = option_number(&options, "iterations", 10)?;
     let kinds = match options.get("kinds") {
@@ -89,7 +89,7 @@ fn bench_gemm(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn bench_memory(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let options = parse_options(arguments, &["megabytes", "iterations"], USAGE)?;
+    let options = parse_options(arguments, &["megabytes", "iterations"], &[], USAGE)?;
     let megabytes = option_number(&options, "megabytes", 2048)?;
     let iterations = option_number(&options, "iterations", 20)?;
     let bandwidth = mmh3_cuda::bench::memory_copy(megabytes << 20, iterations)?;
@@ -108,7 +108,7 @@ fn bench_memory(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn bench_mma(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::bench::{MmaKind, mma_peak};
 
-    let options = parse_options(arguments, &["iterations"], USAGE)?;
+    let options = parse_options(arguments, &["iterations"], &[], USAGE)?;
     let iterations = option_number(&options, "iterations", 4096)?;
     println!(
         "register-only mma.sync throughput, {iterations} iterations of 8 independent chains per warp"
@@ -121,7 +121,7 @@ fn bench_mma(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn bench_attention(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let options = parse_options(arguments, &["tokens", "heads", "iterations"], USAGE)?;
+    let options = parse_options(arguments, &["tokens", "heads", "iterations"], &[], USAGE)?;
     let tokens = option_number(&options, "tokens", 38_710)?;
     let heads = option_number(&options, "heads", 56)?;
     let iterations = option_number(&options, "iterations", 3)?;
@@ -161,6 +161,7 @@ fn bench_vsa(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "iterations",
             "attention-precision",
         ],
+        &[],
         USAGE,
     )?;
     let shape = GenerationShape::new(
@@ -312,6 +313,7 @@ fn bench_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "tile-size",
             "iterations",
         ],
+        &[],
         USAGE,
     )?;
     let weights_path = option_path(&options, "weights", VIDEO_VAE_FILE)?;

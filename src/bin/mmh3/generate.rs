@@ -30,7 +30,12 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use std::time::Instant;
 
     let (arguments, ffmpeg_arguments) = split_ffmpeg_arguments(arguments);
-    let options = parse_options(arguments, &[OPTIONS, &["out", "audio-vae"]].concat(), USAGE)?;
+    let options = parse_options(
+        arguments,
+        &[OPTIONS, &["out", "audio-vae"]].concat(),
+        &[],
+        USAGE,
+    )?;
     #[cfg(feature = "cuda")]
     mmh3::models::load_algorithm_cache();
     let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
@@ -147,7 +152,12 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use std::time::Instant;
 
     let (arguments, ffmpeg_arguments) = split_ffmpeg_arguments(arguments);
-    let options = parse_options(arguments, &[OPTIONS, &["out", "audio-vae"]].concat(), USAGE)?;
+    let options = parse_options(
+        arguments,
+        &[OPTIONS, &["out", "audio-vae"]].concat(),
+        &[],
+        USAGE,
+    )?;
     let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
     let settings = Settings::parse(&options, arguments)?;
     if settings.workers.is_empty() {

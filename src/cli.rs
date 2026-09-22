@@ -4,22 +4,27 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::process::ExitCode;
 
-/// Parses `--name value` pairs, rejecting names outside `allowed`.
+/// Parses `--name value` pairs, rejecting names outside `allowed`. A name in `alone` is a whole
+/// option by itself and takes nothing after it, so what it says is that it was given at all.
 pub fn parse_options<'a>(
     arguments: &'a [String],
     allowed: &[&str],
+    alone: &[&str],
     usage: &str,
 ) -> Result<HashMap<&'a str, &'a str>, Box<dyn Error>> {
     let mut options = HashMap::new();
-    let mut remaining = arguments.iter();
+    let mut remaining = arguments.iter().peekable();
     while let Some(argument) = remaining.next() {
         let name = argument
             .strip_prefix("--")
-            .filter(|name| allowed.contains(name))
+            .filter(|name| allowed.contains(name) || alone.contains(name))
             .ok_or(usage)?;
+        if alone.contains(&name) {
+            options.insert(name, "");
+            continue;
+        }
         let value = remaining
-            .next()
-            .filter(|value| !value.starts_with("--"))
+            .next_if(|value| !value.starts_with("--"))
             .ok_or_else(|| format!("--{name} needs a value"))?;
         options.insert(name, value.as_str());
     }
@@ -132,8 +137,13 @@ mod tests {
             "--prompt",
             "a rainy street",
         ]);
-        let options =
-            parse_options(&arguments, &["tokens", "lora-strength", "prompt"], USAGE).unwrap();
+        let options = parse_options(
+            &arguments,
+            &["tokens", "lora-strength", "prompt"],
+            &[],
+            USAGE,
+        )
+        .unwrap();
         assert_eq!(options["prompt"], "a rainy street");
         assert_eq!(option_number(&options, "tokens", 1).unwrap(), 38_710);
         assert_eq!(option_number(&options, "iterations", 10).unwrap(), 10);
@@ -144,7 +154,7 @@ mod tests {
     #[test]
     fn keeps_the_last_value_of_repeated_options() {
         let arguments = arguments(&["--steps", "20", "--steps", "4"]);
-        let options = parse_options(&arguments, &["steps"], USAGE).unwrap();
+        let options = parse_options(&arguments, &["steps"], &[], USAGE).unwrap();
         assert_eq!(option_number(&options, "steps", 1).unwrap(), 4);
     }
 
@@ -158,7 +168,7 @@ mod tests {
             "--reference",
             "dog.jpg",
         ]);
-        parse_options(&arguments, &["reference", "seed"], USAGE).unwrap();
+        parse_options(&arguments, &["reference", "seed"], &[], USAGE).unwrap();
         assert_eq!(
             option_values(&arguments, "reference"),
             ["cat.png", "dog.jpg"]
@@ -167,16 +177,35 @@ mod tests {
     }
 
     #[test]
+    fn an_option_that_stands_alone_takes_nothing_after_it() {
+        let given = arguments(&["--local-worker", "--seed", "3"]);
+        let options = parse_options(&given, &["seed"], &["local-worker"], USAGE).unwrap();
+        assert_eq!(options.get("local-worker"), Some(&""));
+        assert_eq!(options["seed"], "3");
+
+        // Last of the arguments, with nothing at all after it.
+        let given = arguments(&["--seed", "3", "--local-worker"]);
+        let options = parse_options(&given, &["seed"], &["local-worker"], USAGE).unwrap();
+        assert_eq!(options.get("local-worker"), Some(&""));
+
+        // Not given, which is the whole of what a flag can say otherwise.
+        let given = arguments(&["--seed", "3"]);
+        let options = parse_options(&given, &["seed"], &["local-worker"], USAGE).unwrap();
+        assert_eq!(options.get("local-worker"), None);
+    }
+
+    #[test]
     fn rejects_unknown_options_and_positional_arguments() {
         for values in [&["--unknown", "4"][..], &["steps", "4"][..]] {
-            assert!(parse_options(&arguments(values), &["steps"], USAGE).is_err());
+            assert!(parse_options(&arguments(values), &["steps"], &[], USAGE).is_err());
         }
     }
 
     #[test]
     fn reports_missing_values_before_the_next_option() {
         for values in [&["--steps"][..], &["--steps", "--seed", "3"][..]] {
-            let error = parse_options(&arguments(values), &["steps", "seed"], USAGE).unwrap_err();
+            let error =
+                parse_options(&arguments(values), &["steps", "seed"], &[], USAGE).unwrap_err();
             assert_eq!(error.to_string(), "--steps needs a value");
         }
     }

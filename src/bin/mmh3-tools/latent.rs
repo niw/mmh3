@@ -8,7 +8,7 @@ use std::error::Error;
 use std::path::Path;
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let options = parse_options(arguments, &[OPTIONS, &["out"]].concat(), USAGE)?;
+    let options = parse_options(arguments, &[OPTIONS, &["out"]].concat(), &[], USAGE)?;
     let path = Path::new(options.get("out").ok_or(USAGE)?);
     let settings = Settings::parse(&options, arguments)?;
     let (video, audio) = sample(&options, &settings)?;

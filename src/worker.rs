@@ -1101,6 +1101,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "vram-budget",
             "idle-unload",
         ],
+        &[],
         USAGE,
     )?;
     crate::resident::take_budget(&options)?;
