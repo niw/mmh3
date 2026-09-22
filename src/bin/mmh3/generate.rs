@@ -7,7 +7,9 @@ use mmh3::generation::{FLAGS, OPTIONS, Settings, sample};
 use mmh3::models::{AUDIO_VAE_FILE, option_path, video_vae_path};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::safetensors::SafeTensors;
-use mmh3_core::worker::{CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO};
+#[cfg(any(feature = "cuda", not(feature = "metal")))]
+use mmh3_core::worker::CAPABILITY_DECODE_AUDIO;
+use mmh3_core::worker::CAPABILITY_DECODE_VIDEO;
 use std::error::Error;
 use std::path::Path;
 
