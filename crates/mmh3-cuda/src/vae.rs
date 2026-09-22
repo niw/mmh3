@@ -21,7 +21,9 @@ use mmh3_core::vae::{
     CHUNK_FRAMES, CHUNK_OVERLAP_TOKENS, CHUNK_TOKENS, FRAME_OVERLAP, FRAME_PRE_PADDING,
     SPATIAL_RATIO, TEMPORAL_RATIO, TemporalPlan, TileAxis, rope_angles, split_tiles,
 };
+use std::cell::OnceCell;
 use std::ffi::{c_int, c_void};
+use std::path::PathBuf;
 use std::ptr;
 
 unsafe extern "C" {
@@ -436,20 +438,34 @@ impl CudaVideoFrames {
     }
 }
 
+/// The weights a decode runs on, uploaded when one is asked for and not before.
+struct Weights {
+    tensors: DeviceTensors,
+    /// `post_quant_conv` folded into `x_embedder`, FP16 `[dim, latent channels]` and `[dim]`.
+    embed_weight: DeviceBuffer,
+    embed_bias: DeviceBuffer,
+}
+
+/// A video VAE decoder, which decodes the chunks of a video and puts their canvases together.
+///
+/// Everything but the weights comes from the checkpoint's header, and the weights are uploaded on
+/// the first chunk decoded here. A caller that puts together canvases another machine decoded asks
+/// for no chunk of its own and so uploads nothing: the 3 GB is read by whoever decodes, and by
+/// nobody else.
 pub struct CudaVideoDecoder {
     config: VideoDecoderConfig,
-    tensors: DeviceTensors,
     /// Whether any linear layer has INT8 ConvRot weights.
     quantized: bool,
     /// Whether any feed-forward layer has FP16 weights and applies SwiGLU separately.
     dense_ffn: bool,
-    /// `post_quant_conv` folded into `x_embedder`, FP16 `[dim, latent channels]` and `[dim]`.
-    embed_weight: DeviceBuffer,
-    embed_bias: DeviceBuffer,
     latents_mean: Vec<f32>,
     latents_std: Vec<f32>,
     tile_size: usize,
     tile_overlap_min: usize,
+    /// The checkpoint the weights come from, for the upload that may never happen.
+    path: PathBuf,
+    prefix: String,
+    weights: OnceCell<Weights>,
 }
 
 fn f16_buffer(values: &[f32]) -> Result<DeviceBuffer, Error> {
@@ -465,6 +481,23 @@ impl CudaVideoDecoder {
     /// Uploads the decoder half of a video VAE checkpoint. `prefix` is prepended to every
     /// checkpoint tensor name.
     pub fn load(
+        file: &SafeTensors,
+        prefix: &str,
+        tile_size: usize,
+        tile_overlap_min: usize,
+    ) -> Result<Self, Error> {
+        let decoder = Self::to_assemble(file, prefix, tile_size, tile_overlap_min)?;
+        decoder.weights()?;
+        Ok(decoder)
+    }
+
+    /// A decoder for putting the canvases of a decode together, which reads the weights only if it
+    /// turns out to decode a chunk itself.
+    ///
+    /// A leader hands every chunk out and assembles what comes back, so it holds the plan and the
+    /// buffers and none of the 3 GB. What it does hold is enough to decode a chunk that never
+    /// arrives, which is the one thing that would make it read them.
+    pub fn to_assemble(
         file: &SafeTensors,
         prefix: &str,
         tile_size: usize,
@@ -506,9 +539,55 @@ impl CudaVideoDecoder {
             )));
         }
 
+        // What the header already says, which is everything but the weights themselves.
+        let int8 = |name: &str| {
+            file.get(&format!("{prefix}decoder.{name}"))
+                .is_some_and(|info| info.dtype == DType::I8)
+        };
+        let quantized = file.tensors().iter().any(|info| {
+            info.dtype == DType::I8
+                && info
+                    .name
+                    .strip_prefix(prefix)
+                    .is_some_and(|name| name.starts_with("decoder."))
+        });
+        let dense_ffn = (0..config.layers)
+            .any(|layer| !int8(&format!("transformer_blocks.{layer}.ff.w1.weight")));
+
+        Ok(CudaVideoDecoder {
+            latents_mean: host_tensor(file, &format!("{prefix}latents_mean"))?.data,
+            latents_std: host_tensor(file, &format!("{prefix}latents_std"))?.data,
+            config,
+            quantized,
+            dense_ffn,
+            tile_size,
+            tile_overlap_min,
+            path: file.path().to_path_buf(),
+            prefix: prefix.to_owned(),
+            weights: OnceCell::new(),
+        })
+    }
+
+    /// The weights, uploaded the first time a chunk is decoded here.
+    fn weights(&self) -> Result<&Weights, Error> {
+        if let Some(weights) = self.weights.get() {
+            return Ok(weights);
+        }
+        let weights = self.upload()?;
+        Ok(self.weights.get_or_init(|| weights))
+    }
+
+    /// Uploads the weights.
+    ///
+    /// NOTE: the checkpoint is opened again rather than held from the load. Opening maps the file
+    /// and reads none of it, and a decoder that may never read the weights has no reason to hold a
+    /// map of them until it is dropped.
+    fn upload(&self) -> Result<Weights, Error> {
+        let file =
+            &SafeTensors::open(&self.path).map_err(|error| Error::Model(error.to_string()))?;
+        let prefix = self.prefix.as_str();
         let mut tensors = DeviceTensors::default();
         let mut uploader = Uploader::new(file);
-        let mut quantized = false;
         for info in file.tensors() {
             let Some(name) = info
                 .name
@@ -564,29 +643,25 @@ impl CudaVideoDecoder {
                     )));
                 }
             }
-            quantized |= info.dtype == DType::I8;
         }
         uploader.run()?;
-        let mut dense_ffn = false;
-        for layer in 0..config.layers {
+        for layer in 0..self.config.layers {
             let w1 = format!("transformer_blocks.{layer}.ff.w1");
             if tensors.is_int8(&w1) {
                 for suffix in ["weight", "weight_scale", "bias"] {
                     tensors.interleave_swiglu(&format!("{w1}.{suffix}"))?;
                 }
-            } else {
-                dense_ffn = true;
             }
         }
 
-        let channels = config.latent_channels;
+        let channels = self.config.latent_channels;
         let embed = host_tensor(file, &format!("{prefix}decoder.x_embedder.weight"))?.data;
         let embed_bias = host_tensor(file, &format!("{prefix}decoder.x_embedder.bias"))?.data;
         let post = host_tensor(file, &format!("{prefix}post_quant_conv.weight"))?.data;
         let post_bias = host_tensor(file, &format!("{prefix}post_quant_conv.bias"))?.data;
-        let mut folded = vec![0.0f32; config.dim * channels];
+        let mut folded = vec![0.0f32; self.config.dim * channels];
         let mut folded_bias = embed_bias.clone();
-        for output in 0..config.dim {
+        for output in 0..self.config.dim {
             for middle in 0..channels {
                 let weight = embed[output * channels + middle];
                 folded_bias[output] += weight * post_bias[middle];
@@ -595,18 +670,10 @@ impl CudaVideoDecoder {
                 }
             }
         }
-
-        Ok(CudaVideoDecoder {
+        Ok(Weights {
+            tensors,
             embed_weight: f16_buffer(&folded)?,
             embed_bias: f16_buffer(&folded_bias)?,
-            latents_mean: host_tensor(file, &format!("{prefix}latents_mean"))?.data,
-            latents_std: host_tensor(file, &format!("{prefix}latents_std"))?.data,
-            config,
-            tensors,
-            quantized,
-            dense_ffn,
-            tile_size,
-            tile_overlap_min,
         })
     }
 
@@ -628,8 +695,8 @@ impl CudaVideoDecoder {
         swiglu: bool,
         input_quantized: bool,
     ) -> Result<(), Error> {
-        let weight = self.tensors.get(&format!("{name}.weight"))?;
-        let bias = self.tensors.pointer(&format!("{name}.bias"))?;
+        let weight = self.weights()?.tensors.get(&format!("{name}.weight"))?;
+        let bias = self.weights()?.tensors.pointer(&format!("{name}.bias"))?;
         let (outputs, features) = (weight.shape[0], weight.shape[1]);
         let output_columns = if swiglu { outputs / 2 } else { outputs };
         assert!(
@@ -661,7 +728,10 @@ impl CudaVideoDecoder {
             workspace.quantized.bytes() >= rows * features && workspace.scales.bytes() >= rows * 4,
             "{name}: quantization buffers are too small"
         );
-        let weight_scales = self.tensors.pointer(&format!("{name}.weight_scale"))?;
+        let weight_scales = self
+            .weights()?
+            .tensors
+            .pointer(&format!("{name}.weight_scale"))?;
         // SAFETY: the quantization buffers hold the rows, checked above, and the bias holds
         // `outputs` f32 values.
         unsafe {
@@ -707,14 +777,14 @@ impl CudaVideoDecoder {
         tokens: usize,
     ) -> Result<(), Error> {
         let bias = match bias {
-            Some(name) => self.tensors.pointer(name)?,
+            Some(name) => self.weights()?.tensors.pointer(name)?,
             None => ptr::null(),
         };
         // SAFETY: the workspace holds `tokens × dim` residual and normalized values.
         check(unsafe {
             mmh3_vae_norm(
                 workspace.residual.pointer(),
-                self.tensors.pointer(weight)?,
+                self.weights()?.tensors.pointer(weight)?,
                 bias,
                 workspace.normalized.pointer(),
                 tokens as c_int,
@@ -743,7 +813,7 @@ impl CudaVideoDecoder {
         let (delta, scale) = match scale {
             Some(name) => (
                 workspace.delta.pointer().cast_const(),
-                self.tensors.pointer(name)?,
+                self.weights()?.tensors.pointer(name)?,
             ),
             None => (ptr::null(), ptr::null()),
         };
@@ -754,7 +824,7 @@ impl CudaVideoDecoder {
                 workspace.residual.pointer(),
                 delta,
                 scale,
-                self.tensors.pointer(weight)?,
+                self.weights()?.tensors.pointer(weight)?,
                 workspace.quantized.pointer(),
                 workspace.scales.pointer(),
                 tokens as c_int,
@@ -772,7 +842,7 @@ impl CudaVideoDecoder {
             mmh3_vae_residual_add_scaled(
                 workspace.residual.pointer(),
                 workspace.delta.pointer(),
-                self.tensors.pointer(scale)?,
+                self.weights()?.tensors.pointer(scale)?,
                 tokens as c_int,
                 self.config.dim as c_int,
                 ptr::null_mut(),
@@ -799,8 +869,8 @@ impl CudaVideoDecoder {
             cublaslt_linear(
                 LinearKind::F16,
                 workspace.latent_rows.pointer(),
-                self.embed_weight.pointer(),
-                self.embed_bias.pointer(),
+                self.weights()?.embed_weight.pointer(),
+                self.weights()?.embed_bias.pointer(),
                 workspace.normalized.pointer(),
                 tokens,
                 dim,
@@ -808,7 +878,7 @@ impl CudaVideoDecoder {
             )?;
             check(mmh3_vae_embed_suffix(
                 workspace.normalized.pointer(),
-                self.tensors.pointer("register_tokens")?,
+                self.weights()?.tensors.pointer("register_tokens")?,
                 workspace.residual.pointer(),
                 tiles as c_int,
                 tile_tokens as c_int,
@@ -847,7 +917,7 @@ impl CudaVideoDecoder {
         for layer in 0..config.layers {
             let prefix = format!("transformer_blocks.{layer}");
             let to_qkv = format!("{prefix}.attn.to_qkv");
-            if self.tensors.is_int8(&to_qkv) {
+            if self.weights()?.tensors.is_int8(&to_qkv) {
                 self.add_norm_quantize(
                     pending_scale.take().as_deref(),
                     &format!("{prefix}.norm1.weight"),
@@ -920,7 +990,7 @@ impl CudaVideoDecoder {
             )?;
 
             let w1 = format!("{prefix}.ff.w1");
-            if self.tensors.is_int8(&w1) {
+            if self.weights()?.tensors.is_int8(&w1) {
                 self.add_norm_quantize(
                     Some(&format!("{prefix}.scale1")),
                     &format!("{prefix}.norm2.weight"),

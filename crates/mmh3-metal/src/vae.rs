@@ -1,20 +1,33 @@
 //! Video VAE decoding, unpatchification and spatial/temporal blending on Metal.
-use crate::{Error, Result, model::Weights, ops::Array};
+use crate::{Device, Error, Result, model::Weights, ops::Array};
 use mmh3_core::{
     media::Yuv420,
     safetensors::SafeTensors,
     tensor::Tensor,
     vae::{TemporalPlan, TileAxis, rope_angles, split_tiles},
 };
+use std::cell::OnceCell;
 
 pub const DEFAULT_TILE_SIZE: usize = 256;
 pub const DEFAULT_TILE_OVERLAP_MIN: usize = 64;
+/// A video decoder that reads its configuration from the checkpoint's header and leaves the
+/// weights on disk until something asks it to decode.
+///
+/// Blending canvases another machine decoded needs no weights at all: the geometry, the tiling and
+/// the latent statistics come to a few hundred bytes of header. A leader that hands every chunk to
+/// a worker therefore holds no model, and one that has to decode a chunk itself pays for the
+/// weights at that point.
 pub struct MetalVideoDecoder {
-    weights: Weights,
+    device: Device,
+    file: SafeTensors,
+    prefix: String,
+    weights: OnceCell<Weights>,
     channels: usize,
     dim: usize,
     layers: usize,
     registers: usize,
+    latents_mean: Vec<f32>,
+    latents_std: Vec<f32>,
     tile_size: usize,
     overlap: usize,
 }
@@ -96,7 +109,23 @@ impl MetalVideoFrames {
 }
 
 impl MetalVideoDecoder {
+    /// A decoder with its weights on the device, which is what a machine that decodes wants: the
+    /// time a caller measures around this call is the time the upload took.
     pub fn load(
+        file: &SafeTensors,
+        prefix: &str,
+        tile_size: usize,
+        overlap: usize,
+    ) -> Result<Self> {
+        let decoder = Self::to_assemble(file, prefix, tile_size, overlap)?;
+        decoder.weights()?;
+        Ok(decoder)
+    }
+
+    /// A decoder for assembling canvases other machines decoded, which needs no weights. It reads
+    /// them only if it is left to decode a chunk itself, which is what a leader does with the
+    /// chunks that never came back.
+    pub fn to_assemble(
         file: &SafeTensors,
         prefix: &str,
         tile_size: usize,
@@ -113,35 +142,72 @@ impl MetalVideoDecoder {
             ));
         }
 
-        let weights = Weights::load_selected(file, prefix, |n| {
-            n.starts_with("decoder.")
-                || n.starts_with("post_quant_conv.")
-                || n == "latents_mean"
-                || n == "latents_std"
-        })?;
-        let shape = weights.shape("decoder.x_embedder.weight")?;
-        let (dim, channels) = (shape[0], shape[1]);
-        let registers = weights.shape("decoder.register_tokens")?[1];
+        let info = |name: &str| {
+            file.get(&format!("{prefix}{name}"))
+                .ok_or_else(|| Error::new(format!("missing tensor {prefix}{name}")))
+        };
+        let dimension = |name: &str, index: usize| -> Result<usize> {
+            info(name)?
+                .shape
+                .get(index)
+                .copied()
+                .ok_or_else(|| Error::new(format!("{prefix}{name} has no axis {index}")))
+        };
+        let host = |name: &str| -> Result<Vec<f32>> {
+            Ok(Tensor::load(file, info(name)?).map_err(Error::new)?.data)
+        };
+
+        let dim = dimension("decoder.x_embedder.weight", 0)?;
+        let channels = dimension("decoder.x_embedder.weight", 1)?;
+        let registers = dimension("decoder.register_tokens", 1)?;
         let layers = (0..)
-            .take_while(|i| weights.contains(&format!("decoder.transformer_blocks.{i}.scale1")))
+            .take_while(|i| {
+                file.get(&format!("{prefix}decoder.transformer_blocks.{i}.scale1"))
+                    .is_some()
+            })
             .count();
+        let latents_mean = host("latents_mean")?;
+        let latents_std = host("latents_std")?;
         if dim == 0
             || !dim.is_multiple_of(64)
             || layers == 0
-            || weights.shape("decoder.proj_out.weight")?[0] != 3072
+            || dimension("decoder.proj_out.weight", 0)? != 3072
+            || latents_mean.len() < channels
+            || latents_std.len() < channels
         {
             return Err(Error::new("unsupported video decoder configuration".into()));
         }
 
         Ok(Self {
-            weights,
+            device: Device::shared()?,
+            file: SafeTensors::open(file.path()).map_err(|error| Error::new(error.to_string()))?,
+            prefix: prefix.to_owned(),
+            weights: OnceCell::new(),
             channels,
             dim,
             layers,
             registers,
+            latents_mean,
+            latents_std,
             tile_size,
             overlap,
         })
+    }
+
+    /// The weights, uploaded on the first ask. A decoder that only assembles canvases never
+    /// asks, so it never pays for the upload.
+    fn weights(&self) -> Result<&Weights> {
+        if let Some(weights) = self.weights.get() {
+            return Ok(weights);
+        }
+
+        // NOTE: OnceCell::get_or_try_init is unstable, so the upload happens outside the cell and
+        // a second caller racing to it would only build weights that are then dropped. Nothing
+        // shares a decoder across threads: the table that keeps one holds it behind a lock.
+        let weights = Weights::load_selected(&self.file, &self.prefix, |name| {
+            name.starts_with("decoder.") || name.starts_with("post_quant_conv.")
+        })?;
+        Ok(self.weights.get_or_init(|| weights))
     }
 
     fn tile(
@@ -151,7 +217,7 @@ impl MetalVideoDecoder {
         height: usize,
         width: usize,
     ) -> Result<Array> {
-        let w = &self.weights;
+        let w = self.weights()?;
         let patches = frames * height * width;
         let rows = Array::from_f32(&w.device, patches, self.channels, latent_rows)?;
         let rows = w.linear(&w.linear(&rows, "post_quant_conv")?, "decoder.x_embedder")?;
@@ -326,7 +392,7 @@ impl MetalVideoDecoder {
             if output.is_none() {
                 output = Some(MetalVideoFrames {
                     start: 0,
-                    pixels: Array::empty(&self.weights.device, 3, total * plane)?,
+                    pixels: Array::empty(&self.device, 3, total * plane)?,
                     frames: total,
                     height: part.height,
                     width: part.width,
@@ -334,7 +400,7 @@ impl MetalVideoDecoder {
             }
 
             let out = output.as_ref().unwrap();
-            self.weights.device.run(
+            self.device.run(
                 "copy_rows",
                 &[&part.pixels.buffer, &out.pixels.buffer],
                 &[
@@ -392,8 +458,6 @@ impl MetalVideoDecoder {
             cf,
             canvas_frames: cf * 4,
             output_frames,
-            mean: self.weights.host("latents_mean")?.data,
-            std: self.weights.host("latents_std")?.data,
         })
     }
 
@@ -422,8 +486,8 @@ impl MetalVideoDecoder {
             ..
         } = geometry;
         let (rows, columns) = (&geometry.rows, &geometry.columns);
-        let (mean, std) = (&geometry.mean, &geometry.std);
-        let device = &self.weights.device;
+        let (mean, std) = (&self.latents_mean, &self.latents_std);
+        let device = &self.device;
         let canvas = Array::empty(device, 3, canvas_frames * plane)?;
         let mut first_tile = None;
         let mut previous: Vec<Option<Array>> = vec![None; columns.starts.len()];
@@ -520,7 +584,7 @@ impl MetalVideoDecoder {
             .iter()
             .map(|value| f32::from_le_bytes(*value))
             .collect();
-        Array::from_f32(&self.weights.device, 3, columns, &values).ok()
+        Array::from_f32(&self.device, 3, columns, &values).ok()
     }
 
     fn decode_chunks(
@@ -534,7 +598,7 @@ impl MetalVideoDecoder {
         let (height, width, plane) = (geometry.height, geometry.width, geometry.plane);
         let (chunks, canvas_frames) = (geometry.chunks, geometry.canvas_frames);
         let (latent_frames, output_frames) = (geometry.latent_frames, geometry.output_frames);
-        let device = &self.weights.device;
+        let device = &self.device;
         let mut first_tile = None;
         let mut tail = Array::zeros(device, 3, 5 * plane)?;
         let mut position = 0;
@@ -641,6 +705,4 @@ struct Geometry {
     cf: usize,
     canvas_frames: usize,
     output_frames: usize,
-    mean: Vec<f32>,
-    std: Vec<f32>,
 }
