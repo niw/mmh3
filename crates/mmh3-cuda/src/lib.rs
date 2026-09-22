@@ -223,6 +223,16 @@ pub fn reads_host_memory() -> Result<bool, CudaError> {
     Ok(reads != 0)
 }
 
+/// What `memory_info` answers for `device`, from whichever device this thread computes on, which
+/// it is left computing on afterwards.
+pub fn memory_info_on(device: usize) -> Result<(usize, usize), CudaError> {
+    let here = current_device()?;
+    set_device(device)?;
+    let answer = memory_info();
+    set_device(here)?;
+    answer
+}
+
 pub fn synchronize() -> Result<(), CudaError> {
     // SAFETY: no arguments.
     check(unsafe { mmh3_cuda_synchronize() })

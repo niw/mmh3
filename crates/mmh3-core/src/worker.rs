@@ -23,7 +23,7 @@ pub const TRANSPORT_RDMA: u32 = 1 << 1;
 /// A checkpoint is matched by digest and a protocol is not, which is why this exists: a pair that
 /// disagrees about the wire does not fail, it waits, and two ranks each waiting for the other to
 /// speak look exactly like a slow machine.
-pub const PROTOCOL: u32 = 4;
+pub const PROTOCOL: u32 = 5;
 
 pub const BACKEND_CUDA: u8 = 1;
 pub const BACKEND_METAL: u8 = 2;
@@ -308,6 +308,9 @@ pub struct Hello {
     /// Whether the GEMMs the worker runs on this connection are to be consistent, as the leader's
     /// are, so that rows come out the same whichever machine and rank computes them.
     pub consistent: bool,
+    /// Which of the worker's slots this connection computes on. A leader that wants every card of a
+    /// machine connects once per slot, and each connection is a rank of its own.
+    pub device: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +326,13 @@ pub struct Welcome {
     pub checkpoints: Vec<Checkpoint>,
     /// Answered when the leader offered one and this side has one too.
     pub rdma: RdmaAddresses,
+    /// How many slots this worker serves, which is how many connections a leader may open to it,
+    /// one per slot. A slot is a card, and a worker told to may put two slots on one card.
+    /// `device`, `card`, `memory_bytes` and `speed` are the answers of the slot this connection is
+    /// for.
+    pub devices: u32,
+    /// Which card of its machine this connection computes on.
+    pub card: u32,
 }
 
 /// Token identifiers of a prompt, to be encoded by whichever machine holds the text encoder.
@@ -1058,8 +1068,12 @@ impl Hello {
         encoder.string(&self.leader).string(&self.token);
         encode_rdma(&mut encoder, &self.rdma);
         // After everything an older build reads, so that one reads its fields and ignores the rest,
-        // which is what turns a version difference into a refusal instead of a hang.
-        encoder.u32(self.protocol).u8(u8::from(self.consistent));
+        // which is what turns a version difference into a refusal instead of a hang. What came
+        // after it came with a later protocol, so a build that meets it has already refused.
+        encoder
+            .u32(self.protocol)
+            .u8(u8::from(self.consistent))
+            .u32(self.device);
         encoder.finish()
     }
 
@@ -1074,6 +1088,7 @@ impl Hello {
             rdma,
             protocol: decoder.u32().unwrap_or(0),
             consistent: decoder.u8().unwrap_or(0) != 0,
+            device: decoder.u32().unwrap_or(0),
         })
     }
 }
@@ -1104,7 +1119,7 @@ impl Welcome {
             encoder.string(&checkpoint.role).u64(checkpoint.digest);
         }
         encode_rdma(&mut encoder, &self.rdma);
-        encoder.u32(self.protocol);
+        encoder.u32(self.protocol).u32(self.devices).u32(self.card);
         encoder.finish()
     }
 
@@ -1132,8 +1147,12 @@ impl Welcome {
             });
         }
         let rdma = decode_rdma(&mut decoder)?;
+        let protocol = decoder.u32().unwrap_or(0);
+        // A machine that says nothing of its cards has the one.
+        let devices = decoder.u32().unwrap_or(1).max(1);
+        let card = decoder.u32().unwrap_or(0);
         Ok(Welcome {
-            protocol: decoder.u32().unwrap_or(0),
+            protocol,
             backend,
             device,
             memory_bytes,
@@ -1142,6 +1161,8 @@ impl Welcome {
             speed,
             checkpoints,
             rdma,
+            devices,
+            card,
         })
     }
 }
@@ -1333,17 +1354,20 @@ mod tests {
             rdma: None,
             protocol: PROTOCOL,
             consistent: true,
+            device: 1,
         };
         let encoded = hello.encode();
-        let older = &encoded[..encoded.len() - 5];
+        let older = &encoded[..encoded.len() - 9];
         let decoded = Hello::decode(older).unwrap();
         assert_eq!(decoded.protocol, 0);
         assert!(!decoded.consistent);
         assert_eq!(decoded.leader, hello.leader);
         assert_eq!(decoded.token, hello.token);
-        let decoded = Hello::decode(&encoded).unwrap();
-        assert_eq!(decoded.protocol, PROTOCOL);
-        assert!(decoded.consistent);
+        assert_eq!(decoded.device, 0);
+        let current = Hello::decode(&encoded).unwrap();
+        assert_eq!(current.protocol, PROTOCOL);
+        assert!(current.consistent);
+        assert_eq!(current.device, 1);
     }
 
     #[test]
@@ -1365,6 +1389,8 @@ mod tests {
                 role: "text_encoder.h3.int8_convrot".to_owned(),
                 digest: 0x0123_4567_89ab_cdef,
             }],
+            devices: 2,
+            card: 1,
         };
         let mut stream = Vec::new();
         send(&mut stream, Kind::Welcome, 7, &welcome.encode(), &[]).unwrap();
@@ -1378,6 +1404,8 @@ mod tests {
         assert_eq!(decoded.speed.unwrap().gemm_tops, 181.6);
         assert_eq!(decoded.speed.unwrap().attention_tops, 42.5);
         assert_eq!(decoded.checkpoints, welcome.checkpoints);
+        assert_eq!(decoded.devices, 2);
+        assert_eq!(decoded.card, 1);
     }
 
     #[test]

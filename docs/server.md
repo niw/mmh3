@@ -42,8 +42,8 @@ curl -X POST http://localhost:8833/v1/generations \
 `state` is `queued`, `running`, `done` or `failed`, `seconds` is how long it took once it is one of
 the last two, and `error` says why it is `failed`.
 
-The answer is the generation rather than the video, which is not there yet. There is one device,
-so there is one generation at a time and the rest wait their turn.
+The answer is the generation rather than the video, which is not there yet. There is one generation
+at a time, which takes every GPU the machine has, and the rest wait their turn.
 
 Reference pictures, sounds and clips go the same way, as repeated fields in the order the prompt
 refers to them:
@@ -98,7 +98,8 @@ curl http://localhost:8833/v1/status
 ```
 
 `models` is `null` rather than a list while a generation has them, since a machine that is busy is
-not a machine holding nothing.
+not a machine holding nothing. `memory` is what the GPUs have between them, and `models` is what
+any of them holds.
 
 The models are held by a worker in the server's own process, which is the same worker
 `mmh3 worker` runs and holds its models the same way. A generation is a leader and reads no model

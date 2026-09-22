@@ -412,9 +412,45 @@ pub struct Worker {
 }
 
 impl Worker {
-    /// Connects and exchanges the handshake. The caller decides what to do with a worker that
-    /// cannot serve what it wants, since nothing here falls back on its own.
+    /// Connects to the first slot of a worker and exchanges the handshake. The caller decides what
+    /// to do with a worker that cannot serve what it wants, since nothing here falls back on its
+    /// own.
     pub fn connect(address: &str, token: &str) -> Result<Self, Box<dyn Error>> {
+        Self::connect_to(address, token, 0)
+    }
+
+    /// Connects to every slot a worker serves, a connection apiece, in the order of the slots. A
+    /// slot past the first that does not answer is reported and left out, as a worker that does
+    /// not answer is.
+    pub fn connect_every_card(address: &str, token: &str) -> Result<Vec<Self>, Box<dyn Error>> {
+        let first = Self::connect(address, token)?;
+        let slots = first.slots();
+        let mut workers = vec![first];
+        for slot in 1..slots {
+            match Self::connect_to(address, token, slot) {
+                Ok(worker) => workers.push(worker),
+                Err(error) => eprintln!("warning: worker {address} slot {slot}: {error}"),
+            }
+        }
+        Ok(workers)
+    }
+
+    /// How many slots the worker at the other end serves, which is a slot per card unless it was
+    /// told to put two on one.
+    pub fn slots(&self) -> usize {
+        self.welcome.devices.max(1) as usize
+    }
+
+    /// What a line about this connection calls it: the address, and the card when the worker
+    /// serves more than one slot.
+    pub fn name(&self) -> String {
+        match self.slots() {
+            1 => self.address.clone(),
+            _ => format!("{} card {}", self.address, self.welcome.card),
+        }
+    }
+
+    fn connect_to(address: &str, token: &str, slot: usize) -> Result<Self, Box<dyn Error>> {
         let address = self::address(address);
         let target = address
             .to_socket_addrs()?
@@ -435,6 +471,8 @@ impl Worker {
                 speed: None,
                 checkpoints: Vec::new(),
                 rdma: None,
+                devices: 1,
+                card: 0,
             },
             request: 0,
             rdma: None,
@@ -449,6 +487,7 @@ impl Worker {
             rdma: offered.as_ref().map(|(_, addresses)| addresses.clone()),
             protocol: worker::PROTOCOL,
             consistent: CONSISTENT.load(std::sync::atomic::Ordering::Relaxed),
+            device: slot as u32,
         };
         let body = worker.call(Kind::Hello, &hello.encode(), &[])?;
         worker.welcome = Welcome::decode(&body.1)?;
@@ -830,20 +869,22 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "leader".to_owned())
 }
 
-/// Connects to every address, keeping the ones that answer. A worker that refuses or fails is
-/// reported and left out: a generation never depends on one.
+/// Connects to every card of every address, keeping the ones that answer. A worker that refuses or
+/// fails is reported and left out: a generation never depends on one.
 pub fn connect_all(addresses: &[&str], token: &str) -> Vec<Worker> {
     let mut workers = Vec::new();
     for address in addresses {
-        match Worker::connect(address, token) {
-            Ok(worker) => {
-                println!(
-                    "worker {} on {} with {} GiB",
-                    worker.address,
-                    worker.welcome.device,
-                    worker.welcome.memory_bytes >> 30
-                );
-                workers.push(worker);
+        match Worker::connect_every_card(address, token) {
+            Ok(cards) => {
+                for worker in &cards {
+                    println!(
+                        "worker {} on {} with {} GiB",
+                        worker.name(),
+                        worker.welcome.device,
+                        worker.welcome.memory_bytes >> 30
+                    );
+                }
+                workers.extend(cards);
             }
             Err(error) => eprintln!("warning: worker {address}: {error}"),
         }
@@ -869,6 +910,19 @@ fn probe(address: &str, token: &str) -> Result<(), Box<dyn Error>> {
         worker.welcome.capabilities,
         worker.welcome.transports
     );
+    // The first card answers for the machine above, and the rest say what they are.
+    if worker.slots() > 1 {
+        println!("  serves {} slots, a rank apiece", worker.slots());
+        for slot in 1..worker.slots() {
+            match Worker::connect_to(address, token, slot) {
+                Ok(other) => println!(
+                    "  slot {slot} is card {}, {}",
+                    other.welcome.card, other.welcome.device
+                ),
+                Err(error) => println!("  slot {slot} did not answer: {error}"),
+            }
+        }
+    }
     for checkpoint in &worker.welcome.checkpoints {
         println!("  {} {:016x}", checkpoint.role, checkpoint.digest);
     }
@@ -1115,7 +1169,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use crate::cli::{option_number, parse_options};
     use crate::models::models_directory;
 
-    const USAGE: &str = "usage: mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--transport auto|socket] [--vram-budget GB] [--idle-unload SECONDS] | mmh3 worker --probe HOST[:PORT]";
+    const USAGE: &str = "usage: mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--devices N|CARD,CARD...] [--transport auto|socket] [--vram-budget GB] [--idle-unload SECONDS] | mmh3 worker --probe HOST[:PORT]";
     let options = parse_options(
         arguments,
         &[
@@ -1123,6 +1177,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "models",
             "token",
             "probe",
+            "devices",
             "transport",
             "vram-budget",
             "idle-unload",
@@ -1156,9 +1211,16 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let models = models_directory(&options)
         .ok_or("pass a models directory with --models DIR or MMH3_MODELS")?;
 
+    // Every card the machine has unless told otherwise, since lending a machine is what running
+    // a worker on it asks for.
+    let cards = crate::resident::cards(&options, crate::resident::device_count())?;
+    if cards.is_empty() {
+        return Err("a worker serves at least one card".into());
+    }
+
     let listener = TcpListener::bind(&listen)?;
     println!("serving {} on {listen}", models.display());
-    serve_on(listener, models, token, bare, true)
+    serve_on(listener, models, token, bare, true, cards)
 }
 
 /// The threads of this process that talk to workers, so that the process can wait for them before
@@ -1219,7 +1281,8 @@ pub fn worker_here(models: &Path, token: &str) -> Option<String> {
     std::thread::Builder::new()
         .name("worker".to_owned())
         .spawn(move || {
-            if let Err(error) = serve_on(listener, models, token, false, false) {
+            let cards = (0..crate::resident::device_count()).collect();
+            if let Err(error) = serve_on(listener, models, token, false, false, cards) {
                 eprintln!("warning: the worker on this machine ended: {error}");
             }
         })
@@ -1229,6 +1292,11 @@ pub fn worker_here(models: &Path, token: &str) -> Option<String> {
 
 /// The serving itself, on a socket somebody else bound. `serve` binds the one `--listen` names,
 /// and a run that lends this machine a rank binds one on loopback and keeps it to itself.
+///
+/// It serves `cards`, a slot per card. A leader connects once per slot it wants, each connection
+/// names its slot at the handshake, and its session computes on that slot's card and takes its
+/// models from that card's table, so the cards of one worker are ranks of their own. A card in two
+/// slots holds two ranks.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn serve_on(
     listener: TcpListener,
@@ -1236,6 +1304,7 @@ fn serve_on(
     token: String,
     bare: bool,
     announce: bool,
+    cards: Vec<usize>,
 ) -> Result<(), Box<dyn Error>> {
     let checkpoints: Vec<(Checkpoint, PathBuf)> = ROLES
         .iter()
@@ -1257,14 +1326,35 @@ fn serve_on(
     if announce {
         crate::models::load_algorithm_cache();
     }
-    let speed = measure_speed();
+    // Each card is measured on a thread bound to it, one after the other so that no two of them
+    // are timed while another has the machine, and the leader cuts its shares by what each said.
+    let here = crate::resident::current_device();
+    let slots: Vec<Slot> = cards
+        .iter()
+        .map(|&card| Slot {
+            card,
+            speed: crate::resident::bind_device(card)
+                .ok()
+                .and_then(|()| measure_speed()),
+        })
+        .collect();
+    crate::resident::bind_device(here)?;
     if announce {
-        if let Some(speed) = speed {
-            println!(
-                "  {:.1} TOPS at a block's GEMM, {:.1} at its attention, {:.1} GB/s copying",
-                speed.gemm_tops, speed.attention_tops, speed.bandwidth_gbytes
-            );
+        for (index, slot) in slots.iter().enumerate() {
+            let name = crate::resident::bind_device(slot.card)
+                .map(|()| device_name())
+                .unwrap_or_default();
+            let card = slot.card;
+            match slot.speed {
+                Some(speed) => println!(
+                    "  slot {index}, card {card} {name}: {:.1} TOPS at a block's GEMM, {:.1} at \
+                     its attention, {:.1} GB/s copying",
+                    speed.gemm_tops, speed.attention_tops, speed.bandwidth_gbytes
+                ),
+                None => println!("  slot {index}, card {card} {name}"),
+            }
         }
+        crate::resident::bind_device(here)?;
         for (checkpoint, path) in &checkpoints {
             println!(
                 "  {} {:016x} {}",
@@ -1286,11 +1376,12 @@ fn serve_on(
         let checkpoints = checkpoints.clone();
         let token = token.clone();
         let models = models.clone();
+        let slots = slots.clone();
         let handle = std::thread::spawn(move || {
             let peer = stream
                 .peer_addr()
                 .map_or_else(|_| "?".to_owned(), |address| address.to_string());
-            if let Err(error) = session(stream, &models, &checkpoints, &token, bare, speed) {
+            if let Err(error) = session(stream, &models, &checkpoints, &token, bare, &slots) {
                 eprintln!("worker session with {peer} ended: {error}");
             }
             #[cfg(feature = "cuda")]
@@ -1301,6 +1392,15 @@ fn serve_on(
     Ok(())
 }
 
+/// One card a worker serves, as a connection names it at the handshake.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[derive(Clone, Copy)]
+struct Slot {
+    card: usize,
+    /// What the card measured of itself, which the leader cuts its share by.
+    speed: Option<worker::Speed>,
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn session(
     stream: TcpStream,
@@ -1308,7 +1408,7 @@ fn session(
     checkpoints: &[(Checkpoint, PathBuf)],
     token: &str,
     bare: bool,
-    speed: Option<worker::Speed>,
+    slots: &[Slot],
 ) -> Result<(), Box<dyn Error>> {
     stream.set_nodelay(true)?;
     let mut reader = BufReader::with_capacity(STREAM_BUFFER, stream.try_clone()?);
@@ -1316,8 +1416,9 @@ fn session(
     // Where this session takes its models from. They outlive it, so a leader that comes back
     // finds what the one before it read still loaded. Each request borrows them into a binding of
     // its own and lets go of them before it answers, since answering is a write down a socket and
-    // the machine has other sessions that could be computing meanwhile.
-    let mut table = crate::resident::Table::new(crate::resident::current_device());
+    // the machine has other sessions that could be computing meanwhile. The table is the first
+    // card's until the handshake names the card this connection is for.
+    let mut table = crate::resident::Table::new(0);
     #[cfg(feature = "cuda")]
     let mut rdma: Option<Rdma> = None;
     #[cfg(feature = "cuda")]
@@ -1353,6 +1454,19 @@ fn session(
                 // would from itself.
                 #[cfg(feature = "cuda")]
                 mmh3_cuda::algorithms::set_consistent_on_this_thread(hello.consistent);
+                // Everything this connection computes from here on goes to the card of the slot it
+                // asked for.
+                let Some(slot) = slots.get(hello.device as usize) else {
+                    let message = format!(
+                        "this worker serves {} slots and has no slot {}",
+                        slots.len(),
+                        hello.device
+                    );
+                    reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
+                    return Err(message.into());
+                };
+                crate::resident::bind_device(slot.card)?;
+                table = crate::resident::Table::new(slot.card);
                 // A leader that offers a reliable connection gets this side's, and the bulk of
                 // every later reply goes that way instead of down the socket.
                 let offered = hello
@@ -1365,7 +1479,9 @@ fn session(
                     backend: BACKEND,
                     device: device_name(),
                     memory_bytes: memory_bytes(),
-                    speed,
+                    speed: slot.speed,
+                    devices: slots.len() as u32,
+                    card: slot.card as u32,
                     capabilities: CAPABILITY_ENCODE_TEXT
                         | CAPABILITY_DECODE_AUDIO
                         | CAPABILITY_DECODE_VIDEO

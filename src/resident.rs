@@ -554,6 +554,67 @@ pub fn current_device() -> usize {
     return 0;
 }
 
+/// The cards this machine has that this process can compute on, which a Mac has one of.
+pub fn device_count() -> usize {
+    #[cfg(feature = "cuda")]
+    return mmh3_cuda::device_count().unwrap_or(1).clamp(1, DEVICES);
+    #[cfg(feature = "metal")]
+    return 1;
+}
+
+/// The cards a process computes on, from `--devices`: the first `default` cards when it is not
+/// given, the first N for a number, and the cards a list names for a list, where a card named
+/// twice holds two ranks. That is no faster than one rank, and it is how the ranks of one process
+/// are checked on a machine with a single card.
+pub fn cards(options: &HashMap<&str, &str>, default: usize) -> Result<Vec<usize>, Box<dyn Error>> {
+    let count = device_count();
+    let Some(text) = options.get("devices") else {
+        return Ok((0..default.min(count)).collect());
+    };
+    if !text.contains(',') {
+        let wanted: usize = text
+            .parse()
+            .map_err(|_| format!("--devices takes a number or a list of cards, not {text}"))?;
+        if wanted > count {
+            let gpus = if count == 1 { "GPU" } else { "GPUs" };
+            return Err(format!("--devices {wanted} on a machine with {count} {gpus}").into());
+        }
+        return Ok((0..wanted).collect());
+    }
+    text.split(',')
+        .map(|card| {
+            let card: usize = card
+                .trim()
+                .parse()
+                .map_err(|_| format!("--devices takes a number or a list of cards, not {text}"))?;
+            if card >= count {
+                return Err(format!("--devices names card {card} of the {count} there are").into());
+            }
+            Ok(card)
+        })
+        .collect()
+}
+
+/// Computes on `device` from this thread on, so everything it allocates, launches and reads goes
+/// there, and the models it reads go into that device's table.
+///
+/// NOTE: the current device belongs to the host thread, so this binds the thread that calls it and
+/// nothing else. A worker binds the thread of each connection rather than the process.
+pub fn bind_device(device: usize) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "cuda")]
+    {
+        mmh3_cuda::set_device(device)?;
+        Ok(())
+    }
+    #[cfg(feature = "metal")]
+    {
+        match device {
+            0 => Ok(()),
+            device => Err(format!("this backend has one device, not device {device}").into()),
+        }
+    }
+}
+
 /// What this machine is holding on to, for a caller that only means to say so and must not wait.
 /// None means a request has the models, which is itself an answer: the machine is busy.
 ///

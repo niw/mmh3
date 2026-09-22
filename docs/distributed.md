@@ -25,7 +25,13 @@ It listens on `0.0.0.0:7833`, stays idle until asked, and loads a checkpoint on 
 that needs it. It keeps what it has loaded for the runs that follow, and lets go of the checkpoint
 it has used least when the device has no memory left for the next one, so a second run against the
 same worker finds the models already there. `--idle-unload SECONDS` gives the memory back on a machine
-that is also somebody's desktop. Then on the machine the user runs:
+that is also somebody's desktop.
+
+A worker serves every GPU its machine has. The leader connects once per card, each connection
+computes on its own card and keeps its models there, and **each card takes a rank of its own**, so a
+worker with two cards is two ranks of a shared step and decodes two chunks at once. `--devices N`
+lends the first N instead, and `--devices 0,2` the cards it names. Then on the machine the user
+runs:
 
 ```sh
 target/release/mmh3 generate --out out.mp4 --prompt "..." \
@@ -81,9 +87,12 @@ small. Ranks trade directly with each other rather than through the leader.
 parts back together, and runs no block: the machines that do the work are the workers, and nothing
 else.
 
-So `--local-worker` **lends this machine a rank of its own**. A worker starts here on loopback,
-takes a session like any other, and nothing in the run knows the difference, so one `--worker` and
-a `--local-worker` split a step in two.
+So `--local-worker` **lends this machine a rank of its own**, one per card. A worker starts here on
+loopback, takes a session like any other, and nothing in the run knows the difference, so one
+`--worker` and a `--local-worker` on machines of one card each split a step in two. It is given
+once, since the one worker is already every card here.
+
+Two cards of one worker trade over that worker's own loopback rather than through each other.
 
 **A leader reads no weights at all.** For the DiT it takes the shape from the checkpoint header,
 which costs the header pages and nothing, and assembles the parts from that. For the video VAE it
@@ -263,17 +272,20 @@ On the worker:
 - `--listen ADDR` (default `0.0.0.0:7833`): Where to wait.
 - `--models DIR`: The models directory, or `MMH3_MODELS`.
 - `--token FILE`: A shared secret, matched against the leader's.
+- `--devices N` or `--devices CARD,CARD...` (default: every card): Serve the first N GPUs of this
+  machine, or the cards named, a rank per card. A card named twice holds two ranks, which is only
+  good for checking the path on a machine with one card.
 - `--transport auto|socket` (default `auto`): `socket` keeps this machine's RoCE port to itself.
-- `--vram-budget GB` (default: as much as the device gives): Hold the worker to that much device
-  memory, failing an allocation past it as a device that small would.
+- `--vram-budget GB` (default: as much as the device gives): Hold the worker to that much memory of
+  each card, failing an allocation past it as a card that small would.
 - `--idle-unload SECONDS` (default off): Let go of every model after that long with nothing to do.
 - `--probe HOST[:PORT]`: Report on another worker instead of serving.
 
 On the leader:
 
 - `--worker HOST[:PORT]`: Name a machine to spread the run across, repeated for several.
-- `--local-worker`: Start a worker in this process, so that this machine's GPU takes part as a
-  worker. Without it this machine is the leader and nothing else.
+- `--local-worker`: Start a worker in this process, so that this machine's GPUs take part as a
+  worker, a rank per card. Without it this machine is the leader and nothing else.
 - `--consistent`: Compute so that the video does not depend on how the run is split, here and on
   every worker, as [Determinism](#determinism) describes.
 - `--worker-units UNITS`: What the `--worker` or `--local-worker` before it may be asked for, out

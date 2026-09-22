@@ -33,13 +33,13 @@ pub(crate) fn run() -> Result<(), Box<dyn Error>> {
             "  global memory          {}",
             format_bytes(info.total_global_bytes as usize)
         );
+        let (free_bytes, total_bytes) = mmh3_cuda::memory_info_on(device)?;
+        println!(
+            "  memory                 {} free of {}",
+            format_bytes(free_bytes),
+            format_bytes(total_bytes)
+        );
     }
-    let (free_bytes, total_bytes) = mmh3_cuda::memory_info()?;
-    println!(
-        "memory    {} free of {}",
-        format_bytes(free_bytes),
-        format_bytes(total_bytes)
-    );
     Ok(())
 }
 

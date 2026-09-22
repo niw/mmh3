@@ -394,13 +394,18 @@ fn kept() -> Option<Vec<&'static str>> {
     }
 }
 
-/// What the device says it has left and what it has in all, or None on a build with neither
-/// backend, which has no device to ask.
+/// What the devices say they have left and what they have in all, between them, or None on a
+/// build with neither backend, which has no device to ask. The worker in this process serves every
+/// card, so every card is what a generation here may use.
 fn memory() -> Option<(u64, u64)> {
     #[cfg(feature = "cuda")]
     {
-        let (free, total) = mmh3_cuda::memory_info().ok()?;
-        Some((free as u64, total as u64))
+        let mut sums = (0u64, 0u64);
+        for device in 0..crate::resident::device_count() {
+            let (free, total) = mmh3_cuda::memory_info_on(device).ok()?;
+            sums = (sums.0 + free as u64, sums.1 + total as u64);
+        }
+        Some(sums)
     }
     #[cfg(feature = "metal")]
     {
