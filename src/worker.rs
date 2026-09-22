@@ -1317,7 +1317,7 @@ fn session(
     // finds what the one before it read still loaded. Each request borrows them into a binding of
     // its own and lets go of them before it answers, since answering is a write down a socket and
     // the machine has other sessions that could be computing meanwhile.
-    let mut table = crate::resident::Table::new();
+    let mut table = crate::resident::Table::new(crate::resident::current_device());
     #[cfg(feature = "cuda")]
     let mut rdma: Option<Rdma> = None;
     #[cfg(feature = "cuda")]

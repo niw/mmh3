@@ -5,14 +5,16 @@
 //! the file alone but everything the load read from it, so a decoder built for one tile geometry
 //! is not the one built for another.
 //!
-//! One table serves the whole process on both backends. A model belongs to the device that read
-//! it rather than to the thread that asked for it, so the connection that reads a checkpoint is
-//! not the only one that gets to use it.
+//! One table serves each device on both backends. A model belongs to the device that read it
+//! rather than to the thread that asked for it, so the connection that reads a checkpoint is not
+//! the only one that gets to use it. Two devices hold their models apart and take their turns
+//! apart, which is what lets a machine compute on both at once.
 
 use mmh3_core::safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "cuda")]
@@ -32,6 +34,13 @@ pub type AudioDecoder = mmh3_metal::audio_vae::MetalAudioDecoder;
 pub type Dit = mmh3_cuda::dit::CudaDit;
 #[cfg(feature = "metal")]
 pub type Dit = mmh3_metal::dit::MetalDit;
+
+/// The most devices this process keeps models for, which is a table apiece. It matches what the
+/// backend computes on at once, and a Mac has the one.
+#[cfg(feature = "cuda")]
+pub const DEVICES: usize = mmh3_cuda::MAX_DEVICES;
+#[cfg(feature = "metal")]
+pub const DEVICES: usize = 1;
 
 /// The checkpoint a kept video decoder was built from, with the tile geometry it was built for.
 /// A request may ask for another geometry, which is another decoder.
@@ -100,8 +109,10 @@ impl Kind {
     }
 }
 
-/// The models this machine is holding on to.
+/// The models one device is holding on to.
 pub struct Models {
+    /// Which device they were read onto, for the lines that say what became of them.
+    device: usize,
     text_encoder: Slot<u64, TextEncoder>,
     video_decoder: Slot<VideoDecoderKey, VideoDecoder>,
     audio_decoder: Slot<u64, AudioDecoder>,
@@ -114,15 +125,10 @@ pub struct Models {
     lent: usize,
 }
 
-impl Default for Models {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl Models {
-    pub const fn new() -> Self {
+    pub const fn new(device: usize) -> Self {
         Self {
+            device,
             text_encoder: Slot::new(),
             video_decoder: Slot::new(),
             audio_decoder: Slot::new(),
@@ -213,7 +219,8 @@ impl Models {
             match read().map_err(Into::into) {
                 Err(error) if out_of_memory(&*error) => match self.release_oldest() {
                     Some(released) => println!(
-                        "the device had no memory left, so let go of {} and tried again",
+                        "device {} had no memory left, so let go of {} and tried again",
+                        self.device,
                         released.name()
                     ),
                     None => return Err(error),
@@ -297,7 +304,7 @@ impl Models {
     pub fn return_dit(&mut self, key: DitKey, dit: Dit) {
         self.lent -= 1;
         self.keep_dit(key, dit);
-        RETURNED.notify_all();
+        RETURNED[self.device].notify_all();
     }
 
     /// Keeps a DiT for the sessions that follow.
@@ -392,14 +399,22 @@ pub fn out_of_memory(error: &(dyn Error + 'static)) -> bool {
         .is_some_and(mmh3_metal::Error::is_out_of_memory)
 }
 
-/// Where one connection takes its models from, which is the table this process shares between all
-/// of them.
-#[derive(Default)]
-pub struct Table;
+/// Where one connection takes its models from, which is the table this process shares between
+/// every connection computing on the same device.
+pub struct Table {
+    device: usize,
+}
 
 impl Table {
-    pub const fn new() -> Self {
-        Self
+    /// A table on `device`. A connection that computes on one device takes its models from one
+    /// table, and two connections on two devices wait for nothing of each other's.
+    pub const fn new(device: usize) -> Self {
+        Self { device }
+    }
+
+    /// The device its models were read onto.
+    pub const fn device(&self) -> usize {
+        self.device
     }
 
     /// Lets go of everything when the device ran out of memory, so that a request that failed for
@@ -414,10 +429,11 @@ impl Table {
         if !out_of_memory(&**error) {
             return;
         }
+        let device = self.device;
         match self.borrow().release_all() {
             0 => {}
             released => println!(
-                "the device ran out of memory, so let go of {}",
+                "device {device} ran out of memory, so let go of {}",
                 counted(released)
             ),
         }
@@ -432,7 +448,7 @@ impl Table {
     ) -> Result<T, Box<dyn Error>> {
         let mut released = Vec::new();
         loop {
-            let mut models = locked();
+            let mut models = locked(self.device);
             match work(&mut models) {
                 Err(error) if out_of_memory(&*error) => {
                     if !make_room(models, &mut released) {
@@ -444,33 +460,34 @@ impl Table {
         }
     }
 
-    /// The models, for as long as the returned borrow lives, which is one request at a time across
-    /// the whole process. That is also all the device can do at once.
+    /// The models, for as long as the returned borrow lives, which is one request at a time on
+    /// this device. That is also all the device can do at once, and it is why the tables are apart:
+    /// one lock across the process would make a second device wait for the first.
     ///
     /// A session that panicked while holding the models left them loaded, and the next request may
     /// still use them: what that session was in the middle of is its own business and not theirs.
     pub fn borrow(&mut self) -> impl std::ops::DerefMut<Target = Models> + '_ {
-        locked()
+        locked(self.device)
     }
 }
 
-/// Told whenever a run puts back the DiT it was lent.
-static RETURNED: std::sync::Condvar = std::sync::Condvar::new();
+/// Told whenever a run puts back the DiT it was lent, one per device beside its table.
+static RETURNED: [Condvar; DEVICES] = [const { Condvar::new() }; DEVICES];
 
 /// How long a request that ran out of memory waits for a lent DiT. A run that panicked never puts
 /// its DiT back, and one still computing may not for a long while, so the request fails instead.
 const RETURN_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The models of this process, made on the first ask.
-fn shared() -> &'static std::sync::Mutex<Models> {
-    use std::sync::{Mutex, OnceLock};
+/// The models of each device, made on the first ask. A device nothing has asked anything of has
+/// no table at all, which is how the answers below tell the devices in use from the rest.
+static MODELS: [OnceLock<Mutex<Models>>; DEVICES] = [const { OnceLock::new() }; DEVICES];
 
-    static MODELS: OnceLock<Mutex<Models>> = OnceLock::new();
-    MODELS.get_or_init(|| Mutex::new(Models::new()))
+fn shared(device: usize) -> &'static Mutex<Models> {
+    MODELS[device].get_or_init(|| Mutex::new(Models::new(device)))
 }
 
-fn locked() -> std::sync::MutexGuard<'static, Models> {
-    shared()
+fn locked(device: usize) -> std::sync::MutexGuard<'static, Models> {
+    shared(device)
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
@@ -486,7 +503,8 @@ fn locked() -> std::sync::MutexGuard<'static, Models> {
 fn make_room(mut models: std::sync::MutexGuard<'static, Models>, released: &mut Vec<Kind>) -> bool {
     if let Some(kind) = models.release_oldest_except(released) {
         println!(
-            "the device had no memory left, so let go of {} and tried again",
+            "device {} had no memory left, so let go of {} and tried again",
+            models.device,
             kind.name()
         );
         released.push(kind);
@@ -495,16 +513,17 @@ fn make_room(mut models: std::sync::MutexGuard<'static, Models>, released: &mut 
     if models.lent == 0 {
         return false;
     }
-    println!("the device had no memory left, so waited for a run to put its DiT back");
+    let device = models.device;
+    println!("device {device} had no memory left, so waited for a run to put its DiT back");
     let lent = models.lent;
-    let (_models, waited) = RETURNED
+    let (_models, waited) = RETURNED[device]
         .wait_timeout_while(models, RETURN_TIMEOUT, |models| models.lent >= lent)
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     !waited.timed_out()
 }
 
-/// Runs work of this process's own, letting go of the model used least and trying again each time
-/// the device runs out of memory. A leader that lends its card to a worker in the same process
+/// Runs work of this process's own on the device this thread computes on, letting go of the model
+/// used least there and trying again each time the device runs out of memory. A leader that lends its card to a worker in the same process
 /// shares it with the models that worker keeps, and this is how what the leader does after the
 /// steps finds room beside them.
 ///
@@ -513,11 +532,12 @@ fn make_room(mut models: std::sync::MutexGuard<'static, Models>, released: &mut 
 pub fn with_room<T>(
     mut work: impl FnMut() -> Result<T, Box<dyn Error>>,
 ) -> Result<T, Box<dyn Error>> {
+    let device = current_device();
     let mut released = Vec::new();
     loop {
         match work() {
             Err(error) if out_of_memory(&*error) => {
-                if !make_room(locked(), &mut released) {
+                if !make_room(locked(device), &mut released) {
                     return Err(error);
                 }
             }
@@ -526,10 +546,30 @@ pub fn with_room<T>(
     }
 }
 
+/// The device this thread computes on, which is the table a connection takes its models from.
+pub fn current_device() -> usize {
+    #[cfg(feature = "cuda")]
+    return mmh3_cuda::current_device().unwrap_or(0);
+    #[cfg(feature = "metal")]
+    return 0;
+}
+
 /// What this machine is holding on to, for a caller that only means to say so and must not wait.
 /// None means a request has the models, which is itself an answer: the machine is busy.
+///
+/// NOTE: a machine computing on more than one device answers for all of them at once, since what a
+/// request would find here is what any of them is holding. One busy device makes the machine busy,
+/// which is the answer a caller can do something with.
 pub fn kept() -> Option<Vec<&'static str>> {
-    shared().try_lock().ok().map(|models| models.kept())
+    let mut names: Vec<&'static str> = Vec::new();
+    for models in MODELS.iter().filter_map(OnceLock::get) {
+        for name in models.try_lock().ok()?.kept() {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    Some(names)
 }
 
 /// Lets go of every model after `idle` without a request, so that a machine nothing is asking
@@ -541,12 +581,18 @@ pub fn release_when_idle(idle: Duration) {
     let watch = move || {
         loop {
             std::thread::sleep(interval);
-            let mut models = locked();
-            if models.idle_for().is_some_and(|quiet| quiet >= idle) {
+            for table in MODELS.iter().filter_map(OnceLock::get) {
+                let mut models = table
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !models.idle_for().is_some_and(|quiet| quiet >= idle) {
+                    continue;
+                }
                 match models.release_all() {
                     0 => {}
                     released => println!(
-                        "let go of {} after {} s with nothing to do",
+                        "device {} let go of {} after {} s with nothing to do",
+                        models.device,
                         counted(released),
                         idle.as_secs()
                     ),
@@ -559,5 +605,23 @@ pub fn release_when_idle(idle: Duration) {
         .spawn(watch)
     {
         eprintln!("warning: nothing will watch for idle memory: {error}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Table, kept, shared};
+
+    /// Two devices take their turns apart, which is the whole point of a table apiece: one holding
+    /// its models while it computes leaves the other free to compute too. The machine is busy
+    /// while any of them is, since that is the answer a caller can act on.
+    #[test]
+    fn a_device_holding_its_models_leaves_another_free() {
+        let mut first = Table::new(0);
+        let held = first.borrow();
+        assert!(shared(1).try_lock().is_ok());
+        assert!(kept().is_none());
+        drop(held);
+        assert_eq!(kept(), Some(Vec::new()));
     }
 }
