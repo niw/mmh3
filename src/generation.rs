@@ -359,7 +359,7 @@ pub fn sample(
                     // for a prompt of plain text: pictures and clips still go through the vision tower here.
                     if prompt_references.is_empty()
                         && let Some(context) =
-                            encode_on_worker(settings, &Tokenizer::h3().encode(&prompt))
+                            encode_on_worker(settings, &Tokenizer::h3().encode(&prompt))?
                     {
                         println!(
                             "encoded {} prompt tokens on a worker in {:.1} s",
@@ -738,13 +738,14 @@ pub fn sample(
 /// Nothing in this is a backend's. It asked on one of them only because the client it uses was
 /// that backend's once, and a machine with the smaller memory is the one that most wants the text
 /// encoder to load somewhere else.
-fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
+fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Result<Option<Tensor>, Box<dyn Error>> {
     use crate::worker::{TEXT_ENCODER_ROLE as ROLE, Worker};
     use mmh3_core::worker::CAPABILITY_ENCODE_TEXT;
 
     for address in &settings.workers {
         let mut worker = match Worker::connect(address, &settings.token) {
             Ok(worker) => worker,
+            // A machine that cannot be reached at all offered nothing, so the next one is asked.
             Err(error) => {
                 eprintln!("warning: worker {address}: {error}");
                 continue;
@@ -753,12 +754,12 @@ fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Option<Tensor> {
         if !worker.serves(CAPABILITY_ENCODE_TEXT) || worker.checkpoint(ROLE).is_none() {
             continue;
         }
-        match worker.encode_text(ROLE, ids) {
-            Ok(context) => return Some(context),
-            Err(error) => eprintln!("warning: worker {address}: {error}"),
-        }
+        return worker
+            .encode_text(ROLE, ids)
+            .map(Some)
+            .map_err(|error| format!("the prompt on {address}: {error}").into());
     }
-    None
+    Ok(None)
 }
 
 /// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.

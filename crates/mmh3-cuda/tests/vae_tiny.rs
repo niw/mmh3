@@ -92,3 +92,43 @@ fn matches_comfyui_golden_decode() {
         0.02,
     );
 }
+
+/// A chunk that was handed out and never came back ends the decode rather than being decoded here
+/// after all. What it asked for is the point: a decode that went on to the next chunk would have
+/// asked for that one too.
+#[test]
+fn a_chunk_that_never_came_back_ends_the_decode() {
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let decoder = CudaVideoDecoder::to_assemble(
+        &file,
+        "weight.",
+        metadata_number(&file, "tile_size"),
+        metadata_number(&file, "tile_overlap_min"),
+    )
+    .unwrap();
+    // Enough frames for more than one chunk, so that stopping at the first is visible.
+    let shape = tensor(&file, "input.latent").shape;
+    let (channels, frames) = (shape[0], 12);
+    let count = channels * frames * shape[2] * shape[3];
+    let latent = Tensor::new(
+        vec![channels, frames, shape[2], shape[3]],
+        (0..count)
+            .map(|index| ((index * 2_654_435_761) % 1013) as f32 / 1013.0 - 0.5)
+            .collect(),
+    );
+    assert!(decoder.plan(&latent).unwrap().chunks > 1);
+
+    let mut asked = Vec::new();
+    let decoded = decoder.decode_device_with(&latent, &mut |chunk| {
+        asked.push(chunk);
+        Err(format!("chunk {chunk} never came back"))
+    });
+    let Err(error) = decoded else {
+        panic!("the decode answered with frames for a chunk it never had");
+    };
+    assert!(
+        error.to_string().contains("never came back"),
+        "the decode ends with the reason the chunk gave, not {error}"
+    );
+    assert_eq!(asked, vec![0]);
+}

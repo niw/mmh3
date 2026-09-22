@@ -103,7 +103,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     );
     let started = Instant::now();
     #[cfg(feature = "cuda")]
-    let remote_waveform = remote_audio.take();
+    let remote_waveform = remote_audio.take()?;
     #[cfg(not(feature = "cuda"))]
     let remote_waveform: Option<mmh3_core::tensor::Tensor> = None;
     let waveform = match remote_waveform {
@@ -184,7 +184,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let waveform = remote_audio
-        .take()
+        .take()?
         .ok_or("no worker decoded the audio: name one that holds the audio VAE with --worker")?;
     println!(
         "took the audio from a worker in {:.1} s",

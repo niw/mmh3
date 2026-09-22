@@ -146,7 +146,7 @@ fn a_canvas_from_elsewhere_stands_in_for_the_one_built_here() {
         .map(|chunk| decoder.decode_chunk(&latent, chunk).unwrap())
         .collect();
     let frames = decoder
-        .decode_device_with(&latent, &mut |chunk| Some(canvases[chunk].clone()))
+        .decode_device_with(&latent, &mut |chunk| Ok(Some(canvases[chunk].clone())))
         .unwrap();
 
     assert_eq!(frames.to_pixels().unwrap().data, expected.data);
@@ -163,7 +163,7 @@ fn a_canvas_of_the_wrong_size_is_refused_and_the_chunk_decodes_here() {
     let expected = decoder.decode(&latent, false).unwrap().pixels;
     let short = decoder.decode_chunk(&latent, 0).unwrap().len() - 3;
     let frames = decoder
-        .decode_device_with(&latent, &mut |_| Some(vec![0u8; short]))
+        .decode_device_with(&latent, &mut |_| Ok(Some(vec![0u8; short])))
         .unwrap();
 
     assert_eq!(frames.to_pixels().unwrap().data, expected.data);
@@ -181,11 +181,32 @@ fn the_chunks_are_asked_for_in_order() {
     decoder
         .decode_device_with(&latent, &mut |chunk| {
             asked.push(chunk);
-            None
+            Ok(None)
         })
         .unwrap();
 
     assert_eq!(asked, (0..chunks).collect::<Vec<_>>());
+}
+
+/// A chunk handed to another machine that never came back is not this machine's to decode: it
+/// gave its chunks away because it has no weights to decode them with. The decode says so rather
+/// than filling the gap.
+#[test]
+fn a_chunk_that_never_came_back_ends_the_decode() {
+    let directory = tempfile::tempdir().unwrap();
+    let decoder = decoder(directory.path());
+    let latent = sample_latent(12);
+
+    let mut asked = Vec::new();
+    let Err(error) = decoder.decode_device_with(&latent, &mut |chunk| {
+        asked.push(chunk);
+        Err("the worker on 127.0.0.1 went away".into())
+    }) else {
+        panic!("a chunk that never came back should end the decode");
+    };
+
+    assert_eq!(asked, vec![0], "the decode stopped at the first chunk");
+    assert!(error.message.contains("went away"), "{}", error.message);
 }
 
 #[test]

@@ -10,6 +10,14 @@ use std::cell::OnceCell;
 
 pub const DEFAULT_TILE_SIZE: usize = 256;
 pub const DEFAULT_TILE_OVERLAP_MIN: usize = 64;
+
+/// What a decode is told when it asks for a chunk: the canvas another machine decoded, nothing
+/// when the chunk was never handed out and this machine is to decode it, or why a chunk that was
+/// handed out never came back. Only the middle answer is a reason to read the weights.
+///
+/// This is `std::result::Result` rather than the crate's own alias, since the error crosses from
+/// the caller's world rather than from the device.
+pub type RemoteCanvas = std::result::Result<Option<Vec<u8>>, String>;
 /// A video decoder that reads its configuration from the checkpoint's header and leaves the
 /// weights on disk until something asks it to decode.
 ///
@@ -287,7 +295,8 @@ impl MetalVideoDecoder {
     }
 
     pub fn decode(&self, latent: &Tensor, capture_first_tile: bool) -> Result<VideoDecoding> {
-        let (frames, first_tile) = self.decode_inner(latent, capture_first_tile, &mut |_| None)?;
+        let (frames, first_tile) =
+            self.decode_inner(latent, capture_first_tile, &mut |_| Ok(None))?;
         Ok(VideoDecoding {
             pixels: frames.to_pixels()?,
             first_tile,
@@ -306,16 +315,18 @@ impl MetalVideoDecoder {
     }
 
     pub fn decode_device(&self, latent: &Tensor) -> Result<MetalVideoFrames> {
-        self.decode_device_with(latent, &mut |_| None)
+        self.decode_device_with(latent, &mut |_| Ok(None))
     }
 
     /// `decode_device` where `remote` may answer with a canvas another machine decoded. It is
     /// asked for the chunks in order and answers with nothing for the ones this machine decodes,
-    /// so the temporal tail carries from one chunk to the next as it does without it.
+    /// so the temporal tail carries from one chunk to the next as it does without it. It answers
+    /// with an error for a chunk it handed out and did not get back, which ends the decode: a
+    /// machine that gave its chunks away has no weights to decode them with.
     pub fn decode_device_with(
         &self,
         latent: &Tensor,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+        remote: &mut dyn FnMut(usize) -> RemoteCanvas,
     ) -> Result<MetalVideoFrames> {
         Ok(self.decode_inner(latent, false, remote)?.0)
     }
@@ -339,14 +350,15 @@ impl MetalVideoDecoder {
         latent: &Tensor,
         emit: impl FnMut(&MetalVideoFrames) -> Result<()>,
     ) -> Result<()> {
-        self.decode_stream_with(latent, &mut |_| None, emit)
+        self.decode_stream_with(latent, &mut |_| Ok(None), emit)
     }
 
-    /// `decode_stream` where `remote` may answer with a canvas another machine decoded.
+    /// `decode_stream` where `remote` may answer with a canvas another machine decoded, or with
+    /// an error for one it handed out and did not get back.
     pub fn decode_stream_with(
         &self,
         latent: &Tensor,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+        remote: &mut dyn FnMut(usize) -> RemoteCanvas,
         mut emit: impl FnMut(&MetalVideoFrames) -> Result<()>,
     ) -> Result<()> {
         self.decode_chunks(latent, false, remote, &mut emit)?;
@@ -378,7 +390,7 @@ impl MetalVideoDecoder {
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+        remote: &mut dyn FnMut(usize) -> RemoteCanvas,
     ) -> Result<(MetalVideoFrames, Option<Tensor>)> {
         let mut output: Option<MetalVideoFrames> = None;
         let first = self.decode_chunks(latent, capture_first_tile, remote, &mut |part| {
@@ -591,7 +603,7 @@ impl MetalVideoDecoder {
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+        remote: &mut dyn FnMut(usize) -> RemoteCanvas,
         emit: &mut impl FnMut(&MetalVideoFrames) -> Result<()>,
     ) -> Result<Option<Tensor>> {
         let geometry = self.geometry(latent)?;
@@ -604,8 +616,13 @@ impl MetalVideoDecoder {
         let mut position = 0;
 
         for chunk in 0..chunks {
-            let canvas = match remote(chunk).and_then(|bytes| self.upload_canvas(&geometry, &bytes))
-            {
+            // A canvas that arrived but does not fit this latent is refused by the upload, which
+            // leaves the chunk to be decoded here. Only a chunk that was handed out and never came
+            // back is an error.
+            let arrived = remote(chunk)
+                .map_err(Error::new)?
+                .and_then(|bytes| self.upload_canvas(&geometry, &bytes));
+            let canvas = match arrived {
                 Some(canvas) => canvas,
                 None => {
                     let (canvas, tile) = self.fill_canvas(

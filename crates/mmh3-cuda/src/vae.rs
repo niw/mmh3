@@ -1194,7 +1194,7 @@ impl CudaVideoDecoder {
         capture_first_tile: bool,
     ) -> Result<VideoDecoding, Error> {
         let (pixels, [frames, height, width], first_tile) =
-            self.decode_on_device(latent, capture_first_tile, &mut |_| None)?;
+            self.decode_on_device(latent, capture_first_tile, &mut |_| Ok(None))?;
         Ok(VideoDecoding {
             pixels: Tensor::new(
                 vec![OUTPUT_CHANNELS, frames, height, width],
@@ -1206,16 +1206,20 @@ impl CudaVideoDecoder {
 
     /// Decodes a latent into RGB float32 frames retained on the GPU for native encoding.
     pub fn decode_device(&self, latent: &Tensor) -> Result<CudaVideoFrames, Error> {
-        self.decode_device_with(latent, &mut |_| None)
+        self.decode_device_with(latent, &mut |_| Ok(None))
     }
 
     /// `decode_device` where `remote` may answer with a canvas another machine decoded, which lets
     /// the caller start those before this one walks its own chunks. A chunk `remote` declines is
     /// decoded here.
+    /// `remote` answers with the canvas another machine decoded, `None` for a chunk this one
+    /// decodes itself, and an error for a chunk that was handed out and did not come back. A
+    /// caller that hands every chunk out never reads the weights, so that error is the whole of
+    /// what it can say about a chunk it will not see.
     pub fn decode_device_with(
         &self,
         latent: &Tensor,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+        remote: &mut dyn FnMut(usize) -> Result<Option<Vec<u8>>, String>,
     ) -> Result<CudaVideoFrames, Error> {
         let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false, remote)?;
         CudaVideoFrames::from_rgb(pixels, frames, height, width)
@@ -1225,7 +1229,7 @@ impl CudaVideoDecoder {
     /// match `Yuv420::from_pixels` of `decode`'s pixels.
     pub fn decode_yuv420(&self, latent: &Tensor) -> Result<Yuv420, Error> {
         let (pixels, [frames, height, width], _) =
-            self.decode_on_device(latent, false, &mut |_| None)?;
+            self.decode_on_device(latent, false, &mut |_| Ok(None))?;
         Ok(yuv420(&pixels, frames, height, width)?)
     }
 
@@ -1374,7 +1378,7 @@ impl CudaVideoDecoder {
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
-        remote: &mut dyn FnMut(usize) -> Option<Vec<u8>>,
+        remote: &mut dyn FnMut(usize) -> Result<Option<Vec<u8>>, String>,
     ) -> Result<(DeviceBuffer, [usize; 3], Option<Tensor>), Error> {
         let mut decode = self.context(latent)?;
         let (plane, canvas_frames) = (decode.plane, decode.canvas_frames);
@@ -1417,7 +1421,7 @@ impl CudaVideoDecoder {
         let mut first_tile = None;
         let mut position = 0;
         for chunk in 0..chunks {
-            match remote(chunk) {
+            match remote(chunk).map_err(Error::Model)? {
                 // A canvas another machine decoded, in the bytes this one would have produced.
                 Some(ref bytes) => {
                     let expected = OUTPUT_CHANNELS * canvas_frames * plane * size_of::<f32>();

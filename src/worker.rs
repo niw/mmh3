@@ -931,7 +931,7 @@ pub fn decode_whole_on_worker(
 /// A run's audio decoded on a worker while this machine decodes the video. The workers finish
 /// their chunks before the leader finishes its own, so the waveform costs nothing but the asking.
 pub struct RemoteAudio {
-    receiver: Receiver<Option<Tensor>>,
+    receiver: Receiver<Result<Option<Tensor>, String>>,
 }
 
 impl RemoteAudio {
@@ -954,24 +954,29 @@ impl RemoteAudio {
             // cannot is often another backend with nothing else to do, so the audio goes there
             // first. The sort is stable, so the order given decides within each group.
             candidates.sort_by_key(|worker| worker.serves(CAPABILITY_DIT_SHARD));
-            let mut answer = None;
+            let mut answer = Ok(None);
             for worker in &mut candidates {
-                match worker.decode_audio(&role, &latent) {
-                    Ok(waveform) => {
-                        answer = Some(waveform);
-                        break;
-                    }
-                    Err(error) => eprintln!("warning: the audio on {}: {error}", worker.address),
-                }
+                answer = match worker.decode_audio(&role, &latent) {
+                    Ok(waveform) => Ok(Some(waveform)),
+                    Err(error) => Err(format!("the audio on {}: {error}", worker.address)),
+                };
+                break;
             }
             let _ = sender.send(answer);
         });
         RemoteAudio { receiver }
     }
 
-    /// The waveform a worker decoded, or `None` when this machine should decode it after all.
-    pub fn take(self) -> Option<Tensor> {
-        self.receiver.recv().ok().flatten()
+    /// The waveform a worker decoded, or `None` when no worker holds an audio VAE and this
+    /// machine decodes it after all. An error means one holds it and could not: a worker that
+    /// answered the handshake and then failed is a machine to look at rather than one to work
+    /// around.
+    pub fn take(self) -> Result<Option<Tensor>, Box<dyn Error>> {
+        match self.receiver.recv() {
+            Ok(answer) => answer.map_err(Into::into),
+            // The thread went away without answering, which is not a worker's failure.
+            Err(_) => Ok(None),
+        }
     }
 }
 
@@ -1044,31 +1049,34 @@ impl RemoteCanvases {
         &self.delegated
     }
 
-    /// The canvas of `chunk` when another machine has it, waiting for it if it is still coming, and
-    /// `None` when this machine should decode it after all.
-    pub fn take(&mut self, chunk: usize) -> Option<Vec<u8>> {
+    /// The canvas of `chunk` when another machine has it, waiting for it if it is still coming,
+    /// and `None` for one that was handed to nobody and is this machine's to decode.
+    ///
+    /// A chunk that was handed out and did not come back is an error. A worker that answered the
+    /// handshake and then failed is a machine to look at, and decoding its share here would mean
+    /// reading the weights this machine was meant to be without, to finish a run that has already
+    /// lost a rank of its steps.
+    pub fn take(&mut self, chunk: usize) -> Result<Option<Vec<u8>>, String> {
         if !self.delegated.contains(&chunk) {
-            return None;
+            return Ok(None);
         }
         loop {
             if let Some(values) = self.arrived.remove(&chunk) {
-                return Some(values);
+                return Ok(Some(values));
             }
             match self.receiver.recv() {
                 Ok((arrived, Ok(values))) => {
                     self.arrived.insert(arrived, values);
                 }
                 Ok((arrived, Err(error))) => {
-                    eprintln!("warning: chunk {arrived} comes back here: {error}");
                     self.delegated.retain(|other| *other != arrived);
-                    if arrived == chunk {
-                        return None;
-                    }
+                    return Err(format!("chunk {arrived} never came back: {error}"));
                 }
-                // Every worker is gone, so the rest is this machine's.
                 Err(_) => {
                     self.delegated.retain(|other| *other != chunk);
-                    return None;
+                    return Err(format!(
+                        "chunk {chunk} never came back: every worker is gone"
+                    ));
                 }
             }
         }
