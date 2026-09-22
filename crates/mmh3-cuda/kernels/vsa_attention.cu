@@ -3,9 +3,9 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
-#include <mutex>
 
 #include "attention_workspace.cuh"
+#include "device.cuh"
 #include "tensor_core.cuh"
 
 // VSA over BF16 heads of 128 (see mmh3-core's dit/vsa.rs for the algorithm). The sequence is
@@ -283,24 +283,16 @@ int launch_select(const Mmh3VsaWorkspace &workspace, int tiles, int heads, int p
                                               coarse, stream);
         }
     }
-    // The limit only grows, so a launch never meets a smaller limit that another thread set.
-    static std::mutex mutex;
-    static size_t configured_shared = 0;
+    static Mmh3SharedMemoryLimit limit;
     static const size_t static_shared = [] {
         cudaFuncAttributes attributes{};
         cudaFuncGetAttributes(&attributes, select_kernel<QUERIES>);
         return attributes.sharedSizeBytes;
     }();
     if (static_shared + shared > 48 * 1024) {
-        std::lock_guard<std::mutex> lock(mutex);
-        if (shared > configured_shared) {
-            cudaError_t status = cudaFuncSetAttribute(select_kernel<QUERIES>,
-                                                      cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                                      static_cast<int>(shared));
-            if (status != cudaSuccess) {
-                return static_cast<int>(status);
-            }
-            configured_shared = shared;
+        const cudaError_t status = mmh3_raise_shared_memory(limit, select_kernel<QUERIES>, shared);
+        if (status != cudaSuccess) {
+            return static_cast<int>(status);
         }
     }
     select_kernel<QUERIES>

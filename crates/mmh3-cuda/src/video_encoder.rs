@@ -122,10 +122,18 @@ const TIME_STRIDES: [usize; 4] = [1, 2, 2, 1];
 /// is handed to the GEMM without a round trip through memory, which the 3 x 3 kernels' twenty-seven
 /// columns per channel would otherwise dominate: two thirds of the L2 takes 448 x 256 from 3.4 to
 /// 2.3 seconds on a GB10.
+///
+/// The L2 is a property of the card, so the answer is kept per device: a slice sized for one card
+/// would spill on a smaller one.
 fn column_slice_bytes() -> usize {
-    static BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *BYTES.get_or_init(|| {
-        let cache = crate::device_info(0).map_or(0, |info| info.l2_cache_bytes.max(0) as usize);
+    use std::sync::OnceLock;
+
+    static BYTES: [OnceLock<usize>; crate::MAX_DEVICES] =
+        [const { OnceLock::new() }; crate::MAX_DEVICES];
+    let device = crate::current_device().unwrap_or(0);
+    *BYTES[device].get_or_init(|| {
+        let cache =
+            crate::device_info(device).map_or(0, |info| info.l2_cache_bytes.max(0) as usize);
         (cache / 3 * 2).clamp(16 << 20, 256 << 20)
     })
 }

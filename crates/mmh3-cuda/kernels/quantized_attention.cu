@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include "attention_workspace.cuh"
+#include "device.cuh"
 #include "tensor_core.cuh"
 
 // Quantized DiT attention: Q/K use symmetric INT8 scales per head and 64-token block, or per VSA
@@ -553,8 +554,9 @@ int launch_attention(const Mmh3QuantizedWorkspace &workspace, __nv_bfloat16 *out
                      int heads, Mmh3AttentionLayout layout, float scale, Mmh3SparseWorkspace sparse,
                      int blocks, Mmh3VsaWorkspace vsa, const __nv_bfloat16 *gate,
                      int64_t gate_stride, cudaStream_t stream) {
-    static const cudaError_t configured = cudaFuncSetAttribute(
-        attention_kernel<PATTERN>, cudaFuncAttributeMaxDynamicSharedMemorySize, SHARED_BYTES);
+    static Mmh3SharedMemory shared_memory;
+    const cudaError_t configured =
+        mmh3_configure_shared_memory(shared_memory, attention_kernel<PATTERN>, SHARED_BYTES);
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }
