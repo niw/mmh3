@@ -11,7 +11,8 @@ const USAGE: &str = "usage:
                 [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
-                [--worker HOST[:PORT]]... [--shard-dit N] [--token FILE] [--vram-budget GB] [--ffmpeg [FFMPEG_ARGUMENTS...]]
+                [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
+                [--token FILE] [--vram-budget GB] [--ffmpeg [FFMPEG_ARGUMENTS...]]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
@@ -38,18 +39,20 @@ Arguments normally go after the generated inputs and before the output path.
 For a full invocation, use whole-argument {video}, {audio}, and {out} placeholders. No shell is invoked.
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
 directory has it.
---shard-dit N splits every DiT step across at most N workers, Ulysses style. This machine runs no block of a
-shared step: it hands the step out and puts the parts back together, and lends itself a worker so that its own
-GPU still takes a rank. That one is counted last, after the ones --worker names. Without the option every
-worker that can take a rank does, which is what naming one asks for. --shard-dit 0 keeps the DiT here.
+--worker borrows another machine running `mmh3 worker`, repeat it for several. --local-worker starts one in this
+process, so that this machine's own GPU takes part as a worker rather than as the leader. A leader reads no
+model at all: it hands out the prompt, every step and every chunk of the decode, and puts what comes back
+together. What no machine is asked for, it does itself.
+--worker-units names what the machine before it may be asked for, out of steps, prompt, video and audio,
+separated by commas. Without it a machine may be asked for anything it serves. Every step goes to the machines
+allowed steps, in the order given, which is the order their ranks are numbered in. Where none is allowed them,
+every step runs here.
 --vram-budget GB holds a run to that much device memory, failing an allocation past it as a device that small
 would. A worker lets go of the model it has used least whenever an allocation finds no memory left.
 --idle-unload SECONDS lets a worker go of every model it holds after that long with nothing to do, so that a
 machine nobody is generating on is a machine with its memory back. Without it a worker holds what it loaded.
---worker borrows another machine running `mmh3 worker`, repeat it for several. A worker that holds the text
-encoder encodes the prompt, so this machine never loads it. A run with workers reads no model at all: it hands
-every step and every chunk of the decode out, and puts what comes back together. What no worker offers, this
-machine does itself. What a worker answered for and then failed at ends the run.";
+A machine that cannot be reached, or that holds no checkpoint for what it was asked, is passed over. One that
+answered and then failed ends the run.";
 
 fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();

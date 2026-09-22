@@ -31,6 +31,46 @@ pub fn parse_options<'a>(
     Ok(options)
 }
 
+/// One machine a run was told to borrow: the address of a `--worker`, or None for the
+/// `--local-worker` this process starts for itself, with the units of the `--worker-units` that
+/// followed it. No units means every one the machine can serve.
+pub struct Borrowed<'a> {
+    pub address: Option<&'a str>,
+    pub units: Option<&'a str>,
+}
+
+/// The machines of `--worker` and `--local-worker`, in the order they were given, which is the
+/// order their ranks are numbered in. A `--worker-units` belongs to the machine before it, and
+/// one before any machine, or a second one for the same machine, is an error.
+pub fn borrowed(arguments: &[String]) -> Result<Vec<Borrowed<'_>>, Box<dyn Error>> {
+    let mut borrowed: Vec<Borrowed> = Vec::new();
+    let mut remaining = arguments.iter().peekable();
+    while let Some(argument) = remaining.next() {
+        match argument.strip_prefix("--") {
+            Some("worker") => borrowed.push(Borrowed {
+                address: Some(remaining.next().ok_or("--worker needs an address")?),
+                units: None,
+            }),
+            Some("local-worker") => borrowed.push(Borrowed {
+                address: None,
+                units: None,
+            }),
+            Some("worker-units") => {
+                let units = remaining.next().ok_or("--worker-units needs its units")?;
+                let machine = borrowed
+                    .last_mut()
+                    .ok_or("--worker-units belongs to the --worker or --local-worker before it")?;
+                if machine.units.is_some() {
+                    return Err("one --worker-units for each machine".into());
+                }
+                machine.units = Some(units);
+            }
+            _ => {}
+        }
+    }
+    Ok(borrowed)
+}
+
 /// Every value of `--name` in `arguments` in their order, for an option that may repeat. Parse the
 /// arguments with `parse_options` first, which rejects values that start with `--`.
 pub fn option_values<'a>(arguments: &'a [String], name: &str) -> Vec<&'a str> {
@@ -174,6 +214,56 @@ mod tests {
             ["cat.png", "dog.jpg"]
         );
         assert!(option_values(&arguments, "prompt").is_empty());
+    }
+
+    #[test]
+    fn units_belong_to_the_machine_before_them() {
+        let given = arguments(&[
+            "--seed",
+            "3",
+            "--local-worker",
+            "--worker-units",
+            "video",
+            "--worker",
+            "spark.local",
+            "--worker",
+            "mac.local:7834",
+            "--worker-units",
+            "steps,prompt",
+        ]);
+        let borrowed = borrowed(&given).unwrap();
+        let read: Vec<_> = borrowed
+            .iter()
+            .map(|machine| (machine.address, machine.units))
+            .collect();
+        assert_eq!(
+            read,
+            vec![
+                (None, Some("video")),
+                (Some("spark.local"), None),
+                (Some("mac.local:7834"), Some("steps,prompt")),
+            ]
+        );
+    }
+
+    #[test]
+    fn units_without_a_machine_or_twice_over_are_refused() {
+        for values in [
+            &["--worker-units", "steps"][..],
+            &["--seed", "3", "--worker-units", "steps"][..],
+            &[
+                "--worker",
+                "a",
+                "--worker-units",
+                "steps",
+                "--worker-units",
+                "video",
+            ][..],
+            &["--worker"][..],
+            &["--worker", "a", "--worker-units"][..],
+        ] {
+            assert!(borrowed(&arguments(values)).is_err(), "{values:?}");
+        }
     }
 
     #[test]

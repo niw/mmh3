@@ -60,11 +60,6 @@ use mmh3_metal::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
 pub(crate) type DitStep = mmh3_cuda::dit::DitOutputs;
 #[cfg(feature = "metal")]
 pub(crate) type DitStep = mmh3_metal::dit::DitOutput;
-/// The exchange a rank uses when it shares a step with nobody.
-#[cfg(feature = "cuda")]
-pub(crate) type SoleExchange = mmh3_cuda::shard::WholeExchange;
-#[cfg(feature = "metal")]
-pub(crate) type SoleExchange = mmh3_metal::shard::WholeExchange;
 
 /// Checkpoints a worker offers, as `(role, path inside the models directory)`. Roles name what a
 /// file is for, since the file names differ between machines.

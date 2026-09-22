@@ -2,13 +2,13 @@
 
 use crate::USAGE;
 use mmh3::cli::parse_options;
-use mmh3::generation::{OPTIONS, Settings, sample};
+use mmh3::generation::{FLAGS, OPTIONS, Settings, sample};
 use mmh3_core::safetensors::write_f32;
 use std::error::Error;
 use std::path::Path;
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let options = parse_options(arguments, &[OPTIONS, &["out"]].concat(), &[], USAGE)?;
+    let options = parse_options(arguments, &[OPTIONS, &["out"]].concat(), FLAGS, USAGE)?;
     let path = Path::new(options.get("out").ok_or(USAGE)?);
     let settings = Settings::parse(&options, arguments)?;
     let (video, audio) = sample(&options, &settings)?;

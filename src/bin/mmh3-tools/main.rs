@@ -44,7 +44,8 @@ const USAGE: &str = "usage:
                     [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
                     [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X]
                     [--sparse-start X] [--vsa-sparsity X]
-                    [--worker HOST[:PORT]]... [--shard-dit N] [--token FILE] [--vram-budget GB]
+                    [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker] [--token FILE]
+                    [--vram-budget GB]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 

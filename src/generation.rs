@@ -51,7 +51,7 @@ pub const OPTIONS: &[&str] = &[
     "lora-strength",
     "lora-mode",
     "worker",
-    "shard-dit",
+    "worker-units",
     "token",
     "attention",
     "attention-precision",
@@ -61,6 +61,55 @@ pub const OPTIONS: &[&str] = &[
     "vsa-sparsity",
     "vram-budget",
 ];
+
+/// The options that stand alone, taking nothing after them.
+pub const FLAGS: &[&str] = &["local-worker"];
+
+/// A machine this run may borrow, and what it may be asked for.
+pub struct Machine {
+    pub address: String,
+    /// The capabilities this run will ask it for, which is every one it serves unless
+    /// `--worker-units` named fewer.
+    pub units: u32,
+}
+
+/// Every unit there is, for a machine that was named with no units of its own.
+fn every_unit() -> u32 {
+    use mmh3_core::worker::{
+        CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD,
+        CAPABILITY_ENCODE_TEXT,
+    };
+
+    CAPABILITY_DIT_SHARD
+        | CAPABILITY_ENCODE_TEXT
+        | CAPABILITY_DECODE_VIDEO
+        | CAPABILITY_DECODE_AUDIO
+}
+
+/// The units of one `--worker-units`, as the capabilities a worker announces.
+fn units(text: &str) -> Result<u32, Box<dyn Error>> {
+    use mmh3_core::worker::{
+        CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO, CAPABILITY_DIT_SHARD,
+        CAPABILITY_ENCODE_TEXT,
+    };
+
+    text.split(',')
+        .try_fold(0, |units, unit| -> Result<u32, Box<dyn Error>> {
+            Ok(units
+                | match unit.trim() {
+                    "steps" => CAPABILITY_DIT_SHARD,
+                    "prompt" => CAPABILITY_ENCODE_TEXT,
+                    "video" => CAPABILITY_DECODE_VIDEO,
+                    "audio" => CAPABILITY_DECODE_AUDIO,
+                    other => {
+                        return Err(format!(
+                            "--worker-units takes steps, prompt, video or audio, not {other}"
+                        )
+                        .into());
+                    }
+                })
+        })
+}
 
 /// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
 /// as the reference pipeline fixes it.
@@ -101,16 +150,66 @@ pub struct Settings {
     pub seed: u64,
     pub shift_video: f32,
     pub shift_audio: f32,
-    /// Addresses of `--worker`, machines this run may borrow.
-    pub workers: Vec<String>,
+    /// The machines of `--worker` and `--local-worker`, in the order they were given, which is
+    /// the order their ranks are numbered in.
+    pub workers: Vec<Machine>,
     /// The shared secret of `--token`, empty when there is none.
     pub token: String,
 }
 
 impl Settings {
-    /// The worker addresses as borrowed strings, for `worker::connect_all`.
-    pub fn workers_borrowed(&self) -> Vec<&str> {
-        self.workers.iter().map(String::as_str).collect()
+    /// The same as `workers_for`, for a caller that keeps the addresses.
+    pub fn workers_owned(&self, unit: u32) -> Vec<String> {
+        self.workers_for(unit)
+            .into_iter()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// The machines this run may ask for `unit`, in the order they were given.
+    pub fn workers_for(&self, unit: u32) -> Vec<&str> {
+        self.workers
+            .iter()
+            .filter(|machine| machine.units & unit != 0)
+            .map(|machine| machine.address.as_str())
+            .collect()
+    }
+
+    /// The machines of `--worker` and `--local-worker`, with the units each may be asked for. A
+    /// `--local-worker` is started here, so that this machine's own GPU takes part as a worker
+    /// rather than as the leader: a leader reads no model.
+    fn machines(
+        options: &HashMap<&str, &str>,
+        arguments: &[String],
+        token: &str,
+    ) -> Result<Vec<Machine>, Box<dyn Error>> {
+        let mut machines = Vec::new();
+        for borrowed in crate::cli::borrowed(arguments)? {
+            let units = match borrowed.units {
+                Some(text) => units(text)?,
+                None => every_unit(),
+            };
+            let address = match borrowed.address {
+                Some(address) => address.to_owned(),
+                None => Self::worker_here(options, token)?,
+            };
+            machines.push(Machine { address, units });
+        }
+        Ok(machines)
+    }
+
+    /// The address of a worker started in this process for `--local-worker`.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn worker_here(options: &HashMap<&str, &str>, token: &str) -> Result<String, Box<dyn Error>> {
+        let models = crate::models::models_directory(options)
+            .ok_or("--local-worker needs a models directory, from --models DIR or MMH3_MODELS")?;
+        crate::worker::worker_here(&models, token)
+            .ok_or_else(|| "no worker could start on this machine".into())
+    }
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    fn worker_here(_options: &HashMap<&str, &str>, _token: &str) -> Result<String, Box<dyn Error>> {
+        Err("this build runs nothing of its own, so it has no --local-worker to give".into())
     }
 
     /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
@@ -121,6 +220,11 @@ impl Settings {
     ) -> Result<Self, Box<dyn Error>> {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         crate::resident::take_budget(options)?;
+        let token = match options.get("token") {
+            Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
+            None => String::new(),
+        };
+        let workers = Self::machines(options, arguments, &token)?;
         #[cfg(feature = "metal")]
         {
             crate::metal::validate_options(options)?;
@@ -128,9 +232,10 @@ impl Settings {
             // cannot run it can refuse now rather than after encoding a prompt. A run that means
             // to hand them out is judged by `load_dit`, which is reached only if it ends up
             // running them here after all.
-            let hands_out = !option_values(arguments, "worker").is_empty()
-                && option_number(options, "shard-dit", 1).unwrap_or(1) > 0;
-            if !hands_out {
+            if workers
+                .iter()
+                .all(|machine| machine.units & mmh3_core::worker::CAPABILITY_DIT_SHARD == 0)
+            {
                 crate::metal::validate_step_options(options)?;
             }
         }
@@ -241,26 +346,6 @@ impl Settings {
                 picture.resize(reference_width, reference_height)
             })
             .collect();
-        let token = match options.get("token") {
-            Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
-            None => String::new(),
-        };
-        #[allow(unused_mut)]
-        let mut workers: Vec<String> = option_values(arguments, "worker")
-            .iter()
-            .map(|address| (*address).to_owned())
-            .collect();
-        // A run that shares its steps hands every one of them to a worker, so a machine with a
-        // backend lends itself one rather than sitting out its own run. It goes last, so that
-        // `--shard-dit N` still means the first N machines named.
-        #[cfg(any(feature = "cuda", feature = "metal"))]
-        if !workers.is_empty()
-            && option_number(options, "shard-dit", 1).unwrap_or(1) > 0
-            && let Some(models) = crate::models::models_directory(options)
-            && let Some(address) = crate::worker::worker_here(&models, &token)
-        {
-            workers.push(address);
-        }
         Ok(Settings {
             shape,
             keyframes,
@@ -604,24 +689,6 @@ pub fn sample(
     #[cfg(any(feature = "cuda", feature = "metal"))]
     #[allow(unused_variables)]
     let dit = dit;
-    // `--shard-dit 1` runs the same path with nothing to carry anywhere, which tells the cost of
-    // the machinery apart from the cost of the link.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    if sharing.is_none()
-        && let Some(dit) = &dit
-    {
-        sharing = alone_shard(
-            options,
-            &config,
-            &context,
-            &video,
-            &audio,
-            &keyframes,
-            &references,
-            settings,
-        )
-        .map(|shard| Sharing::Alone(sole_exchange(dit), shard));
-    }
     #[cfg(feature = "metal")]
     let prepared = match &dit {
         Some(dit) => Some(dit.prepare_text(&context)?),
@@ -655,26 +722,6 @@ pub fn sample(
                     step,
                 )?;
                 (velocity, None)
-            }
-            #[cfg(any(feature = "cuda", feature = "metal"))]
-            Some(Sharing::Alone(exchange, shard)) => {
-                let dit = dit
-                    .as_ref()
-                    .ok_or("a step to take here and no DiT to take it")?;
-                let began = Instant::now();
-                let (part, timing) = crate::worker::share_a_step(
-                    dit,
-                    &inputs,
-                    step_sparse.as_ref(),
-                    shard,
-                    exchange,
-                    || began.elapsed(),
-                )?;
-                if !timing.is_empty() {
-                    println!("  {timing}");
-                }
-                let outputs = dit.assemble_velocity(&inputs, step_sparse.as_ref(), &[part])?;
-                (whole_velocity(&outputs), outputs.routed_fraction)
             }
             // A run that shares a step with nobody takes the whole one, which on Metal goes
             // through the text this run refined once rather than through the DiT directly.
@@ -742,7 +789,7 @@ fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Result<Option<Tensor>, 
     use crate::worker::{TEXT_ENCODER_ROLE as ROLE, Worker};
     use mmh3_core::worker::CAPABILITY_ENCODE_TEXT;
 
-    for address in &settings.workers {
+    for address in settings.workers_for(CAPABILITY_ENCODE_TEXT) {
         let mut worker = match Worker::connect(address, &settings.token) {
             Ok(worker) => worker,
             // A machine that cannot be reached at all offered nothing, so the next one is asked.
@@ -947,9 +994,8 @@ fn prepare_workers(
     use crate::worker::{Worker, digest};
     use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint};
 
-    let ranks =
-        crate::cli::option_number(options, "shard-dit", settings.workers.len()).unwrap_or(0);
-    if ranks < 1 || settings.workers.is_empty() {
+    let ranks = settings.workers_for(CAPABILITY_DIT_SHARD);
+    if ranks.is_empty() {
         return Vec::new();
     }
     let Ok(path) = crate::models::option_path(options, "dit", dit_file) else {
@@ -966,10 +1012,7 @@ fn prepare_workers(
         }
     };
     let mut workers = Vec::new();
-    for address in &settings.workers {
-        if workers.len() >= ranks {
-            break;
-        }
+    for address in ranks {
         let mut worker = match Worker::connect(address, &settings.token) {
             Ok(worker) => worker,
             Err(error) => {
@@ -1008,26 +1051,13 @@ fn shard_target(
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
     use mmh3_core::shard::Shard;
-    use mmh3_core::worker::{Checkpoint, OpenSession};
+    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
 
-    // A worker that only encodes the prompt and decodes some chunks is worth 9% of a run, which is
-    // not worth a second machine. Sharing every step is worth 35%, so it is what `--worker` does
-    // unless `--shard-dit 0` says otherwise.
-    let asked = options.contains_key("shard-dit");
-    // Without `--shard-dit`, every worker that can take a rank does: naming a machine is what
-    // asks for it. With it, the number is a cap on the ranks rather than a promise of them.
-    let ranks = crate::cli::option_number(options, "shard-dit", settings.workers.len()).ok()?;
-    if ranks < 1 {
-        // Zero keeps the DiT here. With no worker to fill a rank, `alone_shard` runs the same
-        // path on this machine, which tells the cost of the machinery apart from the wire.
-        return None;
-    }
-    if settings.workers.is_empty() {
-        // One rank is the path with nobody to carry anything to, which `alone_shard` picks up, so
-        // saying the DiT stays here would be answered two lines later by a shared step.
-        if asked && ranks != 1 {
-            println!("sharing a step needs a worker, so the DiT stays here");
-        }
+    // A machine that only encodes the prompt and decodes some chunks is worth 9% of a run, which
+    // is not worth a second machine. Sharing every step is worth 35%, so a machine named with no
+    // units of its own takes a rank as well.
+    if settings.workers_for(CAPABILITY_DIT_SHARD).is_empty() {
+        // Nobody may be asked for a step, so every one of them runs here.
         return None;
     }
     let file = if references.is_empty() {
@@ -1054,7 +1084,6 @@ fn shard_target(
 
     // The workers `prepare_workers` reached, which are already reading this DiT.
     let mut workers = workers;
-    workers.truncate(ranks);
     // What each rank says it can do. This machine is not one of them: it hands the work out and
     // puts the answers together, and runs no block of its own.
     let mut measured: Vec<Option<mmh3_core::worker::Speed>> =
@@ -1083,13 +1112,11 @@ fn shard_target(
         measured.retain(Option::is_some);
     }
     if workers.is_empty() {
-        if asked {
-            println!("no worker can take a share of a step, so the DiT stays here");
-        }
+        println!("no worker can take a share of a step, so the DiT stays here");
         return None;
     }
     // A rank that cannot be filled is one the run does without: the ranks are what the machines
-    // that answered add up to, not what `--shard-dit` asked for.
+    // that answered add up to, not what the arguments named.
     let ranks = workers.len();
     let inputs = DitInputs {
         video: video.clone(),
@@ -1234,27 +1261,10 @@ fn session_adapters(
     Ok(adapters)
 }
 
-/// How a step is shared out, which is either with another machine or, for `--shard-dit 1`, with
-/// nobody at all so that the machinery can be timed on its own.
+/// How a step is shared out. There is one way now: every step goes to the workers, and this
+/// machine puts the parts back together.
 enum Sharing<'a> {
-    /// Every step goes to the workers and this machine only puts the parts back together, so it
-    /// holds no exchange and no cut of its own.
     With(Box<crate::worker::Coordinator<'a>>),
-    /// The same path with one rank and nothing to carry anywhere, which needs a backend here.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    Alone(crate::worker::SoleExchange, mmh3_core::shard::Shard),
-}
-
-/// The exchange a rank uses when it shares with nobody. One backend's is made from the device it
-/// computes on and the other's needs nothing, so the difference lives here rather than at the use.
-#[cfg(feature = "cuda")]
-fn sole_exchange(_dit: &crate::resident::Dit) -> crate::worker::SoleExchange {
-    crate::worker::SoleExchange::new()
-}
-
-#[cfg(feature = "metal")]
-fn sole_exchange(dit: &crate::resident::Dit) -> crate::worker::SoleExchange {
-    crate::worker::SoleExchange::new(dit.device())
 }
 
 /// The GEMM choices a leader hands its workers, and the key that says whose they are. A backend
@@ -1287,40 +1297,4 @@ fn attention_precision(options: &HashMap<&str, &str>) -> u8 {
 #[cfg(not(feature = "cuda"))]
 fn attention_precision(_options: &HashMap<&str, &str>) -> u8 {
     0
-}
-
-#[cfg(any(feature = "cuda", feature = "metal"))]
-/// The shard of a run that shares a step with nobody. One rank covers the whole sequence and every
-/// head, so the result is the whole step's, and what is left is the gathers and the waits.
-#[allow(clippy::too_many_arguments)]
-fn alone_shard(
-    options: &HashMap<&str, &str>,
-    config: &mmh3_core::dit::config::DitConfig,
-    context: &Tensor,
-    video: &Tensor,
-    audio: &Tensor,
-    keyframes: &[mmh3_core::dit::inputs::Keyframe],
-    references: &[mmh3_core::dit::inputs::Reference],
-    settings: &Settings,
-) -> Option<mmh3_core::shard::Shard> {
-    use mmh3_core::dit::inputs::DitInputs;
-    use mmh3_core::dit::layout::PackedLayout;
-
-    if crate::cli::option_number(options, "shard-dit", 0).ok()? != 1 {
-        return None;
-    }
-    let inputs = DitInputs {
-        video: video.clone(),
-        audio: audio.clone(),
-        context: context.clone(),
-        context_modalities: Vec::new(),
-        keyframes: keyframes.to_vec(),
-        references: references.to_vec(),
-        sigma: 1.0,
-        shift_video: settings.shift_video,
-        shift_audio: settings.shift_audio,
-    };
-    let tokens = PackedLayout::for_inputs(&inputs).len();
-    println!("sharing every step with nobody, {tokens} tokens in one piece");
-    Some(mmh3_core::shard::Shard::even(0, 1, tokens, config.heads, 1))
 }

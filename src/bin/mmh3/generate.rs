@@ -2,11 +2,12 @@
 
 use crate::USAGE;
 use mmh3::cli::{parse_options, split_ffmpeg_arguments};
-use mmh3::generation::{OPTIONS, Settings, sample};
+use mmh3::generation::{FLAGS, OPTIONS, Settings, sample};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3::models::{AUDIO_VAE_FILE, option_path, video_vae_path};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use mmh3_core::safetensors::SafeTensors;
+use mmh3_core::worker::{CAPABILITY_DECODE_AUDIO, CAPABILITY_DECODE_VIDEO};
 use std::error::Error;
 use std::path::Path;
 
@@ -33,7 +34,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(
         arguments,
         &[OPTIONS, &["out", "audio-vae"]].concat(),
-        &[],
+        FLAGS,
         USAGE,
     )?;
     #[cfg(feature = "cuda")]
@@ -55,7 +56,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     // the video before this machine finishes blending its own and is idle until then.
     #[cfg(feature = "cuda")]
     let remote_audio = mmh3::worker::RemoteAudio::start(
-        settings.workers.clone(),
+        settings.workers_owned(CAPABILITY_DECODE_AUDIO),
         settings.token.clone(),
         mmh3::worker::AUDIO_VAE_ROLE,
         &audio,
@@ -66,14 +67,15 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let file = SafeTensors::open(Path::new(&path))?;
     // A run with workers hands every chunk out and only puts the canvases together, so it reads
     // the weights that made them only if one never arrives.
-    let decoder = match settings.workers.is_empty() {
+    let chunks_out = settings.workers_for(CAPABILITY_DECODE_VIDEO);
+    let decoder = match chunks_out.is_empty() {
         true => VideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?,
         false => VideoDecoder::to_assemble(&file, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?,
     };
     // Chunks of the decode go to whichever machines answer, and this one walks the rest while
     // they work. A chunk that does not come back is decoded here.
     let mut remote = mmh3::worker::RemoteCanvases::start(
-        mmh3::worker::connect_all(&settings.workers_borrowed(), &settings.token),
+        mmh3::worker::connect_all(&chunks_out, &settings.token),
         mmh3::worker::VIDEO_VAE_ROLE,
         &video,
         decoder.plan(&video)?.chunks,
@@ -155,7 +157,7 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(
         arguments,
         &[OPTIONS, &["out", "audio-vae"]].concat(),
-        &[],
+        FLAGS,
         USAGE,
     )?;
     let video_path = Path::new(options.get("out").ok_or(USAGE)?).to_path_buf();
@@ -176,15 +178,20 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     // The audio goes on a connection of its own while the video decodes, as it does anywhere else.
     let remote_audio = RemoteAudio::start(
-        settings.workers.clone(),
+        settings.workers_owned(CAPABILITY_DECODE_AUDIO),
         settings.token.clone(),
         AUDIO_VAE_ROLE,
         &audio,
     );
 
     let started = Instant::now();
-    let frames = decode_whole_on_worker(&settings.workers, &settings.token, VIDEO_VAE_ROLE, &video)
-        .ok_or("no worker decoded the video: name one that holds the video VAE with --worker")?;
+    let frames = decode_whole_on_worker(
+        &settings.workers_owned(CAPABILITY_DECODE_VIDEO),
+        &settings.token,
+        VIDEO_VAE_ROLE,
+        &video,
+    )
+    .ok_or("no worker decoded the video: name one that holds the video VAE with --worker")?;
     println!(
         "took {} frames from a worker in {:.1} s",
         frames.frames,
