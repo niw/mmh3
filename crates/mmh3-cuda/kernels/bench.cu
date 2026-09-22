@@ -6,6 +6,8 @@
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+#include "device.cuh"
+
 extern "C" int mmh3_attention_bf16(const __nv_bfloat16 *query, const __nv_bfloat16 *key,
                                    const __nv_bfloat16 *value, __nv_bfloat16 *output, int tokens,
                                    int heads, int64_t query_stride, int64_t key_stride,
@@ -326,8 +328,8 @@ extern "C" int mmh3_bench_memory_copy(size_t bytes, int iterations,
     if ((status = fill_pattern(source.pointer, bytes, 3)) != cudaSuccess) {
         return cuda_failure(status, "fill", message, message_size);
     }
-    int multiprocessors = 0;
-    cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0);
+    // The card this thread measures, which on a machine of two kinds need not be the first.
+    const int multiprocessors = mmh3_multiprocessor_count();
     size_t count = bytes / sizeof(uint4);
     unsigned blocks = static_cast<unsigned>(multiprocessors * 16);
 

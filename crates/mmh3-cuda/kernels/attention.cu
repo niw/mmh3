@@ -5,6 +5,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "device.cuh"
 #include "tensor_core.cuh"
 #include "tma.cuh"
 
@@ -415,8 +416,9 @@ int launch_kernel(const Element *query, const Element *key, const Element *value
     auto kernel = attention_kernel<Element, HEAD_DIM, TMA, ROPE>;
     // The TMA path adds its barriers and the alignment its boxes need.
     constexpr int shared_bytes = Tiles<HEAD_DIM>::shared_bytes + (TMA ? 256 : 0);
-    static const cudaError_t configured =
-        cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_bytes);
+    static Mmh3SharedMemory shared_memory;
+    const cudaError_t configured =
+        mmh3_configure_shared_memory(shared_memory, kernel, shared_bytes);
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }

@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "device.cuh"
 #include "tma.cuh"
 
 // Scaled INT8 GEMM for the DiT, text encoder and video VAE linear layers:
@@ -467,20 +468,6 @@ bool encode_tensor_map(CUtensorMap *map, const void *base, CUtensorMapDataType t
                    CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
 }
 
-int multiprocessor_count() {
-    static const int count = [] {
-        int device = 0;
-        int processors = 0;
-        if (cudaGetDevice(&device) != cudaSuccess ||
-            cudaDeviceGetAttribute(&processors, cudaDevAttrMultiProcessorCount, device) !=
-                cudaSuccess) {
-            return 0;
-        }
-        return processors;
-    }();
-    return count;
-}
-
 // A low-rank adapter to add to the product, or none when `down` is null. The rows of `down` lie
 // `down_stride` elements apart.
 struct Adapter {
@@ -521,14 +508,14 @@ int launch(const int8_t *activations, const int8_t *weights, const float *activa
         maps.adapter_down = maps.activations;
         maps.adapter_up = maps.weights;
     }
-    static const cudaError_t configured =
-        cudaFuncSetAttribute(int8_gemm_kernel<Config, Output, SWIGLU>,
-                             cudaFuncAttributeMaxDynamicSharedMemorySize, Config::shared_bytes);
+    static Mmh3SharedMemory shared_memory;
+    const cudaError_t configured = mmh3_configure_shared_memory(
+        shared_memory, int8_gemm_kernel<Config, Output, SWIGLU>, Config::shared_bytes);
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }
     const int tiles = (m + Config::block_m - 1) / Config::block_m * (n / Config::block_n);
-    const int processors = multiprocessor_count();
+    const int processors = mmh3_multiprocessor_count();
     if (processors == 0) {
         return static_cast<int>(cudaErrorInvalidDevice);
     }

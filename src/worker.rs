@@ -1781,10 +1781,13 @@ fn host_of(address: &str) -> String {
     }
 }
 
+/// The card this thread computes on, which is also what the speeds measured on it are kept under.
 fn device_name() -> String {
     #[cfg(feature = "cuda")]
     {
-        mmh3_cuda::device_info(0).map_or_else(|_| "CUDA".to_owned(), |info| info.name)
+        mmh3_cuda::current_device()
+            .and_then(mmh3_cuda::device_info)
+            .map_or_else(|_| "CUDA".to_owned(), |info| info.name)
     }
     #[cfg(feature = "metal")]
     {

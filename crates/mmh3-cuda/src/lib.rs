@@ -48,9 +48,11 @@ unsafe extern "C" {
     fn mmh3_cuda_device_info(device: c_int, info: *mut RawDeviceInfo) -> c_int;
     fn mmh3_cuda_memory_info(free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
     fn mmh3_cuda_reads_host_memory(reads: *mut c_int) -> c_int;
+    fn mmh3_cuda_get_device(device: *mut c_int) -> c_int;
+    fn mmh3_cuda_set_device(device: c_int) -> c_int;
     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
     fn mmh3_cuda_malloc(pointer: *mut *mut c_void, bytes: usize) -> c_int;
-    fn mmh3_cuda_free(pointer: *mut c_void) -> c_int;
+    fn mmh3_cuda_free_on(device: c_int, pointer: *mut c_void) -> c_int;
     fn mmh3_cuda_copy_to_device(
         destination: *mut c_void,
         source: *const c_void,
@@ -81,6 +83,13 @@ pub struct CudaError {
 /// `cudaErrorMemoryAllocation`, which a caller holding memory it could let go of can do something
 /// about, unlike every other way a call here fails.
 pub const OUT_OF_MEMORY: i32 = 2;
+
+/// `cudaErrorInvalidDevice`, which is also what this build answers for a device it cannot index.
+pub const INVALID_DEVICE: i32 = 101;
+
+/// The most devices this process computes on. It matches `MMH3_MAX_DEVICES` in `device.cuh`, which
+/// caches the same kind of per-device answer on the other side of the ABI.
+pub const MAX_DEVICES: usize = 16;
 
 impl CudaError {
     pub fn is_out_of_memory(&self) -> bool {
@@ -155,6 +164,42 @@ pub fn device_info(device: usize) -> Result<DeviceInfo, CudaError> {
     })
 }
 
+/// The device this thread computes on.
+///
+/// NOTE: the current device belongs to the host thread rather than to the process, so a thread
+/// that has not chosen one is on device 0 whatever another thread is doing. A device this build
+/// cannot index is refused rather than counted against another one.
+pub fn current_device() -> Result<usize, CudaError> {
+    let mut device = 0;
+    // SAFETY: device is a valid out pointer.
+    check(unsafe { mmh3_cuda_get_device(&mut device) })?;
+    let device = device as usize;
+    if device >= MAX_DEVICES {
+        return Err(CudaError {
+            code: INVALID_DEVICE,
+            message: format!(
+                "device {device} is past the {MAX_DEVICES} this build computes on at once"
+            ),
+        });
+    }
+    Ok(device)
+}
+
+/// Computes on `device` from this thread on, so every allocation and launch that follows goes
+/// there. A rank of a shared step binds the device of the thread that runs it and lets it be.
+pub fn set_device(device: usize) -> Result<(), CudaError> {
+    if device >= MAX_DEVICES {
+        return Err(CudaError {
+            code: INVALID_DEVICE,
+            message: format!(
+                "device {device} is past the {MAX_DEVICES} this build computes on at once"
+            ),
+        });
+    }
+    // SAFETY: no pointers.
+    check(unsafe { mmh3_cuda_set_device(device as c_int) })
+}
+
 /// Free and total device memory in bytes.
 ///
 /// NOTE: this is the whole device's, not this process's. What another program on the same GPU
@@ -216,31 +261,37 @@ pub unsafe fn download(destination: &mut [u8], source: *const c_void) -> Result<
     })
 }
 
-/// Bytes in live device allocations. Everything a model and its work allocate comes through
-/// `DeviceBuffer`, so this is what this process is holding, which the device does not say: what it
-/// reports free is what every program on the GPU has left between them.
-static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
-/// The most this process will hold, or zero for as much as the device will give.
-static LIMIT: AtomicUsize = AtomicUsize::new(0);
+/// Bytes in live device allocations, per device. Everything a model and its work allocate comes
+/// through `DeviceBuffer`, so this is what this process is holding, which the device does not say:
+/// what it reports free is what every program on the GPU has left between them.
+static ALLOCATED: [AtomicUsize; MAX_DEVICES] = [const { AtomicUsize::new(0) }; MAX_DEVICES];
+/// The most this process will hold on one device, or zero for as much as the device will give.
+static LIMIT: [AtomicUsize; MAX_DEVICES] = [const { AtomicUsize::new(0) }; MAX_DEVICES];
 
-/// Bytes in live device allocations.
+/// Bytes in live device allocations on the device this thread computes on.
 pub fn allocated_bytes() -> usize {
-    ALLOCATED.load(Ordering::Relaxed)
+    current_device().map_or(0, |device| ALLOCATED[device].load(Ordering::Relaxed))
 }
 
-/// Holds this process to `bytes`, beyond which an allocation fails as it would on a device that
-/// small. Zero lifts the limit.
+/// Holds this process to `bytes` on every device, beyond which an allocation fails as it would on a
+/// device that small. Zero lifts the limit.
+///
+/// NOTE: the budget is what one device may give rather than what they may give between them, which
+/// is what `--vram-budget` means on a machine that answers for a smaller one.
 pub fn set_allocation_limit(bytes: usize) {
-    LIMIT.store(bytes, Ordering::Relaxed);
+    for limit in &LIMIT {
+        limit.store(bytes, Ordering::Relaxed);
+    }
 }
 
-/// Bytes this process may still allocate: what the device has left, held to what the limit
-/// leaves.
+/// Bytes this process may still allocate on the device this thread computes on: what the device
+/// has left, held to what the limit leaves.
 pub fn free_bytes() -> Result<usize, CudaError> {
+    let device = current_device()?;
     let (free, _) = memory_info()?;
-    Ok(match LIMIT.load(Ordering::Relaxed) {
+    Ok(match LIMIT[device].load(Ordering::Relaxed) {
         0 => free,
-        limit => free.min(limit.saturating_sub(ALLOCATED.load(Ordering::Relaxed))),
+        limit => free.min(limit.saturating_sub(ALLOCATED[device].load(Ordering::Relaxed))),
     })
 }
 
@@ -249,26 +300,34 @@ pub struct DeviceBuffer {
     pointer: *mut c_void,
     bytes: usize,
     owned: bool,
+    /// The device it was allocated on, which is where it is freed and where a kernel may read it.
+    device: usize,
 }
 
-// SAFETY: a device address belongs to the context of the process rather than to a thread, and
-// every kernel and copy here is submitted to the legacy default stream, which orders the work of
-// all threads against each other. So a buffer means the same thing on whichever thread reads it,
-// and a model built from buffers can be kept in one place and used from the thread that asks for
-// it. Two threads using one model at the same time would still be two runs over one set of
-// scratch buffers, which is what the table that hands models out prevents by handing one out at a
-// time.
+// SAFETY: a device address is unique across the process rather than to a thread, and every
+// kernel and copy here is submitted to the legacy default stream, which orders the work of all
+// threads on one device against each other. So a buffer means the same thing on whichever thread
+// reads it, and a model built from buffers can be kept in one place and used from the thread that
+// asks for it. Two threads using one model at the same time would still be two runs over one set
+// of scratch buffers, which is what the table that hands models out prevents by handing one out at
+// a time, per device.
+//
+// NOTE: the buffer carries the device it was allocated on, since the thread that drops it need not
+// be computing on that one, and a kernel reading it has to be on that device or a peer of it.
 unsafe impl Send for DeviceBuffer {}
 unsafe impl Sync for DeviceBuffer {}
 
 impl DeviceBuffer {
     pub fn new(bytes: usize) -> Result<Self, CudaError> {
-        match LIMIT.load(Ordering::Relaxed) {
+        let device = current_device()?;
+        match LIMIT[device].load(Ordering::Relaxed) {
             0 => {}
-            limit if ALLOCATED.load(Ordering::Relaxed) + bytes > limit => {
+            limit if ALLOCATED[device].load(Ordering::Relaxed) + bytes > limit => {
                 return Err(CudaError {
                     code: OUT_OF_MEMORY,
-                    message: format!("{bytes} bytes would take this process past its limit"),
+                    message: format!(
+                        "{bytes} bytes would take this process past its limit on device {device}"
+                    ),
                 });
             }
             _ => {}
@@ -276,11 +335,12 @@ impl DeviceBuffer {
         let mut pointer = ptr::null_mut();
         // SAFETY: pointer is a valid out pointer.
         check(unsafe { mmh3_cuda_malloc(&mut pointer, bytes) })?;
-        ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
+        ALLOCATED[device].fetch_add(bytes, Ordering::Relaxed);
         Ok(Self {
             pointer,
             bytes,
             owned: true,
+            device,
         })
     }
 
@@ -297,6 +357,7 @@ impl DeviceBuffer {
             pointer: owner.pointer_at(offset),
             bytes,
             owned: false,
+            device: owner.device,
         }
     }
 
@@ -338,6 +399,11 @@ impl DeviceBuffer {
 
     pub fn bytes(&self) -> usize {
         self.bytes
+    }
+
+    /// The device this buffer lives on.
+    pub fn device(&self) -> usize {
+        self.device
     }
 
     /// Raw CUDA device address for native API interoperability. This is not a host pointer.
@@ -417,10 +483,10 @@ impl Drop for DeviceBuffer {
         if !self.owned {
             return;
         }
-        ALLOCATED.fetch_sub(self.bytes, Ordering::Relaxed);
-        // SAFETY: pointer came from cudaMalloc and is freed once.
+        ALLOCATED[self.device].fetch_sub(self.bytes, Ordering::Relaxed);
+        // SAFETY: pointer came from cudaMalloc on self.device and is freed once.
         unsafe {
-            mmh3_cuda_free(self.pointer);
+            mmh3_cuda_free_on(self.device as c_int, self.pointer);
         }
     }
 }

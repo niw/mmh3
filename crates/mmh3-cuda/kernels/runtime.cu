@@ -70,6 +70,25 @@ extern "C" int mmh3_cuda_malloc(void **pointer, size_t bytes) {
 
 extern "C" int mmh3_cuda_free(void *pointer) { return static_cast<int>(cudaFree(pointer)); }
 
+// Frees an allocation on the device it was made on, which is not always the one this thread is
+// computing on. The current device belongs to the thread, so it is put back before returning.
+extern "C" int mmh3_cuda_free_on(int device, void *pointer) {
+    int current = 0;
+    cudaError_t status = cudaGetDevice(&current);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    if (current == device) {
+        return static_cast<int>(cudaFree(pointer));
+    }
+    if ((status = cudaSetDevice(device)) != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    const cudaError_t freed = cudaFree(pointer);
+    const cudaError_t restored = cudaSetDevice(current);
+    return static_cast<int>(freed != cudaSuccess ? freed : restored);
+}
+
 extern "C" int mmh3_cuda_copy_to_device(void *destination, const void *source, size_t bytes) {
     return static_cast<int>(cudaMemcpy(destination, source, bytes, cudaMemcpyHostToDevice));
 }

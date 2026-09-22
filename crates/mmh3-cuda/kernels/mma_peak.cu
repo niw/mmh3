@@ -3,6 +3,8 @@
 #include <cstdio>
 #include <cuda_runtime.h>
 
+#include "device.cuh"
+
 // Register-only mma.sync loops that measure tensor core throughput per instruction form.
 
 namespace {
@@ -140,8 +142,8 @@ cudaError_t launch_kind(int kind, int blocks, int iterations, uint32_t *sink,
 
 extern "C" int mmh3_bench_mma_peak(int kind, int iterations, float *tera_operations_per_second,
                                    char *message, size_t message_size) {
-    int multiprocessors = 0;
-    cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, 0);
+    // The card this thread measures, which on a machine of two kinds need not be the first.
+    const int multiprocessors = mmh3_multiprocessor_count();
     const int blocks = multiprocessors * BLOCKS_PER_MULTIPROCESSOR;
     uint32_t *sink = nullptr;
     cudaError_t status = cudaMalloc(&sink, THREADS_PER_BLOCK * sizeof(uint32_t));
