@@ -1,6 +1,7 @@
 #![cfg(target_os = "linux")]
 use mmh3_core::numeric::{bf16_to_f32, f32_to_bf16};
 use mmh3_cuda::DeviceBuffer;
+use mmh3_cuda::algorithms;
 use mmh3_cuda::gemm::{self, Output};
 use mmh3_cuda::nvfp4::{
     self, ADAPTER_DOWN_NORM, AdapterSource, Columns, Nvfp4Activations, Nvfp4Scale, Nvfp4Weight,
@@ -602,16 +603,16 @@ fn saves_and_loads_the_chosen_algorithms() {
 
     let directory = std::env::temp_dir().join(format!("mmh3-nvfp4-{}", std::process::id()));
     let path = directory.join("algorithms.txt");
-    assert!(nvfp4::save_algorithms(&path).unwrap());
+    assert!(algorithms::save_nvfp4(&path).unwrap());
     let text = std::fs::read_to_string(&path).unwrap();
     assert!(
         text.lines()
             .any(|line| line.starts_with(&format!("{m} {n} {k} ")))
     );
     let saved = text.lines().count() - 2;
-    assert!(nvfp4::load_algorithms(&path).unwrap() >= saved);
+    assert!(algorithms::load_nvfp4(&path).unwrap() >= saved);
 
     std::fs::write(&path, text.replacen("format", "other format", 1)).unwrap();
-    assert_eq!(nvfp4::load_algorithms(&path).unwrap(), 0);
+    assert_eq!(algorithms::load_nvfp4(&path).unwrap(), 0);
     std::fs::remove_dir_all(&directory).unwrap();
 }

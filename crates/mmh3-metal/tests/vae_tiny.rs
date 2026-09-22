@@ -129,7 +129,7 @@ fn matches_comfyui_golden_decode() {
         })
         .unwrap_err();
     assert_eq!(calls, 1);
-    assert_eq!(error.0, "stop output");
+    assert_eq!(error.message, "stop output");
     let [channels, latent_frames, lh, lw] = latent.shape.as_slice() else {
         panic!("shape")
     };
