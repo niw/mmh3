@@ -131,6 +131,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             defaults.push(value.clone());
         }
     }
+    keep_the_models(&mut defaults);
 
     let (queue, waiting) = channel();
     let server = Arc::new(Server {
@@ -166,6 +167,26 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         axum::serve(listener, application).await
     })?;
     Ok(())
+}
+
+/// Asks for a worker in this process, so that the models stay loaded between the generations
+/// rather than being read for each one.
+///
+/// A leader reads no model: it hands out the prompt, every step and every chunk of the decode. A
+/// run with nothing to hand them to reads them all itself and lets go of them when it ends, which
+/// is right for a command and wrong for a server. A worker is what holds models between the runs
+/// that use them, with the budget it is held to and the letting go it does when the device has no
+/// memory left, so the server asks for one of its own.
+///
+/// A server told to use machines of its own is left alone: whoever named them meant them.
+fn keep_the_models(defaults: &mut Vec<String>) {
+    if defaults
+        .iter()
+        .any(|argument| argument == "--worker" || argument == "--local-worker")
+    {
+        return;
+    }
+    defaults.push("--local-worker".to_owned());
 }
 
 /// Runs one job to its end, whichever end that is.

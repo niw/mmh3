@@ -79,12 +79,23 @@ enum Kind {
 }
 
 impl Kind {
+    /// What a line about letting go of one calls it.
     fn name(self) -> &'static str {
         match self {
             Kind::TextEncoder => "the text encoder",
             Kind::VideoDecoder => "the video VAE",
             Kind::AudioDecoder => "the audio VAE",
             Kind::Dit => "the DiT",
+        }
+    }
+
+    /// What a program reading an answer calls it.
+    fn key(self) -> &'static str {
+        match self {
+            Kind::TextEncoder => "text_encoder",
+            Kind::VideoDecoder => "video_vae",
+            Kind::AudioDecoder => "audio_vae",
+            Kind::Dit => "dit",
         }
     }
 }
@@ -203,6 +214,19 @@ impl Models {
     /// How long since a model was last asked for, or None while none has been.
     fn idle_for(&self) -> Option<Duration> {
         self.touched.map(|touched| touched.elapsed())
+    }
+
+    /// What this machine is holding on to, for an answer about what a request would find here.
+    pub fn kept(&self) -> Vec<&'static str> {
+        [
+            (self.text_encoder.kept.is_some(), Kind::TextEncoder),
+            (self.video_decoder.kept.is_some(), Kind::VideoDecoder),
+            (self.audio_decoder.kept.is_some(), Kind::AudioDecoder),
+            (self.dit.kept.is_some(), Kind::Dit),
+        ]
+        .into_iter()
+        .filter_map(|(kept, kind)| kept.then(|| kind.key()))
+        .collect()
     }
 
     /// Lets go of every model, and says how many there were.
