@@ -554,6 +554,56 @@ pub fn current_device() -> usize {
     return 0;
 }
 
+/// The cards this machine has that this process can compute on, which a Mac has one of.
+pub fn device_count() -> usize {
+    #[cfg(feature = "cuda")]
+    return mmh3_cuda::device_count().unwrap_or(1).clamp(1, DEVICES);
+    #[cfg(feature = "metal")]
+    return 1;
+}
+
+/// The cards a process computes on, from `--devices`: every card when it is not given, and the
+/// cards it names otherwise, where a card named twice holds two ranks. That is no faster than one
+/// rank, and it is how the ranks of one process are checked on a machine with a single card.
+pub fn cards(options: &HashMap<&str, &str>) -> Result<Vec<usize>, Box<dyn Error>> {
+    let count = device_count();
+    let Some(text) = options.get("devices") else {
+        return Ok((0..count).collect());
+    };
+    text.split(',')
+        .map(|card| {
+            let card: usize = card
+                .trim()
+                .parse()
+                .map_err(|_| format!("--devices takes a card or a list of cards, not {text}"))?;
+            if card >= count {
+                return Err(format!("--devices names card {card} of the {count} there are").into());
+            }
+            Ok(card)
+        })
+        .collect()
+}
+
+/// Computes on `device` from this thread on, so everything it allocates, launches and reads goes
+/// there, and the models it reads go into that device's table.
+///
+/// NOTE: the current device belongs to the host thread, so this binds the thread that calls it and
+/// nothing else. A worker binds the thread of each connection rather than the process.
+pub fn bind_device(device: usize) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "cuda")]
+    {
+        mmh3_cuda::set_device(device)?;
+        Ok(())
+    }
+    #[cfg(feature = "metal")]
+    {
+        match device {
+            0 => Ok(()),
+            device => Err(format!("this backend has one device, not device {device}").into()),
+        }
+    }
+}
+
 /// What this machine is holding on to, for a caller that only means to say so and must not wait.
 /// None means a request has the models, which is itself an answer: the machine is busy.
 ///
@@ -610,7 +660,8 @@ pub fn release_when_idle(idle: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Table, kept, shared};
+    use super::{Table, cards, device_count, kept, shared};
+    use std::collections::HashMap;
 
     /// Two devices take their turns apart, which is the whole point of a table apiece: one holding
     /// its models while it computes leaves the other free to compute too. The machine is busy
@@ -623,5 +674,21 @@ mod tests {
         assert!(kept().is_none());
         drop(held);
         assert_eq!(kept(), Some(Vec::new()));
+    }
+
+    /// A number names a card rather than a count, so the last card can compute alone.
+    #[test]
+    fn devices_names_cards() {
+        let count = device_count();
+        let last = (count - 1).to_string();
+        let named = |text: &str| cards(&HashMap::from([("devices", text)]));
+        assert_eq!(
+            cards(&HashMap::new()).unwrap(),
+            (0..count).collect::<Vec<_>>()
+        );
+        assert_eq!(named(&last).unwrap(), vec![count - 1]);
+        assert_eq!(named("0,0").unwrap(), vec![0, 0]);
+        assert!(named(&count.to_string()).is_err());
+        assert!(named("").is_err());
     }
 }

@@ -216,8 +216,22 @@ impl Settings {
         arguments: &[String],
         token: &str,
     ) -> Result<Vec<Machine>, Box<dyn Error>> {
+        let borrowed = crate::cli::borrowed(arguments)?;
+        // One worker in this process lends every card this machine has, so a second would lend
+        // the same cards again.
+        if borrowed
+            .iter()
+            .filter(|machine| machine.address.is_none())
+            .count()
+            > 1
+        {
+            return Err(
+                "--local-worker lends this machine once, with every GPU it has, so give it once"
+                    .into(),
+            );
+        }
         let mut machines = Vec::new();
-        for borrowed in crate::cli::borrowed(arguments)? {
+        for borrowed in borrowed {
             let units = match borrowed.units {
                 Some(text) => units(text)?,
                 None => every_unit(),
@@ -1030,8 +1044,8 @@ struct ShardTarget {
 /// they read it while this machine still has a prompt to encode. The connections are the ones the
 /// session opens on, since what a worker reads early is only there for the connection it came on.
 ///
-/// The worker that encodes the prompt, when `prompt_on_worker` says one does, is not told. Its
-/// reads take turns, so the DiT read ahead would only hold the prompt up, and on a card without
+/// The card that encodes the prompt, when `prompt_on_worker` says a worker does, is not told, for
+/// any slot on it. Its reads take turns, so the DiT read ahead would only hold the prompt up, and on a card without
 /// the room for both it would be let go for the text encoder and read again for the steps.
 fn prepare_workers(
     settings: &Settings,
@@ -1068,30 +1082,37 @@ fn prepare_workers(
                 .copied()
         })
         .flatten();
+    // A connection per card, since each card of a worker is a rank of its own.
     let mut workers = Vec::new();
     for address in ranks {
-        let mut worker = match Worker::connect(address, &settings.token) {
-            Ok(worker) => worker,
+        let cards = match Worker::connect_every_card(address, &settings.token) {
+            Ok(cards) => cards,
             Err(error) => {
                 eprintln!("warning: worker {address}: {error}");
                 continue;
             }
         };
-        if !worker.serves(CAPABILITY_DIT_SHARD) {
-            continue;
-        }
-        let encodes = encoder == Some(address)
-            && worker.serves(CAPABILITY_ENCODE_TEXT)
-            && worker.checkpoint(TEXT_ENCODER_ROLE).is_some();
-        if encodes {
+        // The first slot is the one `encode_on_worker` asks, and every slot on its card shares its
+        // turns at reading.
+        let encoding_card = cards.first().map(|worker| worker.welcome.card);
+        for mut worker in cards {
+            if !worker.serves(CAPABILITY_DIT_SHARD) {
+                continue;
+            }
+            let encodes = encoder == Some(address)
+                && Some(worker.welcome.card) == encoding_card
+                && worker.serves(CAPABILITY_ENCODE_TEXT)
+                && worker.checkpoint(TEXT_ENCODER_ROLE).is_some();
+            if encodes {
+                workers.push(worker);
+                continue;
+            }
+            if let Err(error) = worker.prepare(&checkpoint) {
+                eprintln!("warning: worker {}: {error}", worker.name());
+                continue;
+            }
             workers.push(worker);
-            continue;
         }
-        if let Err(error) = worker.prepare(&checkpoint) {
-            eprintln!("warning: worker {address}: {error}");
-            continue;
-        }
-        workers.push(worker);
     }
     workers
 }
@@ -1159,10 +1180,10 @@ fn shard_target(
     // measured, which is a cluster whose backend cannot measure itself, the shares stay even,
     // since machines that all say nothing are most likely alike.
     if measured.iter().any(Option::is_some) && measured.iter().any(Option::is_none) {
-        let refused: Vec<&str> = workers
+        let refused: Vec<String> = workers
             .iter()
             .filter(|worker| worker.speed().is_none())
-            .map(|worker| worker.address.as_str())
+            .map(crate::worker::Worker::name)
             .collect();
         if !refused.is_empty() {
             println!(
@@ -1270,7 +1291,7 @@ fn shard_target(
         "{} takes every step, {tokens} tokens split {ranks} ways",
         workers
             .iter()
-            .map(|worker| worker.address.as_str())
+            .map(crate::worker::Worker::name)
             .collect::<Vec<_>>()
             .join(", ")
     );
