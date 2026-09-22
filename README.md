@@ -61,7 +61,10 @@ See [Usage](docs/usage.md) for the other settings.
   machine with neither. Shares follow what each machine measures itself to do. Between two DGX
   Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark rather
   than taking one itself generates about twenty-five times faster than it does alone.
-- Not yet: an HTTP server.
+- An [HTTP server](docs/server.md) takes a generation as a form and keeps its models loaded
+  between the generations it runs, so the second one against a warm server starts at its first
+  step. It has no authentication of its own and waits on loopback.
+- Not yet: stopping a generation that is already running.
 
 ## Documentation
 

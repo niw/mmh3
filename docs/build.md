@@ -34,6 +34,9 @@ cargo run --release --features cuda --bin mmh3-tools -- device
 
 The `cuda` and `metal` features build generation with the ffmpeg CLI output. Choose one backend.
 The `metal` feature also includes native VideoToolbox H.264/AAC MP4 output without ffmpeg.
+The `server` feature builds `mmh3 server`, which takes a generation over HTTP. See
+[Server](server.md). `make` includes it, and a build that leaves it out has none of the crates
+behind it.
 The `mp4` and `webm` features add native output formats. `mp4` encodes video with NVENC
 and implies `cuda`. No feature is enabled by default. Examples:
 
