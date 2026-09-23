@@ -44,7 +44,7 @@ generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead 
 directory has it.
 --devices N computes on the first N GPUs of this machine, and --devices CARD,CARD... on the cards named, every card
 when it is left out. A run with no --worker computes here: on one card it takes every step itself, and on several it
-lends them through a worker in this process, a rank per card.
+lends them through a worker in this process, a rank per card, where ranks in one process trade through their cards.
 --worker borrows another machine running `mmh3 worker`, repeat it for several, and every card of it takes a rank.
 A run that names one is the leader and nothing else: it reads no model at all, needs no GPU of its own, hands out
 the prompt, every step and every chunk of the decode, and puts what comes back together. --local-worker lends this

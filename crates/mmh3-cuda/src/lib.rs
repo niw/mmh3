@@ -50,6 +50,13 @@ unsafe extern "C" {
     fn mmh3_cuda_reads_host_memory(reads: *mut c_int) -> c_int;
     fn mmh3_cuda_get_device(device: *mut c_int) -> c_int;
     fn mmh3_cuda_set_device(device: c_int) -> c_int;
+    fn mmh3_cuda_can_access_peer(device: c_int, peer: c_int, can: *mut c_int) -> c_int;
+    fn mmh3_cuda_enable_peer_access(peer: c_int) -> c_int;
+    fn mmh3_cuda_copy_across(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> c_int;
     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
     fn mmh3_cuda_malloc(pointer: *mut *mut c_void, bytes: usize) -> c_int;
     fn mmh3_cuda_free_on(device: c_int, pointer: *mut c_void) -> c_int;
@@ -198,6 +205,37 @@ pub fn set_device(device: usize) -> Result<(), CudaError> {
     }
     // SAFETY: no pointers.
     check(unsafe { mmh3_cuda_set_device(device as c_int) })
+}
+
+/// Whether `device` can read `peer`'s memory directly, which is what makes an exchange with another
+/// card of this process a copy between the two rather than one through the host.
+pub fn can_access_peer(device: usize, peer: usize) -> Result<bool, CudaError> {
+    let mut can = 0;
+    // SAFETY: can is a valid out pointer.
+    check(unsafe { mmh3_cuda_can_access_peer(device as c_int, peer as c_int, &mut can) })?;
+    Ok(can != 0)
+}
+
+/// Lets the device this thread computes on read `peer`'s memory. A pair that has it already is no
+/// error, and a pair that cannot have it at all says so.
+pub fn enable_peer_access(peer: usize) -> Result<(), CudaError> {
+    // SAFETY: no pointers.
+    check(unsafe { mmh3_cuda_enable_peer_access(peer as c_int) })
+}
+
+/// Copies `bytes` bytes between two addresses this process holds, on one card, between two cards
+/// or through the host, in order with the kernels on the default stream of the device this thread
+/// computes on. It returns before the copy is done, which `synchronize` waits for.
+///
+/// # Safety
+/// Both ranges must lie inside live allocations of this process.
+pub unsafe fn copy_across(
+    destination: *mut c_void,
+    source: *const c_void,
+    bytes: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: the caller keeps both ranges inside their allocations.
+    check(unsafe { mmh3_cuda_copy_across(destination, source, bytes) })
 }
 
 /// Free and total device memory in bytes.

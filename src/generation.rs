@@ -1363,6 +1363,13 @@ fn shard_target(
             heads: [heads.start as u32, heads.end as u32],
         })
         .collect();
+    // The ranks that answer from one process find each other by the run and trade through their
+    // cards, so every rank is told the process of every other.
+    let run = crate::worker::random_id();
+    let processes: Vec<u64> = workers
+        .iter()
+        .map(|worker| worker.welcome.process)
+        .collect();
     let open = |rank: usize| -> Option<OpenSession> {
         Some(OpenSession {
             checkpoint: checkpoint.clone(),
@@ -1379,6 +1386,8 @@ fn shard_target(
             adapters: adapters.clone(),
             shard: spans.clone(),
             precision: attention_precision(options),
+            run,
+            processes: processes.clone(),
         })
     };
     let open: Option<Vec<OpenSession>> = (0..ranks).map(open).collect();

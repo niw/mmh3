@@ -53,6 +53,27 @@ extern "C" int mmh3_cuda_reads_host_memory(int *reads) {
         cudaDeviceGetAttribute(reads, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
 }
 
+extern "C" int mmh3_cuda_can_access_peer(int device, int peer, int *can) {
+    return static_cast<int>(cudaDeviceCanAccessPeer(can, device, peer));
+}
+
+// Lets the current device read `peer`'s memory. A pair that has it already is not an error, since
+// every run over the same two cards asks again.
+extern "C" int mmh3_cuda_enable_peer_access(int peer) {
+    const cudaError_t status = cudaDeviceEnablePeerAccess(peer, 0);
+    if (status == cudaErrorPeerAccessAlreadyEnabled) {
+        cudaGetLastError();
+        return 0;
+    }
+    return static_cast<int>(status);
+}
+
+// Copies between any two addresses the process holds, on one card, between two cards or through
+// the host, in order with the kernels on the current device's default stream.
+extern "C" int mmh3_cuda_copy_across(void *destination, const void *source, size_t bytes) {
+    return static_cast<int>(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDefault));
+}
+
 extern "C" const char *mmh3_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }

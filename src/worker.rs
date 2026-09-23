@@ -416,6 +416,24 @@ fn join_rdma(link: Rdma, peer: &[[u8; worker::RDMA_ADDRESS_BYTES]]) -> Option<Rd
     }
 }
 
+/// A number no other process or run is likely to draw, from the keys the standard library seeds its
+/// hash maps with.
+pub fn random_id() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+
+    std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish()
+}
+
+/// This process, as its worker names it in the handshake: the same for every slot, and for no
+/// other process.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn process_id() -> u64 {
+    static ID: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *ID.get_or_init(random_id)
+}
+
 /// One worker as the leader sees it.
 pub struct Worker {
     pub address: String,
@@ -490,6 +508,7 @@ impl Worker {
                 rdma: None,
                 devices: 1,
                 card: 0,
+                process: 0,
             },
             request: 0,
             rdma: None,
@@ -1511,6 +1530,7 @@ fn session(
                     speed: slot.speed,
                     devices: slots.len() as u32,
                     card: slot.card as u32,
+                    process: process_id(),
                     capabilities: CAPABILITY_ENCODE_TEXT
                         | CAPABILITY_DECODE_AUDIO
                         | CAPABILITY_DECODE_VIDEO
@@ -2035,21 +2055,29 @@ type BlockMemory = *mut std::ffi::c_void;
 /// and copies between the two. One that can answers with that memory and copies nothing.
 #[cfg(feature = "cuda")]
 #[derive(Default)]
-struct Computed(HashMap<shard::Region, mmh3_cuda::DeviceBuffer>);
+struct Computed(HashMap<shard::Region, Arc<mmh3_cuda::DeviceBuffer>>);
 
 #[cfg(feature = "cuda")]
 impl Computed {
     /// Memory for a region a block computes in, kept for the run. Regions a block only exchanges
-    /// through are not given any: they are read and written where the peer left them. That is
-    /// host memory, which a peer's attention output is read from once, so a device that cannot
-    /// read host memory where it lies takes that on the device too, copied after each exchange.
-    fn make(&mut self, region: shard::Region, bytes: usize) -> Result<(), Box<dyn Error>> {
+    /// through are not given any: they are read and written where the peer left them. `always`
+    /// gives one to such a region too, for a peer in this process that writes into it directly.
+    /// The one a peer's attention output lands in is host memory otherwise, read from once, so a
+    /// device that cannot read host memory where it lies takes that on the device as well, copied
+    /// after each exchange.
+    fn make(
+        &mut self,
+        region: shard::Region,
+        bytes: usize,
+        always: bool,
+    ) -> Result<(), Box<dyn Error>> {
         let read_once = matches!(region, shard::Region::Received(_));
         if region.is_computed_in()
+            || always
             || (read_once && !mmh3_cuda::reads_host_memory().unwrap_or(false))
         {
             self.0
-                .insert(region, mmh3_cuda::DeviceBuffer::zeroed(bytes)?);
+                .insert(region, Arc::new(mmh3_cuda::DeviceBuffer::zeroed(bytes)?));
         }
         Ok(())
     }
@@ -2199,6 +2227,148 @@ pub struct Exchanger<'a> {
     /// backend that would do that over host memory pays about seven times as much.
     computed: Computed,
     peers: HashMap<(usize, shard::Region), worker::RemoteRegion>,
+    /// The ranks of this run in this process, and where they compute.
+    #[cfg(feature = "cuda")]
+    local: Local,
+}
+
+/// Memory a rank of this process computes in, as its peers in the process address it.
+#[cfg(feature = "cuda")]
+#[derive(Clone, Copy)]
+struct Target {
+    pointer: BlockMemory,
+    bytes: usize,
+}
+
+// SAFETY: a device address is unique across the process and means the same thing on every thread,
+// and a rank hands its peers an address it keeps for the run. What orders a write against the
+// kernels that read it is the barrier, not the ownership of a pointer.
+#[cfg(feature = "cuda")]
+unsafe impl Send for Target {}
+#[cfg(feature = "cuda")]
+unsafe impl Sync for Target {}
+
+/// One rank of a run as the other ranks of its process find it.
+#[cfg(feature = "cuda")]
+struct Meeting {
+    card: usize,
+    memory: HashMap<shard::Region, Target>,
+    /// The buffers `memory` points into, which live as long as any rank holds this meeting. A
+    /// rank that fails mid-step lets go of its own, and a peer that has not reached the barrier
+    /// that would tell it so may still be copying into them.
+    _buffers: Vec<Arc<mmh3_cuda::DeviceBuffer>>,
+}
+
+/// The ranks of a run that share this rank's process, and who carries which rows.
+#[cfg(feature = "cuda")]
+#[derive(Default)]
+struct Local {
+    /// The other ranks of this process.
+    peers: std::collections::HashSet<usize>,
+    /// Where each of them computes, by rank and region.
+    memory: HashMap<(usize, shard::Region), Target>,
+    /// Their meetings, held for the memory in them for as long as this rank may write into it.
+    met: Vec<Arc<Meeting>>,
+    /// The tokens each rank carries, which is who wrote a row and who reads it.
+    tokens: Vec<std::ops::Range<usize>>,
+    /// Every token of the step, which divides a region of all of them into rows.
+    total: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl Local {
+    /// The ranks of `shard` that answer from the same process as its own, as `processes` names the
+    /// process of every rank. A leader that names none leaves every rank on the wire.
+    fn of(shard: &Shard, tokens: usize, processes: &[u64]) -> Self {
+        let ranks = shard.ranks();
+        let peers = match processes.get(shard.rank) {
+            Some(mine) if processes.len() == ranks => (0..ranks)
+                .filter(|peer| *peer != shard.rank && processes[*peer] == *mine)
+                .collect(),
+            _ => Default::default(),
+        };
+        Local {
+            peers,
+            memory: HashMap::new(),
+            met: Vec::new(),
+            tokens: shard.tokens.clone(),
+            total: tokens,
+        }
+    }
+}
+
+/// The ranks of one run in this process that have come to swap addresses, and how many of them
+/// have taken the whole table.
+#[cfg(feature = "cuda")]
+struct Gathering {
+    run: u64,
+    ranks: HashMap<usize, Arc<Meeting>>,
+    taken: usize,
+}
+
+/// Where the ranks of one run in this process meet to swap the addresses they compute in.
+#[cfg(feature = "cuda")]
+static MEETINGS: std::sync::Mutex<Vec<Gathering>> = std::sync::Mutex::new(Vec::new());
+#[cfg(feature = "cuda")]
+static ARRIVED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// Leaves `mine` for the other `count - 1` ranks of `run` in this process and waits for theirs.
+/// The last to take the whole table clears it away.
+#[cfg(feature = "cuda")]
+fn meet(
+    run: u64,
+    rank: usize,
+    count: usize,
+    mine: Meeting,
+) -> Result<HashMap<usize, Arc<Meeting>>, String> {
+    let deadline = Instant::now() + Duration::from_millis(EXCHANGE_TIMEOUT as u64);
+    let mut meetings = MEETINGS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = match meetings.iter().position(|gathering| gathering.run == run) {
+        Some(index) => index,
+        None => {
+            meetings.push(Gathering {
+                run,
+                ranks: HashMap::new(),
+                taken: 0,
+            });
+            meetings.len() - 1
+        }
+    };
+    meetings[index].ranks.insert(rank, Arc::new(mine));
+    ARRIVED.notify_all();
+    loop {
+        let index = meetings
+            .iter()
+            .position(|gathering| gathering.run == run)
+            .ok_or("the meeting of this run was cleared away before this rank took it")?;
+        if meetings[index].ranks.len() >= count {
+            let whole = meetings[index].ranks.clone();
+            meetings[index].taken += 1;
+            if meetings[index].taken == count {
+                meetings.remove(index);
+            }
+            return Ok(whole);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            meetings[index].ranks.remove(&rank);
+            let others = meetings[index].ranks.len();
+            // The last rank to give up takes the meeting away, since no rank will come for it.
+            if others == 0 {
+                meetings.remove(index);
+            }
+            return Err(format!(
+                "{} of the {count} ranks of this process came to the run",
+                others + 1
+            ));
+        }
+        meetings = ARRIVED
+            .wait_timeout(meetings, deadline - now)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0;
+    }
 }
 
 /// Memory a step exchanges through. Where this machine has a device to register it with, a peer
@@ -2264,6 +2434,11 @@ impl<'a> Exchanger<'a> {
     /// connections through the leader, then every rank registers its regions and the leader passes
     /// the table of them round. After this nothing is allocated again, so the addresses the peers
     /// hold stay good for the run.
+    ///
+    /// `run` names the run and the process of every rank. The ranks that share this one's process
+    /// trade through their cards: each writes straight into the memory the other computes in, and
+    /// the socket between them carries the barriers alone.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         shard: &Shard,
         tokens: usize,
@@ -2272,8 +2447,11 @@ impl<'a> Exchanger<'a> {
         leader_reader: &'a mut BufReader<TcpStream>,
         leader_writer: &'a mut BufWriter<TcpStream>,
         token: &str,
+        run: (u64, &[u64]),
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
+        #[cfg(not(feature = "cuda"))]
+        let _ = run;
         let mut exchanger = Exchanger {
             rank,
             ranks,
@@ -2295,9 +2473,13 @@ impl<'a> Exchanger<'a> {
             pending: HashMap::new(),
             computed: Computed::default(),
             peers: HashMap::new(),
+            #[cfg(feature = "cuda")]
+            local: Local::of(shard, tokens, run.1),
         };
         exchanger.link_peers()?;
         exchanger.register(shard, tokens, hidden, gated)?;
+        #[cfg(feature = "cuda")]
+        exchanger.meet_locally(run.0)?;
         exchanger.dial_peers()?;
         Ok(exchanger)
     }
@@ -2336,6 +2518,7 @@ impl<'a> Exchanger<'a> {
             if peer == self.rank
                 || self.links.contains_key(&peer)
                 || self.sockets.contains_key(&peer)
+                || self.local.peers.contains(&peer)
             {
                 continue;
             }
@@ -2417,8 +2600,10 @@ impl<'a> Exchanger<'a> {
         // A machine with a port registers its memory, so a peer writes into it from its own
         // machine. One without gets plain buffers and its peers write down the socket: the table
         // carries no address for them, which is how a peer knows which way to send.
+        // Memory only ranks of this process write into is never registered: nothing reaches it
+        // over a wire.
         #[cfg(feature = "cuda")]
-        let device = rdma_device();
+        let device = rdma_device().filter(|_| self.local.peers.len() + 1 < self.ranks);
         let mut table = Vec::new();
         for (region, bytes) in shard::regions(shard, tokens, hidden, gated) {
             // A region a block computes in gets a device buffer beside it, and the two are kept in
@@ -2441,6 +2626,14 @@ impl<'a> Exchanger<'a> {
                 keys,
             });
             self.regions.insert(region, held);
+            // A rank of this process writes a peer's attention output straight into memory the
+            // peer computes in, where a rank elsewhere writes host memory the peer reads.
+            #[cfg(feature = "cuda")]
+            let written_here = matches!(region, shard::Region::Received(peer)
+                if self.local.peers.contains(&peer));
+            #[cfg(feature = "cuda")]
+            self.computed.make(region, bytes, written_here)?;
+            #[cfg(not(feature = "cuda"))]
             self.computed.make(region, bytes)?;
         }
         let listen_port = self
@@ -2774,6 +2967,132 @@ impl Exchanger<'_> {
     }
 }
 
+#[cfg(feature = "cuda")]
+impl Exchanger<'_> {
+    /// Swaps where every rank of this process computes, once each has made its regions, and opens
+    /// the direct path between their cards where a pair has one.
+    fn meet_locally(&mut self, run: u64) -> Result<(), Box<dyn Error>> {
+        if self.local.peers.is_empty() {
+            return Ok(());
+        }
+        let card = mmh3_cuda::current_device()?;
+        let computed = &self.computed;
+        let memory = self
+            .regions
+            .iter_mut()
+            .map(|(region, held)| {
+                let bytes = held.bytes();
+                let pointer = computed.memory(*region, held.as_mut_slice());
+                (*region, Target { pointer, bytes })
+            })
+            .collect();
+        let buffers = self.computed.0.values().cloned().collect();
+        let whole = meet(
+            run,
+            self.rank,
+            self.local.peers.len() + 1,
+            Meeting {
+                card,
+                memory,
+                _buffers: buffers,
+            },
+        )?;
+        for (peer, meeting) in whole {
+            if peer == self.rank {
+                continue;
+            }
+            for (region, target) in &meeting.memory {
+                self.local.memory.insert((peer, *region), *target);
+            }
+            // A pair that cannot take the direct path still copies, through the host.
+            if meeting.card != card && mmh3_cuda::can_access_peer(card, meeting.card)? {
+                mmh3_cuda::enable_peer_access(meeting.card)?;
+            }
+            self.local.met.push(meeting);
+        }
+        Ok(())
+    }
+
+    /// The rank whose rows lie `offset` bytes into `region`. A region of one peer's rows is that
+    /// peer's, and one of every token divides into rows by the tokens each rank carries.
+    fn owner(&self, region: shard::Region, offset: usize) -> Option<usize> {
+        match region {
+            shard::Region::Received(peer)
+            | shard::Region::SendInputs(peer)
+            | shard::Region::SendGate(peer) => Some(peer),
+            _ => {
+                let row = self.regions.get(&region)?.bytes() / self.local.total.max(1);
+                let token = offset / row.max(1);
+                self.local
+                    .tokens
+                    .iter()
+                    .position(|tokens| tokens.contains(&token))
+            }
+        }
+    }
+
+    /// Whether only ranks of this process read the rows `offset` bytes into `region`: a rank's own
+    /// rows are read by every peer, and a peer's rows by that peer.
+    fn read_here_alone(&self, region: shard::Region, offset: usize) -> bool {
+        match self.owner(region, offset) {
+            Some(owner) if owner == self.rank => self.local.peers.len() + 1 == self.ranks,
+            Some(owner) => self.local.peers.contains(&owner),
+            None => false,
+        }
+    }
+
+    /// Whether a rank of this process wrote the rows `offset` bytes into `region`.
+    fn written_here(&self, region: shard::Region, offset: usize) -> bool {
+        self.owner(region, offset)
+            .is_some_and(|owner| self.local.peers.contains(&owner))
+    }
+
+    /// Writes into the memory a rank of this process computes in, straight from the memory this
+    /// one computes in, which is a copy between the two cards or within one.
+    fn write_here(
+        &mut self,
+        peer: usize,
+        from: shard::Region,
+        offset: usize,
+        into: shard::Region,
+        peer_offset: usize,
+        bytes: usize,
+    ) -> Result<(), shard::ExchangeError> {
+        let target = self
+            .local
+            .memory
+            .get(&(peer, into))
+            .copied()
+            .ok_or_else(|| exchange_error(format!("rank {peer} made no {into:?}")))?;
+        if peer_offset + bytes > target.bytes {
+            return Err(exchange_error(format!(
+                "{bytes} bytes at {peer_offset} of rank {peer}'s {} byte {into:?}",
+                target.bytes
+            )));
+        }
+        let held = self
+            .regions
+            .get_mut(&from)
+            .ok_or_else(|| exchange_error(format!("no {from:?} was registered")))?;
+        if offset + bytes > held.bytes() {
+            return Err(exchange_error(format!(
+                "{bytes} bytes at {offset} of a {} byte {from:?}",
+                held.bytes()
+            )));
+        }
+        let source = self.computed.memory(from, held.as_mut_slice());
+        // SAFETY: both ranges lie inside memory their ranks keep for the run, checked above.
+        unsafe {
+            mmh3_cuda::copy_across(
+                target.pointer.byte_add(peer_offset),
+                source.byte_add(offset).cast_const(),
+                bytes,
+            )
+        }
+        .map_err(|error| exchange_error(format!("writing {into:?} of rank {peer}: {error}")))
+    }
+}
+
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl shard::Exchange for Exchanger<'_> {
     type Memory = BlockMemory;
@@ -2813,6 +3132,11 @@ impl shard::Exchange for Exchanger<'_> {
         if !self.computed.holds(region) {
             return Ok(());
         }
+        // Rows only ranks of this process read are read where the block wrote them.
+        #[cfg(feature = "cuda")]
+        if self.read_here_alone(region, offset) {
+            return Ok(());
+        }
         let held = self
             .regions
             .get_mut(&region)
@@ -2837,6 +3161,12 @@ impl shard::Exchange for Exchanger<'_> {
         bytes: usize,
     ) -> Result<(), shard::ExchangeError> {
         if !self.computed.holds(region) {
+            return Ok(());
+        }
+        // Rows a rank of this process wrote are already where the block reads them, and the host
+        // memory beside them holds nothing of theirs.
+        #[cfg(feature = "cuda")]
+        if self.written_here(region, offset) {
             return Ok(());
         }
         let held = self
@@ -2864,6 +3194,10 @@ impl shard::Exchange for Exchanger<'_> {
     ) -> Result<(), shard::ExchangeError> {
         if peer == self.rank {
             return Err(exchange_error("a rank cannot write to itself".to_owned()));
+        }
+        #[cfg(feature = "cuda")]
+        if self.local.peers.contains(&peer) {
+            return self.write_here(peer, from, offset, into, peer_offset, bytes);
         }
         let remote = self
             .peers
@@ -2912,6 +3246,14 @@ impl shard::Exchange for Exchanger<'_> {
     }
 
     fn barrier(&mut self) -> Result<(), shard::ExchangeError> {
+        // A copy into a peer of this process is queued on this card, and the peer reads what it
+        // wrote once it hears this rank at the barrier. So the card is through the copies first,
+        // and through the reads of what the peers wrote before, which the next copies overwrite.
+        #[cfg(feature = "cuda")]
+        if !self.local.peers.is_empty() {
+            mmh3_cuda::synchronize()
+                .map_err(|error| exchange_error(format!("waiting for this card: {error}")))?;
+        }
         self.exchange_pending()?;
         let arrive = |exchanger: &mut Self, peer: usize| -> Result<(), shard::ExchangeError> {
             exchanger
@@ -3401,6 +3743,7 @@ fn serve_shard(
         reader,
         writer,
         token,
+        (open.run, &open.processes),
     )?;
     println!(
         "rank {} of {} takes tokens {:?} and heads {:?}",

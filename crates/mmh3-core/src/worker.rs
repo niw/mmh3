@@ -333,6 +333,9 @@ pub struct Welcome {
     pub devices: u32,
     /// Which card of its machine this connection computes on.
     pub card: u32,
+    /// Which process of its machine answers, the same for every slot of one worker. Two ranks of a
+    /// run that share it trade through their cards rather than over a wire.
+    pub process: u64,
 }
 
 /// Token identifiers of a prompt, to be encoded by whichever machine holds the text encoder.
@@ -562,6 +565,12 @@ pub struct OpenSession {
     pub precision: u8,
     /// What each rank carries, in rank order. Empty leaves every rank an equal share.
     pub shard: Vec<ShardSpan>,
+    /// Which run this is, the same for every rank of it, so that ranks in one process find each
+    /// other among the runs that process serves.
+    pub run: u64,
+    /// The process each rank answers from, in rank order, as its `Welcome` named it. Ranks that
+    /// share one trade through their cards.
+    pub processes: Vec<u64>,
 }
 
 /// What one rank of a shared-out step carries: a run of the sequence and a run of the heads. The
@@ -846,6 +855,10 @@ impl OpenSession {
                 .u32(span.heads[0])
                 .u32(span.heads[1]);
         }
+        encoder.u64(self.run).u32(self.processes.len() as u32);
+        for process in &self.processes {
+            encoder.u64(*process);
+        }
         encoder.finish()
     }
 
@@ -890,6 +903,8 @@ impl OpenSession {
             conditions: Vec::new(),
             adapters: Vec::new(),
             shard: Vec::new(),
+            run: 0,
+            processes: Vec::new(),
         };
         let count = decoder.u32()? as usize;
         let mut conditions = Vec::with_capacity(count.min(64));
@@ -924,10 +939,18 @@ impl OpenSession {
                 heads: [decoder.u32()?, decoder.u32()?],
             });
         }
+        let run = decoder.u64()?;
+        let count = decoder.u32()? as usize;
+        let mut processes = Vec::with_capacity(count.min(1024));
+        for _ in 0..count {
+            processes.push(decoder.u64()?);
+        }
         let session = OpenSession {
             conditions,
             adapters,
             shard,
+            run,
+            processes,
             ..session
         };
         Ok((session, decoder.position))
@@ -1119,7 +1142,11 @@ impl Welcome {
             encoder.string(&checkpoint.role).u64(checkpoint.digest);
         }
         encode_rdma(&mut encoder, &self.rdma);
-        encoder.u32(self.protocol).u32(self.devices).u32(self.card);
+        encoder
+            .u32(self.protocol)
+            .u32(self.devices)
+            .u32(self.card)
+            .u64(self.process);
         encoder.finish()
     }
 
@@ -1151,6 +1178,7 @@ impl Welcome {
         // A machine that says nothing of its cards has the one.
         let devices = decoder.u32().unwrap_or(1).max(1);
         let card = decoder.u32().unwrap_or(0);
+        let process = decoder.u64().unwrap_or(0);
         Ok(Welcome {
             protocol,
             backend,
@@ -1163,6 +1191,7 @@ impl Welcome {
             rdma,
             devices,
             card,
+            process,
         })
     }
 }
@@ -1391,6 +1420,7 @@ mod tests {
             }],
             devices: 2,
             card: 1,
+            process: 0x5eed,
         };
         let mut stream = Vec::new();
         send(&mut stream, Kind::Welcome, 7, &welcome.encode(), &[]).unwrap();
@@ -1406,6 +1436,7 @@ mod tests {
         assert_eq!(decoded.checkpoints, welcome.checkpoints);
         assert_eq!(decoded.devices, 2);
         assert_eq!(decoded.card, 1);
+        assert_eq!(decoded.process, 0x5eed);
     }
 
     #[test]
