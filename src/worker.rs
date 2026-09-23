@@ -949,14 +949,13 @@ impl RemoteAudio {
             // cannot is often another backend with nothing else to do, so the audio goes there
             // first. The sort is stable, so the order given decides within each group.
             candidates.sort_by_key(|worker| worker.serves(CAPABILITY_DIT_SHARD));
-            let mut answer = Ok(None);
-            for worker in &mut candidates {
-                answer = match worker.decode_audio(&role, &latent) {
+            let answer = match candidates.first_mut() {
+                Some(worker) => match worker.decode_audio(&role, &latent) {
                     Ok(waveform) => Ok(Some(waveform)),
                     Err(error) => Err(format!("the audio on {}: {error}", worker.address)),
-                };
-                break;
-            }
+                },
+                None => Ok(None),
+            };
             let _ = sender.send(answer);
         });
         RemoteAudio { receiver }
