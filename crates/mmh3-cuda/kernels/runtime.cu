@@ -47,8 +47,15 @@ extern "C" const char *mmh3_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }
 
+// A failed allocation also stays behind as the last error, where the next kernel launch would read
+// it as its own. The caller has the status already and may free something and try again, so it is
+// cleared here.
 extern "C" int mmh3_cuda_malloc(void **pointer, size_t bytes) {
-    return static_cast<int>(cudaMalloc(pointer, bytes));
+    const cudaError_t status = cudaMalloc(pointer, bytes);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+    }
+    return static_cast<int>(status);
 }
 
 extern "C" int mmh3_cuda_free(void *pointer) { return static_cast<int>(cudaFree(pointer)); }
