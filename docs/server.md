@@ -103,10 +103,12 @@ any of them holds.
 
 The models are held by a worker in the server's own process, which is the same worker
 `mmh3 worker` runs and holds its models the same way. A generation is a leader and reads no model
-itself, so without one there would be nothing to keep: the server asks for `--local-worker` unless
-it was told to use machines of its own. So `--vram-budget GB` and `--idle-unload SECONDS` mean here
-what they mean there. See [Distributed generation](distributed.md). `--consistent` given to the
-server holds for every generation it runs.
+itself, so without one there would be nothing to keep: the server lends its cards through that
+worker even when a run could have taken every step on one card by itself. A server told to use
+machines of its own with `--worker` lends none of its cards unless `--local-worker` says so, as a
+run does. So `--vram-budget GB` and `--idle-unload SECONDS` mean here what they mean there. See
+[Distributed generation](distributed.md). `--consistent` given to the server holds for every
+generation it runs.
 
 On a DGX Spark the models take about 6.4 s to read, and that is what the first generation pays and
 the ones after it do not, whatever they generate. Three generations of the same request against a
