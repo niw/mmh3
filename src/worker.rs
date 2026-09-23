@@ -1385,21 +1385,30 @@ fn session(
                 }
             }
             Kind::OpenSession => {
-                // A shared run holds the models for as long as it lasts, which is the one time
-                // this machine has nothing to spare for another session anyway.
+                // The session borrows its DiT out of the table for the run and puts it back after,
+                // rather than holding the table for as long. Another session that wants one then
+                // reads a DiT of its own instead of waiting for a lock this one lets go of only
+                // when every rank of the run, that session's among them, has finished.
                 let (open, payload) = OpenSession::decode(&body)?;
-                let mut kept = table.borrow();
-                let served = session_dit(&mut kept, models, &open).and_then(|dit| {
-                    serve_shard(
+                let lent = {
+                    let mut kept = table.borrow();
+                    match session_dit(&mut kept, models, &open) {
+                        Ok(_) => Ok(kept.take_dit().expect("a DiT the session just kept")),
+                        Err(error) => Err(error),
+                    }
+                };
+                let served = lent.and_then(|(key, dit)| {
+                    let served = serve_shard(
                         &mut reader,
                         &mut writer,
-                        dit,
+                        &dit,
                         &open,
                         &body[payload..],
                         token,
-                    )
+                    );
+                    table.borrow().keep_dit(key, dit);
+                    served
                 });
-                drop(kept);
                 table.let_go_if_out_of_memory(&served);
                 if let Err(error) = served {
                     reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?;
