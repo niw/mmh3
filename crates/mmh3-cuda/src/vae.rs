@@ -248,8 +248,11 @@ impl DecodePlan {
 
 /// One decode's buffers and geometry, shared by a whole video and by a single chunk.
 struct Decode {
-    workspace: Workspace,
-    angles: DeviceBuffer,
+    /// The room the tiles are decoded in, with their rotary angles, made by the first chunk this
+    /// machine decodes itself. A decode that only puts canvases from elsewhere together never
+    /// makes it, and how much it takes is not known before the first chunk asks.
+    work: Option<(Workspace, DeviceBuffer)>,
+    tokens: usize,
     canvas: DeviceBuffer,
     denormalized: Tensor,
     grid: TileGrid,
@@ -1291,15 +1294,8 @@ impl CudaVideoDecoder {
         let tokens = tiles * tile_tokens;
         let plane = height * width;
         Ok(Decode {
-            workspace: Workspace::new(config, tokens, self.quantized, self.dense_ffn)?,
-            angles: DeviceBuffer::from_f32(&rope_angles(
-                chunk_frames,
-                grid.latent_height(),
-                grid.latent_width(),
-                config.registers + 1,
-                ROPE_FREQUENCIES,
-                ROPE_BASE,
-            ))?,
+            work: None,
+            tokens,
             canvas: DeviceBuffer::new(OUTPUT_CHANNELS * canvas_frames * plane * 4)?,
             denormalized,
             grid,
@@ -1338,23 +1334,39 @@ impl CudaVideoDecoder {
             &decode.grid,
             decode.tile_tokens,
         );
-        decode.workspace.latent_rows.copy_from_host(&rows)?;
+        if decode.work.is_none() {
+            let config = &self.config;
+            decode.work = Some((
+                Workspace::new(config, decode.tokens, self.quantized, self.dense_ffn)?,
+                DeviceBuffer::from_f32(&rope_angles(
+                    decode.chunk_frames,
+                    decode.grid.latent_height(),
+                    decode.grid.latent_width(),
+                    config.registers + 1,
+                    ROPE_FREQUENCIES,
+                    ROPE_BASE,
+                ))?,
+            ));
+        }
+        let (workspace, angles) = decode.work.as_mut().expect("just made");
+        workspace.latent_rows.copy_from_host(&rows)?;
+        let (workspace, angles) = (&*workspace, &*angles);
         self.decode_tiles(
-            &decode.workspace,
+            workspace,
             decode.tiles,
             decode.tile_tokens,
             decode.patches,
-            &decode.angles,
+            angles,
         )?;
         let first_tile = if capture_first_tile {
-            Some(self.first_tile(&decode.workspace, decode.chunk_frames, &decode.grid)?)
+            Some(self.first_tile(workspace, decode.chunk_frames, &decode.grid)?)
         } else {
             None
         };
         // SAFETY: projected holds every tile's patch features and the canvas its full frames.
         check(unsafe {
             mmh3_vae_unpatchify_blend(
-                decode.workspace.projected.pointer(),
+                workspace.projected.pointer(),
                 decode.grid.starts_y.pointer(),
                 decode.grid.starts_x.pointer(),
                 decode.grid.overlaps_y.pointer(),
