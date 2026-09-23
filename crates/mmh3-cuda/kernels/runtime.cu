@@ -72,8 +72,13 @@ extern "C" int mmh3_cuda_copy_device(void *destination, const void *source, size
     return static_cast<int>(cudaMemcpy(destination, source, bytes, cudaMemcpyDeviceToDevice));
 }
 
+// Clears a failed allocation from the last error, as `mmh3_cuda_malloc` does.
 extern "C" int mmh3_cuda_host_alloc(void **pointer, size_t bytes) {
-    return static_cast<int>(cudaHostAlloc(pointer, bytes, cudaHostAllocDefault));
+    const cudaError_t status = cudaHostAlloc(pointer, bytes, cudaHostAllocDefault);
+    if (status != cudaSuccess) {
+        cudaGetLastError();
+    }
+    return static_cast<int>(status);
 }
 
 extern "C" int mmh3_cuda_host_free(void *pointer) {

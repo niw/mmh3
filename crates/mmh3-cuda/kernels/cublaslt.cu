@@ -18,8 +18,7 @@ int status_code(cublasStatus_t status) {
     return status == CUBLAS_STATUS_SUCCESS ? 0 : 1000 + static_cast<int>(status);
 }
 
-// A handle and workspace for the calls of one host thread, or the status that made creating them
-// fail.
+// A handle and workspace for the calls of one host thread.
 // NOTE: an algorithm may run several kernels that pass partial results through the workspace. Calls
 // from two threads interleave their kernels even on the legacy default stream, so a shared
 // workspace lets one call read the partial results of another. The calls of one thread share its
@@ -27,15 +26,30 @@ int status_code(cublasStatus_t status) {
 struct ThreadState {
     cublasLtHandle_t handle = nullptr;
     void *workspace = nullptr;
-    int status = 0;
 
-    ThreadState() {
-        status = status_code(cublasLtCreate(&handle));
-        if (status != 0) {
-            handle = nullptr;
-            return;
+    ThreadState() = default;
+
+    // Makes what is still missing, or says why it could not. A device that had no memory left may
+    // have some after its caller lets go of a model, so a failure is not kept for the next call,
+    // and the failed allocation is cleared from the last error, where the next kernel launch
+    // would read it as its own.
+    int prepare() {
+        if (handle == nullptr) {
+            const int status = status_code(cublasLtCreate(&handle));
+            if (status != 0) {
+                handle = nullptr;
+                return status;
+            }
         }
-        status = static_cast<int>(cudaMalloc(&workspace, WORKSPACE_BYTES));
+        if (workspace == nullptr) {
+            const cudaError_t status = cudaMalloc(&workspace, WORKSPACE_BYTES);
+            if (status != cudaSuccess) {
+                workspace = nullptr;
+                cudaGetLastError();
+                return static_cast<int>(status);
+            }
+        }
+        return 0;
     }
 
     // cudaFree waits for the kernels that still use the workspace.
@@ -146,9 +160,9 @@ extern "C" const char *mmh3_cublaslt_status_string(int code) {
 extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *weight,
                                     const void *bias, void *output, int64_t m, int64_t n, int64_t k,
                                     float alpha, float beta, cudaStream_t stream) {
-    thread_local const ThreadState state;
-    if (state.status != 0) {
-        return state.status;
+    thread_local ThreadState state;
+    if (const int prepared = state.prepare(); prepared != 0) {
+        return prepared;
     }
     const cudaDataType_t data_type =
         kind == 0 ? CUDA_R_16BF : (kind == 1 ? CUDA_R_32F : CUDA_R_16F);
@@ -311,9 +325,9 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
                                    const void *activations, const void *activation_scales,
                                    const float *alpha_beta, void *output, int64_t m, int64_t n,
                                    int64_t k, cudaStream_t stream) {
-    thread_local const ThreadState state;
-    if (state.status != 0) {
-        return state.status;
+    thread_local ThreadState state;
+    if (const int prepared = state.prepare(); prepared != 0) {
+        return prepared;
     }
     Descriptors descriptors;
     cublasStatus_t status;
