@@ -94,8 +94,9 @@ loopback, takes sessions like any other, and nothing in the run knows the differ
 
 **A run needs no worker at all to use the cards of one machine.** `mmh3 generate` on a machine with
 several cards lends every one of them to itself this way, and a machine with one card takes every
-step on it without a worker. Two cards of one worker trade over that worker's own loopback rather
-than through each other.
+step on it without a worker. **Two ranks in one process trade through their cards**, whichever
+worker they belong to: each writes straight into the memory the other computes in, and the socket
+between them carries the barriers alone.
 
 **A leader reads no weights at all.** For the DiT it takes the shape from the checkpoint header,
 which costs the header pages and nothing, and assembles the parts from that. For the video VAE it
@@ -162,6 +163,11 @@ no machine measures anything, the shares stay even.
 
 The exchange follows whatever path there is, and RDMA is an accelerator rather than a requirement.
 
+- **The cards themselves**, between two ranks in one process. A worker names its process in the
+  handshake and the leader tells every rank the process of every other, so ranks that share one
+  swap the addresses they compute in when the session opens and write there directly: between two
+  cards where the pair can reach each other, through the host where it cannot, and within the card
+  where two ranks share one.
 - **RoCE**, when both ends have a port and a route. A region is registered on every active port of
   the device and a transfer is cut into a piece per path, which on hardware whose NIC hangs off two
   PCIe links is most of the available bandwidth rather than half of it.

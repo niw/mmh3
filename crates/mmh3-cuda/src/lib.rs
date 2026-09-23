@@ -51,6 +51,22 @@ unsafe extern "C" {
     fn mmh3_cuda_reads_host_memory(reads: *mut c_int) -> c_int;
     fn mmh3_cuda_get_device(device: *mut c_int) -> c_int;
     fn mmh3_cuda_set_device(device: c_int) -> c_int;
+    fn mmh3_cuda_can_access_peer(device: c_int, peer: c_int, can: *mut c_int) -> c_int;
+    fn mmh3_cuda_enable_peer_access(peer: c_int) -> c_int;
+    fn mmh3_cuda_copy_across(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> c_int;
+    fn mmh3_cuda_copy_across_on(
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+        stream: *mut c_void,
+    ) -> c_int;
+    fn mmh3_cuda_stream_create(stream: *mut *mut c_void) -> c_int;
+    fn mmh3_cuda_stream_destroy(stream: *mut c_void) -> c_int;
+    fn mmh3_cuda_stream_synchronize(stream: *mut c_void) -> c_int;
     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
     fn mmh3_cuda_malloc(pointer: *mut *mut c_void, bytes: usize) -> c_int;
     fn mmh3_cuda_free_on(device: c_int, pointer: *mut c_void) -> c_int;
@@ -201,6 +217,87 @@ pub fn set_device(device: usize) -> Result<(), CudaError> {
     check(unsafe { mmh3_cuda_set_device(device as c_int) })
 }
 
+/// Whether `device` can read `peer`'s memory directly, which is what makes an exchange with another
+/// card of this process a copy between the two rather than one through the host.
+pub fn can_access_peer(device: usize, peer: usize) -> Result<bool, CudaError> {
+    let mut can = 0;
+    // SAFETY: can is a valid out pointer.
+    check(unsafe { mmh3_cuda_can_access_peer(device as c_int, peer as c_int, &mut can) })?;
+    Ok(can != 0)
+}
+
+/// Lets the device this thread computes on read `peer`'s memory. A pair that has it already is no
+/// error, and a pair that cannot have it at all says so.
+pub fn enable_peer_access(peer: usize) -> Result<(), CudaError> {
+    // SAFETY: no pointers.
+    check(unsafe { mmh3_cuda_enable_peer_access(peer as c_int) })
+}
+
+/// Copies `bytes` bytes between two addresses this process holds, on one card, between two cards
+/// or through the host, in order with the kernels on the default stream of the device this thread
+/// computes on. It returns before the copy is done, which `synchronize` waits for.
+///
+/// # Safety
+/// Both ranges must lie inside live allocations of this process.
+pub unsafe fn copy_across(
+    destination: *mut c_void,
+    source: *const c_void,
+    bytes: usize,
+) -> Result<(), CudaError> {
+    // SAFETY: the caller keeps both ranges inside their allocations.
+    check(unsafe { mmh3_cuda_copy_across(destination, source, bytes) })
+}
+
+/// A stream of its own for copies between cards, which run beside the kernels on the default
+/// stream instead of queueing behind them. It does not wait for the default stream either, so the
+/// caller copies only what the kernels have finished writing.
+pub struct CopyStream {
+    stream: *mut c_void,
+}
+
+// SAFETY: a stream handle means the same on every thread of the process.
+unsafe impl Send for CopyStream {}
+
+impl CopyStream {
+    /// A stream on the device this thread computes on.
+    pub fn new() -> Result<Self, CudaError> {
+        let mut stream = ptr::null_mut();
+        // SAFETY: stream is a valid out pointer.
+        check(unsafe { mmh3_cuda_stream_create(&mut stream) })?;
+        Ok(Self { stream })
+    }
+
+    /// `copy_across` on this stream.
+    ///
+    /// # Safety
+    /// Both ranges must lie inside live allocations of this process until `synchronize` returns.
+    pub unsafe fn copy_across(
+        &self,
+        destination: *mut c_void,
+        source: *const c_void,
+        bytes: usize,
+    ) -> Result<(), CudaError> {
+        // SAFETY: the caller keeps both ranges inside their allocations.
+        check(unsafe { mmh3_cuda_copy_across_on(destination, source, bytes, self.stream) })
+    }
+
+    /// Waits for every copy on this stream.
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        // SAFETY: the stream is live.
+        check(unsafe { mmh3_cuda_stream_synchronize(self.stream) })
+    }
+}
+
+impl Drop for CopyStream {
+    fn drop(&mut self) {
+        // SAFETY: the stream is live and nothing uses it after this.
+        unsafe {
+            mmh3_cuda_stream_synchronize(self.stream);
+            mmh3_cuda_stream_destroy(self.stream);
+        }
+    }
+}
+
 /// Checks that the current device has the shared memory and registers per SM the kernels were
 /// tuned for, which every sm_12x device has.
 pub fn check_device() -> Result<(), CudaError> {
@@ -339,11 +436,12 @@ pub struct DeviceBuffer {
 
 // SAFETY: a device address is unique across the process rather than to a thread, and every
 // kernel and copy here is submitted to the legacy default stream, which orders the work of all
-// threads on one device against each other. So a buffer means the same thing on whichever thread
-// reads it, and a model built from buffers can be kept in one place and used from the thread that
-// asks for it. Two threads using one model at the same time would still be two runs over one set
-// of scratch buffers, which is what the table that hands models out prevents by handing one out at
-// a time, per device.
+// threads on one device against each other. The copies on a `CopyStream` are the exception, and
+// the exchange that makes them waits for that stream at its barrier. So a buffer means the same
+// thing on whichever thread reads it, and a model built from buffers can be kept in one place and
+// used from the thread that asks for it. Two threads using one model at the same time would still
+// be two runs over one set of scratch buffers, which is what the table that hands models out
+// prevents by handing one out at a time, per device.
 //
 // NOTE: the buffer carries the device it was allocated on, since the thread that drops it need not
 // be computing on that one, and a kernel reading it has to be on that device or a peer of it.
