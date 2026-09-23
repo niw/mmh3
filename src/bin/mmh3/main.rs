@@ -2,17 +2,19 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--worker HOST[:PORT]]... [--local-worker]
-              [--consistent] [--vram-budget GB] [--idle-unload SECONDS]
-  mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--vram-budget GB] [--idle-unload SECONDS]
+  mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--devices N|CARD,CARD...] [--worker HOST[:PORT]]...
+              [--local-worker] [--consistent] [--vram-budget GB] [--idle-unload SECONDS]
+  mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--devices N|CARD,CARD...] [--vram-budget GB]
+              [--idle-unload SECONDS]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
                 [--reference-audio FILE]... [--reference-video FILE]...
                 [--steps N | --schedule taomate] [--seed N] [--shift-video X] [--shift-audio X]
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
-                [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
-                [--token FILE] [--consistent] [--vram-budget GB] [--ffmpeg [FFMPEG_ARGUMENTS...]]
+                [--devices N|CARD,CARD...] [--worker HOST[:PORT] [--worker-units UNITS]]...
+                [--local-worker [--worker-units UNITS]] [--token FILE] [--consistent] [--vram-budget GB]
+                [--ffmpeg [FFMPEG_ARGUMENTS...]]
 
 Metal linear precision: int8 (MPP, default on macOS 26), fp16 (MPP), mps-fp16 (default before macOS 26), or fp32.
 Metal attention precision: fp16 (MPP, default on macOS 26) or fp32.
@@ -40,10 +42,14 @@ Arguments normally go after the generated inputs and before the output path.
 For a full invocation, use whole-argument {video}, {audio}, and {out} placeholders. No shell is invoked.
 generate decodes with vae/minimax_h3_video_vae_int8_convrot.safetensors instead of the FP16 video VAE when the models
 directory has it.
---worker borrows another machine running `mmh3 worker`, repeat it for several. --local-worker starts one in this
-process, so that this machine's own GPU takes part as a worker rather than as the leader. A leader reads no
-model at all: it hands out the prompt, every step and every chunk of the decode, and puts what comes back
-together. What no machine is asked for, it does itself.
+--devices N computes on the first N GPUs of this machine, and --devices CARD,CARD... on the cards named, every card
+when it is left out. A run with no --worker computes here: on one card it takes every step itself, and on several it
+lends them through a worker in this process, a rank per card.
+--worker borrows another machine running `mmh3 worker`, repeat it for several, and every card of it takes a rank.
+A run that names one is the leader and nothing else: it reads no model at all, needs no GPU of its own, hands out
+the prompt, every step and every chunk of the decode, and puts what comes back together. --local-worker lends this
+machine's cards to such a run too, through a worker in this process. What no machine is asked for, the leader does
+itself.
 --worker-units names what the machine before it may be asked for, out of steps, prompt, video and audio,
 separated by commas. Without it a machine may be asked for anything it serves. Every step goes to the machines
 allowed steps, in the order given, which is the order their ranks are numbered in. Where none is allowed them,

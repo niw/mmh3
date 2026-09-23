@@ -45,8 +45,8 @@ const USAGE: &str = "usage:
                     [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
                     [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X]
                     [--sparse-start X] [--vsa-sparsity X]
-                    [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker] [--token FILE]
-                    [--consistent] [--vram-budget GB]
+                    [--devices N|CARD,CARD...] [--worker HOST[:PORT] [--worker-units UNITS]]...
+                    [--local-worker [--worker-units UNITS]] [--token FILE] [--consistent] [--vram-budget GB]
 
 Metal linear precision: int8 (MPP, default on macOS 26), fp16 (MPP), mps-fp16 (default before macOS 26), or fp32.
 Metal attention precision: fp16 (MPP, default on macOS 26) or fp32.

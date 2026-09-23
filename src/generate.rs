@@ -46,16 +46,19 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
     #[cfg(feature = "cuda")]
     crate::models::load_algorithm_cache();
     let video_path = Path::new(options.get("out").ok_or(usage)?).to_path_buf();
-    let settings = Settings::parse(&options, arguments)?;
-    let spec = MediaSpec {
-        width: settings.shape.width,
-        height: settings.shape.height,
-        frames: settings.shape.frames,
-        fps: FPS,
-        sample_rate: SAMPLE_RATE,
-        channels: 2,
-    };
-    let mut output = crate::output::prepare(ffmpeg_arguments, spec, &video_path)?;
+    // Where the video goes is checked before this machine's cards are lent, so that a run that
+    // could not write it starts no worker.
+    let (settings, mut output) = Settings::parse_then(&options, arguments, |settings| {
+        let spec = MediaSpec {
+            width: settings.shape.width,
+            height: settings.shape.height,
+            frames: settings.shape.frames,
+            fps: FPS,
+            sample_rate: SAMPLE_RATE,
+            channels: 2,
+        };
+        crate::output::prepare(ffmpeg_arguments, spec, &video_path)
+    })?;
     let (video, audio) = sample(&options, &settings)?;
 
     // The audio goes to a worker on a connection of its own, since a worker finishes its share of

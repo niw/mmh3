@@ -39,13 +39,14 @@ target/release/mmh3 generate --out out.mp4 --prompt "..." \
 ```
 
 Repeat `--worker` for several. `--worker HOST` uses port 7833, and `--worker HOST:PORT` names
-another. `--local-worker` starts one in this process, so that this machine's GPU takes part as a
-worker rather than as the leader. Leave it out and this machine is the leader and nothing else,
-which reads no model at all.
+another. `--local-worker` starts one in this process, so that this machine's GPUs take part as a
+worker rather than as the leader, every card of it unless `--devices` names fewer. Leave it out
+and this machine is the leader and nothing else, which reads no model at all and needs no GPU.
 
 `--local-worker` is not `--worker localhost`. The first starts a worker inside this process, which
 shares the models it holds with the run. The second connects to a worker somebody else started,
-which holds a second copy of everything it reads.
+which holds a
+second copy of everything it reads.
 
 To see what a worker offers before running a generation:
 
@@ -87,12 +88,14 @@ small. Ranks trade directly with each other rather than through the leader.
 parts back together, and runs no block: the machines that do the work are the workers, and nothing
 else.
 
-So `--local-worker` **lends this machine a rank of its own**, one per card. A worker starts here on
-loopback, takes a session like any other, and nothing in the run knows the difference, so one
-`--worker` and a `--local-worker` on machines of one card each split a step in two. It is given
-once, since the one worker is already every card here.
+So `--local-worker` **lends this machine ranks of its own**, one per card. A worker starts here on
+loopback, takes sessions like any other, and nothing in the run knows the difference, so one
+`--worker` and a `--local-worker` on machines of one card each split a step in two.
 
-Two cards of one worker trade over that worker's own loopback rather than through each other.
+**A run needs no worker at all to use the cards of one machine.** `mmh3 generate` on a machine with
+several cards lends every one of them to itself this way, and a machine with one card takes every
+step on it without a worker. Two cards of one worker trade over that worker's own loopback rather
+than through each other.
 
 **A leader reads no weights at all.** For the DiT it takes the shape from the checkpoint header,
 which costs the header pages and nothing, and assembles the parts from that. For the video VAE it
@@ -286,6 +289,7 @@ On the leader:
 - `--worker HOST[:PORT]`: Name a machine to spread the run across, repeated for several.
 - `--local-worker`: Start a worker in this process, so that this machine's GPUs take part as a
   worker, a rank per card. Without it this machine is the leader and nothing else.
+- `--devices N` or `--devices CARD,CARD...` (default: every card): The cards `--local-worker` lends.
 - `--consistent`: Compute so that the video does not depend on how the run is split, here and on
   every worker, as [Determinism](#determinism) describes.
 - `--worker-units UNITS`: What the `--worker` or `--local-worker` before it may be asked for, out

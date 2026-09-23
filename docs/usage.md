@@ -80,6 +80,10 @@ make generate \
 - `--local-worker` (default off): Start a worker in this process, so that this machine's GPUs take
   part as a worker, a rank per card, rather than as the leader. Without it, a run with workers is
   the leader and nothing else, and reads no model at all.
+- `--devices N` or `--devices CARD,CARD...` (default: every card): The GPUs of this machine that
+  compute, the first N or the cards named. A run with no worker and one card takes every step on
+  it by itself. With several, it lends them through a worker in this process, a rank per card,
+  and every step is split among them. With workers, it is the cards `--local-worker` lends.
 - `--worker-units UNITS` (default: everything the machine serves): What the `--worker` or
   `--local-worker` before it may be asked for, out of `steps`, `prompt`, `video` and `audio`,
   separated by commas.

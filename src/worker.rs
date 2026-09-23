@@ -1283,27 +1283,39 @@ pub fn end_threads_here() {
 /// closing them, and one that has not after this is left to the exit.
 const THREADS_END: Duration = Duration::from_secs(10);
 
-/// A worker on this machine, for a run that shares its steps out. The machine handing the work
-/// out runs no block, so without this its own GPU sits out every step it hands to somebody else.
-/// It is an ordinary rank: it waits on loopback, takes the session the coordinator opens like any
-/// other worker, and nothing in the run knows the difference.
+/// The worker in this process that lends `cards` to the runs this process leads. The machine
+/// handing the work out runs no block, so without it its own GPUs sit out every step it hands to
+/// somebody else. It is an ordinary worker: it waits on loopback, takes the sessions the
+/// coordinator opens like any other, and nothing in the run knows the difference.
 ///
-/// The socket is bound here rather than by the worker, so the port is known without asking and
+/// It is started once and kept, so that a process that leads one run after another, which is
+/// what a server does, keeps one worker and the models it holds rather than a new one a run. The
+/// socket is bound here rather than by the worker, so the port is known without asking and
 /// nobody else can take it in between.
 #[cfg(any(feature = "cuda", feature = "metal"))]
-pub fn worker_here(models: &Path, token: &str) -> Option<String> {
+pub fn worker_here(models: &Path, token: &str, cards: &[usize]) -> Option<String> {
+    type Started = Vec<((PathBuf, String, Vec<usize>), String)>;
+    static STARTED: std::sync::Mutex<Started> = std::sync::Mutex::new(Vec::new());
+
+    let wanted = (models.to_path_buf(), token.to_owned(), cards.to_vec());
+    let mut started = STARTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((_, address)) = started.iter().find(|(key, _)| *key == wanted) {
+        return Some(address.clone());
+    }
     let listener = TcpListener::bind("127.0.0.1:0").ok()?;
     let address = listener.local_addr().ok()?.to_string();
-    let (models, token) = (models.to_path_buf(), token.to_owned());
+    let (models, token, cards) = wanted.clone();
     std::thread::Builder::new()
         .name("worker".to_owned())
         .spawn(move || {
-            let cards = (0..crate::resident::device_count()).collect();
             if let Err(error) = serve_on(listener, models, token, false, false, cards) {
                 eprintln!("warning: the worker on this machine ended: {error}");
             }
         })
         .ok()?;
+    started.push((wanted, address.clone()));
     Some(address)
 }
 

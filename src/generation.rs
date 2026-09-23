@@ -60,10 +60,22 @@ pub const OPTIONS: &[&str] = &[
     "sparse-start",
     "vsa-sparsity",
     "vram-budget",
+    "devices",
 ];
 
 /// The options that stand alone, taking nothing after them.
 pub const FLAGS: &[&str] = &["local-worker", "consistent"];
+
+/// Whether this process keeps its models between the runs it leads, which a server does and a
+/// command does not. A process that keeps them lends its cards through the worker in it even when
+/// a run could have taken every step on one card by itself, since the worker is what holds models
+/// between runs.
+static KEEPS_MODELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Keeps the models of the runs this process leads loaded between them.
+pub fn keep_models() {
+    KEEPS_MODELS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
 
 /// A machine this run may borrow, and what it may be asked for.
 pub struct Machine {
@@ -72,6 +84,10 @@ pub struct Machine {
     /// `--worker-units` named fewer.
     pub units: u32,
 }
+
+/// A machine of the run and the units it may be asked for, with no address for the worker in this
+/// process, which starts only once the run has been checked.
+type PlannedMachine = (Option<String>, u32);
 
 /// Every unit there is, for a machine that was named with no units of its own.
 fn every_unit() -> u32 {
@@ -183,8 +199,10 @@ pub struct Settings {
     pub seed: u64,
     pub shift_video: f32,
     pub shift_audio: f32,
-    /// The machines of `--worker` and `--local-worker`, in the order they were given, which is
-    /// the order their ranks are numbered in.
+    /// The machines this run borrows, in the order their ranks are numbered in: the `--worker`s and
+    /// the `--local-worker` in the order given, or this machine's cards alone through the worker in
+    /// this process for a run that names none. Empty for a run that takes every step on one card
+    /// by itself.
     pub workers: Vec<Machine>,
     /// The shared secret of `--token`, empty when there is none.
     pub token: String,
@@ -208,55 +226,103 @@ impl Settings {
             .collect()
     }
 
-    /// The machines of `--worker` and `--local-worker`, with the units each may be asked for. A
-    /// `--local-worker` is started here, so that this machine's own GPU takes part as a worker
-    /// rather than as the leader: a leader reads no model.
+    /// The machines of the run, with the units each may be asked for.
+    ///
+    /// A run that names a `--worker` hands its work out, and this machine is the leader and nothing
+    /// else unless `--local-worker` lends it too: a leader reads no model, and a machine with no GPU
+    /// can lead. A run that names none computes here, on every card `--devices` names, and needs a
+    /// worker only when there is more than one card to share a step among.
+    ///
+    /// The worker in this process is not started here. Its address is `None`, and `parse_then`
+    /// starts it once everything else about the run has been checked.
     fn machines(
         options: &HashMap<&str, &str>,
         arguments: &[String],
-        token: &str,
-    ) -> Result<Vec<Machine>, Box<dyn Error>> {
+    ) -> Result<(Vec<PlannedMachine>, Vec<usize>), Box<dyn Error>> {
         let borrowed = crate::cli::borrowed(arguments)?;
-        // One worker in this process lends every card this machine has, so a second would lend
-        // the same cards again.
-        if borrowed
+        let lent = borrowed
             .iter()
             .filter(|machine| machine.address.is_none())
-            .count()
-            > 1
-        {
+            .count();
+        let named = borrowed.len() > lent;
+        if lent > 1 {
             return Err(
-                "--local-worker lends this machine once, with every GPU it has, so give it once"
+                "--local-worker lends this machine once, with the cards --devices names, so give \
+                 it once"
                     .into(),
             );
         }
+        if named && lent == 0 && options.contains_key("devices") {
+            return Err(
+                "--devices names the cards this machine lends, which a run with --worker \
+                        lends only with --local-worker"
+                    .into(),
+            );
+        }
+        let cards = Self::cards(options)?;
+        if cards.is_empty() && lent == 1 {
+            #[cfg(not(any(feature = "cuda", feature = "metal")))]
+            return Err(
+                "this build runs nothing of its own, so it has no --local-worker to give".into(),
+            );
+            #[cfg(any(feature = "cuda", feature = "metal"))]
+            return Err("--local-worker with --devices 0 lends nothing".into());
+        }
+        if cards.is_empty() && !named && options.contains_key("devices") {
+            return Err("--devices 0 leaves this machine nothing to compute on".into());
+        }
         let mut machines = Vec::new();
+        // A run that has one card and nothing else to hand work to takes every step on that card
+        // itself, which needs no worker at all.
+        let alone = !named && lent == 0;
+        if alone && (cards.len() > 1 || KEEPS_MODELS.load(std::sync::atomic::Ordering::Relaxed)) {
+            machines.push((None, every_unit()));
+        }
         for borrowed in borrowed {
             let units = match borrowed.units {
                 Some(text) => units(text)?,
                 None => every_unit(),
             };
-            let address = match borrowed.address {
-                Some(address) => address.to_owned(),
-                None => Self::worker_here(options, token)?,
-            };
-            machines.push(Machine { address, units });
+            machines.push((borrowed.address.map(str::to_owned), units));
         }
-        Ok(machines)
+        Ok((machines, cards))
     }
 
-    /// The address of a worker started in this process for `--local-worker`.
+    /// The cards of this machine `--devices` names, every card when it names none.
     #[cfg(any(feature = "cuda", feature = "metal"))]
-    fn worker_here(options: &HashMap<&str, &str>, token: &str) -> Result<String, Box<dyn Error>> {
-        let models = crate::models::models_directory(options)
-            .ok_or("--local-worker needs a models directory, from --models DIR or MMH3_MODELS")?;
-        crate::worker::worker_here(&models, token)
+    fn cards(options: &HashMap<&str, &str>) -> Result<Vec<usize>, Box<dyn Error>> {
+        crate::resident::cards(options, crate::resident::device_count())
+    }
+
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    fn cards(options: &HashMap<&str, &str>) -> Result<Vec<usize>, Box<dyn Error>> {
+        match options.get("devices").copied() {
+            None | Some("0") => Ok(Vec::new()),
+            Some(_) => Err("this build has no device of its own for --devices to name".into()),
+        }
+    }
+
+    /// The address of the worker in this process that lends `cards` to the runs it leads.
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    fn worker_here(
+        options: &HashMap<&str, &str>,
+        token: &str,
+        cards: &[usize],
+    ) -> Result<String, Box<dyn Error>> {
+        let models = crate::models::models_directory(options).ok_or(
+            "this machine's cards need a models directory, from --models DIR or MMH3_MODELS",
+        )?;
+        crate::worker::worker_here(&models, token, cards)
             .ok_or_else(|| "no worker could start on this machine".into())
     }
 
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
-    fn worker_here(_options: &HashMap<&str, &str>, _token: &str) -> Result<String, Box<dyn Error>> {
-        Err("this build runs nothing of its own, so it has no --local-worker to give".into())
+    fn worker_here(
+        _options: &HashMap<&str, &str>,
+        _token: &str,
+        _cards: &[usize],
+    ) -> Result<String, Box<dyn Error>> {
+        Err("this build runs nothing of its own".into())
     }
 
     /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
@@ -265,6 +331,17 @@ impl Settings {
         options: &HashMap<&str, &str>,
         arguments: &[String],
     ) -> Result<Self, Box<dyn Error>> {
+        Self::parse_then(options, arguments, |_| Ok(())).map(|(settings, ())| settings)
+    }
+
+    /// `parse`, running `before_lending` on the settings before this machine's cards are lent to a
+    /// worker in this process. A caller with more to check, such as where the video goes, checks it
+    /// there, so that a run it refuses starts no worker and needs no models directory.
+    pub fn parse_then<T>(
+        options: &HashMap<&str, &str>,
+        arguments: &[String],
+        before_lending: impl FnOnce(&Self) -> Result<T, Box<dyn Error>>,
+    ) -> Result<(Self, T), Box<dyn Error>> {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         crate::resident::take_budget(options)?;
         crate::worker::set_consistent(options.contains_key("consistent"));
@@ -272,7 +349,14 @@ impl Settings {
             Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
             None => String::new(),
         };
-        let workers = Self::machines(options, arguments, &token)?;
+        let (machines, cards) = Self::machines(options, arguments)?;
+        // Whatever this run computes on this thread goes to the first card it was given: every
+        // step of a run alone on one card, and beside the cards lent through the worker in this
+        // process, the canvases the decode puts together and the room it makes for them.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        if let Some(&card) = cards.first() {
+            crate::resident::bind_device(card)?;
+        }
         #[cfg(feature = "metal")]
         {
             crate::metal::validate_options(options)?;
@@ -280,9 +364,9 @@ impl Settings {
             // cannot run it can refuse now rather than after encoding a prompt. A run that means
             // to hand them out is judged by `load_dit`, which is reached only if it ends up
             // running them here after all.
-            if workers
+            if machines
                 .iter()
-                .all(|machine| machine.units & mmh3_core::worker::CAPABILITY_DIT_SHARD == 0)
+                .all(|(_, units)| units & mmh3_core::worker::CAPABILITY_DIT_SHARD == 0)
             {
                 crate::metal::validate_step_options(options)?;
             }
@@ -394,7 +478,7 @@ impl Settings {
                 picture.resize(reference_width, reference_height)
             })
             .collect();
-        Ok(Settings {
+        let mut settings = Settings {
             shape,
             keyframes,
             references,
@@ -405,9 +489,21 @@ impl Settings {
             seed: option_number(options, "seed", 0)? as u64,
             shift_video,
             shift_audio,
-            workers,
+            workers: Vec::new(),
             token,
-        })
+        };
+        let checked = before_lending(&settings)?;
+        settings.workers = machines
+            .into_iter()
+            .map(|(address, units)| {
+                let address = match address {
+                    Some(address) => address,
+                    None => Self::worker_here(options, &settings.token, &cards)?,
+                };
+                Ok(Machine { address, units })
+            })
+            .collect::<Result<_, Box<dyn Error>>>()?;
+        Ok((settings, checked))
     }
 }
 
