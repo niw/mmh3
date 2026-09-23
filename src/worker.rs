@@ -1392,7 +1392,7 @@ fn session(
                 let lent = {
                     let mut kept = table.borrow();
                     match session_dit(&mut kept, models, &open) {
-                        Ok(_) => Ok(kept.take_dit().expect("a DiT the session just kept")),
+                        Ok(_) => Ok(kept.lend_dit().expect("a DiT the session just kept")),
                         Err(error) => Err(error),
                     }
                 };
@@ -1405,7 +1405,7 @@ fn session(
                         &body[payload..],
                         token,
                     );
-                    table.borrow().keep_dit(key, dit);
+                    table.borrow().return_dit(key, dit);
                     served
                 });
                 table.let_go_if_out_of_memory(&served);

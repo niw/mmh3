@@ -110,6 +110,8 @@ pub struct Models {
     tick: u64,
     /// When a model was last asked for, for letting go of them all after a quiet while.
     touched: Option<Instant>,
+    /// The DiTs lent out of the table to runs that have not put them back yet.
+    lent: usize,
 }
 
 impl Default for Models {
@@ -127,6 +129,7 @@ impl Models {
             dit: Slot::new(),
             tick: 0,
             touched: None,
+            lent: 0,
         }
     }
 
@@ -249,6 +252,20 @@ impl Models {
     /// session's adapters is not one anybody asked for.
     pub fn take_dit(&mut self) -> Option<(DitKey, Dit)> {
         self.dit.kept.take()
+    }
+
+    /// The kept DiT, lent out of the table for a run, which puts it back with `return_dit`.
+    pub fn lend_dit(&mut self) -> Option<(DitKey, Dit)> {
+        let lent = self.dit.kept.take();
+        self.lent += usize::from(lent.is_some());
+        lent
+    }
+
+    /// Puts back a DiT `lend_dit` lent, and tells whoever waits for the memory it holds.
+    pub fn return_dit(&mut self, key: DitKey, dit: Dit) {
+        self.lent -= 1;
+        self.keep_dit(key, dit);
+        RETURNED.notify_all();
     }
 
     /// Keeps a DiT for the sessions that follow.
@@ -405,6 +422,13 @@ impl Table {
     }
 }
 
+/// Told whenever a run puts back the DiT it was lent.
+static RETURNED: std::sync::Condvar = std::sync::Condvar::new();
+
+/// How long a request that ran out of memory waits for a lent DiT. A run that panicked never puts
+/// its DiT back, and one still computing may not for a long while, so the request fails instead.
+const RETURN_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// The models of this process, made on the first ask.
 fn shared() -> &'static std::sync::Mutex<Models> {
     use std::sync::{Mutex, OnceLock};
@@ -421,17 +445,30 @@ fn locked() -> std::sync::MutexGuard<'static, Models> {
 
 /// Makes room for work that ran out of memory to try again in, and says whether it did. It lets go
 /// of the model used least, but none of the `released` ones again: the work read that one back
-/// itself, so letting go of it once more would only make the next attempt read it again.
+/// itself, so letting go of it once more would only make the next attempt read it again. With
+/// nothing left to let go of, it waits for a DiT a run still has.
+///
+/// NOTE: a run puts its DiT back only after the leader has closed its session, which it does
+/// without waiting for the worker, so the next request of the same leader may find the DiT still
+/// out. The wait lets go of the table, which the run needs to put it back.
 fn make_room(mut models: std::sync::MutexGuard<'static, Models>, released: &mut Vec<Kind>) -> bool {
-    let Some(kind) = models.release_oldest_except(released) else {
+    if let Some(kind) = models.release_oldest_except(released) {
+        println!(
+            "the device had no memory left, so let go of {} and tried again",
+            kind.name()
+        );
+        released.push(kind);
+        return true;
+    }
+    if models.lent == 0 {
         return false;
-    };
-    println!(
-        "the device had no memory left, so let go of {} and tried again",
-        kind.name()
-    );
-    released.push(kind);
-    true
+    }
+    println!("the device had no memory left, so waited for a run to put its DiT back");
+    let lent = models.lent;
+    let (_models, waited) = RETURNED
+        .wait_timeout_while(models, RETURN_TIMEOUT, |models| models.lent >= lent)
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    !waited.timed_out()
 }
 
 /// Runs work of this process's own, letting go of the model used least and trying again each time
