@@ -464,7 +464,10 @@ pub fn sample(
     } else {
         DIT_FILE
     };
-    let prepared_workers = prepare_workers(settings, options, dit_file);
+    // A prompt of plain text goes to a worker, which reads nothing ahead for it.
+    let prompt_on_worker =
+        prompt.is_some() && options.get("context").is_none() && prompt_references.is_empty();
+    let prepared_workers = prepare_workers(settings, options, dit_file, prompt_on_worker);
 
     let encode_context = || -> Result<(Tensor, Vec<mmh3_core::dit::timestep::Modality>), String> {
         #[allow(unused_mut)]
@@ -1024,13 +1027,18 @@ struct ShardTarget {
 /// Connects to the workers a shared-out run would use and names the DiT it will share, so that
 /// they read it while this machine still has a prompt to encode. The connections are the ones the
 /// session opens on, since what a worker reads early is only there for the connection it came on.
+///
+/// The worker that encodes the prompt, when `prompt_on_worker` says one does, is not told. Its
+/// reads take turns, so the DiT read ahead would only hold the prompt up, and on a card without
+/// the room for both it would be let go for the text encoder and read again for the steps.
 fn prepare_workers(
     settings: &Settings,
     options: &HashMap<&str, &str>,
     dit_file: &str,
+    prompt_on_worker: bool,
 ) -> Vec<crate::worker::Worker> {
-    use crate::worker::{Worker, digest};
-    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint};
+    use crate::worker::{TEXT_ENCODER_ROLE, Worker, digest};
+    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, CAPABILITY_ENCODE_TEXT, Checkpoint};
 
     let ranks = settings.workers_for(CAPABILITY_DIT_SHARD);
     if ranks.is_empty() {
@@ -1049,6 +1057,15 @@ fn prepare_workers(
             return Vec::new();
         }
     };
+    // The machine `encode_on_worker` asks first, which is the one that encodes.
+    let encoder = prompt_on_worker
+        .then(|| {
+            settings
+                .workers_for(CAPABILITY_ENCODE_TEXT)
+                .first()
+                .copied()
+        })
+        .flatten();
     let mut workers = Vec::new();
     for address in ranks {
         let mut worker = match Worker::connect(address, &settings.token) {
@@ -1059,6 +1076,13 @@ fn prepare_workers(
             }
         };
         if !worker.serves(CAPABILITY_DIT_SHARD) {
+            continue;
+        }
+        let encodes = encoder == Some(address)
+            && worker.serves(CAPABILITY_ENCODE_TEXT)
+            && worker.checkpoint(TEXT_ENCODER_ROLE).is_some();
+        if encodes {
+            workers.push(worker);
             continue;
         }
         if let Err(error) = worker.prepare(&checkpoint) {
