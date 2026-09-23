@@ -93,7 +93,21 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
     }
     #[cfg(feature = "cuda")]
     {
-        let decoded = decoder.decode_device_with(&video, &mut |chunk| remote.take(chunk))?;
+        // The card this machine lends a worker of its own holds its models, and the decode makes
+        // room beside them. It tries again only while it has taken no canvas, since one taken is
+        // one the workers do not send twice.
+        let decoded = crate::resident::with_room(|| {
+            let mut taken = false;
+            match decoder.decode_device_with(&video, &mut |chunk| {
+                let canvas = remote.take(chunk)?;
+                taken |= canvas.is_some();
+                Ok(canvas)
+            }) {
+                Ok(decoded) => Ok(decoded),
+                Err(error) if taken => Err(format!("decoding the video: {error}").into()),
+                Err(error) => Err(error.into()),
+            }
+        })?;
         drop(decoder);
         output.write_cuda_video(&decoded)?;
     }

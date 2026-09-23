@@ -259,6 +259,11 @@ impl Models {
 
     /// Lets go of the model used least recently, and says which it was.
     fn release_oldest(&mut self) -> Option<Kind> {
+        self.release_oldest_except(&[])
+    }
+
+    /// Lets go of the model used least recently that is none of `kept`, and says which it was.
+    fn release_oldest_except(&mut self, kept: &[Kind]) -> Option<Kind> {
         let oldest = [
             (self.text_encoder.releasable(), Kind::TextEncoder),
             (self.video_decoder.releasable(), Kind::VideoDecoder),
@@ -266,6 +271,7 @@ impl Models {
             (self.dit.releasable(), Kind::Dit),
         ]
         .into_iter()
+        .filter(|(_, kind)| !kept.contains(kind))
         .filter_map(|(used, kind)| Some((used?, kind)))
         .min_by_key(|(used, _)| *used);
         let (_, kind) = oldest?;
@@ -368,6 +374,27 @@ impl Table {
         }
     }
 
+    /// Runs a request that may be run again, letting go of the model used least and trying again
+    /// each time the device runs out of memory, as a read does. A decode reads its decoder and then
+    /// needs room to work in besides, which a DiT kept from the steps before it may be holding.
+    pub fn with_room<T>(
+        &mut self,
+        mut work: impl FnMut(&mut Models) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let mut released = Vec::new();
+        loop {
+            let mut models = locked();
+            match work(&mut models) {
+                Err(error) if out_of_memory(&*error) => {
+                    if !make_room(models, &mut released) {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// The models, for as long as the returned borrow lives, which is one request at a time across
     /// the whole process. That is also all the device can do at once.
     ///
@@ -390,6 +417,44 @@ fn locked() -> std::sync::MutexGuard<'static, Models> {
     shared()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Makes room for work that ran out of memory to try again in, and says whether it did. It lets go
+/// of the model used least, but none of the `released` ones again: the work read that one back
+/// itself, so letting go of it once more would only make the next attempt read it again.
+fn make_room(mut models: std::sync::MutexGuard<'static, Models>, released: &mut Vec<Kind>) -> bool {
+    let Some(kind) = models.release_oldest_except(released) else {
+        return false;
+    };
+    println!(
+        "the device had no memory left, so let go of {} and tried again",
+        kind.name()
+    );
+    released.push(kind);
+    true
+}
+
+/// Runs work of this process's own, letting go of the model used least and trying again each time
+/// the device runs out of memory. A leader that lends its card to a worker in the same process
+/// shares it with the models that worker keeps, and this is how what the leader does after the
+/// steps finds room beside them.
+///
+/// NOTE: the table is locked only to let go, never while the work runs. The work may wait on that
+/// same worker, which takes the table for everything it does.
+pub fn with_room<T>(
+    mut work: impl FnMut() -> Result<T, Box<dyn Error>>,
+) -> Result<T, Box<dyn Error>> {
+    let mut released = Vec::new();
+    loop {
+        match work() {
+            Err(error) if out_of_memory(&*error) => {
+                if !make_room(locked(), &mut released) {
+                    return Err(error);
+                }
+            }
+            result => return result,
+        }
+    }
 }
 
 /// What this machine is holding on to, for a caller that only means to say so and must not wait.

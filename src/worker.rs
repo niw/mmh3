@@ -1353,7 +1353,7 @@ fn session(
             },
             Kind::EncodeText => {
                 let request = EncodeText::decode(&body)?;
-                let encoded = encode_text(checkpoints, &request, &mut table.borrow());
+                let encoded = table.with_room(|models| encode_text(checkpoints, &request, models));
                 table.let_go_if_out_of_memory(&encoded);
                 match encoded {
                     Ok(context) => {
@@ -1416,7 +1416,7 @@ fn session(
             }
             Kind::DecodeAudio => {
                 let started = Instant::now();
-                let decoded = decode_audio(checkpoints, &body, &mut table.borrow());
+                let decoded = table.with_room(|models| decode_audio(checkpoints, &body, models));
                 table.let_go_if_out_of_memory(&decoded);
                 match decoded {
                     Ok(waveform) => {
@@ -1444,7 +1444,7 @@ fn session(
             }
             Kind::DecodeVideo => {
                 let started = Instant::now();
-                let decoded = decode_video(checkpoints, &body, &mut table.borrow());
+                let decoded = table.with_room(|models| decode_video(checkpoints, &body, models));
                 table.let_go_if_out_of_memory(&decoded);
                 match decoded {
                     Ok((chunk, payload)) => {
@@ -1519,7 +1519,7 @@ fn session(
             }
             Kind::DecodeWhole => {
                 let started = Instant::now();
-                let decoded = decode_whole(checkpoints, &body, &mut table.borrow());
+                let decoded = table.with_room(|models| decode_whole(checkpoints, &body, models));
                 table.let_go_if_out_of_memory(&decoded);
                 match decoded {
                     Ok((frames, payload)) => {
