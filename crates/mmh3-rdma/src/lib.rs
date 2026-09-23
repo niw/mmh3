@@ -78,6 +78,7 @@ struct Part {
 const PARTS: usize = 4;
 const NAME_BYTES: usize = 64;
 
+#[cfg(not(mmh3_rdma_without_verbs))]
 unsafe extern "C" {
     fn mmh3_rdma_device_names(names: *mut c_char, capacity: c_int) -> c_int;
     fn mmh3_rdma_open(device: *const c_char, global_id_index: c_int) -> *mut c_void;
@@ -96,6 +97,48 @@ unsafe extern "C" {
     fn mmh3_rdma_read_all(parts: *const Part, count: c_int, milliseconds: c_int) -> c_int;
     fn mmh3_rdma_write_all(parts: *const Part, count: c_int, milliseconds: c_int) -> c_int;
 }
+
+/// Stand-ins for `rdma.c` when it was built without the libibverbs headers. No device is ever
+/// found, so no handle exists for the rest to be called with.
+#[cfg(mmh3_rdma_without_verbs)]
+mod without_verbs {
+    use super::{Address, Part, c_char, c_int, c_void};
+
+    pub unsafe fn mmh3_rdma_device_names(_names: *mut c_char, _capacity: c_int) -> c_int {
+        0
+    }
+    pub unsafe fn mmh3_rdma_open(_device: *const c_char, _global_id_index: c_int) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn mmh3_rdma_close(_rdma: *mut c_void) {}
+    pub unsafe fn mmh3_rdma_link_open(_rdma: *mut c_void) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn mmh3_rdma_link_close(_link: *mut c_void) {}
+    pub unsafe fn mmh3_rdma_link_address(_link: *mut c_void, _address: *mut Address) -> c_int {
+        -1
+    }
+    pub unsafe fn mmh3_rdma_link_connect(_link: *mut c_void, _peer: *const Address) -> c_int {
+        -1
+    }
+    pub unsafe fn mmh3_rdma_register(
+        _rdma: *mut c_void,
+        _buffer: *mut c_void,
+        _bytes: usize,
+        _remote_key: *mut u32,
+    ) -> *mut c_void {
+        std::ptr::null_mut()
+    }
+    pub unsafe fn mmh3_rdma_unregister(_region: *mut c_void) {}
+    pub unsafe fn mmh3_rdma_read_all(_parts: *const Part, _count: c_int, _ms: c_int) -> c_int {
+        -1
+    }
+    pub unsafe fn mmh3_rdma_write_all(_parts: *const Part, _count: c_int, _ms: c_int) -> c_int {
+        -1
+    }
+}
+#[cfg(mmh3_rdma_without_verbs)]
+use without_verbs::*;
 
 /// The RoCEv2 entry of a port's table, which is what these machines use.
 pub const DEFAULT_GLOBAL_ID: i32 = 3;

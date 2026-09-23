@@ -1,6 +1,7 @@
 use std::env;
+use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
@@ -12,8 +13,19 @@ fn main() {
     let source = manifest.join("src/rdma.c");
     println!("cargo:rerun-if-changed={}", source.display());
 
-    let object = out.join("rdma.o");
+    println!("cargo:rerun-if-env-changed=CC");
+    println!("cargo:rustc-check-cfg=cfg(mmh3_rdma_without_verbs)");
+
     let compiler = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
+    if !has_verbs(&compiler) {
+        // Without the headers the crate builds with no device to open, and the socket carries
+        // everything. Installing libibverbs later needs `cargo clean -p mmh3-rdma` to be noticed.
+        println!("cargo:warning=infiniband/verbs.h was not found, so mmh3 builds without RDMA");
+        println!("cargo:rustc-cfg=mmh3_rdma_without_verbs");
+        return;
+    }
+
+    let object = out.join("rdma.o");
     let status = Command::new(&compiler)
         .args([
             "-O2",
@@ -42,4 +54,24 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=mmh3_rdma");
     println!("cargo:rustc-link-lib=dylib=ibverbs");
+}
+
+/// Whether the compiler finds the libibverbs headers.
+fn has_verbs(compiler: &str) -> bool {
+    let Ok(mut child) = Command::new(compiler)
+        .args(["-E", "-x", "c", "-", "-o", "/dev/null"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let written = child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"#include <infiniband/verbs.h>\n")
+        .is_ok();
+    child.wait().is_ok_and(|status| status.success()) && written
 }

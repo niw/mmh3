@@ -11,6 +11,9 @@ The `cuda` backend runs every part of a generation on an NVIDIA Blackwell GPU, w
 - The Hugging Face CLI (`hf`) to download the models, for example installed with
   `uv tool install huggingface_hub`.
 - A C/C++ toolchain for the CUDA kernels and NVENC adapter.
+- Optionally, the libibverbs headers (`libibverbs-dev`) for RDMA between machines. Without them
+  mmh3 builds without RDMA and sends everything over the socket. After installing them, run
+  `cargo clean -p mmh3-rdma` so that the next build finds them.
 - About 55 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
   21 GB of weights plus activations.
 
