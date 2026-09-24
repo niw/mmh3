@@ -1827,9 +1827,14 @@ struct Computed(HashMap<shard::Region, mmh3_cuda::DeviceBuffer>);
 #[cfg(feature = "cuda")]
 impl Computed {
     /// Memory for a region a block computes in, kept for the run. Regions a block only exchanges
-    /// through are not given any: they are read and written where the peer left them.
+    /// through are not given any: they are read and written where the peer left them. That is
+    /// host memory, which a peer's attention output is read from once, so a device that cannot
+    /// read host memory where it lies takes that on the device too, copied after each exchange.
     fn make(&mut self, region: shard::Region, bytes: usize) -> Result<(), Box<dyn Error>> {
-        if region.is_computed_in() {
+        let read_once = matches!(region, shard::Region::Received(_));
+        if region.is_computed_in()
+            || (read_once && !mmh3_cuda::reads_host_memory().unwrap_or(false))
+        {
             self.0
                 .insert(region, mmh3_cuda::DeviceBuffer::zeroed(bytes)?);
         }

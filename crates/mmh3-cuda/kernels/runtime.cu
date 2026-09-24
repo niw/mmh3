@@ -43,6 +43,16 @@ extern "C" int mmh3_cuda_memory_info(size_t *free_bytes, size_t *total_bytes) {
     return static_cast<int>(cudaMemGetInfo(free_bytes, total_bytes));
 }
 
+extern "C" int mmh3_cuda_reads_host_memory(int *reads) {
+    int device = 0;
+    const cudaError_t status = cudaGetDevice(&device);
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    return static_cast<int>(
+        cudaDeviceGetAttribute(reads, cudaDevAttrPageableMemoryAccessUsesHostPageTables, device));
+}
+
 extern "C" const char *mmh3_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }

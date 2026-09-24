@@ -46,6 +46,7 @@ unsafe extern "C" {
     fn mmh3_cuda_device_count(count: *mut c_int) -> c_int;
     fn mmh3_cuda_device_info(device: c_int, info: *mut RawDeviceInfo) -> c_int;
     fn mmh3_cuda_memory_info(free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
+    fn mmh3_cuda_reads_host_memory(reads: *mut c_int) -> c_int;
     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
     fn mmh3_cuda_malloc(pointer: *mut *mut c_void, bytes: usize) -> c_int;
     fn mmh3_cuda_free(pointer: *mut c_void) -> c_int;
@@ -164,6 +165,16 @@ pub fn memory_info() -> Result<(usize, usize), CudaError> {
     // SAFETY: both are valid out pointers.
     check(unsafe { mmh3_cuda_memory_info(&mut free_bytes, &mut total_bytes) })?;
     Ok((free_bytes, total_bytes))
+}
+
+/// Whether a kernel on this thread's device reads ordinary host memory where it lies, through the
+/// host's own page tables, as a GB10 or a Grace GPU does. A discrete GPU does not: without HMM it
+/// cannot read such memory at all, and with it every access faults its way across PCIe.
+pub fn reads_host_memory() -> Result<bool, CudaError> {
+    let mut reads = 0;
+    // SAFETY: a valid out pointer.
+    check(unsafe { mmh3_cuda_reads_host_memory(&mut reads) })?;
+    Ok(reads != 0)
 }
 
 pub fn synchronize() -> Result<(), CudaError> {
