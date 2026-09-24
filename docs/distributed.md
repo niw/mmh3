@@ -219,16 +219,21 @@ first exchange, which is what they did before and which looks exactly like one s
 
 ## Determinism
 
-Within one backend, a shared run is reproducible: the same machines with the same cut produce the
-same video every time, and the same cut reached two different ways produces the same video. Ulysses
-concatenates per-head outputs and never reduces across heads, so which machine computed which head
-is invisible, and the exchange carries a block's input in the INT8 its layers already consume.
+With `--consistent`, a run on CUDA comes out bit for bit the same however it is split: on one
+GPU, across the ranks of any number of machines with the same GPU and cuBLASLt version, and from
+one run to the next. Ulysses concatenates
+per-head outputs and never reduces across heads, so which machine computed which head is invisible,
+and the exchange carries a block's input in the INT8 its layers already consume. What is left is
+cuBLASLt, whose algorithm for a GEMM depends on its shape, and a rank's share of the rows is another
+shape. `--consistent` runs one algorithm for every shape of a layer, never splits K and times
+nothing, and the leader tells every worker to do the same. It costs no measurable speed at 448×256
+or at 768p.
 
-It is not always what one machine produces on its own, though. Splitting the sequence changes the
-shape of every GEMM in a block, and the algorithm kept for a shape is the fastest one timed for it,
-so two shapes can round differently. Split in two, a 448×256 run over two steps came out different
-from the same run unsplit. A step handed to one rank, which splits nothing, came out identical to
-it.
+Without it, each shape takes the fastest algorithm timed for it, which a later run takes over from
+`cublaslt-matmul-algorithms.txt` in `$XDG_CACHE_HOME/mmh3`. A split run then differs from the same
+run on one GPU, and two machines or two runs that timed differently differ from each other. One
+FP32 rounding in the last layer is enough to make a different video after a few steps, not a
+noisier one.
 
 Across backends it does not hold, and cannot: a Metal rank packs as halves what a CUDA rank carries
 as INT8, and one value crossing a rounding edge moves most of the velocity fifty blocks later. A
@@ -269,6 +274,8 @@ On the leader:
 - `--worker HOST[:PORT]`: Name a machine to spread the run across, repeated for several.
 - `--local-worker`: Start a worker in this process, so that this machine's GPU takes part as a
   worker. Without it this machine is the leader and nothing else.
+- `--consistent`: Compute so that the video does not depend on how the run is split, here and on
+  every worker, as [Determinism](#determinism) describes.
 - `--worker-units UNITS`: What the `--worker` or `--local-worker` before it may be asked for, out
   of `steps`, `prompt`, `video` and `audio`, separated by commas. Without it a machine may be
   asked for anything it serves.

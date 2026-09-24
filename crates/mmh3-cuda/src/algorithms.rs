@@ -1,13 +1,11 @@
-//! The cuBLASLt algorithms chosen for the GEMM shapes of a run, and the files that keep them
-//! between runs.
+//! The cuBLASLt algorithms chosen for the GEMM shapes of a run, the files that keep them between
+//! runs, and the consistency that chooses none by measuring.
 //!
 //! A choice comes from timing the heuristic's candidates on the shape's own operands, which costs
-//! about a second on the first step of a run and, in a shared-out step, happens while the wire and
-//! another rank have the device. A file taken over at startup spares both: a run that has met its
-//! shapes before times none of them, and two ranks that read the same file make the same choices.
+//! about a second on the first step of a run. A file taken over at startup spares it: a run that
+//! has met its shapes before times none of them.
 
 use crate::{CudaError, check};
-use mmh3_core::worker::Algorithm;
 use std::ffi::{CStr, c_char, c_int};
 use std::path::Path;
 use std::{fs, io, ptr};
@@ -19,6 +17,38 @@ unsafe extern "C" {
     fn mmh3_cublaslt_nvfp4_algorithms(algorithms: *mut Nvfp4Algorithm, capacity: c_int) -> c_int;
     fn mmh3_cublaslt_nvfp4_adopt(algorithms: *const Nvfp4Algorithm, count: c_int);
     fn mmh3_cublaslt_nvfp4_algorithm_key(key: *mut c_char, capacity: c_int) -> c_int;
+    fn mmh3_cublaslt_consistent_by_default(consistent: c_int);
+    fn mmh3_cublaslt_consistent_on_this_thread(consistent: c_int);
+}
+
+/// Makes the GEMMs of every thread that has not been told otherwise consistent, or not. A
+/// consistent GEMM gives every row the same arithmetic whatever the shape of the call it is in, the
+/// process it runs in or what a measurement said, so a step split across ranks or machines comes
+/// out bit for bit what it does whole. It runs the algorithm cuBLASLt's heuristic names for the
+/// layer rather than the fastest one.
+pub fn set_consistent(consistent: bool) {
+    // SAFETY: it stores a flag.
+    unsafe { mmh3_cublaslt_consistent_by_default(c_int::from(consistent)) }
+}
+
+/// Makes the GEMMs of this thread consistent or not whatever `set_consistent` said, which is how a
+/// worker's connection follows the leader it serves.
+pub fn set_consistent_on_this_thread(consistent: bool) {
+    // SAFETY: it stores a flag of this thread.
+    unsafe { mmh3_cublaslt_consistent_on_this_thread(c_int::from(consistent)) }
+}
+
+/// The algorithm chosen for a plain GEMM. The fields before the words are the key of the choice,
+/// and the words are the algorithm as cuBLASLt hands it over, in the layout the backend reads.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Algorithm {
+    kind: i64,
+    bias: i64,
+    m: i64,
+    n: i64,
+    k: i64,
+    data: [u64; 8],
 }
 
 /// The algorithm chosen for an NVFP4 GEMM of `m × k` activations and `n` outputs.
@@ -114,23 +144,15 @@ fn chosen<T: Copy + Default>(of: impl Fn(*mut T, c_int) -> c_int) -> Vec<T> {
     algorithms
 }
 
-/// What the algorithms chosen here depend on: another rank takes them over only when it names the
-/// same thing, which a rank on another GPU, another cuBLASLt or another backend does not.
-pub fn key() -> Result<String, CudaError> {
+/// What the algorithms chosen here depend on: a file is taken over only when it names the same
+/// thing, which one written on another GPU or with another cuBLASLt does not.
+fn key() -> Result<String, CudaError> {
     key_of(|key, capacity| unsafe { mmh3_cublaslt_matmul_algorithm_key(key, capacity) })
 }
 
 /// The algorithms this process has chosen for ordinary GEMM shapes.
-pub fn chosen_matmul() -> Vec<Algorithm> {
+fn chosen_matmul() -> Vec<Algorithm> {
     chosen(|algorithms, capacity| unsafe { mmh3_cublaslt_matmul_algorithms(algorithms, capacity) })
-}
-
-/// Takes over `algorithms` for the shapes that have none chosen here yet, and returns how many
-/// crossed. It is for the ranks of one run, where `load_matmul` is for the runs of one machine.
-pub fn adopt_matmul(algorithms: &[Algorithm]) -> usize {
-    // SAFETY: the slice holds `algorithms.len()` algorithms.
-    unsafe { mmh3_cublaslt_matmul_adopt(algorithms.as_ptr(), algorithms.len() as c_int) };
-    algorithms.len()
 }
 
 /// Takes over the algorithms that `save_matmul` left in `path` for ordinary GEMM shapes and

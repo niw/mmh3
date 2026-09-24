@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--worker HOST[:PORT]]... [--local-worker]
-              [--vram-budget GB] [--idle-unload SECONDS]
+              [--consistent] [--vram-budget GB] [--idle-unload SECONDS]
   mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--vram-budget GB] [--idle-unload SECONDS]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
@@ -12,7 +12,7 @@ const USAGE: &str = "usage:
                 [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
                 [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
-                [--token FILE] [--vram-budget GB] [--ffmpeg [FFMPEG_ARGUMENTS...]]
+                [--token FILE] [--consistent] [--vram-budget GB] [--ffmpeg [FFMPEG_ARGUMENTS...]]
 
 Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
 
@@ -47,6 +47,8 @@ together. What no machine is asked for, it does itself.
 separated by commas. Without it a machine may be asked for anything it serves. Every step goes to the machines
 allowed steps, in the order given, which is the order their ranks are numbered in. Where none is allowed them,
 every step runs here.
+--consistent makes every cuBLASLt GEMM run one algorithm for all shapes of a layer, here and on every worker, so
+that the video does not depend on how the run is split, on which machine computes what, or on what was timed.
 --vram-budget GB holds a run to that much device memory, failing an allocation past it as a device that small
 would. A worker lets go of the model it has used least whenever an allocation finds no memory left.
 --idle-unload SECONDS lets a worker go of every model it holds after that long with nothing to do, so that a

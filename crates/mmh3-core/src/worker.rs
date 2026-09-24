@@ -23,7 +23,7 @@ pub const TRANSPORT_RDMA: u32 = 1 << 1;
 /// A checkpoint is matched by digest and a protocol is not, which is why this exists: a pair that
 /// disagrees about the wire does not fail, it waits, and two ranks each waiting for the other to
 /// speak look exactly like a slow machine.
-pub const PROTOCOL: u32 = 3;
+pub const PROTOCOL: u32 = 4;
 
 pub const BACKEND_CUDA: u8 = 1;
 pub const BACKEND_METAL: u8 = 2;
@@ -305,6 +305,9 @@ pub struct Hello {
     pub rdma: RdmaAddresses,
     /// What this side speaks, see `PROTOCOL`. Zero from a build made before this was sent.
     pub protocol: u32,
+    /// Whether the GEMMs the worker runs on this connection are to be consistent, as the leader's
+    /// are, so that rows come out the same whichever machine and rank computes them.
+    pub consistent: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -522,24 +525,6 @@ impl Adapter {
     pub const MERGE: u8 = 1;
 }
 
-/// A cuBLASLt algorithm the leader chose for a GEMM shape, which the other ranks take rather than
-/// timing the candidates themselves: a measurement that separates two of near-equal speed
-/// separates the arithmetic, and a rank measures while the wire and the others have its device.
-///
-/// The fields before the words are the key of the choice, and the words are the algorithm as
-/// cuBLASLt hands it over. The layout is the one the backend reads, so the table crosses without
-/// being rebuilt.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Algorithm {
-    pub kind: i64,
-    pub bias: i64,
-    pub m: i64,
-    pub n: i64,
-    pub k: i64,
-    pub data: [u64; 8],
-}
-
 /// Opening a shared-out step: everything a rank needs to stand up the same layout the leader has,
 /// except the latents, which change every step. Both sides work the shard out of `ranks`, so only
 /// which rank this worker takes crosses the wire.
@@ -565,11 +550,6 @@ pub struct OpenSession {
     pub adapters: Vec<Adapter>,
     /// 0 for bf16 attention, 1 for INT8 QK with FP8 PV.
     pub precision: u8,
-    /// What the leader's chosen algorithms depend on, as its backend names it. A rank whose own
-    /// name for it differs, a Metal one above all, takes none of them.
-    pub algorithm_key: String,
-    /// The algorithms the leader chose for the GEMM shapes it has met.
-    pub algorithms: Vec<Algorithm>,
     /// What each rank carries, in rank order. Empty leaves every rank an equal share.
     pub shard: Vec<ShardSpan>,
 }
@@ -687,11 +667,9 @@ impl PeerLink {
 }
 
 /// What a rank made of the session it was given: the regions it registered, for the leader to pass
-/// round, and how many of the leader's chosen algorithms it took. A rank that took none of them
-/// times its own candidates, which two ranks may answer differently.
+/// round.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SessionReady {
-    pub algorithms: u32,
     /// The port this rank's session listens on for the peers that reach it over a socket, or
     /// zero where it offers none. The leader pairs it with the host it reached this rank at,
     /// since a rank behind more than one interface cannot say which of them a peer should use.
@@ -770,7 +748,7 @@ impl SessionTable {
 impl SessionReady {
     pub fn encode(&self) -> Vec<u8> {
         let mut encoder = Encoder::default();
-        encoder.u32(self.algorithms).u32(self.listen_port);
+        encoder.u32(self.listen_port);
         let mut bytes = encoder.finish();
         bytes.extend(RemoteRegion::encode_all(&self.regions));
         bytes
@@ -778,10 +756,8 @@ impl SessionReady {
 
     pub fn decode(bytes: &[u8]) -> io::Result<Self> {
         let mut decoder = Decoder::new(bytes);
-        let algorithms = decoder.u32()?;
         let listen_port = decoder.u32()?;
         Ok(SessionReady {
-            algorithms,
             listen_port,
             regions: RemoteRegion::decode_all(decoder.rest())?,
         })
@@ -860,20 +836,6 @@ impl OpenSession {
                 .u32(span.heads[0])
                 .u32(span.heads[1]);
         }
-        encoder
-            .string(&self.algorithm_key)
-            .u32(self.algorithms.len() as u32);
-        for algorithm in &self.algorithms {
-            encoder
-                .u64(algorithm.kind as u64)
-                .u64(algorithm.bias as u64)
-                .u64(algorithm.m as u64)
-                .u64(algorithm.n as u64)
-                .u64(algorithm.k as u64);
-            for word in algorithm.data {
-                encoder.u64(word);
-            }
-        }
         encoder.finish()
     }
 
@@ -918,8 +880,6 @@ impl OpenSession {
             conditions: Vec::new(),
             adapters: Vec::new(),
             shard: Vec::new(),
-            algorithm_key: String::new(),
-            algorithms: Vec::new(),
         };
         let count = decoder.u32()? as usize;
         let mut conditions = Vec::with_capacity(count.min(64));
@@ -954,29 +914,10 @@ impl OpenSession {
                 heads: [decoder.u32()?, decoder.u32()?],
             });
         }
-        let algorithm_key = decoder.string()?;
-        let count = decoder.u32()? as usize;
-        let mut algorithms = Vec::with_capacity(count.min(1024));
-        for _ in 0..count {
-            let mut algorithm = Algorithm {
-                kind: decoder.u64()? as i64,
-                bias: decoder.u64()? as i64,
-                m: decoder.u64()? as i64,
-                n: decoder.u64()? as i64,
-                k: decoder.u64()? as i64,
-                ..Algorithm::default()
-            };
-            for word in &mut algorithm.data {
-                *word = decoder.u64()?;
-            }
-            algorithms.push(algorithm);
-        }
         let session = OpenSession {
             conditions,
             adapters,
             shard,
-            algorithm_key,
-            algorithms,
             ..session
         };
         Ok((session, decoder.position))
@@ -1116,9 +1057,9 @@ impl Hello {
         let mut encoder = Encoder::default();
         encoder.string(&self.leader).string(&self.token);
         encode_rdma(&mut encoder, &self.rdma);
-        // Last, so a build that does not know about it reads everything before it and ignores
-        // this, which is what turns a version difference into a refusal instead of a hang.
-        encoder.u32(self.protocol);
+        // After everything an older build reads, so that one reads its fields and ignores the rest,
+        // which is what turns a version difference into a refusal instead of a hang.
+        encoder.u32(self.protocol).u8(u8::from(self.consistent));
         encoder.finish()
     }
 
@@ -1132,6 +1073,7 @@ impl Hello {
             token,
             rdma,
             protocol: decoder.u32().unwrap_or(0),
+            consistent: decoder.u8().unwrap_or(0) != 0,
         })
     }
 }
@@ -1390,14 +1332,18 @@ mod tests {
             token: "secret".to_owned(),
             rdma: None,
             protocol: PROTOCOL,
+            consistent: true,
         };
         let encoded = hello.encode();
-        let older = &encoded[..encoded.len() - 4];
+        let older = &encoded[..encoded.len() - 5];
         let decoded = Hello::decode(older).unwrap();
         assert_eq!(decoded.protocol, 0);
+        assert!(!decoded.consistent);
         assert_eq!(decoded.leader, hello.leader);
         assert_eq!(decoded.token, hello.token);
-        assert_eq!(Hello::decode(&encoded).unwrap().protocol, PROTOCOL);
+        let decoded = Hello::decode(&encoded).unwrap();
+        assert_eq!(decoded.protocol, PROTOCOL);
+        assert!(decoded.consistent);
     }
 
     #[test]

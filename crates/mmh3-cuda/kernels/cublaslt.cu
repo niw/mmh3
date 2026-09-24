@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -91,12 +92,11 @@ struct Descriptors {
     }
 };
 
-// Bumped whenever the descriptors of mmh3_cublaslt_nvfp4 change, so that algorithms chosen for the
-// old ones are not taken over.
-constexpr int NVFP4_ALGORITHM_FORMAT = 1;
-// The same for the ordinary GEMM shapes. It goes up whenever the rule that picks between the
-// candidates changes, so that a file written under the old one is not taken over under the new.
-constexpr int MATMUL_ALGORITHM_FORMAT = 1;
+// Bumped whenever the descriptors of mmh3_cublaslt_nvfp4 or the rule that picks between its
+// candidates change, so that algorithms chosen under the old ones are not taken over.
+constexpr int NVFP4_ALGORITHM_FORMAT = 2;
+// The same for the ordinary GEMM shapes.
+constexpr int MATMUL_ALGORITHM_FORMAT = 2;
 
 using Shape = std::tuple<int64_t, int64_t, int64_t>;
 
@@ -112,22 +112,106 @@ std::map<MatmulKey, cublasLtMatmulAlgo_t> matmul_algorithms;
 // How many heuristic candidates a new shape times against each other. cuBLASLt offers only a few
 // for the convolution shapes of the VAE encoder, so the list is as long as it will fill.
 constexpr int MATMUL_CANDIDATES = 32;
-// How much faster than the standing choice a candidate has to be, in every pass, to displace it.
-// Over the shapes of a run the ratio between the heuristic's first candidate and the fastest one
-// is either under 1.13, where it is noise on a measurement of tenths of a millisecond, or over
-// 1.35, where it is a kernel that really is slower. The gap sits above the noise, and a candidate
-// that clears it in one pass but not in the next has not cleared it.
-constexpr float MATMUL_GAP = 1.35f;
-// How long one timing pass runs for, how many calls that may take, and how many passes are timed.
-constexpr float MATMUL_MEASURE_MS = 1.0f;
-constexpr int MATMUL_REPEATS = 500;
-constexpr int MATMUL_PASSES = 3;
-// Below this a shape is not timed at all. A kernel of tens of microseconds is mostly launch
-// overhead, so the measurements of its candidates cross from run to run, and taking one half again
-// slower than the best would cost microseconds. It takes the heuristic's first candidate, which is
-// the only choice that does not move.
-constexpr float MATMUL_TRIVIAL_MS = 0.05f;
 constexpr int NVFP4_CANDIDATES = 8;
+
+// NOTE: two algorithms round differently, and cuBLASLt picks one by the shape, M included. A timed
+// choice also moves with the noise of the measurement. So without consistency the same rows come
+// out differently when a step is split across ranks, in two processes, or on two machines. With
+// it, a GEMM runs the one algorithm cuBLASLt's heuristic names for its operands at CONSISTENT_ROWS
+// rows, whatever its own M is, without a split of K, and nothing is timed. Every row then goes
+// through the same kernel in the same order.
+constexpr int64_t CONSISTENT_ROWS = 4096;
+
+// Consistency for every thread that has not been told otherwise, and for this thread. -1 follows
+// the process.
+std::atomic<bool> consistent_by_default{false};
+thread_local int consistent_here = -1;
+
+bool consistent() {
+    return consistent_here >= 0 ? consistent_here != 0
+                                : consistent_by_default.load(std::memory_order_relaxed);
+}
+
+// The algorithm consistency runs for each kind, n, k and bias of the plain GEMMs, and for each n
+// and k of the NVFP4 ones. It is derived rather than measured, so it is not kept between runs.
+using ConsistentKey = std::tuple<int, int64_t, int64_t, bool>;
+std::mutex consistent_mutex;
+std::map<ConsistentKey, cublasLtMatmulAlgo_t> consistent_matmul;
+std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t> consistent_nvfp4;
+
+// Asks the heuristic for the algorithm of `operation` over `weight` at CONSISTENT_ROWS rows.
+cublasStatus_t consistent_algorithm(cublasLtHandle_t handle, cublasLtMatmulDesc_t operation,
+                                    cublasLtMatrixLayout_t weight, cudaDataType_t input_type,
+                                    cudaDataType_t output_type, int64_t n, int64_t k,
+                                    cublasLtMatmulPreference_t preference,
+                                    cublasLtMatmulAlgo_t *algorithm) {
+    cublasLtMatrixLayout_t input = nullptr;
+    cublasLtMatrixLayout_t output = nullptr;
+    cublasStatus_t status = cublasLtMatrixLayoutCreate(&input, input_type, k, CONSISTENT_ROWS, k);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatrixLayoutCreate(&output, output_type, n, CONSISTENT_ROWS, n);
+    }
+    cublasLtMatmulHeuristicResult_t result;
+    int returned = 0;
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        status = cublasLtMatmulAlgoGetHeuristic(handle, operation, weight, input, output, output,
+                                                preference, 1, &result, &returned);
+    }
+    if (status == CUBLAS_STATUS_SUCCESS && returned == 0) {
+        status = CUBLAS_STATUS_NOT_SUPPORTED;
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+        *algorithm = result.algo;
+    }
+    if (output != nullptr) {
+        cublasLtMatrixLayoutDestroy(output);
+    }
+    if (input != nullptr) {
+        cublasLtMatrixLayoutDestroy(input);
+    }
+    return status;
+}
+
+// Runs `run` with the algorithm consistency takes for `table[key]`, choosing it on the first call.
+// A call whose own shape that algorithm cannot run takes the heuristic's first answer for its own
+// shape, which still does not move from run to run.
+template <typename Key, typename Choose, typename Run>
+cublasStatus_t run_consistently(std::map<Key, cublasLtMatmulAlgo_t> &table, const Key &key,
+                                cublasLtHandle_t handle, cublasLtMatmulDesc_t operation,
+                                cublasLtMatrixLayout_t weight, cublasLtMatrixLayout_t input,
+                                cublasLtMatrixLayout_t output,
+                                cublasLtMatmulPreference_t preference, Choose choose, Run run) {
+    const uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_NONE;
+    cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
+                                         &reduction, sizeof(reduction));
+    cublasLtMatmulAlgo_t algorithm;
+    {
+        const std::lock_guard<std::mutex> lock(consistent_mutex);
+        const auto found = table.find(key);
+        if (found != table.end()) {
+            algorithm = found->second;
+        } else {
+            const cublasStatus_t status = choose(&algorithm);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                return status;
+            }
+            table.emplace(key, algorithm);
+        }
+    }
+    cublasLtMatmulHeuristicResult_t checked;
+    if (cublasLtMatmulAlgoCheck(handle, operation, weight, input, output, output, &algorithm,
+                                &checked) != CUBLAS_STATUS_SUCCESS ||
+        checked.workspaceSize > WORKSPACE_BYTES) {
+        int returned = 0;
+        const cublasStatus_t status = cublasLtMatmulAlgoGetHeuristic(
+            handle, operation, weight, input, output, output, preference, 1, &checked, &returned);
+        if (status != CUBLAS_STATUS_SUCCESS || returned == 0) {
+            return status == CUBLAS_STATUS_SUCCESS ? CUBLAS_STATUS_NOT_SUPPORTED : status;
+        }
+        algorithm = checked.algo;
+    }
+    return run(&algorithm);
+}
 
 } // namespace
 
@@ -206,6 +290,18 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
                               descriptors.output, output, descriptors.output, algorithm,
                               state.workspace, WORKSPACE_BYTES, stream);
     };
+    if (consistent()) {
+        return status_code(run_consistently(
+            consistent_matmul, std::make_tuple(kind, n, k, bias != nullptr), state.handle,
+            descriptors.operation, descriptors.weight, descriptors.input, descriptors.output,
+            descriptors.preference,
+            [&](cublasLtMatmulAlgo_t *algorithm) {
+                return consistent_algorithm(state.handle, descriptors.operation, descriptors.weight,
+                                            data_type, data_type, n, k, descriptors.preference,
+                                            algorithm);
+            },
+            run));
+    }
     // NOTE: the first heuristic result is often a small-tile kernel that runs at a fraction of the
     // bandwidth the shape allows, so the first call of each shape times the candidates on its own
     // operands and keeps the fastest. A call that accumulates cannot be repeated, so it takes the
@@ -235,73 +331,24 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     cudaEvent_t start, stop;
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
-    // NOTE: two algorithms round differently, so a measurement that picks between two of
-    // near-equal speed picks the arithmetic, and the same call then answers differently in two
-    // processes, or in two ranks of one run. A small shape runs in microseconds, where the launch
-    // overhead and the clock dominate a single call, so a candidate is timed over as many calls as
-    // fit in MATMUL_MEASURE_MS, and has to beat the standing choice by MATMUL_GAP in every pass to
-    // displace it.
-    auto measure = [&](const cublasLtMatmulAlgo_t &algorithm, float *passes) {
-        auto time = [&](int repeats) {
-            cudaEventRecord(start, stream);
-            for (int repeat = 0; repeat < repeats; repeat++) {
-                if (run(&algorithm) != CUBLAS_STATUS_SUCCESS) {
-                    return -1.0f;
-                }
-            }
-            cudaEventRecord(stop, stream);
-            float elapsed = 0.0f;
-            if (cudaEventSynchronize(stop) != cudaSuccess ||
-                cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
-                return -1.0f;
-            }
-            return elapsed / static_cast<float>(repeats);
-        };
-        const float once = time(1);
-        if (once < 0.0f) {
-            return false;
-        }
-        int repeats = static_cast<int>(MATMUL_MEASURE_MS / (once > 1e-4f ? once : 1e-4f));
-        repeats = repeats < 1 ? 1 : (repeats > MATMUL_REPEATS ? MATMUL_REPEATS : repeats);
-        for (int pass = 0; pass < MATMUL_PASSES; pass++) {
-            const float elapsed = time(repeats);
-            if (elapsed < 0.0f) {
-                return false;
-            }
-            passes[pass] = elapsed;
-        }
-        return true;
-    };
-    float times[MATMUL_CANDIDATES][MATMUL_PASSES];
+    float best = 0.0f;
     int chosen = -1;
     for (int index = 0; index < returned; index++) {
         // The first run of a candidate loads its kernel, which costs more than the call itself.
         if (run(&results[index].algo) != CUBLAS_STATUS_SUCCESS) {
             continue;
         }
-        if (!measure(results[index].algo, times[index])) {
+        cudaEventRecord(start, stream);
+        const cublasStatus_t timed = run(&results[index].algo);
+        cudaEventRecord(stop, stream);
+        float elapsed = 0.0f;
+        if (timed != CUBLAS_STATUS_SUCCESS || cudaEventSynchronize(stop) != cudaSuccess ||
+            cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
             continue;
         }
-        if (chosen < 0) {
+        if (chosen < 0 || elapsed < best) {
+            best = elapsed;
             chosen = index;
-        } else {
-            bool faster = true;
-            for (int pass = 0; pass < MATMUL_PASSES; pass++) {
-                faster = faster && times[index][pass] * MATMUL_GAP <= times[chosen][pass];
-            }
-            if (faster) {
-                chosen = index;
-            }
-        }
-        if (index == 0) {
-            // The fastest pass, since a pass only ever loses time to something else on the device.
-            float fastest = times[0][0];
-            for (int pass = 1; pass < MATMUL_PASSES; pass++) {
-                fastest = times[0][pass] < fastest ? times[0][pass] : fastest;
-            }
-            if (fastest < MATMUL_TRIVIAL_MS) {
-                break;
-            }
         }
     }
     cudaEventDestroy(start);
@@ -379,6 +426,17 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
                               output, descriptors.output, output, descriptors.output, algorithm,
                               state.workspace, WORKSPACE_BYTES, stream);
     };
+    if (consistent()) {
+        return status_code(run_consistently(
+            consistent_nvfp4, std::make_tuple(n, k), state.handle, descriptors.operation,
+            descriptors.weight, descriptors.input, descriptors.output, descriptors.preference,
+            [&](cublasLtMatmulAlgo_t *algorithm) {
+                return consistent_algorithm(state.handle, descriptors.operation, descriptors.weight,
+                                            CUDA_R_4F_E2M1, CUDA_R_16BF, n, k,
+                                            descriptors.preference, algorithm);
+            },
+            run));
+    }
     const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
     const auto found = nvfp4_algorithms.find(key);
     if (found != nvfp4_algorithms.end()) {
@@ -412,12 +470,7 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
             cudaEventElapsedTime(&elapsed, start, stop) != cudaSuccess) {
             continue;
         }
-        // NOTE: two algorithms round differently, so a measurement that decides between two of
-        // near-equal speed decides the arithmetic by noise, and the same call then answers
-        // differently in two processes. A later candidate has to beat the standing choice by
-        // MATMUL_GAP to displace it, which leaves the choice to the heuristic's order wherever
-        // the speeds are close.
-        if (best_index < 0 || elapsed * MATMUL_GAP < best) {
+        if (best_index < 0 || elapsed < best) {
             best = elapsed;
             best_index = index;
         }
@@ -511,6 +564,17 @@ extern "C" int mmh3_cublaslt_matmul_algorithms(Mmh3MatmulAlgorithm *algorithms, 
         index++;
     }
     return index;
+}
+
+// Makes every thread that has not been told otherwise run consistently, or not.
+extern "C" void mmh3_cublaslt_consistent_by_default(int consistent) {
+    consistent_by_default.store(consistent != 0, std::memory_order_relaxed);
+}
+
+// Makes this thread run consistently or not whatever the process does, or follow the process
+// again for -1.
+extern "C" void mmh3_cublaslt_consistent_on_this_thread(int consistent) {
+    consistent_here = consistent < 0 ? -1 : (consistent != 0 ? 1 : 0);
 }
 
 // Takes over algorithms for ordinary GEMM shapes that have none chosen yet.

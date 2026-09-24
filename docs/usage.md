@@ -85,6 +85,9 @@ make generate \
   separated by commas.
 - `--token FILE` (default none): A shared secret sent to every worker, which refuses a leader whose
   token does not match its own.
+- `--consistent` (default off): Make the video independent of how the run is split and of what
+  cuBLASLt timed. The same options give the same video on one GPU, on several machines with the
+  same GPU and cuBLASLt version, and in every run, at no measurable cost in speed. See [Determinism](distributed.md#determinism).
 - `--vram-budget GB` (default: as much as the device gives): Hold the run to that much device
   memory, failing an allocation past it as a device that small would. It is a limit on this run
   rather than on the GPU, so what another program on the same device holds is not counted against

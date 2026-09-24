@@ -259,9 +259,10 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "vsa-sparsity",
             "shard",
         ],
-        &[],
+        &["consistent"],
         USAGE,
     )?;
+    mmh3_cuda::algorithms::set_consistent(options.contains_key("consistent"));
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
     let text_file = GoldenFile::open(golden, "text.safetensors")?;
@@ -296,7 +297,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     // `--shard 1` runs the path a shared-out step takes, with one rank and nothing to carry
     // anywhere, and `--shard N` splits the step N ways across threads of this process, a DiT each.
-    // Either has to give what a whole step gives.
+    // Either has to give what a whole step gives, which `--consistent` holds for every N.
     let ranks: usize = option_number(&options, "shard", 0)?;
     let outputs = if ranks > 0 {
         use mmh3_cuda::shard::{Shard, ShardContext, WholeExchange};

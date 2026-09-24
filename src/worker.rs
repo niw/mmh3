@@ -39,6 +39,18 @@ pub const TEXT_ENCODER_ROLE: &str = "text_encoder.h3.int8_convrot";
 pub const AUDIO_VAE_ROLE: &str = "audio_vae.h3.fp32";
 /// Bodies larger than this are refused before they are read.
 const BODY_LIMIT: u64 = 4 << 30;
+
+/// Whether the runs this process leads compute consistently, which every worker it asks is told.
+static CONSISTENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Makes the GEMMs of the runs this process leads consistent or not, here and on every worker they
+/// ask: a row then comes out the same whichever machine, rank or process computes it, at the cost
+/// of the fastest algorithm for each shape.
+pub fn set_consistent(consistent: bool) {
+    CONSISTENT.store(consistent, std::sync::atomic::Ordering::Relaxed);
+    #[cfg(feature = "cuda")]
+    mmh3_cuda::algorithms::set_consistent(consistent);
+}
 /// How long one exchange of a block may take before the run gives up on the peer.
 #[cfg(feature = "cuda")]
 const EXCHANGE_TIMEOUT: i32 = 60_000;
@@ -421,6 +433,7 @@ impl Worker {
             token: token.to_owned(),
             rdma: offered.as_ref().map(|(_, addresses)| addresses.clone()),
             protocol: worker::PROTOCOL,
+            consistent: CONSISTENT.load(std::sync::atomic::Ordering::Relaxed),
         };
         let body = worker.call(Kind::Hello, &hello.encode(), &[])?;
         worker.welcome = Welcome::decode(&body.1)?;
@@ -1272,6 +1285,11 @@ fn session(
                     reply(&mut writer, Kind::Error, message.as_bytes(), &[])?;
                     return Err(message.into());
                 }
+                // Everything this connection computes follows the leader, which is a thread of
+                // its own, so a leader that runs consistently gets the same rows from here as it
+                // would from itself.
+                #[cfg(feature = "cuda")]
+                mmh3_cuda::algorithms::set_consistent_on_this_thread(hello.consistent);
                 // A leader that offers a reliable connection gets this side's, and the bulk of
                 // every later reply goes that way instead of down the socket.
                 let offered = hello
@@ -2035,7 +2053,6 @@ impl<'a> Exchanger<'a> {
         gated: bool,
         leader_reader: &'a mut BufReader<TcpStream>,
         leader_writer: &'a mut BufWriter<TcpStream>,
-        algorithms: u32,
         token: &str,
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
@@ -2062,7 +2079,7 @@ impl<'a> Exchanger<'a> {
             peers: HashMap::new(),
         };
         exchanger.link_peers()?;
-        exchanger.register(shard, tokens, hidden, gated, algorithms)?;
+        exchanger.register(shard, tokens, hidden, gated)?;
         exchanger.dial_peers()?;
         Ok(exchanger)
     }
@@ -2171,14 +2188,13 @@ impl<'a> Exchanger<'a> {
     }
 
     /// Registers every region a step will use and takes back the table of every rank's, which the
-    /// leader puts together. `algorithms` is how many cuBLASLt choices this rank took from it.
+    /// leader puts together.
     fn register(
         &mut self,
         shard: &Shard,
         tokens: usize,
         hidden: usize,
         gated: bool,
-        algorithms: u32,
     ) -> Result<(), Box<dyn Error>> {
         // A machine with a port registers its memory, so a peer writes into it from its own
         // machine. One without gets plain buffers and its peers write down the socket: the table
@@ -2217,7 +2233,6 @@ impl<'a> Exchanger<'a> {
         self.send_leader(
             Kind::SessionReady,
             &worker::SessionReady {
-                algorithms,
                 listen_port,
                 regions: table,
             }
@@ -2901,23 +2916,6 @@ fn add_adapter(
     Ok(dit.add_lora(file, adapter.strength)?)
 }
 
-/// How many of the leader's GEMM choices this rank took. A rank whose key the leader's does not
-/// match, which is what another backend is, takes none and chooses its own.
-#[cfg(feature = "cuda")]
-fn adopt_algorithms(open: &OpenSession) -> usize {
-    match mmh3_cuda::algorithms::key() {
-        Ok(key) if key == open.algorithm_key => {
-            mmh3_cuda::algorithms::adopt_matmul(&open.algorithms)
-        }
-        _ => 0,
-    }
-}
-
-#[cfg(feature = "metal")]
-fn adopt_algorithms(_open: &OpenSession) -> usize {
-    0
-}
-
 /// This rank's share of one step, and whatever it can say about where the time went.
 #[cfg(feature = "cuda")]
 pub fn share_a_step(
@@ -3169,10 +3167,6 @@ fn serve_shard(
         shard
     };
     let gated = dit.has_vsa_gates();
-    // The leader's choices for the GEMM shapes, which this rank runs rather than timing the
-    // candidates while the wire and the other ranks have its device. A key of its own that the
-    // leader's does not match, which is what another GPU or another backend has, leaves them.
-    let algorithms = adopt_algorithms(open);
     // A rank's only socket when a session opens is the one the leader opened. The leader is not a
     // rank, so it is a channel of its own here, and the sockets to the other ranks come out of the
     // rendezvous it relays.
@@ -3183,7 +3177,6 @@ fn serve_shard(
         gated,
         reader,
         writer,
-        algorithms as u32,
         token,
     )?;
     println!(
@@ -3265,7 +3258,6 @@ impl<'a> Coordinator<'a> {
         workers: &'a mut [Worker],
         opens: &[OpenSession],
         payload: &[u8],
-        algorithms: u32,
     ) -> Result<Self, Box<dyn Error>> {
         let mut peers = Vec::with_capacity(workers.len());
         for (index, worker) in workers.iter_mut().enumerate() {
@@ -3276,7 +3268,7 @@ impl<'a> Coordinator<'a> {
         }
         let mut coordinator = Coordinator { peers };
         coordinator.relay_links()?;
-        coordinator.relay_regions(algorithms)?;
+        coordinator.relay_regions()?;
         Ok(coordinator)
     }
 
@@ -3326,7 +3318,7 @@ impl<'a> Coordinator<'a> {
     /// this machine reached over loopback is named to each recipient by the address this machine
     /// wears on its own socket to that recipient, and the table goes out once per rank rather
     /// than once for all of them.
-    fn relay_regions(&mut self, algorithms: u32) -> Result<(), Box<dyn Error>> {
+    fn relay_regions(&mut self) -> Result<(), Box<dyn Error>> {
         let mut here = Vec::with_capacity(self.ranks());
         let mut ports = vec![0u32; self.ranks()];
         for rank in 0..self.ranks() {
@@ -3352,19 +3344,6 @@ impl<'a> Coordinator<'a> {
                     rank: rank as u32,
                     address: format!("{}:{}", self.peers[rank].host, ready.listen_port),
                 });
-            }
-            // A CUDA rank that took none of them times its own candidates, so the two may choose
-            // differently and the run is then only what these machines together produce. A rank on
-            // another backend never had them to take, which is ordinary and says nothing: warning
-            // there would make a Mac warn on every run.
-            if ready.algorithms == 0
-                && algorithms > 0
-                && self.peers[rank].backend == worker::BACKEND_CUDA
-            {
-                println!(
-                    "rank {rank} took none of the {algorithms} cuBLASLt algorithms, so it \
-                     chooses its own"
-                );
             }
             whole.regions.extend(ready.regions);
         }

@@ -63,7 +63,7 @@ pub const OPTIONS: &[&str] = &[
 ];
 
 /// The options that stand alone, taking nothing after them.
-pub const FLAGS: &[&str] = &["local-worker"];
+pub const FLAGS: &[&str] = &["local-worker", "consistent"];
 
 /// A machine this run may borrow, and what it may be asked for.
 pub struct Machine {
@@ -253,6 +253,7 @@ impl Settings {
     ) -> Result<Self, Box<dyn Error>> {
         #[cfg(any(feature = "cuda", feature = "metal"))]
         crate::resident::take_budget(options)?;
+        crate::worker::set_consistent(options.contains_key("consistent"));
         let token = match options.get("token") {
             Some(path) => std::fs::read_to_string(path)?.trim().to_owned(),
             None => String::new(),
@@ -696,15 +697,10 @@ pub fn sample(
     );
     let mut sharing = match &mut target {
         Some(target) => {
-            let algorithms = target
-                .open
-                .first()
-                .map_or(0, |open| open.algorithms.len() as u32);
             match crate::worker::Coordinator::open(
                 &mut target.workers,
                 &target.open,
                 &target.payload,
-                algorithms,
             ) {
                 Ok(coordinator) => Some(Sharing::With(Box::new(coordinator))),
                 Err(error) => {
@@ -1195,9 +1191,6 @@ fn shard_target(
     let shape = |dimensions: &[usize]| -> Vec<u32> {
         dimensions.iter().map(|value| *value as u32).collect()
     };
-    // The workers run the leader's choices rather than timing the candidates themselves, since a
-    // rank that measures while the wire and the others have its device measures the load.
-    let (algorithm_key, algorithms) = chosen_algorithms();
     // A block is two kinds of work and a machine is not equally good at both. The projections
     // and the MLP follow a rank's tokens, and attention follows its heads, since a rank attends
     // its own heads over the whole sequence however few tokens it carries. So the two axes are
@@ -1262,8 +1255,6 @@ fn shard_target(
             conditions: session_conditions(keyframes, references),
             adapters: adapters.clone(),
             shard: spans.clone(),
-            algorithm_key: algorithm_key.clone(),
-            algorithms: algorithms.clone(),
             precision: attention_precision(options),
         })
     };
@@ -1327,22 +1318,6 @@ fn session_adapters(
 /// machine puts the parts back together.
 enum Sharing<'a> {
     With(Box<crate::worker::Coordinator<'a>>),
-}
-
-/// The GEMM choices a leader hands its workers, and the key that says whose they are. A backend
-/// that chooses nothing hands nothing over, and a key that matches no rank is what leaves every
-/// machine choosing for itself.
-#[cfg(feature = "cuda")]
-fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
-    (
-        mmh3_cuda::algorithms::key().unwrap_or_default(),
-        mmh3_cuda::algorithms::chosen_matmul(),
-    )
-}
-
-#[cfg(not(feature = "cuda"))]
-fn chosen_algorithms() -> (String, Vec<mmh3_core::worker::Algorithm>) {
-    (String::new(), Vec::new())
 }
 
 /// How a session says this run attends, which only one backend offers a choice about. It comes

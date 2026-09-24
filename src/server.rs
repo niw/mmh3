@@ -38,7 +38,8 @@ const FILE_BYTES: u64 = 4 << 30;
 const WATCH: Duration = Duration::from_millis(250);
 
 const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--worker HOST[:PORT]]... \
-                     [--local-worker] [--token FILE] [--vram-budget GB] [--idle-unload SECONDS]";
+                     [--local-worker] [--consistent] [--token FILE] [--vram-budget GB] \
+                     [--idle-unload SECONDS]";
 
 /// What a generation the server was asked for is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
