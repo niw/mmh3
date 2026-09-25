@@ -9,6 +9,7 @@ pub mod dit;
 mod model;
 pub mod ops;
 pub mod shard;
+mod streaming;
 pub mod text_encoder;
 pub mod vae;
 
@@ -35,6 +36,15 @@ impl Error {
         Self {
             message,
             out_of_memory: false,
+        }
+    }
+
+    /// The device having no room for something, which a caller holding memory it could let go of
+    /// can do something about.
+    pub fn out_of_memory(message: String) -> Self {
+        Self {
+            message,
+            out_of_memory: true,
         }
     }
 
@@ -153,6 +163,15 @@ pub fn memory_info() -> Result<(usize, usize)> {
     check(unsafe { mmh3_metal_memory_info(values.as_mut_ptr()) })?;
     let [working_set, allocated] = values.map(|value| value as usize);
     Ok((working_set.saturating_sub(allocated), working_set))
+}
+
+/// Bytes this process may still fill: what the device leaves it, held to what the limit leaves.
+pub fn free_bytes() -> Result<usize> {
+    let (free, _) = memory_info()?;
+    Ok(match LIMIT.load(Ordering::Relaxed) {
+        0 => free,
+        limit => free.min(limit.saturating_sub(ALLOCATED.load(Ordering::Relaxed))),
+    })
 }
 
 /// Bytes in live allocations of this process.

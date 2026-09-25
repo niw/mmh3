@@ -2974,11 +2974,7 @@ fn dit_key(open: &OpenSession) -> DitKey {
 fn read_dit(kept: &mut Models, path: &Path) -> Result<Dit, Box<dyn Error>> {
     let file = SafeTensors::open(path)?;
     kept.take_dit();
-    #[cfg(feature = "cuda")]
-    let fitting = || Dit::load_fitting(&file, "");
-    #[cfg(feature = "metal")]
-    let fitting = || Dit::load(&file, "");
-    kept.read_fitting(|| Dit::load(&file, ""), fitting)
+    kept.read_fitting(|| Dit::load(&file, ""), || Dit::load_fitting(&file, ""))
 }
 
 /// Reads the DiT a run is about to share, so that it is here when the session opens rather than

@@ -78,7 +78,7 @@ pub fn load_dit(
     validate_step_options(options)?;
     let path = option_path(options, name, default_file)?;
     let started = std::time::Instant::now();
-    let mut dit = MetalDit::load(&SafeTensors::open(Path::new(&path))?, "")?;
+    let mut dit = MetalDit::load_fitting(&SafeTensors::open(Path::new(&path))?, "")?;
     let precision = match options
         .get("linear-precision")
         .copied()

@@ -4,6 +4,7 @@ use crate::{
     model::Weights,
     ops::{Array, RowMap},
     shard::ShardContext,
+    streaming::{Pass, Stream, fits},
 };
 use mmh3_core::{
     dit::{
@@ -15,8 +16,10 @@ use mmh3_core::{
     },
     safetensors::SafeTensors,
     shard::{ExchangeError, Region, VelocityRows, regions as shard_regions},
+    streaming::{Arrangement, Files, Unit, give_up_order},
     tensor::Tensor,
 };
+use std::cell::RefCell;
 use std::time::Instant;
 
 /// A transport's failure in this backend's terms, since a block reports one error type.
@@ -24,11 +27,16 @@ fn shard_error(error: ExchangeError) -> Error {
     Error::new(error.0)
 }
 
+/// The DiT's blocks, the refiner's first and then the main ones, are its units, which a Mac without
+/// the room for all of them reads on the way. The refiner's go first, since they run only for a new
+/// prompt.
 pub struct MetalDit {
     weights: Weights,
     config: DitConfig,
     time_table: Tensor,
     inv_freq: Vec<f32>,
+    /// The blocks read on the way, when some are.
+    stream: Option<RefCell<Stream>>,
 }
 
 /// Refined prompt states retained on the GPU for an entire sampling run.
@@ -67,9 +75,73 @@ pub struct DitOutput {
 }
 
 impl MetalDit {
+    /// Loads the whole DiT, or fails as out of memory when it does not fit in the GPU's share,
+    /// which Metal would fill past by paging rather than refuse.
     pub fn load(file: &SafeTensors, prefix: &str) -> Result<Self> {
+        let bytes = file
+            .tensors()
+            .iter()
+            .filter(|info| info.name.starts_with(prefix))
+            .map(|info| info.byte_count())
+            .sum();
+        if !fits(bytes)? {
+            return Err(Error::out_of_memory(format!(
+                "the DiT's {bytes} bytes do not fit in the GPU's share of memory"
+            )));
+        }
         let config = DitConfig::of(file, prefix)?;
-        let weights = Weights::load(file, prefix)?;
+        Self::from_weights(Weights::load(file, prefix)?, config, None)
+    }
+
+    /// `load`, or, without the room for the whole DiT, a DiT that reads its blocks on the way and
+    /// keeps back what fits once it knows the shape of its first call.
+    pub fn load_fitting(file: &SafeTensors, prefix: &str) -> Result<Self> {
+        match Self::load(file, prefix) {
+            Err(error) if error.is_out_of_memory() => {}
+            result => return result,
+        }
+        let config = DitConfig::of(file, prefix)?;
+        let mut files = Files::default();
+        let mut units: Vec<Unit> = (0..config.refiner_layers)
+            .map(|layer| Unit::new(&format!("token_refiner.blocks.{layer}")))
+            .chain((0..config.layers).map(|layer| Unit::new(&format!("blocks.{layer}"))))
+            .collect();
+        for info in file.tensors() {
+            let Some(name) = info.name.strip_prefix(prefix) else {
+                continue;
+            };
+            if name.ends_with(".comfy_quant") {
+                continue;
+            }
+            if let Some(unit) = Self::unit_index(&config, name) {
+                units[unit].insert(
+                    name,
+                    info.dtype,
+                    info.shape.clone(),
+                    vec![files.piece(file, info)],
+                    Arrangement::Contiguous,
+                );
+            }
+        }
+        let weights = Weights::load_leaving(
+            file,
+            prefix,
+            |_| true,
+            |name| Self::unit_index(&config, name).is_some(),
+        )?;
+        let refiner = config.refiner_layers;
+        let give_up = (0..refiner)
+            .chain(
+                give_up_order(config.layers)
+                    .into_iter()
+                    .map(|layer| refiner + layer),
+            )
+            .collect();
+        let stream = Stream::new("DiT blocks", files, units, give_up);
+        Self::from_weights(weights, config, Some(stream))
+    }
+
+    fn from_weights(weights: Weights, config: DitConfig, stream: Option<Stream>) -> Result<Self> {
         let time_table = weights.host("adaln_t_table")?;
         let inv_freq = weights.host("rope.inv_freq")?.data;
         Ok(Self {
@@ -77,7 +149,29 @@ impl MetalDit {
             config,
             time_table,
             inv_freq,
+            stream: stream.map(RefCell::new),
         })
+    }
+
+    /// The unit a tensor belongs to.
+    fn unit_index(config: &DitConfig, name: &str) -> Option<usize> {
+        let block = |rest: &str| rest.split_once('.')?.0.parse::<usize>().ok();
+        if let Some(rest) = name.strip_prefix("token_refiner.blocks.") {
+            block(rest).filter(|&layer| layer < config.refiner_layers)
+        } else if let Some(rest) = name.strip_prefix("blocks.") {
+            block(rest)
+                .filter(|&layer| layer < config.layers)
+                .map(|layer| config.refiner_layers + layer)
+        } else {
+            None
+        }
+    }
+
+    /// Memory a call over `tokens` rows computes in: FP32 rows of the residual, the attention and
+    /// the MLP, several of each alive at once.
+    fn work_bytes(&self, tokens: usize) -> usize {
+        let c = &self.config;
+        tokens * (c.hidden * 32 + c.inner() * 24 + c.ffn * 16)
     }
 
     /// Select computation for INT8 ConvRot layers before preparing the prompt.
@@ -448,15 +542,27 @@ impl MetalDit {
 
         let uploaded = Array::from_f32(&w.device, context.shape[0], c.text_dim, &context.data)?;
         let mut text = w.linear(&uploaded, "condition_proj")?;
+        let mut stream = self.stream.as_ref().map(RefCell::borrow_mut);
+        let mut pass = stream
+            .as_mut()
+            .map(|stream| stream.pass(w, 0..c.refiner_layers))
+            .transpose()?;
         for layer in 0..c.refiner_layers {
             let p = format!("token_refiner.blocks.{layer}");
+            if let Some(pass) = &mut pass {
+                pass.enter(layer)?;
+            }
             text = text.add(&self.attention(
                 &w.norm(&text, &format!("{p}.norm1"), c.norm_eps)?,
                 &p,
                 None,
             )?)?;
             text = text.add(&self.mlp(&w.norm(&text, &format!("{p}.norm2"), c.norm_eps)?, &p)?)?;
+            if let Some(pass) = &mut pass {
+                pass.leave(layer);
+            }
         }
+        drop(pass);
 
         text = w.norm(&text, "token_refiner.final_norm", c.norm_eps)?;
         Ok(PreparedText {
@@ -659,9 +765,21 @@ impl MetalDit {
             a.reshape(values / (chunks * width), chunks * width)
         };
 
+        let mut stream = self.stream.as_ref().map(RefCell::borrow_mut);
+        if let Some(stream) = &mut stream {
+            stream.settle(w, self.work_bytes(layout.len()))?;
+        }
+        let refiner = c.refiner_layers;
+        let mut pass: Option<Pass> = stream
+            .as_mut()
+            .map(|stream| stream.pass(w, (0..c.layers).map(|layer| refiner + layer)))
+            .transpose()?;
         let mut blocks = Vec::new();
         for layer in 0..c.layers {
             let p = format!("blocks.{layer}");
+            if let Some(pass) = &mut pass {
+                pass.enter(refiner + layer)?;
+            }
             let m = modulation(&format!("{p}.adaln_proj.linear"), 6)?;
             let norm = w
                 .norm(&hidden, &format!("{p}.norm1"), c.norm_eps)?
@@ -675,6 +793,9 @@ impl MetalDit {
                 .norm(&hidden, &format!("{p}.norm2"), c.norm_eps)?
                 .modulate(&m, &rows, 3, 4)?;
             hidden = hidden.add_gated(&self.mlp(&norm, &p)?, &m, &rows, 5)?;
+            if let Some(pass) = &mut pass {
+                pass.leave(refiner + layer);
+            }
 
             if capture.contains(&layer) {
                 blocks.push((layer, hidden.to_f32()?));

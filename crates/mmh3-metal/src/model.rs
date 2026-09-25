@@ -7,12 +7,14 @@ use mmh3_core::{
     safetensors::{DType, SafeTensors},
     tensor::Tensor,
 };
+use std::cell::RefCell;
 use std::collections::HashMap;
 
-struct Weight {
-    buffer: Buffer,
-    shape: Vec<usize>,
-    dtype: DType,
+#[derive(Clone)]
+pub(crate) struct Weight {
+    pub(crate) buffer: Buffer,
+    pub(crate) shape: Vec<usize>,
+    pub(crate) dtype: DType,
 }
 
 struct Adapter {
@@ -24,6 +26,11 @@ pub(crate) struct Weights {
     pub device: Device,
     pub linear_precision: LinearPrecision,
     tensors: HashMap<String, Weight>,
+    /// Tensors of the units read on the way, while their units are on the device.
+    loaded: RefCell<HashMap<String, Weight>>,
+    /// The type and shape of every tensor left on the disk, which a caller may ask about while its
+    /// unit is not on the device.
+    absent: HashMap<String, (DType, Vec<usize>)>,
     adapters: HashMap<String, Adapter>,
 }
 
@@ -37,8 +44,20 @@ impl Weights {
         prefix: &str,
         keep: impl Fn(&str) -> bool,
     ) -> Result<Self> {
+        Self::load_leaving(file, prefix, keep, |_| false)
+    }
+
+    /// `load_selected`, leaving the tensors `leave` names on the disk. Their units bring them to the
+    /// device with `load_unit` when they run.
+    pub fn load_leaving(
+        file: &SafeTensors,
+        prefix: &str,
+        keep: impl Fn(&str) -> bool,
+        leave: impl Fn(&str) -> bool,
+    ) -> Result<Self> {
         let device = Device::shared()?;
         let mut tensors = HashMap::new();
+        let mut absent = HashMap::new();
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
@@ -69,6 +88,11 @@ impl Weights {
                 return Err(Error::new(format!("empty weight {name}")));
             }
 
+            if leave(name) {
+                absent.insert(name.to_owned(), (info.dtype, info.shape.clone()));
+                continue;
+            }
+
             tensors.insert(
                 name.to_owned(),
                 Weight {
@@ -79,19 +103,28 @@ impl Weights {
             );
         }
 
-        for (name, weight) in &tensors {
-            if weight.dtype == DType::I8 {
+        let described: HashMap<&str, (DType, &[usize])> = tensors
+            .iter()
+            .map(|(name, weight)| (name.as_str(), (weight.dtype, weight.shape.as_slice())))
+            .chain(
+                absent
+                    .iter()
+                    .map(|(name, (dtype, shape))| (name.as_str(), (*dtype, shape.as_slice()))),
+            )
+            .collect();
+        for (name, &(dtype, shape)) in &described {
+            if dtype == DType::I8 {
                 let layer = name
                     .strip_suffix(".weight")
                     .ok_or_else(|| Error::new(format!("unexpected INT8 tensor {name}")))?;
                 if file.get(&format!("{prefix}{layer}.comfy_quant")).is_none()
-                    || weight.shape.len() != 2
-                    || !weight.shape[1].is_multiple_of(256)
-                    || tensors
-                        .get(&format!("{layer}.weight_scale"))
-                        .is_none_or(|s| {
-                            s.dtype != DType::F32
-                                || s.shape.iter().product::<usize>() != weight.shape[0]
+                    || shape.len() != 2
+                    || !shape[1].is_multiple_of(256)
+                    || described
+                        .get(format!("{layer}.weight_scale").as_str())
+                        .is_none_or(|&(scale_dtype, scale_shape)| {
+                            scale_dtype != DType::F32
+                                || scale_shape.iter().product::<usize>() != shape[0]
                         })
                 {
                     return Err(Error::new(format!(
@@ -101,23 +134,59 @@ impl Weights {
             }
         }
 
+        drop(described);
         Ok(Self {
             device,
             tensors,
+            loaded: RefCell::default(),
+            absent,
             adapters: HashMap::new(),
             linear_precision: LinearPrecision::Fp32,
         })
     }
 
+    /// A tensor on the device, whether it stays there or its unit was brought for this call.
+    fn weight(&self, name: &str) -> Result<Weight> {
+        if let Some(weight) = self.tensors.get(name) {
+            return Ok(weight.clone());
+        }
+        if let Some(weight) = self.loaded.borrow().get(name) {
+            return Ok(weight.clone());
+        }
+        Err(Error::new(match self.absent.contains_key(name) {
+            true => format!("{name} is on the disk, and its unit is not on the device"),
+            false => format!("missing tensor {name}"),
+        }))
+    }
+
+    /// The type and shape of a tensor, wherever it is.
+    fn describe(&self, name: &str) -> Option<(DType, Vec<usize>)> {
+        self.tensors
+            .get(name)
+            .map(|weight| (weight.dtype, weight.shape.clone()))
+            .or_else(|| self.absent.get(name).cloned())
+    }
+
+    /// Brings tensors of a unit read on the way to the device, until `unload_unit` takes them.
+    pub(crate) fn load_unit(&self, tensors: Vec<(String, Weight)>) {
+        self.loaded.borrow_mut().extend(tensors);
+    }
+
+    pub(crate) fn unload_unit<'a>(&self, names: impl IntoIterator<Item = &'a str>) {
+        let mut loaded = self.loaded.borrow_mut();
+        for name in names {
+            loaded.remove(name);
+        }
+    }
+
     /// Whether a layer's weights are INT8, which is what an exchanged block input reaches.
     pub fn is_int8(&self, name: &str) -> bool {
-        self.tensors
-            .get(&format!("{name}.weight"))
-            .is_some_and(|w| w.dtype == DType::I8)
+        self.describe(&format!("{name}.weight"))
+            .is_some_and(|(dtype, _)| dtype == DType::I8)
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tensors.contains_key(name)
+        self.tensors.contains_key(name) || self.absent.contains_key(name)
     }
 
     /// Prepack audio convolution matrices once, directly on the GPU, replacing their originals.
@@ -157,10 +226,11 @@ impl Weights {
     }
 
     pub fn embedding(&self, name: &str, ids: &[u32]) -> Result<Array> {
-        let w = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| Error::new(format!("missing tensor {name}")))?;
+        self.embedding_of(&self.weight(name)?, ids)
+    }
+
+    /// The rows `ids` of an embedding table.
+    pub(crate) fn embedding_of(&self, w: &Weight, ids: &[u32]) -> Result<Array> {
         if w.shape.len() != 2 || ids.is_empty() || ids.iter().any(|&i| i as usize >= w.shape[0]) {
             return Err(Error::new("invalid embedding indices".into()));
         }
@@ -179,17 +249,13 @@ impl Weights {
     }
 
     pub fn shape(&self, name: &str) -> Result<Vec<usize>> {
-        self.tensors
-            .get(name)
-            .map(|w| w.shape.clone())
+        self.describe(name)
+            .map(|(_, shape)| shape)
             .ok_or_else(|| Error::new(format!("missing tensor {name}")))
     }
 
     pub fn array(&self, name: &str) -> Result<Array> {
-        let w = self
-            .tensors
-            .get(name)
-            .ok_or_else(|| Error::new(format!("missing tensor {name}")))?;
+        let w = self.weight(name)?;
         let rows = if w.shape.len() >= 2 { w.shape[0] } else { 1 };
         let count = w.shape.iter().product::<usize>();
         convert(&self.device, &w.buffer, rows, count / rows, w.dtype)
@@ -206,10 +272,7 @@ impl Weights {
 
     pub fn linear(&self, x: &Array, name: &str) -> Result<Array> {
         let key = format!("{name}.weight");
-        let w = self
-            .tensors
-            .get(&key)
-            .ok_or_else(|| Error::new(format!("missing tensor {key}")))?;
+        let w = self.weight(&key)?;
         if w.shape.len() < 2 || w.shape[1..].iter().product::<usize>() != x.cols {
             return Err(Error::new(format!("{name}: linear input shape mismatch")));
         }
@@ -263,10 +326,7 @@ impl Weights {
         keep: &[std::ops::Range<usize>],
     ) -> Result<Array> {
         let key = format!("{name}.weight");
-        let w = self
-            .tensors
-            .get(&key)
-            .ok_or_else(|| Error::new(format!("missing tensor {key}")))?;
+        let w = self.weight(&key)?;
         if w.dtype != DType::I8 {
             return Err(Error::new(format!(
                 "{name}: an exchanged input reaches INT8 layers only"
@@ -483,6 +543,8 @@ mod tests {
         let mut w = Weights {
             device: device.clone(),
             tensors,
+            loaded: RefCell::default(),
+            absent: HashMap::new(),
             adapters: HashMap::new(),
             linear_precision: LinearPrecision::Fp32,
         };

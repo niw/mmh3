@@ -140,7 +140,7 @@ impl Models {
             let file = SafeTensors::open(path)?;
             let encoder = self.read_fitting(
                 || load(path, || TextEncoder::load(&file)),
-                || load(path, || load_text_encoder_fitting(&file)),
+                || load(path, || TextEncoder::load_fitting(&file)),
             )?;
             self.text_encoder.kept = Some((key, encoder));
         }
@@ -326,16 +326,6 @@ fn counted(models: usize) -> String {
         1 => "1 model".to_owned(),
         models => format!("{models} models"),
     }
-}
-
-#[cfg(feature = "cuda")]
-fn load_text_encoder_fitting(file: &SafeTensors) -> Result<TextEncoder, Box<dyn Error>> {
-    Ok(TextEncoder::load_fitting(file)?)
-}
-
-#[cfg(feature = "metal")]
-fn load_text_encoder_fitting(file: &SafeTensors) -> Result<TextEncoder, Box<dyn Error>> {
-    Ok(TextEncoder::load(file)?)
 }
 
 /// Loads a model, saying what it read and how long it took.

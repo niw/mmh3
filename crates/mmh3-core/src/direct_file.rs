@@ -1,12 +1,12 @@
 //! File reads that bypass the page cache, for streaming large checkpoints once.
 //!
 //! A checkpoint read through the page cache stays in memory next to its copy on the GPU, which on
-//! unified-memory systems such as GB10 holds the weights twice in the same RAM. Direct reads leave
-//! nothing behind.
+//! unified-memory systems such as GB10 or a Mac holds the weights twice in the same RAM. Direct
+//! reads leave nothing behind.
 
 use std::fs::{File, OpenOptions};
 use std::io;
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -26,6 +26,14 @@ unsafe extern "C" {
     fn posix_fadvise(descriptor: i32, offset: i64, length: i64, advice: i32) -> i32;
 }
 
+#[cfg(target_os = "macos")]
+const F_NOCACHE: i32 = 48;
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn fcntl(descriptor: i32, command: i32, ...) -> i32;
+}
+
 pub struct DirectFile {
     file: File,
     direct: bool,
@@ -33,8 +41,9 @@ pub struct DirectFile {
 
 impl DirectFile {
     /// Opens `path` for direct reads, or, where the file system refuses them, for buffered reads
-    /// that drop what they read from the page cache on Linux. Other Unix platforms use ordinary
-    /// buffered reads without Linux's cache-discard advice.
+    /// that drop what they read from the page cache on Linux. On macOS the reads bypass the cache
+    /// through `F_NOCACHE`, which asks no alignment of them. Other Unix platforms use ordinary
+    /// buffered reads.
     pub fn open(path: &Path) -> io::Result<Self> {
         #[cfg(target_os = "linux")]
         {
@@ -47,8 +56,15 @@ impl DirectFile {
                 return Ok(DirectFile { file, direct: true });
             }
         }
+        let file = OpenOptions::new().read(true).open(path)?;
+        // SAFETY: plain advice on an open descriptor. A file system that refuses it is read
+        // through the cache.
+        #[cfg(target_os = "macos")]
+        unsafe {
+            fcntl(file.as_raw_fd(), F_NOCACHE, 1);
+        }
         Ok(DirectFile {
-            file: OpenOptions::new().read(true).open(path)?,
+            file,
             direct: false,
         })
     }
