@@ -8,8 +8,13 @@ use mmh3::models::{
 };
 use mmh3_core::json;
 use mmh3_core::safetensors::SafeTensors;
+use mmh3_cuda::DeviceBuffer;
+use mmh3_cuda::shard::{Exchange, ExchangeError, Region, VelocityRows};
+use std::collections::HashMap;
 use std::error::Error;
+use std::ffi::c_void;
 use std::path::Path;
+use std::sync::{Barrier, Mutex};
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments.first().map(String::as_str) {
@@ -290,20 +295,25 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let started = Instant::now();
     let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     // `--shard 1` runs the path a shared-out step takes, with one rank and nothing to carry
-    // anywhere, which has to give what a whole step gives.
+    // anywhere, and `--shard N` splits the step N ways across threads of this process, a DiT each.
+    // Either has to give what a whole step gives.
     let ranks: usize = option_number(&options, "shard", 0)?;
     let outputs = if ranks > 0 {
         use mmh3_cuda::shard::{Shard, ShardContext, WholeExchange};
-        let layout = PackedLayout::for_inputs(&inputs);
-        let mut exchange = WholeExchange::new();
-        let mut context = ShardContext {
-            shard: Shard::even(0, ranks, layout.len(), dit.config().heads, 1),
-            exchange: &mut exchange,
-            timing: Default::default(),
+        let parts = if ranks == 1 {
+            let layout = PackedLayout::for_inputs(&inputs);
+            let mut exchange = WholeExchange::new();
+            let mut context = ShardContext {
+                shard: Shard::even(0, ranks, layout.len(), dit.config().heads, 1),
+                exchange: &mut exchange,
+                timing: Default::default(),
+            };
+            let part = dit.forward_shard(&inputs, sparse.as_ref(), &mut context)?;
+            vec![part.part.ok_or("no part")?]
+        } else {
+            split_step(&options, &inputs, ranks)?
         };
-        let part = dit.forward_shard(&inputs, sparse.as_ref(), &mut context)?;
-        let shared =
-            dit.assemble_velocity(&inputs, sparse.as_ref(), &[part.part.ok_or("no part")?])?;
+        let shared = dit.assemble_velocity(&inputs, sparse.as_ref(), &parts)?;
         // The same step without the shard, in the same process, so that the two can be compared
         // directly instead of through the golden data.
         let whole = dit.forward(&inputs, &[], sparse.as_ref())?;
@@ -313,7 +323,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         ] {
             let (cosine, difference, worst, scale) = compare(left, right);
             println!(
-                "{what:<8} shared against whole  {cosine:.7}  {difference:.3e}  {worst:.3e}                   {scale:.3}"
+                "{what:<8} {ranks} ranks against whole  {cosine:.7}  {difference:.3e}  {worst:.3e}                   {scale:.3}"
             );
         }
         shared
@@ -414,6 +424,177 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         &negated(&format!("step{step}.velocity.audio"))?,
     );
     Ok(())
+}
+
+/// Where the ranks of a split step in one process find each other's regions, and wait for each
+/// other.
+struct SplitHub {
+    regions: Mutex<HashMap<(usize, Region), (usize, usize)>>,
+    barrier: Barrier,
+}
+
+/// One rank's side of a split step in one process. A write goes through host memory, which is slow
+/// and plain, since what it checks is the arithmetic of a split rather than a transport.
+struct SplitExchange<'a> {
+    hub: &'a SplitHub,
+    rank: usize,
+    ranks: usize,
+    held: HashMap<Region, DeviceBuffer>,
+}
+
+impl SplitExchange<'_> {
+    fn make(&mut self, region: Region, bytes: usize) -> Result<*mut c_void, ExchangeError> {
+        if self.held.get(&region).map_or(0, DeviceBuffer::bytes) < bytes {
+            let buffer =
+                DeviceBuffer::zeroed(bytes).map_err(|error| ExchangeError(error.to_string()))?;
+            self.hub
+                .regions
+                .lock()
+                .unwrap()
+                .insert((self.rank, region), (buffer.pointer() as usize, bytes));
+            self.held.insert(region, buffer);
+        }
+        Ok(self.held[&region].pointer())
+    }
+}
+
+impl Exchange for SplitExchange<'_> {
+    type Memory = *mut c_void;
+
+    fn rank(&self) -> usize {
+        self.rank
+    }
+
+    fn ranks(&self) -> usize {
+        self.ranks
+    }
+
+    fn region(&mut self, region: Region, bytes: usize) -> Result<*mut c_void, ExchangeError> {
+        self.make(region, bytes)
+    }
+
+    fn write(
+        &mut self,
+        peer: usize,
+        from: Region,
+        offset: usize,
+        into: Region,
+        peer_offset: usize,
+        bytes: usize,
+    ) -> Result<(), ExchangeError> {
+        let source = self
+            .held
+            .get(&from)
+            .ok_or_else(|| ExchangeError(format!("no {from:?}")))?
+            .pointer();
+        let (target, size) = *self
+            .hub
+            .regions
+            .lock()
+            .unwrap()
+            .get(&(peer, into))
+            .ok_or_else(|| ExchangeError(format!("rank {peer} made no {into:?}")))?;
+        if peer_offset + bytes > size {
+            return Err(ExchangeError(format!(
+                "{bytes} bytes at {peer_offset} of rank {peer}'s {size} byte {into:?}"
+            )));
+        }
+        let mut staged = vec![0u8; bytes];
+        // SAFETY: both ranges lie inside regions their ranks keep for the step, checked above.
+        unsafe {
+            mmh3_cuda::download(&mut staged, source.byte_add(offset).cast_const())
+                .map_err(|error| ExchangeError(error.to_string()))?;
+            mmh3_cuda::upload((target as *mut c_void).byte_add(peer_offset), &staged)
+                .map_err(|error| ExchangeError(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn publish(
+        &mut self,
+        _region: Region,
+        _offset: usize,
+        _bytes: usize,
+    ) -> Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    fn receive(
+        &mut self,
+        _region: Region,
+        _offset: usize,
+        _bytes: usize,
+    ) -> Result<(), ExchangeError> {
+        Ok(())
+    }
+
+    fn barrier(&mut self) -> Result<(), ExchangeError> {
+        mmh3_cuda::synchronize().map_err(|error| ExchangeError(error.to_string()))?;
+        self.hub.barrier.wait();
+        Ok(())
+    }
+}
+
+/// The parts of one step split `ranks` ways across threads of this process, each with a DiT of its
+/// own, in rank order.
+///
+/// NOTE: a rank that fails leaves the others waiting at the next barrier for good. Every rank reads
+/// the same checkpoint and runs the same step, so they fail together or not at all.
+fn split_step(
+    options: &HashMap<&str, &str>,
+    inputs: &mmh3_core::dit::inputs::DitInputs,
+    ranks: usize,
+) -> Result<Vec<VelocityRows>, Box<dyn Error>> {
+    use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_cuda::shard::{Shard, ShardContext, regions};
+
+    let hub = SplitHub {
+        regions: Mutex::new(HashMap::new()),
+        barrier: Barrier::new(ranks),
+    };
+    let tokens = PackedLayout::for_inputs(inputs).len();
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..ranks)
+            .map(|rank| {
+                let hub = &hub;
+                scope.spawn(move || -> Result<VelocityRows, String> {
+                    let dit = load_dit(options, "weights", dit_file_for(&inputs.references))
+                        .map_err(|error| error.to_string())?;
+                    let sparse = sparse_attention(options, dit.has_vsa_gates())
+                        .map_err(|error| error.to_string())?;
+                    let shard = Shard::even(rank, ranks, tokens, dit.config().heads, 1);
+                    let mut exchange = SplitExchange {
+                        hub,
+                        rank,
+                        ranks,
+                        held: HashMap::new(),
+                    };
+                    // Every region a peer may write into is there before any rank starts.
+                    for (region, bytes) in regions(&shard, tokens, dit.config().hidden, true) {
+                        exchange.make(region, bytes).map_err(|error| error.0)?;
+                    }
+                    hub.barrier.wait();
+                    let mut context = ShardContext {
+                        shard,
+                        exchange: &mut exchange,
+                        timing: Default::default(),
+                    };
+                    let part = dit
+                        .forward_shard(inputs, sparse.as_ref(), &mut context)
+                        .map_err(|error| error.to_string())?;
+                    // A peer may still read what this rank holds until every rank is done.
+                    hub.barrier.wait();
+                    part.part
+                        .ok_or_else(|| format!("rank {rank} returned no part"))
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a rank panicked"))
+            .collect::<Result<Vec<_>, _>>()
+    })?;
+    Ok(parts)
 }
 
 /// Samples every step of a golden directory from its initial noise and compares the latents after
