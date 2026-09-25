@@ -15,10 +15,29 @@ The `cuda` backend runs every part of a generation on an NVIDIA Blackwell GPU, w
   mmh3 builds without RDMA and sends everything over the socket. After installing them, run
   `cargo clean -p mmh3-rdma` so that the next build finds them.
 - About 55 GB of disk for the models. mmh3 loads one model at a time. The largest is the DiT, with
-  21 GB of weights plus activations.
+  21 GB of weights plus activations. A GPU with less memory reads part of each model from the disk
+  as it runs, see [Less GPU memory](#less-gpu-memory).
 
 A machine that only hands work out to others needs none of these. See
 [Distributed generation](distributed.md).
+
+## Less GPU memory
+
+The text encoder and the DiT load whole when they fit. When one does not, it keeps as many of its
+layers on the GPU as fit beside the buffers of the run, and reads the others from the disk each time
+they run. They take turns in two buffers: while the kernels of one layer run, a thread reads the
+next one into pinned host memory and copies it to the GPU. A line such as `keeping 29 of 52 DiT
+blocks on the device and reading the rest as they run` says how many it kept. The text encoder
+also leaves its embedding table on the disk and reads the rows of the prompt from there.
+
+A GB10 held with `--vram-budget 21` to about what a 24 GB card leaves a run generates the 768p
+FastH3 clip of `make generate` with the DiT's steps as fast as without the limit, since the reads
+hide behind the layers kept between them. How well they hide elsewhere depends on the disk and on
+how long the layers take to run. The reads bypass the page cache, so they want a fast NVMe drive
+rather than host memory.
+
+`--lora-mode merge` and `--linear-precision nvfp4` change the DiT's weights on the GPU, so a DiT
+with either cannot read its blocks again and needs the memory for all of them.
 
 ## Output
 

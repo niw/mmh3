@@ -92,7 +92,9 @@ make generate \
   memory, failing an allocation past it as a device that small would. It is a limit on this run
   rather than on the GPU, so what another program on the same device holds is not counted against
   it. A run reads the 27 GB text encoder and the DiT one after the other whatever the budget says,
-  so the encoder is gone before the DiT arrives.
+  so the encoder is gone before the DiT arrives. A model that does not fit in the budget keeps what
+  fits and reads the rest from the disk as it runs, as on a GPU that small. See
+  [Less GPU memory](cuda.md#less-gpu-memory).
 
 ## Prompts
 
