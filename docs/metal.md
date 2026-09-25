@@ -12,6 +12,14 @@ External encoding through ffmpeg is optional.
 - About 55 GB of disk for the models. A run loads one model at a time. The largest is the DiT, with
   21 GB of weights plus activations. See [Models](models.md) for the checkpoints.
 
+A Mac whose GPU may not hold a whole model runs it anyway. The text encoder and the DiT load whole
+when they fit in the share of memory the GPU may fill. When one does not, it keeps as many of its
+layers as fit beside what the run computes in, and reads the others from the disk each time they
+run, while the layers before them compute. A line such as `keeping 25 of 52 DiT blocks on the
+device and reading the rest as they run` says how many it kept. The text encoder also leaves its
+embedding table on the disk and reads the rows of the prompt from there. A 24 GB Mac generates the
+clip of `make generate` this way within 18 GB.
+
 A worker is the exception: it keeps what it has read for the runs that follow, so a Mac serving one
 holds several models at once and lets go of the one it used least when the device has no memory
 left. `--vram-budget GB` holds it to less than the device would give, and `--idle-unload SECONDS`
