@@ -69,20 +69,23 @@ struct Upload {
 }
 
 /// Pinned host memory freed on drop.
-struct PinnedBuffer {
+pub(crate) struct PinnedBuffer {
     pointer: *mut c_void,
     bytes: usize,
 }
 
+// SAFETY: plain host memory, used by one owner at a time.
+unsafe impl Send for PinnedBuffer {}
+
 impl PinnedBuffer {
-    fn new(bytes: usize) -> Result<Self, CudaError> {
+    pub(crate) fn new(bytes: usize) -> Result<Self, CudaError> {
         let mut pointer = ptr::null_mut();
         // SAFETY: pointer is a valid out pointer.
         check(unsafe { mmh3_cuda_host_alloc(&mut pointer, bytes) })?;
         Ok(PinnedBuffer { pointer, bytes })
     }
 
-    fn as_mut_slice(&mut self) -> &mut [u8] {
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
         // SAFETY: the allocation holds `bytes` bytes and lives as long as self.
         unsafe { std::slice::from_raw_parts_mut(self.pointer.cast(), self.bytes) }
     }

@@ -138,7 +138,10 @@ impl Models {
         if self.text_encoder.kept.as_ref().map(|(kept, _)| *kept) != Some(key) {
             self.text_encoder.kept = None;
             let file = SafeTensors::open(path)?;
-            let encoder = self.read(|| load(path, || TextEncoder::load(&file)))?;
+            let encoder = self.read_fitting(
+                || load(path, || TextEncoder::load(&file)),
+                || load(path, || load_text_encoder_fitting(&file)),
+            )?;
             self.text_encoder.kept = Some((key, encoder));
         }
         self.text_encoder.used = self.touch();
@@ -204,6 +207,21 @@ impl Models {
                 },
                 result => return result,
             }
+        }
+    }
+
+    /// `read`, and when there is nothing left to let go of and the whole model still does not fit,
+    /// `fitting`, which reads a model that keeps what fits of its weights and reads the rest from
+    /// the disk as it runs. The other models go first, since a model that reads on the way is a
+    /// slower one.
+    pub fn read_fitting<T, E: Into<Box<dyn Error>>, F: Into<Box<dyn Error>>>(
+        &mut self,
+        whole: impl FnMut() -> Result<T, E>,
+        fitting: impl FnOnce() -> Result<T, F>,
+    ) -> Result<T, Box<dyn Error>> {
+        match self.read(whole) {
+            Err(error) if out_of_memory(&*error) => fitting().map_err(Into::into),
+            result => result,
         }
     }
 
@@ -308,6 +326,16 @@ fn counted(models: usize) -> String {
         1 => "1 model".to_owned(),
         models => format!("{models} models"),
     }
+}
+
+#[cfg(feature = "cuda")]
+fn load_text_encoder_fitting(file: &SafeTensors) -> Result<TextEncoder, Box<dyn Error>> {
+    Ok(TextEncoder::load_fitting(file)?)
+}
+
+#[cfg(feature = "metal")]
+fn load_text_encoder_fitting(file: &SafeTensors) -> Result<TextEncoder, Box<dyn Error>> {
+    Ok(TextEncoder::load(file)?)
 }
 
 /// Loads a model, saying what it read and how long it took.

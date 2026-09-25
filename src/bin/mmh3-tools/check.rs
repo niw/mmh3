@@ -258,10 +258,12 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "sparse-tau",
             "vsa-sparsity",
             "shard",
+            "vram-budget",
         ],
         &["consistent"],
         USAGE,
     )?;
+    mmh3::resident::take_budget(&options)?;
     mmh3_cuda::algorithms::set_consistent(options.contains_key("consistent"));
     let golden = Path::new(options.get("golden").ok_or(USAGE)?);
     let dit_file = GoldenFile::open(golden, "dit.safetensors")?;
@@ -1097,7 +1099,13 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::text_encoder::CudaTextEncoder;
     use std::time::Instant;
 
-    let options = parse_options(arguments, &["golden", "models", "weights"], &[], USAGE)?;
+    let options = parse_options(
+        arguments,
+        &["golden", "models", "weights", "vram-budget"],
+        &[],
+        USAGE,
+    )?;
+    mmh3::resident::take_budget(&options)?;
     let golden = GoldenFile(SafeTensors::open(Path::new(
         options.get("golden").ok_or(USAGE)?,
     ))?);
@@ -1148,7 +1156,7 @@ fn check_text_encoder(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let weights_path = option_path(&options, "weights", TEXT_ENCODER_FILE)?;
-    let encoder = CudaTextEncoder::load(&SafeTensors::open(Path::new(&weights_path))?)?;
+    let encoder = CudaTextEncoder::load_fitting(&SafeTensors::open(Path::new(&weights_path))?)?;
     println!(
         "loaded {weights_path} in {:.1} s",
         started.elapsed().as_secs_f64()

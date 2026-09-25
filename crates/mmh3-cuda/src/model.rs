@@ -143,6 +143,10 @@ impl DeviceTensors {
         );
     }
 
+    pub(crate) fn remove(&mut self, name: &str) -> Option<DeviceTensor> {
+        self.0.remove(name)
+    }
+
     pub(crate) fn get(&self, name: &str) -> Result<&DeviceTensor, Error> {
         self.0
             .get(name)

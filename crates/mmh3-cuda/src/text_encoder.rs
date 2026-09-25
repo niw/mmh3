@@ -12,12 +12,17 @@
 use crate::attention::{AttentionLayout, Element, attention_pointers};
 use crate::loader::Uploader;
 use crate::model::{CONVROT_GROUP, DeviceTensors, Error, check_quantization};
+use crate::streaming::Stream;
 use crate::vision::{VisionEmbeddings, mmh3_vision_add};
 use crate::{DeviceBuffer, check, copy_device};
 use mmh3_core::safetensors::{DType, SafeTensors, TensorInfo};
+use mmh3_core::streaming::{Arrangement, Files, Unit, give_up_order};
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vision::VisionPrompt;
+use std::cell::{Cell, Ref, RefCell};
 use std::ffi::{c_int, c_void};
+use std::os::unix::fs::FileExt;
+use std::path::PathBuf;
 use std::ptr;
 
 unsafe extern "C" {
@@ -134,9 +139,16 @@ pub struct TextEncoding {
     pub layers: Vec<(usize, Tensor)>,
 }
 
+/// The text encoder's layers are its units, which a device short of memory reads on the way. The
+/// embedding table, 1.6 GB of which a prompt reads a few rows, is the first thing it lets go of:
+/// the rows then come from the checkpoint.
 pub struct CudaTextEncoder {
     config: TextEncoderConfig,
-    tensors: DeviceTensors,
+    tensors: RefCell<DeviceTensors>,
+    stream: RefCell<Stream>,
+    /// The checkpoint and the offset of the embedding table in it.
+    embedding: (PathBuf, u64),
+    embedding_on_device: Cell<bool>,
 }
 
 fn tensor_info<'a>(file: &'a SafeTensors, name: &str) -> Result<&'a TensorInfo, Error> {
@@ -148,6 +160,19 @@ impl CudaTextEncoder {
     /// Uploads the language model of a ComfyUI text encoder checkpoint with INT8 ConvRot linear
     /// layers.
     pub fn load(file: &SafeTensors) -> Result<Self, Error> {
+        Self::load_as(file, true)
+    }
+
+    /// `load`, or, on a device without the memory for the whole encoder, an encoder that reads its
+    /// layers on the way and keeps back what fits once it knows the prompt.
+    pub fn load_fitting(file: &SafeTensors) -> Result<Self, Error> {
+        match Self::load(file) {
+            Err(error) if error.is_out_of_memory() => Self::load_as(file, false),
+            result => result,
+        }
+    }
+
+    fn load_as(file: &SafeTensors, whole: bool) -> Result<Self, Error> {
         let embedding = tensor_info(file, "embed_tokens.weight")?;
         let query = tensor_info(file, "layers.0.self_attn.q_proj.weight")?;
         let key = tensor_info(file, "layers.0.self_attn.k_proj.weight")?;
@@ -176,9 +201,14 @@ impl CudaTextEncoder {
 
         let mut tensors = DeviceTensors::default();
         let mut uploader = Uploader::new(file);
-        tensors.insert("embed_tokens.weight", file, embedding, &mut uploader)?;
+        let mut files = Files::default();
+        let mut units = Vec::new();
+        if whole {
+            tensors.insert("embed_tokens.weight", file, embedding, &mut uploader)?;
+        }
         for layer in 0..config.layers {
             let prefix = format!("layers.{layer}");
+            let mut unit = Unit::new(&prefix);
             for name in [
                 "input_layernorm",
                 "post_attention_layernorm",
@@ -186,7 +216,17 @@ impl CudaTextEncoder {
                 "self_attn.k_norm",
             ] {
                 let name = format!("{prefix}.{name}.weight");
-                tensors.insert(&name, file, tensor_info(file, &name)?, &mut uploader)?;
+                let info = tensor_info(file, &name)?;
+                if whole {
+                    tensors.insert(&name, file, info, &mut uploader)?;
+                }
+                unit.insert(
+                    &name,
+                    info.dtype,
+                    info.shape.clone(),
+                    vec![files.piece(file, info)],
+                    Arrangement::Contiguous,
+                );
             }
             for (name, parts) in [
                 (
@@ -201,28 +241,65 @@ impl CudaTextEncoder {
                     .iter()
                     .map(|part| format!("{prefix}.{part}"))
                     .collect();
-                Self::insert_concatenated(
-                    &mut tensors,
-                    &mut uploader,
-                    file,
-                    &format!("{prefix}.{name}"),
-                    &parts,
-                )?;
+                let (weights, scales) =
+                    Self::concatenated_parts(file, &format!("{prefix}.{name}"), &parts)?;
+                if whole {
+                    Self::insert_concatenated(
+                        &mut tensors,
+                        &mut uploader,
+                        file,
+                        &format!("{prefix}.{name}"),
+                        &weights,
+                        &scales,
+                    )?;
+                }
+                let outputs: usize = weights.iter().map(|weight| weight.shape[0]).sum();
+                for (suffix, parts, dtype, shape) in [
+                    (
+                        "weight",
+                        &weights,
+                        DType::I8,
+                        vec![outputs, weights[0].shape[1]],
+                    ),
+                    ("weight_scale", &scales, DType::F32, vec![outputs]),
+                ] {
+                    unit.insert(
+                        &format!("{prefix}.{name}.{suffix}"),
+                        dtype,
+                        shape,
+                        parts.iter().map(|info| files.piece(file, info)).collect(),
+                        Arrangement::Contiguous,
+                    );
+                }
             }
+            units.push(unit);
         }
         uploader.run()?;
-        Ok(CudaTextEncoder { config, tensors })
+        let mut stream = Stream::new(
+            "text encoder layers",
+            files,
+            units,
+            give_up_order(config.layers),
+            0..config.layers,
+        );
+        if !whole {
+            stream.start_reading(&mut tensors)?;
+        }
+        Ok(CudaTextEncoder {
+            config,
+            tensors: RefCell::new(tensors),
+            stream: RefCell::new(stream),
+            embedding: (file.path().to_owned(), file.file_offset(embedding)),
+            embedding_on_device: Cell::new(whole),
+        })
     }
 
-    /// Queues the INT8 ConvRot layers `parts` as one layer `name` whose output rows are theirs in
-    /// order.
-    fn insert_concatenated(
-        tensors: &mut DeviceTensors,
-        uploader: &mut Uploader,
-        file: &SafeTensors,
+    /// The weights and scales of the INT8 ConvRot layers `parts`, checked to form one layer `name`.
+    fn concatenated_parts<'a>(
+        file: &'a SafeTensors,
         name: &str,
         parts: &[String],
-    ) -> Result<(), Error> {
+    ) -> Result<(Vec<&'a TensorInfo>, Vec<&'a TensorInfo>), Error> {
         let mut weights = Vec::new();
         let mut scales = Vec::new();
         for part in parts {
@@ -249,6 +326,19 @@ impl CudaTextEncoder {
             weights.push(weight);
             scales.push(scale);
         }
+        Ok((weights, scales))
+    }
+
+    /// Queues the INT8 ConvRot layers of `weights` and `scales` as one layer `name` whose output
+    /// rows are theirs in order.
+    fn insert_concatenated(
+        tensors: &mut DeviceTensors,
+        uploader: &mut Uploader,
+        file: &SafeTensors,
+        name: &str,
+        weights: &[&TensorInfo],
+        scales: &[&TensorInfo],
+    ) -> Result<(), Error> {
         let outputs: usize = weights.iter().map(|weight| weight.shape[0]).sum();
         let features = weights[0].shape[1];
         let mut concatenate = |infos: &[&TensorInfo]| -> Result<DeviceBuffer, Error> {
@@ -260,8 +350,8 @@ impl CudaTextEncoder {
             }
             Ok(buffer)
         };
-        let weight = concatenate(&weights)?;
-        let scale = concatenate(&scales)?;
+        let weight = concatenate(weights)?;
+        let scale = concatenate(scales)?;
         tensors.insert_buffer(
             &format!("{name}.weight"),
             weight,
@@ -281,6 +371,36 @@ impl CudaTextEncoder {
         &self.config
     }
 
+    fn tensors(&self) -> Ref<'_, DeviceTensors> {
+        self.tensors.borrow()
+    }
+
+    /// Makes room on a device that ran out of memory, and says whether there was any to make. The
+    /// embedding table goes first, then the layers.
+    fn make_room(&self) -> Result<bool, Error> {
+        let mut tensors = self.tensors.borrow_mut();
+        if self.embedding_on_device.replace(false) {
+            tensors.remove("embed_tokens.weight");
+            return Ok(true);
+        }
+        self.stream.borrow_mut().make_room(&mut tensors)
+    }
+
+    /// The rows of the embedding table for `ids`, read from the checkpoint, `[tokens, hidden]`
+    /// BF16.
+    fn embedding_rows(&self, ids: &[u32]) -> Result<DeviceBuffer, Error> {
+        let (path, offset) = &self.embedding;
+        let row_bytes = self.config.hidden * 2;
+        let file = std::fs::File::open(path)
+            .map_err(|error| Error::Model(format!("reading embeddings: {error}")))?;
+        let mut rows = vec![0; ids.len() * row_bytes];
+        for (&id, row) in ids.iter().zip(rows.chunks_exact_mut(row_bytes)) {
+            file.read_exact_at(row, offset + (id as usize * row_bytes) as u64)
+                .map_err(|error| Error::Model(format!("reading embeddings: {error}")))?;
+        }
+        Ok(DeviceBuffer::from_bytes(&rows)?)
+    }
+
     fn linear(
         &self,
         name: &str,
@@ -289,7 +409,7 @@ impl CudaTextEncoder {
         tokens: usize,
         workspace: &Workspace,
     ) -> Result<(), Error> {
-        self.tensors.linear(
+        self.tensors().linear(
             name,
             input.pointer(),
             output.pointer(),
@@ -305,7 +425,7 @@ impl CudaTextEncoder {
         check(unsafe {
             mmh3_rms_norm_modulate(
                 workspace.residual.pointer(),
-                self.tensors.pointer(weight)?,
+                self.tensors().pointer(weight)?,
                 ptr::null(),
                 ptr::null(),
                 0,
@@ -394,7 +514,23 @@ impl CudaTextEncoder {
         self.encode_positions(&prompt.ids, &prompt.positions, &pictures, capture)
     }
 
+    /// Encodes the prompt, making room and trying again each time the device runs out of memory.
     fn encode_positions(
+        &self,
+        ids: &[u32],
+        positions: &[[usize; 3]],
+        pictures: &[(usize, &VisionEmbeddings)],
+        capture: &[usize],
+    ) -> Result<TextEncoding, Error> {
+        loop {
+            match self.encode_once(ids, positions, pictures, capture) {
+                Err(error) if error.is_out_of_memory() && self.make_room()? => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn encode_once(
         &self,
         ids: &[u32],
         positions: &[[usize; 3]],
@@ -410,17 +546,33 @@ impl CudaTextEncoder {
             )));
         }
         let workspace = Workspace::new(config, tokens)?;
+        self.stream
+            .borrow_mut()
+            .settle(&mut self.tensors.borrow_mut())?;
+        // Without the table on the device, the prompt's rows come from the checkpoint and the
+        // kernel looks them up in order.
+        let (table, table_ids) = match self.embedding_on_device.get() {
+            true => (None, ids.to_vec()),
+            false => (
+                Some(self.embedding_rows(ids)?),
+                (0..tokens as u32).collect(),
+            ),
+        };
         let id_buffer = DeviceBuffer::from_bytes(
-            &ids.iter()
+            &table_ids
+                .iter()
                 .flat_map(|&id| (id as i32).to_le_bytes())
                 .collect::<Vec<_>>(),
         )?;
-        // SAFETY: the ids are below the vocabulary size, checked above, and the residual holds
-        // `tokens × hidden`.
+        // SAFETY: the ids are below the vocabulary size, checked above, or index the rows read,
+        // and the residual holds `tokens × hidden`.
         check(unsafe {
             mmh3_embedding_bf16(
                 id_buffer.pointer(),
-                self.tensors.pointer("embed_tokens.weight")?,
+                match &table {
+                    Some(table) => table.pointer(),
+                    None => self.tensors().pointer("embed_tokens.weight")?,
+                },
                 workspace.residual.pointer(),
                 tokens as c_int,
                 config.hidden as c_int,
@@ -463,8 +615,11 @@ impl CudaTextEncoder {
             ..AttentionLayout::default()
         };
         let mut layers = Vec::new();
+        let mut stream = self.stream.borrow_mut();
+        let mut pass = stream.pass(0..config.layers)?;
         for layer in 0..config.layers {
             let prefix = format!("layers.{layer}");
+            pass.enter(layer)?;
             self.normalize(
                 &format!("{prefix}.input_layernorm.weight"),
                 &workspace,
@@ -483,9 +638,9 @@ impl CudaTextEncoder {
             unsafe {
                 check(mmh3_qk_norm_rope(
                     qkv.cast(),
-                    self.tensors
+                    self.tensors()
                         .pointer(&format!("{prefix}.self_attn.q_norm.weight"))?,
-                    self.tensors
+                    self.tensors()
                         .pointer(&format!("{prefix}.self_attn.k_norm.weight"))?,
                     angles.pointer(),
                     (HEAD_DIM / 2) as c_int,
@@ -548,6 +703,7 @@ impl CudaTextEncoder {
                 &workspace,
             )?;
             self.add_residual(&workspace, tokens)?;
+            pass.leave(layer)?;
             if capture.contains(&layer) {
                 layers.push((
                     layer,

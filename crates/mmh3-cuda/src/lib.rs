@@ -12,6 +12,7 @@ pub mod loader;
 pub mod model;
 pub mod nvfp4;
 pub mod shard;
+mod streaming;
 pub mod text_encoder;
 pub mod vae;
 pub mod video_encoder;
@@ -233,10 +234,21 @@ pub fn set_allocation_limit(bytes: usize) {
     LIMIT.store(bytes, Ordering::Relaxed);
 }
 
-/// An owned device allocation.
+/// Bytes this process may still allocate: what the device has left, held to what the limit
+/// leaves.
+pub fn free_bytes() -> Result<usize, CudaError> {
+    let (free, _) = memory_info()?;
+    Ok(match LIMIT.load(Ordering::Relaxed) {
+        0 => free,
+        limit => free.min(limit.saturating_sub(ALLOCATED.load(Ordering::Relaxed))),
+    })
+}
+
+/// A device allocation, or a view into one that somebody else owns.
 pub struct DeviceBuffer {
     pointer: *mut c_void,
     bytes: usize,
+    owned: bool,
 }
 
 // SAFETY: a device address belongs to the context of the process rather than to a thread, and
@@ -265,7 +277,27 @@ impl DeviceBuffer {
         // SAFETY: pointer is a valid out pointer.
         check(unsafe { mmh3_cuda_malloc(&mut pointer, bytes) })?;
         ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
-        Ok(Self { pointer, bytes })
+        Ok(Self {
+            pointer,
+            bytes,
+            owned: true,
+        })
+    }
+
+    /// `bytes` bytes from `offset` into `owner`, freed with it rather than with the view.
+    ///
+    /// # Safety
+    /// The view must not outlive the allocation it points into.
+    pub(crate) unsafe fn view(owner: &DeviceBuffer, offset: usize, bytes: usize) -> Self {
+        assert!(
+            offset + bytes <= owner.bytes,
+            "the view reaches past the end of the buffer"
+        );
+        Self {
+            pointer: owner.pointer_at(offset),
+            bytes,
+            owned: false,
+        }
     }
 
     /// A buffer filled with zero bytes.
@@ -382,6 +414,9 @@ impl DeviceBuffer {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
+        if !self.owned {
+            return;
+        }
         ALLOCATED.fetch_sub(self.bytes, Ordering::Relaxed);
         // SAFETY: pointer came from cudaMalloc and is freed once.
         unsafe {

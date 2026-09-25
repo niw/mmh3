@@ -123,6 +123,16 @@ extern "C" int mmh3_cuda_event_synchronize(cudaEvent_t event) {
     return static_cast<int>(cudaEventSynchronize(event));
 }
 
+// Holds later work on `stream` back until the work before the last record of `event` is done. The
+// null stream is the legacy default stream, which every kernel here is launched on.
+extern "C" int mmh3_cuda_stream_wait_event(cudaStream_t stream, cudaEvent_t event) {
+    return static_cast<int>(cudaStreamWaitEvent(stream, event, 0));
+}
+
+extern "C" int mmh3_cuda_get_device(int *device) { return static_cast<int>(cudaGetDevice(device)); }
+
+extern "C" int mmh3_cuda_set_device(int device) { return static_cast<int>(cudaSetDevice(device)); }
+
 extern "C" int mmh3_cuda_copy_to_device_async(void *destination, const void *source, size_t bytes,
                                               cudaStream_t stream) {
     return static_cast<int>(

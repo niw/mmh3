@@ -19,6 +19,7 @@ use crate::nvfp4::{
     self, AdapterSource, Columns, Nvfp4Activations, Nvfp4Input, Nvfp4Scale, Nvfp4Weight,
 };
 use crate::shard::{self, Region, ShardContext, VelocityRows};
+use crate::streaming::{Pass, Stream};
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -28,9 +29,10 @@ use mmh3_core::dit::sparse::{SparseAttention, SparseMethod, SparseSinks};
 use mmh3_core::dit::timestep::{MODALITY_COUNT, StepTimesteps};
 use mmh3_core::dit::vsa::VsaPlan;
 use mmh3_core::numeric::f32_to_bf16;
-use mmh3_core::safetensors::{DType, SafeTensors};
+use mmh3_core::safetensors::{DType, SafeTensors, TensorInfo};
+use mmh3_core::streaming::{Arrangement, Files, Unit, give_up_order};
 use mmh3_core::tensor::Tensor;
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_int, c_void};
 use std::ops::Range;
@@ -295,10 +297,15 @@ enum SparsePass<'a> {
     },
 }
 
+/// The DiT's blocks, the refiner's first and then the main ones, are its units, which a device short
+/// of memory reads on the way. The refiner's go first, since they run only for a new prompt.
 pub struct CudaDit {
     attention_precision: AttentionPrecision,
     config: DitConfig,
-    tensors: DeviceTensors,
+    tensors: RefCell<DeviceTensors>,
+    stream: RefCell<Stream>,
+    /// Whether a LoRA was merged into the weights, which the checkpoint then no longer holds.
+    merged: bool,
     /// Low-rank adapters by layer name.
     adapters: HashMap<String, LowRank>,
     /// NVFP4 versions of block linear layers by name, with their adapters, which run the video
@@ -315,6 +322,50 @@ pub struct CudaDit {
 impl CudaDit {
     /// Uploads a pruned DiT checkpoint. `prefix` is prepended to every checkpoint tensor name.
     pub fn load(file: &SafeTensors, prefix: &str) -> Result<Self, Error> {
+        Self::load_as(file, prefix, true)
+    }
+
+    /// `load`, or, on a device without the memory for the whole DiT, a DiT that holds what every
+    /// block shares, reads its blocks on the way and keeps back what fits once it knows the shape
+    /// of its first call.
+    pub fn load_fitting(file: &SafeTensors, prefix: &str) -> Result<Self, Error> {
+        match Self::load(file, prefix) {
+            Err(error) if error.is_out_of_memory() => Self::load_as(file, prefix, false),
+            result => result,
+        }
+    }
+
+    /// The unit a tensor belongs to, before there is a stream to ask.
+    fn unit_index(config: &DitConfig, name: &str) -> Option<usize> {
+        let block = |rest: &str| rest.split_once('.')?.0.parse::<usize>().ok();
+        if let Some(rest) = name.strip_prefix("token_refiner.blocks.") {
+            block(rest).filter(|&layer| layer < config.refiner_layers)
+        } else if let Some(rest) = name.strip_prefix("blocks.") {
+            block(rest)
+                .filter(|&layer| layer < config.layers)
+                .map(|layer| config.refiner_layers + layer)
+        } else {
+            None
+        }
+    }
+
+    /// How a unit tensor sits in its unit: the INT8 GEMM wants the rows of an INT8 SwiGLU layer's
+    /// weights and scales interleaved, which `interleave_swiglu` does to the ones on the device.
+    fn arrangement(name: &str, info: &TensorInfo, int8: bool) -> Arrangement {
+        let fc1 = name
+            .strip_suffix(".weight")
+            .or_else(|| name.strip_suffix(".weight_scale"))
+            .is_some_and(|layer| layer.ends_with(".mlp.fc1"));
+        match fc1 && int8 {
+            true => Arrangement::InterleavedHalves {
+                row_bytes: info.byte_count() / info.shape[0],
+                group: 4,
+            },
+            false => Arrangement::Contiguous,
+        }
+    }
+
+    fn load_as(file: &SafeTensors, prefix: &str, whole: bool) -> Result<Self, Error> {
         let config = DitConfig::of(file, prefix).map_err(Error::Model)?;
         if config.head_dim != HEAD_DIM {
             return Err(Error::Model(format!(
@@ -324,6 +375,11 @@ impl CudaDit {
         }
         let mut tensors = DeviceTensors::default();
         let mut uploader = Uploader::new(file);
+        let mut files = Files::default();
+        let mut units: Vec<Unit> = (0..config.refiner_layers)
+            .map(|layer| Unit::new(&format!("token_refiner.blocks.{layer}")))
+            .chain((0..config.layers).map(|layer| Unit::new(&format!("blocks.{layer}"))))
+            .collect();
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
@@ -335,20 +391,58 @@ impl CudaDit {
             if name == "adaln_t_table" || name == "rope.inv_freq" {
                 continue;
             }
-            tensors.insert(name, file, info, &mut uploader)?;
+            let unit = Self::unit_index(&config, name);
+            if let Some(unit) = unit {
+                let layer = name.rsplit_once('.').map_or(name, |(layer, _)| layer);
+                let int8 = file
+                    .get(&format!("{prefix}{layer}.weight"))
+                    .is_some_and(|weight| weight.dtype == DType::I8);
+                units[unit].insert(
+                    name,
+                    info.dtype,
+                    info.shape.clone(),
+                    vec![files.piece(file, info)],
+                    Self::arrangement(name, info, int8),
+                );
+            }
+            if whole || unit.is_none() {
+                tensors.insert(name, file, info, &mut uploader)?;
+            }
         }
         uploader.run()?;
-        for layer in 0..config.layers {
-            let fc1 = format!("blocks.{layer}.mlp.fc1");
-            if tensors.is_int8(&fc1) {
-                tensors.interleave_swiglu(&format!("{fc1}.weight"))?;
-                tensors.interleave_swiglu(&format!("{fc1}.weight_scale"))?;
+        if whole {
+            for layer in 0..config.layers {
+                let fc1 = format!("blocks.{layer}.mlp.fc1");
+                if tensors.is_int8(&fc1) {
+                    tensors.interleave_swiglu(&format!("{fc1}.weight"))?;
+                    tensors.interleave_swiglu(&format!("{fc1}.weight_scale"))?;
+                }
             }
+        }
+        let refiner = config.refiner_layers;
+        let give_up = (0..refiner)
+            .chain(
+                give_up_order(config.layers)
+                    .into_iter()
+                    .map(|layer| refiner + layer),
+            )
+            .collect();
+        let mut stream = Stream::new(
+            "DiT blocks",
+            files,
+            units,
+            give_up,
+            refiner..refiner + config.layers,
+        );
+        if !whole {
+            stream.start_reading(&mut tensors)?;
         }
         Ok(CudaDit {
             attention_precision: AttentionPrecision::Bf16,
             config,
-            tensors,
+            tensors: RefCell::new(tensors),
+            stream: RefCell::new(stream),
+            merged: false,
             adapters: HashMap::new(),
             nvfp4: HashMap::new(),
             nvfp4_scales: HashMap::new(),
@@ -384,9 +478,25 @@ impl CudaDit {
     /// Whether the blocks carry the gates of VSA's coarse branch, which VSA-trained checkpoints
     /// such as FastH3 have.
     pub fn has_vsa_gates(&self) -> bool {
-        self.tensors
+        self.tensors()
             .optional("blocks.0.attn.to_gate_compress.weight")
             .is_some()
+    }
+
+    fn tensors(&self) -> Ref<'_, DeviceTensors> {
+        self.tensors.borrow()
+    }
+
+    /// Makes room on a device that ran out of memory, and says whether there was any to make. A
+    /// DiT whose weights no longer match its checkpoint has none: a merged LoRA and NVFP4 weights
+    /// live on the device alone.
+    fn make_room(&self) -> Result<bool, Error> {
+        if self.merged || !self.nvfp4.is_empty() {
+            return Ok(false);
+        }
+        self.stream
+            .borrow_mut()
+            .make_room(&mut self.tensors.borrow_mut())
     }
 
     /// Refined text states `[text tokens, hidden]` of the last call's context, or `None` before the
@@ -401,7 +511,7 @@ impl CudaDit {
     }
 
     fn pointer(&self, name: &str) -> Result<*const c_void, Error> {
-        self.tensors.pointer(name)
+        self.tensors().pointer(name)
     }
 
     /// Adds the LoRA of a ComfyUI LoRA file at `strength`: every layer `{name}` with
@@ -419,6 +529,15 @@ impl CudaDit {
         mode: LoraMode,
     ) -> Result<usize, Error> {
         const PREFIX: &str = "diffusion_model.";
+        // A DiT holding its blocks as it loaded them, on a device without the room for this file
+        // beside them, reads them on the way from now on, which leaves the file's tensors of the
+        // blocks on the disk too.
+        if !self.stream.get_mut().reads() && !crate::streaming::fits(file.file_size())? {
+            self.stream
+                .get_mut()
+                .start_reading(self.tensors.get_mut())?;
+        }
+        let reads = self.stream.get_mut().reads();
         let mut uploader = Uploader::new(file);
         let mut adapters = Vec::new();
         let mut merged = 0;
@@ -430,7 +549,7 @@ impl CudaDit {
             else {
                 continue;
             };
-            let weight = self.tensors.get(&format!("{layer}.weight"))?;
+            let weight = self.tensors.get_mut().get(&format!("{layer}.weight"))?;
             let (weight_dtype, weight_shape) = (weight.dtype, weight.shape.clone());
             let up = file
                 .get(&format!("{PREFIX}{layer}.lora_B.weight"))
@@ -459,6 +578,12 @@ impl CudaDit {
             }
             let scale = strength * alpha / rank as f32;
             if mode == LoraMode::Merge && weight_dtype == DType::I8 {
+                if reads {
+                    return Err(Error::Model(format!(
+                        "{layer}: merging a LoRA needs the DiT's blocks on the device, and this \
+                         device reads them from the disk as they run"
+                    )));
+                }
                 let mut down: Vec<f32> = host_tensor(file, &info.name)?.data;
                 down.iter_mut().for_each(|value| *value *= scale);
                 let mut down = DeviceBuffer::from_f32(&down)?;
@@ -466,7 +591,10 @@ impl CudaDit {
                 if layer.ends_with(".mlp.fc1") {
                     up = interleave_swiglu_rows(&up, outputs, rank * 4)?;
                 }
-                self.tensors.merge_low_rank(layer, &up, &mut down, rank)?;
+                self.tensors
+                    .get_mut()
+                    .merge_low_rank(layer, &up, &mut down, rank)?;
+                self.merged = true;
                 merged += 1;
                 continue;
             }
@@ -520,31 +648,60 @@ impl CudaDit {
             if name == "adaln_t_table" {
                 self.adaln_table = host_tensor(file, &info.name)?;
             } else {
-                if let Some(existing) = self.tensors.optional(name)
+                let tensors = self.tensors.get_mut();
+                if let Some(existing) = tensors.optional(name)
                     && (existing.dtype != info.dtype || existing.shape != info.shape)
                 {
                     return Err(Error::Model(format!(
                         "{name} in the LoRA does not match the checkpoint's"
                     )));
                 }
-                self.tensors.insert(name, file, info, &mut uploader)?;
+                // The blocks' tensors come from this file from now on, whenever they are read.
+                let stream = self.stream.get_mut();
+                if let Some(unit) = stream.unit_of(name) {
+                    let layer = name.rsplit_once('.').map_or(name, |(layer, _)| layer);
+                    let int8 = file
+                        .get(&format!("{PREFIX}{layer}.weight"))
+                        .map(|weight| weight.dtype)
+                        .or_else(|| {
+                            tensors
+                                .optional(&format!("{layer}.weight"))
+                                .map(|weight| weight.dtype)
+                        })
+                        == Some(DType::I8);
+                    let piece = stream.files().piece(file, info);
+                    stream.insert(
+                        unit,
+                        name,
+                        info.dtype,
+                        info.shape.clone(),
+                        vec![piece],
+                        Self::arrangement(name, info, int8),
+                    );
+                }
+                if !reads || stream.unit_of(name).is_none() {
+                    tensors.insert(name, file, info, &mut uploader)?;
+                }
             }
             replaced.push(name.to_owned());
         }
         uploader.run()?;
-        for name in &replaced {
+        let tensors = self.tensors.get_mut();
+        // Blocks read on the way have their rows interleaved as they are read.
+        for name in replaced.iter().filter(|_| !reads) {
             let fc1 = name
                 .strip_suffix(".weight")
                 .or_else(|| name.strip_suffix(".weight_scale"))
                 .filter(|layer| layer.ends_with(".mlp.fc1"));
             if let Some(layer) = fc1
-                && self.tensors.is_int8(layer)
+                && tensors.is_int8(layer)
             {
-                self.tensors.interleave_swiglu(name)?;
+                tensors.interleave_swiglu(name)?;
             }
         }
+        self.stream.get_mut().changed(tensors)?;
         for (layer, adapter) in &mut adapters {
-            if layer.ends_with(".mlp.fc1") && self.tensors.is_int8(layer) {
+            if layer.ends_with(".mlp.fc1") && tensors.is_int8(layer) {
                 adapter.up =
                     interleave_swiglu_rows(&adapter.up, adapter.outputs, adapter.rank * 2)?;
             }
@@ -562,6 +719,14 @@ impl CudaDit {
     /// produce them. The adapters of these layers go into their NVFP4 weights too, so LoRAs come
     /// first. The INT8 weights and adapters stay for the text and audio rows.
     pub fn use_nvfp4(&mut self) -> Result<usize, Error> {
+        if self.stream.get_mut().reads() {
+            return Err(Error::Model(
+                "NVFP4 needs the DiT's blocks on the device, and this device reads them from the \
+                 disk as they run"
+                    .to_owned(),
+            ));
+        }
+        let tensors = self.tensors.get_mut();
         for layer in 0..self.config.layers {
             let qkv = format!("blocks.{layer}.attn.qkv_proj");
             for part in [
@@ -572,7 +737,7 @@ impl CudaDit {
                 "mlp.fc2",
             ] {
                 let name = format!("blocks.{layer}.{part}");
-                if !self.tensors.is_int8(&name)
+                if !tensors.is_int8(&name)
                     || self.nvfp4.contains_key(&name)
                     || (part == "attn.to_gate_compress" && !self.nvfp4.contains_key(&qkv))
                 {
@@ -607,8 +772,8 @@ impl CudaDit {
                     }
                     None => Columns::Inputs,
                 };
-                let weight = self.tensors.get(&format!("{name}.weight"))?;
-                let scales = self.tensors.get(&format!("{name}.weight_scale"))?;
+                let weight = tensors.get(&format!("{name}.weight"))?;
+                let scales = tensors.get(&format!("{name}.weight_scale"))?;
                 let converted = Nvfp4Weight::from_int8_with(
                     &weight.buffer,
                     &scales.buffer,
@@ -715,7 +880,7 @@ impl CudaDit {
             .get(name)
             .map(|adapter| (adapter, &workspace.adapter));
         let Some(weight) = self.nvfp4.get(name) else {
-            return self.tensors.linear(
+            return self.tensors().linear(
                 name,
                 input,
                 output,
@@ -726,7 +891,7 @@ impl CudaDit {
             );
         };
         if head > 0 {
-            self.tensors.linear(
+            self.tensors().linear(
                 name,
                 input,
                 output,
@@ -895,7 +1060,8 @@ impl CudaDit {
         steps: usize,
         output: &DeviceBuffer,
     ) -> Result<(), Error> {
-        let weight = self.tensors.get(&format!("{name}.weight"))?;
+        let tensors = self.tensors();
+        let weight = tensors.get(&format!("{name}.weight"))?;
         if weight.dtype != DType::F16 {
             return Err(Error::Model(format!(
                 "{name}: AdaLN weights must be F16 in pruned checkpoints"
@@ -954,7 +1120,7 @@ impl CudaDit {
                 .map(|adapter| (adapter, &workspace.adapter));
             // SAFETY: the range holds `count` rows of the input and its scales.
             unsafe {
-                self.tensors
+                self.tensors()
                     .adapter_down(adapter, name, count, normalized, scales)
             }
         };
@@ -967,7 +1133,7 @@ impl CudaDit {
                 (tensor * whole + heads.start * HEAD_DIM)..(tensor * whole + heads.end * HEAD_DIM);
             // SAFETY: the region holds `tokens × 3 × inner` values.
             let into = unsafe { inputs.byte_add((rows.start * 3 * inner + tensor * inner) * 2) };
-            self.tensors.linear_quantized_range(
+            self.tensors().linear_quantized_range(
                 &qkv,
                 into,
                 count,
@@ -983,7 +1149,7 @@ impl CudaDit {
             let adapter = down(&name)?;
             // SAFETY: the gate holds `tokens × inner` values.
             let into = unsafe { gate.byte_add(rows.start * inner * 2) };
-            self.tensors.linear_quantized_range(
+            self.tensors().linear_quantized_range(
                 &name,
                 into,
                 count,
@@ -1024,7 +1190,7 @@ impl CudaDit {
         // schedule may turn VSA on partway through a run, and the dense steps leave it alone.
         let gated = matches!(sparse, Some(SparsePass::Vsa { .. }))
             && self
-                .tensors
+                .tensors()
                 .optional(&format!("{prefix}.attn.to_gate_compress.weight"))
                 .is_some();
         let gate = if gated {
@@ -1404,7 +1570,7 @@ impl CudaDit {
         // Modulated blocks normalize and quantize the inputs of their INT8 and NVFP4 layers in one
         // pass. NVFP4 layers keep their INT8 weights.
         let nvfp4_qkv = self.nvfp4.get(&qkv).filter(|_| modulation.is_some());
-        if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&qkv)) {
+        if let Some(modulation) = modulation.filter(|_| self.tensors().is_int8(&qkv)) {
             let pending_gate = pending.map(|table| (table, MLP_GATE_CHUNK));
             let int8_rows = if nvfp4_qkv.is_some() { head } else { tokens };
             if int8_rows > 0 {
@@ -1421,7 +1587,7 @@ impl CudaDit {
                 // A shared-out block exchanges what this just quantized and projects afterwards,
                 // over the whole sequence and its own heads.
                 if shard.is_none() {
-                    self.tensors.linear_quantized(
+                    self.tensors().linear_quantized(
                         &qkv,
                         workspace.qkv.pointer(),
                         int8_rows,
@@ -1478,7 +1644,7 @@ impl CudaDit {
         let vsa_gate = match sparse {
             // A shared-out block's gate comes out of the same exchanged input as its projections.
             Some(SparsePass::Vsa { .. }) if shard.is_none() => {
-                let fused = modulation.is_some() && self.tensors.is_int8(&qkv);
+                let fused = modulation.is_some() && self.tensors().is_int8(&qkv);
                 self.vsa_gate(prefix, workspace, tokens, head, fused)?
             }
             _ => None,
@@ -1621,7 +1787,7 @@ impl CudaDit {
         let fc1 = format!("{prefix}.mlp.fc1");
         let fc2 = format!("{prefix}.mlp.fc2");
         let nvfp4_fc1 = self.nvfp4.get(&fc1).filter(|_| modulation.is_some());
-        if let Some(modulation) = modulation.filter(|_| self.tensors.is_int8(&fc1)) {
+        if let Some(modulation) = modulation.filter(|_| self.tensors().is_int8(&fc1)) {
             let int8_rows = if nvfp4_fc1.is_some() { head } else { tokens };
             if int8_rows > 0 {
                 self.add_norm_quantize(
@@ -1634,7 +1800,7 @@ impl CudaDit {
                     3,
                     4,
                 )?;
-                self.tensors.linear_quantized(
+                self.tensors().linear_quantized(
                     &fc1,
                     workspace.activated.pointer(),
                     int8_rows,
@@ -1741,7 +1907,7 @@ impl CudaDit {
                 );
             };
             if head > 0 {
-                self.tensors.linear(
+                self.tensors().linear(
                     &fc2,
                     workspace.activated.pointer(),
                     workspace.delta.pointer(),
@@ -1787,13 +1953,13 @@ impl CudaDit {
         let Some(gate) = workspace
             .gate
             .as_ref()
-            .filter(|_| self.tensors.optional(&format!("{name}.weight")).is_some())
+            .filter(|_| self.tensors().optional(&format!("{name}.weight")).is_some())
         else {
             return Ok(None);
         };
         if let Some(weight) = self.nvfp4.get(&name) {
             if head > 0 {
-                self.tensors.linear_quantized(
+                self.tensors().linear_quantized(
                     &name,
                     gate.pointer(),
                     head,
@@ -1813,8 +1979,8 @@ impl CudaDit {
                     tokens - head,
                 )?
             };
-        } else if fused && self.tensors.is_int8(&name) {
-            self.tensors.linear_quantized(
+        } else if fused && self.tensors().is_int8(&name) {
+            self.tensors().linear_quantized(
                 &name,
                 gate.pointer(),
                 tokens,
@@ -1849,7 +2015,12 @@ impl CudaDit {
     }
 
     /// Writes the refined text states into the first rows of the residual stream.
-    fn refine_text(&self, context: &Tensor, workspace: &Workspace) -> Result<(), Error> {
+    fn refine_text(
+        &self,
+        context: &Tensor,
+        workspace: &Workspace,
+        pass: &mut Pass<'_>,
+    ) -> Result<(), Error> {
         let tokens = context.shape[0];
         let context_bytes: Vec<u8> = context
             .data
@@ -1875,6 +2046,7 @@ impl CudaDit {
             )
         })?;
         for layer in 0..self.config.refiner_layers {
+            pass.enter(layer)?;
             self.transformer_block(
                 &format!("token_refiner.blocks.{layer}"),
                 workspace,
@@ -1886,6 +2058,7 @@ impl CudaDit {
                 None,
                 None,
             )?;
+            pass.leave(layer)?;
         }
         self.normalize(
             "token_refiner.final_norm.weight",
@@ -1900,19 +2073,27 @@ impl CudaDit {
     /// Runs one DiT call and returns the velocity, capturing the residual stream after the listed
     /// blocks. `sparse` switches the blocks to Sol-Attn or VSA when the sequence is long enough.
     /// VSA runs the blocks on the sequence with the video in cube order, and uses the blocks' gates
-    /// for its coarse branch when they have them.
+    /// for its coarse branch when they have them. A call that runs out of memory makes room by
+    /// reading blocks on the way and runs again.
     pub fn forward(
         &self,
         inputs: &DitInputs,
         capture: &[usize],
         sparse: Option<&SparseAttention>,
     ) -> Result<DitOutputs, Error> {
-        self.run(inputs, capture, sparse, None)
+        loop {
+            match self.run(inputs, capture, sparse, None) {
+                Err(error) if error.is_out_of_memory() && self.make_room()? => continue,
+                result => return result,
+            }
+        }
     }
 
     /// One rank's share of a step. Ulysses gives this rank a run of the sequence to carry through
     /// the blocks and a run of the heads to attend with, and `context` carries the two exchanges
-    /// each block needs. Rank 0 returns the velocity; the others return nothing to unpatchify.
+    /// each block needs. Rank 0 returns the velocity; the others return nothing to unpatchify. A
+    /// share that runs out of memory is not run again, since the other ranks are part way through
+    /// the same step.
     pub fn forward_shard(
         &self,
         inputs: &DitInputs,
@@ -1968,7 +2149,7 @@ impl CudaDit {
             // memory no block filled.
             if let Some(layer) = (0..config.layers).find(|layer| {
                 !self
-                    .tensors
+                    .tensors()
                     .is_int8(&format!("blocks.{layer}.attn.qkv_proj"))
             }) {
                 return Err(Error::Model(format!(
@@ -1997,7 +2178,7 @@ impl CudaDit {
         // The refiner's MLPs still write the gate and up projections for the text tokens.
         let fused = (0..config.layers).all(|layer| {
             let fc1 = format!("blocks.{layer}.mlp.fc1");
-            self.tensors.is_int8(&fc1) && !self.nvfp4.contains_key(&fc1)
+            self.tensors().is_int8(&fc1) && !self.nvfp4.contains_key(&fc1)
         });
         let method = sparse
             .filter(|settings| tokens >= settings.min_tokens)
@@ -2107,6 +2288,19 @@ impl CudaDit {
             }
             None => *cached_vsa = None,
         }
+        // The blocks kept back on the device take what the buffers above leave.
+        self.stream
+            .borrow_mut()
+            .settle(&mut self.tensors.borrow_mut())?;
+        let refine =
+            rows.start == 0 && !matches!(cached_text, Some(text) if text.context == inputs.context);
+        let refiner = config.refiner_layers;
+        let mut stream = self.stream.borrow_mut();
+        let mut pass = stream.pass(
+            (0..refiner)
+                .filter(|_| refine)
+                .chain((0..config.layers).map(|layer| refiner + layer)),
+        )?;
 
         // Every table below is one entry per token, so a rank takes the slice its rows cover. The
         // rope angles are the exception: attention sees the whole sequence once the inputs have
@@ -2149,7 +2343,7 @@ impl CudaDit {
                     };
                 }
                 _ => {
-                    self.refine_text(&inputs.context, workspace)?;
+                    self.refine_text(&inputs.context, workspace, &mut pass)?;
                     let states = DeviceBuffer::new(text_bytes)?;
                     // SAFETY: both buffers hold the text rows.
                     unsafe {
@@ -2254,6 +2448,7 @@ impl CudaDit {
         for layer in 0..config.layers {
             let prefix = format!("blocks.{layer}");
             let modulation = &modulations[layer % 2];
+            pass.enter(refiner + layer)?;
             self.modulation(
                 &format!("{prefix}.adaln_proj.linear"),
                 &time_embedding,
@@ -2271,6 +2466,7 @@ impl CudaDit {
                 sparse_pass.as_ref(),
                 context.as_deref_mut().map(|context| (context, tokens)),
             )?;
+            pass.leave(refiner + layer)?;
             pending = Some(modulation);
             if let Some(SparsePass::Sol { workspace, .. }) = &sparse_pass {
                 routed += workspace.routed_fraction()?;

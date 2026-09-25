@@ -502,7 +502,9 @@ pub fn sample(
                         let path = option_path(options, "text-encoder", TEXT_ENCODER_FILE)?;
                         #[cfg(any(feature = "cuda", feature = "metal"))]
                         let file = SafeTensors::open(Path::new(&path))?;
-                        #[cfg(any(feature = "cuda", feature = "metal"))]
+                        #[cfg(feature = "cuda")]
+                        let encoder = TextEncoder::load_fitting(&file)?;
+                        #[cfg(feature = "metal")]
                         let encoder = TextEncoder::load(&file)?;
                         #[cfg(any(feature = "cuda", feature = "metal"))]
                         let context = if prompt_references.is_empty() {

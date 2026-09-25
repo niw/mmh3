@@ -50,7 +50,7 @@ pub fn load_dit(
     };
     let started = Instant::now();
     let path = option_path(options, name, file)?;
-    let mut dit = mmh3_cuda::dit::CudaDit::load(&SafeTensors::open(Path::new(&path))?, "")?;
+    let mut dit = mmh3_cuda::dit::CudaDit::load_fitting(&SafeTensors::open(Path::new(&path))?, "")?;
     dit.set_attention_precision(precision);
     println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
     // NOTE: a patch is a LoRA file whose other tensors replace or add checkpoint tensors, and it
