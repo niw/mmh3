@@ -10,6 +10,7 @@ pub mod picture;
 pub mod random;
 pub mod safetensors;
 pub mod shard;
+pub mod streaming;
 pub mod tensor;
 pub mod tokenizer;
 pub mod vae;
