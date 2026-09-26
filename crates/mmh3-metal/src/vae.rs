@@ -283,6 +283,7 @@ impl MetalVideoDecoder {
                     Some(&angles),
                     attends_in_half(&w.device, w.attention_precision, 64),
                     true,
+                    false,
                 )?
                 .attend()?,
                 &format!("{p}.attn.to_out"),

@@ -43,10 +43,10 @@ pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dy
     }
 
     if let Some(value) = options.get("attention-precision")
-        && !["fp32", "fp16"].contains(value)
+        && !["fp32", "fp16", "int8-fp16"].contains(value)
     {
         return Err(format!(
-            "Metal runs --attention-precision fp32 or fp16, not {value}. Hand every step to a worker with --worker, or drop it"
+            "Metal runs --attention-precision fp32, fp16 or int8-fp16, not {value}. Hand every step to a worker with --worker, or drop it"
         )
         .into());
     }
@@ -95,10 +95,12 @@ pub fn attention_precision(
     Ok(match options.get("attention-precision").copied() {
         Some("fp32") => AttentionPrecision::Fp32,
         Some("fp16") => AttentionPrecision::Fp16,
+        Some("int8-fp16") => AttentionPrecision::Int8,
         Some(value) => {
-            return Err(
-                format!("Metal runs --attention-precision fp32 or fp16, not {value}").into(),
-            );
+            return Err(format!(
+                "Metal runs --attention-precision fp32, fp16 or int8-fp16, not {value}"
+            )
+            .into());
         }
         None => default_attention_precision(),
     })
@@ -184,6 +186,7 @@ mod tests {
             ("sparse-start", "0"),
             ("vsa-sparsity", "0.9"),
             ("patch", "some.safetensors"),
+            ("attention-precision", "int8-fp16"),
         ] {
             let options = options(&[(option, value)]);
             assert!(

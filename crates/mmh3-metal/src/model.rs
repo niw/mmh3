@@ -341,7 +341,7 @@ impl Weights {
     /// FP16 attention runs on the matrix units, so a device without them refuses it here rather
     /// than quietly running FP32.
     pub fn set_attention_precision(&mut self, precision: AttentionPrecision) -> Result<()> {
-        if precision == AttentionPrecision::Fp16 && !self.device.supports_tensor_ops() {
+        if precision.on_matrix_units() && !self.device.supports_tensor_ops() {
             return Err(Error::new(
                 "FP16 Metal attention requires macOS 26 and Apple silicon".into(),
             ));

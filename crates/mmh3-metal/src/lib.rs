@@ -102,6 +102,17 @@ pub enum AttentionPrecision {
 
     /// FP16 products on the matrix units, with FP32 softmax and accumulation. Needs macOS 26.
     Fp16,
+
+    /// Fp16, with the DiT's scores taking INT8 queries and keys, one scale a token and head.
+    /// The text encoder and the video VAE attend in FP16.
+    Int8,
+}
+
+impl AttentionPrecision {
+    /// Whether the products run on the matrix units, which need macOS 26.
+    pub fn on_matrix_units(self) -> bool {
+        self != AttentionPrecision::Fp32
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -356,7 +367,9 @@ impl Device {
             | "mpp_lora"
             | "mpp_attention_64"
             | "mpp_attention_128"
-            | "mpp_sparse_attention_128" => 128,
+            | "mpp_attention_int8_128"
+            | "mpp_sparse_attention_128"
+            | "mpp_sparse_attention_int8_128" => 128,
             _ => 256,
         };
         let name = CString::new(name).unwrap();

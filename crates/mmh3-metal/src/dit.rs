@@ -1,7 +1,7 @@
 //! DiT on Metal, with dense or block-sparse attention, including the shared keyframe and reference
 //! token layouts.
 use crate::{
-    Device, Error, Result,
+    AttentionPrecision, Device, Error, Result,
     model::Weights,
     ops::{Array, PackedRows, RowMap, attends_in_half},
     shard::ShardContext,
@@ -278,6 +278,8 @@ impl MetalDit {
             angles,
             half,
             false,
+            half && self.weights.attention_precision == AttentionPrecision::Int8
+                && c.head_dim == 128,
         )?;
         let attended = match sparse {
             Some(sparse) => {

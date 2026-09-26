@@ -249,7 +249,32 @@ impl SparsePass {
             scale_log2.to_bits(),
         ];
         let gate = gate.map_or(&self.starts, |gate| &gate.buffer);
-        if inputs.half {
+        if let Some(quantized) = &inputs.quantized {
+            let mut parameters = parameters.to_vec();
+            parameters.push(self.tokens as u32);
+            device.run(
+                "mpp_sparse_attention_int8_128",
+                &[
+                    &inputs.query,
+                    &inputs.key,
+                    &inputs.value,
+                    &out.buffer,
+                    &self.starts,
+                    &self.lengths,
+                    &self.routes,
+                    &self.counts,
+                    &self.tails,
+                    &self.key_mean,
+                    gate,
+                    &quantized.query,
+                    &quantized.key,
+                    &quantized.scales,
+                ],
+                &parameters,
+                self.tiles * self.heads,
+                true,
+            )?;
+        } else if inputs.half {
             device.run(
                 "mpp_sparse_attention_128",
                 &[
@@ -338,6 +363,86 @@ mod tests {
             precisions.push((true, 5e-3));
         }
         precisions
+    }
+
+    /// Queries, keys and values as a block's qkv projection yields them, with INT8 queries and
+    /// keys for the scores, and the FP32 values of what the attention reads, for a reference.
+    fn quantized_inputs(
+        device: &Device,
+        tokens: usize,
+        heads: usize,
+        seeds: [usize; 3],
+    ) -> (AttentionInputs, [Vec<f32>; 3]) {
+        let inner = heads * HEAD;
+        let [q, k, v] = seeds.map(|seed| inputs(tokens, heads, seed));
+        let qkv: Vec<f32> = (0..tokens)
+            .flat_map(|t| {
+                [&q, &k, &v]
+                    .into_iter()
+                    .flat_map(move |x| x[t * inner..(t + 1) * inner].iter().copied())
+            })
+            .collect();
+        let qkv = Array::from_f32(device, tokens, 3 * inner, &qkv).unwrap();
+        let ones = Array::from_f32(device, 1, HEAD, &[1.0; HEAD]).unwrap();
+        let inputs = qkv
+            .attention_inputs(heads, (&ones, &ones), 1e-5, None, true, false, true)
+            .unwrap();
+        let read = |buffer: &Buffer| -> Vec<f32> {
+            buffer
+                .to_bytes()
+                .unwrap()
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| mmh3_core::numeric::f16_to_f32(u16::from_le_bytes(*bytes)))
+                .collect()
+        };
+        let values = [read(&inputs.query), read(&inputs.key), read(&inputs.value)];
+        (inputs, values)
+    }
+
+    #[test]
+    fn int8_scores_stay_near_the_references() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let scale = (HEAD as f32).sqrt().recip();
+        let heads = 2;
+
+        let layout = PackedLayout::text_to_video(100, 3, 16, 24, 20);
+        let tokens = layout.len();
+        let sinks = SparseSinks::for_layout(&layout);
+        let (inputs, [q, k, v]) = quantized_inputs(&device, tokens, heads, [1, 2, 3]);
+        let (expected, _) =
+            mmh3_core::dit::sparse::reference(&q, &k, &v, tokens, heads, HEAD, 1.3, scale, sinks);
+        let out = SparsePass::sol(&device, tokens, heads, 1.3, sinks)
+            .unwrap()
+            .attend(&inputs, None)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        let difference = largest_difference(&out, &expected);
+        assert!(
+            difference < 3e-2,
+            "Sol-Attn: {difference} from the reference"
+        );
+
+        let layout = PackedLayout::text_to_video(70, 5, 12, 24, 40);
+        let plan = VsaPlan::for_layout(&layout);
+        let tokens = layout.len();
+        let kept = plan.kept_video_tiles(0.5);
+        let (inputs, [q, k, v]) = quantized_inputs(&device, tokens, heads, [4, 5, 6]);
+        let expected =
+            mmh3_core::dit::vsa::reference(&q, &k, &v, None, &plan, heads, HEAD, scale, kept);
+        let out = SparsePass::vsa(&device, &plan, heads, kept)
+            .unwrap()
+            .attend(&inputs, None)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        let difference = largest_difference(&out, &expected);
+        assert!(difference < 3e-2, "VSA: {difference} from the reference");
     }
 
     #[test]

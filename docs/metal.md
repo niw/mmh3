@@ -85,10 +85,16 @@ attention.
 | Value | Mode |
 | --- | --- |
 | `fp16` | FP16 products through MPP (default on macOS 26+) |
+| `int8-fp16` | `fp16`, with the DiT's scores from INT8 queries and keys (macOS 26+) |
 | `fp32` | FP32 reference mode (default before macOS 26) |
 
 Changing precision can change the generated sample even with the same seed. The other layers
 compute in FP32.
+
+`int8-fp16` quantizes the DiT's queries and keys to INT8 with one scale a token and head, and
+keeps the values and the probabilities in FP16, since Metal's matrix units take FP8 only from
+memory. The text encoder and the video VAE attend in FP16. The scores are a small share of a step,
+so it gains little. It is this machine's setting: workers asked for a step take their own default.
 
 Text prompts, precomputed `--context` tensors, adapter LoRAs, patches such as
 [FastH3](fasth3.md)'s, and Sol-Attn and VSA sparse attention are supported. Image, audio and video

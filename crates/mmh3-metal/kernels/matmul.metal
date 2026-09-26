@@ -170,18 +170,18 @@ constexpr short fragment_column(short j) { return FRAGMENT_PAIRS ? (j & 1) + (j 
 // read and the rest are zero; a whole block skips the checks, which slow the attention down
 // markedly. A lane's columns are offsets from one address, so that the consecutive ones are read
 // together.
-template <bool CHECK, bool RIGHT = false>
-fragment_half load_fragment(device const half *src, int stride, int rows, short2 at) {
-    fragment_half out;
+template <bool CHECK, bool RIGHT = false, typename T = half>
+vec<T, 8> load_fragment(device const T *src, int stride, int rows, short2 at) {
+    vec<T, 8> out;
     _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
         const int r = at.y + i * 8;
         _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
             const short column = fragment_column(j);
             if constexpr (RIGHT && FRAGMENT_PAIRS) {
                 out[i * 4 + j] =
-                    !CHECK || at.x + column < rows ? src[(at.x + column) * stride + r] : half(0);
+                    !CHECK || at.x + column < rows ? src[(at.x + column) * stride + r] : T(0);
             } else {
-                out[i * 4 + j] = !CHECK || r < rows ? src[r * stride + at.x + column] : half(0);
+                out[i * 4 + j] = !CHECK || r < rows ? src[r * stride + at.x + column] : T(0);
             }
         }
     }
@@ -194,17 +194,17 @@ constexpr short element_of(short i) { return FRAGMENT_PAIRS ? (i >> 3) << 2 | (i
 
 // c (16 × 32, two fragments) += a (16 × 16) · b (16 × 32, two fragments), with b transposed when
 // TRANSPOSE: then its fragments are its rows 0 to 15 and 16 to 31 as stored, loaded with RIGHT.
-template <bool TRANSPOSE, typename A>
-void multiply_fragments(thread fragment_float &c0, thread fragment_float &c1,
-                        thread const vec<A, 8> &a, thread const fragment_half &b0,
-                        thread const fragment_half &b1) {
+template <bool TRANSPOSE, typename A, typename B = half, typename C = float>
+void multiply_fragments(thread vec<C, 8> &c0, thread vec<C, 8> &c1, thread const vec<A, 8> &a,
+                        thread const vec<B, 8> &b0, thread const vec<B, 8> &b1) {
     constexpr auto desc = matmul2d_descriptor(FRAGMENT, 2 * FRAGMENT, FRAGMENT, false, TRANSPOSE,
                                               true, matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc, execution_simdgroup> op;
-    auto left = op.template get_left_input_cooperative_tensor<A, half, float>();
-    auto right = op.template get_right_input_cooperative_tensor<A, half, float>();
-    auto out = op.template get_destination_cooperative_tensor<
-        remove_addrspace_t<decltype(left)>, remove_addrspace_t<decltype(right)>, float>();
+    auto left = op.template get_left_input_cooperative_tensor<A, B, C>();
+    auto right = op.template get_right_input_cooperative_tensor<A, B, C>();
+    auto out =
+        op.template get_destination_cooperative_tensor<remove_addrspace_t<decltype(left)>,
+                                                       remove_addrspace_t<decltype(right)>, C>();
     _Pragma("clang loop unroll(full)") for (short i = 0; i < 8; ++i) left[i] = a[i];
     _Pragma("clang loop unroll(full)") for (short i = 0; i < 16; ++i) {
         const short e = element_of(i);
@@ -220,6 +220,61 @@ void multiply_fragments(thread fragment_float &c0, thread fragment_float &c1,
     }
 }
 
+// The scores of a SIMD group's 16 query rows against a block of up to 32 keys, by FP16 products:
+// `queries` are the group's rows, `rows` of them real, and `keys` the block's, `length` of them
+// real.
+template <int D> struct HalfScores {
+    device const half *queries, *keys;
+    int q_stride, kv_stride;
+
+    template <bool CHECK>
+    void score(thread fragment_float (&s)[2], int rows, int length, short2 at) const {
+        _Pragma("clang loop unroll(full)") for (short part = 0; part < D / FRAGMENT; ++part) {
+            const fragment_half a =
+                load_fragment<CHECK>(queries + part * FRAGMENT, q_stride, rows, at);
+            const fragment_half b0 =
+                load_fragment<CHECK, true>(keys + part * FRAGMENT, kv_stride, length, at);
+            const fragment_half b1 = load_fragment<CHECK, true>(
+                keys + FRAGMENT * kv_stride + part * FRAGMENT, kv_stride, length - FRAGMENT, at);
+            multiply_fragments<true>(s[0], s[1], a, b0, b1);
+        }
+    }
+};
+
+// HalfScores by INT8 products with INT32 accumulation, each score then taking its query's and
+// key's scales, which are `scale_stride` apart row by row.
+template <int D> struct Int8Scores {
+    device const int8_t *queries, *keys;
+    device const float *query_scales, *key_scales;
+    int q_stride, kv_stride, scale_stride;
+
+    template <bool CHECK>
+    void score(thread fragment_float (&s)[2], int rows, int length, short2 at) const {
+        vec<int, 8> products[2] = {0, 0};
+        _Pragma("clang loop unroll(full)") for (short part = 0; part < D / FRAGMENT; ++part) {
+            const vec<int8_t, 8> a =
+                load_fragment<CHECK>(queries + part * FRAGMENT, q_stride, rows, at);
+            const vec<int8_t, 8> b0 =
+                load_fragment<CHECK, true>(keys + part * FRAGMENT, kv_stride, length, at);
+            const vec<int8_t, 8> b1 = load_fragment<CHECK, true>(
+                keys + FRAGMENT * kv_stride + part * FRAGMENT, kv_stride, length - FRAGMENT, at);
+            multiply_fragments<true, int8_t, int8_t, int>(products[0], products[1], a, b0, b1);
+        }
+        _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+            const int r = at.y + i * 8;
+            const float query = !CHECK || r < rows ? query_scales[r * scale_stride] : 0.0f;
+            _Pragma("clang loop unroll(full)") for (short f = 0; f < 2; ++f) {
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const int key = f * FRAGMENT + at.x + fragment_column(j);
+                    const float scale =
+                        !CHECK || key < length ? query * key_scales[key * scale_stride] : 0.0f;
+                    s[f][i * 4 + j] = float(products[f][i * 4 + j]) * scale;
+                }
+            }
+        }
+    }
+};
+
 // The running softmax of a SIMD group's 16 query rows over the keys seen so far: its output before
 // the division, and each of the lane's two rows' reference and total.
 template <int D> struct AttentionState {
@@ -230,27 +285,19 @@ template <int D> struct AttentionState {
         _Pragma("clang loop unroll(full)") for (short f = 0; f < D / FRAGMENT; ++f) out[f] = 0;
     }
 
-    // Takes in up to 32 keys: `keys` and `values` point at the first, rows `kv_stride` apart, and
-    // `length` of them are real. `queries` are the group's rows, `rows` of them real. `seen` says
-    // whether a (row, key) pair takes part, and `offset` is taken off each of the lane's rows.
-    template <bool CHECK, typename Seen>
-    void attend(device const half *queries, int q_stride, int rows, device const half *keys,
-                device const half *values, int kv_stride, int length, float scale_log2,
-                thread const float *offset, Seen seen, short2 at) {
+    // Takes in a block of up to 32 keys, which `scores` scores against the group's rows, `rows`
+    // of them real. `values` point at the block's first, rows `kv_stride` apart, and `length` of
+    // them are real. `seen` says whether a (row, key) pair takes part, and `offset` is taken off
+    // each of the lane's rows.
+    template <bool CHECK, typename Scores, typename Seen>
+    void attend(thread const Scores &scores, int rows, device const half *values, int kv_stride,
+                int length, float scale_log2, thread const float *offset, Seen seen, short2 at) {
         constexpr int PARTS = D / FRAGMENT;
         // The SIMD groups take each block together, so that its keys and values are read into
         // the cache once for all four.
         threadgroup_barrier(mem_flags::mem_none);
         fragment_float s[2] = {0, 0};
-        _Pragma("clang loop unroll(full)") for (short part = 0; part < PARTS; ++part) {
-            const fragment_half a =
-                load_fragment<CHECK>(queries + part * FRAGMENT, q_stride, rows, at);
-            const fragment_half b0 =
-                load_fragment<CHECK, true>(keys + part * FRAGMENT, kv_stride, length, at);
-            const fragment_half b1 = load_fragment<CHECK, true>(
-                keys + FRAGMENT * kv_stride + part * FRAGMENT, kv_stride, length - FRAGMENT, at);
-            multiply_fragments<true>(s[0], s[1], a, b0, b1);
-        }
+        scores.template score<CHECK>(s, rows, length, at);
 
         float maximum[2];
         _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
@@ -308,8 +355,9 @@ template <int D> struct AttentionState {
 
 // Dense attention for heads of D, grouped heads and a causal mask included: a threadgroup of four
 // SIMD groups takes 64 queries of one head.
-template <int D>
+template <int D, bool INT8>
 void flash_attention(device half *q, device half *k, device half *v, device float *o,
+                     device const int8_t *q8, device const int8_t *k8, device const float *scales,
                      constant uint *p, uint g, uint simd, uint lane) {
     const int count = p[0], heads = p[1], kv_heads = p[2], causal = p[4], rows = p[5];
     // Threadgroups take a head's query blocks one after another, so the ones running together
@@ -331,12 +379,21 @@ void flash_attention(device half *q, device half *k, device half *v, device floa
         device const half *values = v + (base * kv_heads + kv_head) * D;
         const int length = min(ATTENTION_KEYS, count - base);
         auto seen = [&](int row, int key) { return !causal || base + key <= first + row; };
-        if (length == ATTENTION_KEYS && mine >= FRAGMENT)
-            state.template attend<false>(queries, q_stride, mine, keys, values, kv_stride, length,
-                                         scale_log2, offset, seen, at);
+        auto attend = [&](thread const auto &scores) {
+            if (length == ATTENTION_KEYS && mine >= FRAGMENT)
+                state.template attend<false>(scores, mine, values, kv_stride, length, scale_log2,
+                                             offset, seen, at);
+            else
+                state.template attend<true>(scores, mine, values, kv_stride, length, scale_log2,
+                                            offset, seen, at);
+        };
+        if constexpr (INT8)
+            attend(Int8Scores<D>{
+                q8 + (first * heads + head) * D, k8 + (base * kv_heads + kv_head) * D,
+                scales + first * heads + head, scales + (rows + base) * kv_heads + kv_head,
+                q_stride, kv_stride, heads});
         else
-            state.template attend<true>(queries, q_stride, mine, keys, values, kv_stride, length,
-                                        scale_log2, offset, seen, at);
+            attend(HalfScores<D>{queries, keys, q_stride, kv_stride});
     }
     _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
         const int r = at.y + i * 8;
@@ -355,11 +412,21 @@ void flash_attention(device half *q, device half *k, device half *v, device floa
         device float *o [[buffer(3)]], constant uint *p [[buffer(4)]],                             \
         uint g [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],     \
         uint lane [[thread_index_in_simdgroup]]) {                                                 \
-        flash_attention<D>(q, k, v, o, p, g, simd, lane);                                          \
+        flash_attention<D, false>(q, k, v, o, nullptr, nullptr, nullptr, p, g, simd, lane);        \
     }
 ATTENTION(64)
 ATTENTION(128)
 #undef ATTENTION
+
+// mpp_attention_128 with the scores of INT8 queries and keys, one scale a token and head.
+[[kernel, max_total_threads_per_threadgroup(128)]] void mpp_attention_int8_128(
+    device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],
+    device float *o [[buffer(3)]], device const int8_t *q8 [[buffer(4)]],
+    device const int8_t *k8 [[buffer(5)]], device const float *scales [[buffer(6)]],
+    constant uint *p [[buffer(7)]], uint g [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    flash_attention<128, true>(q, k, v, o, q8, k8, scales, p, g, simd, lane);
+}
 
 // Block-sparse attention on the matrix units over heads of 128, the last step of Sol-Attn and VSA
 // (see ops.metal): flash_attention over the tiles one query tile attends token by token, a
@@ -369,14 +436,13 @@ ATTENTION(128)
 //
 // Parameters: tiles, heads, the method (0 for Sol-Attn, 1 for VSA), whether VSA is gated, and the
 // scale in log2 units.
-[[kernel, max_total_threads_per_threadgroup(128)]] void mpp_sparse_attention_128(
-    device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],
-    device float *o [[buffer(3)]], device const uint *starts [[buffer(4)]],
-    device const uint *lengths [[buffer(5)]], device const ushort *routes [[buffer(6)]],
-    device const uint *counts [[buffer(7)]], device const float *tails [[buffer(8)]],
-    device const float *key_mean [[buffer(9)]], device const float *gate [[buffer(10)]],
-    constant uint *p [[buffer(11)]], uint g [[threadgroup_position_in_grid]],
-    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+template <bool INT8>
+void sparse_attention(device half *q, device half *k, device half *v, device float *o,
+                      device const uint *starts, device const uint *lengths,
+                      device const ushort *routes, device const uint *counts,
+                      device const float *tails, device const float *key_mean,
+                      device const float *gate, device const int8_t *q8, device const int8_t *k8,
+                      device const float *scales, constant uint *p, uint g, uint simd, uint lane) {
     constexpr int D = 128, TAIL = D + 2;
     const int tiles = p[0], heads = p[1], gated = p[3];
     const bool sol = p[2] == 0;
@@ -406,12 +472,20 @@ ATTENTION(128)
             const int at_key = ((base + block) * heads + head) * D;
             const int keys = min(ATTENTION_KEYS, length - block);
             auto seen = [](int, int) { return true; };
-            if (keys == ATTENTION_KEYS && mine >= FRAGMENT)
-                state.template attend<false>(queries, stride, mine, k + at_key, v + at_key, stride,
-                                             keys, scale_log2, offset, seen, at);
+            auto attend = [&](thread const auto &scores) {
+                if (keys == ATTENTION_KEYS && mine >= FRAGMENT)
+                    state.template attend<false>(scores, mine, v + at_key, stride, keys, scale_log2,
+                                                 offset, seen, at);
+                else
+                    state.template attend<true>(scores, mine, v + at_key, stride, keys, scale_log2,
+                                                offset, seen, at);
+            };
+            if constexpr (INT8)
+                attend(Int8Scores<D>{
+                    q8 + (first * heads + head) * D, k8 + at_key, scales + first * heads + head,
+                    scales + (int(p[5]) + base + block) * heads + head, stride, stride, heads});
             else
-                state.template attend<true>(queries, stride, mine, k + at_key, v + at_key, stride,
-                                            keys, scale_log2, offset, seen, at);
+                attend(HalfScores<D>{queries, k + at_key, stride, stride});
         }
     }
 
@@ -445,4 +519,32 @@ ATTENTION(128)
             }
         }
     }
+}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void mpp_sparse_attention_128(
+    device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],
+    device float *o [[buffer(3)]], device const uint *starts [[buffer(4)]],
+    device const uint *lengths [[buffer(5)]], device const ushort *routes [[buffer(6)]],
+    device const uint *counts [[buffer(7)]], device const float *tails [[buffer(8)]],
+    device const float *key_mean [[buffer(9)]], device const float *gate [[buffer(10)]],
+    constant uint *p [[buffer(11)]], uint g [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    sparse_attention<false>(q, k, v, o, starts, lengths, routes, counts, tails, key_mean, gate,
+                            nullptr, nullptr, nullptr, p, g, simd, lane);
+}
+
+// mpp_sparse_attention_128 with the scores of INT8 queries and keys, one scale a token and head.
+// Parameters: those of mpp_sparse_attention_128, and the tokens.
+[[kernel, max_total_threads_per_threadgroup(128)]] void mpp_sparse_attention_int8_128(
+    device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],
+    device float *o [[buffer(3)]], device const uint *starts [[buffer(4)]],
+    device const uint *lengths [[buffer(5)]], device const ushort *routes [[buffer(6)]],
+    device const uint *counts [[buffer(7)]], device const float *tails [[buffer(8)]],
+    device const float *key_mean [[buffer(9)]], device const float *gate [[buffer(10)]],
+    device const int8_t *q8 [[buffer(11)]], device const int8_t *k8 [[buffer(12)]],
+    device const float *scales [[buffer(13)]], constant uint *p [[buffer(14)]],
+    uint g [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    sparse_attention<true>(q, k, v, o, starts, lengths, routes, counts, tails, key_mean, gate, q8,
+                           k8, scales, p, g, simd, lane);
 }

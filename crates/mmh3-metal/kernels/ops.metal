@@ -452,14 +452,19 @@ kernel void swiglu(device const float *x [[buffer(0)]], device float *y [[buffer
 // A block's attention inputs from its qkv projection, rows of [3][heads][p[4]], or of
 // [heads][3][p[4]] with p[5] = 1, for heads of up to 256: the queries and keys RMS-normalized per
 // head by their weights, and with p[1] pairs of angles a token rotated in the first 2 × p[1]
-// dimensions of each head. All three are written as FP16 for the matrix units, or as FP32. Eight
-// SIMD groups a token, a head at a time.
-kernel void attention_inputs(
-    device const float *qkv [[buffer(0)]], device const float *q_norm [[buffer(1)]],
-    device const float *k_norm [[buffer(2)]], device const float *angles [[buffer(3)]],
-    device uchar *q [[buffer(4)]], device uchar *k [[buffer(5)]], device uchar *v [[buffer(6)]],
-    constant uint *p [[buffer(7)]], uint token [[threadgroup_position_in_grid]],
-    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+// dimensions of each head. All three are written as FP16 for the matrix units, or as FP32. With
+// p[6], the queries and keys are also written as INT8 with one scale a token and head, the
+// queries' p[7] tokens of scales first and then the keys'. Eight SIMD groups a token, a head at a
+// time.
+kernel void
+attention_inputs(device const float *qkv [[buffer(0)]], device const float *q_norm [[buffer(1)]],
+                 device const float *k_norm [[buffer(2)]], device const float *angles [[buffer(3)]],
+                 device uchar *q [[buffer(4)]], device uchar *k [[buffer(5)]],
+                 device uchar *v [[buffer(6)]], device char *q8 [[buffer(7)]],
+                 device char *k8 [[buffer(8)]], device float *scales [[buffer(9)]],
+                 constant uint *p [[buffer(10)]], uint token [[threadgroup_position_in_grid]],
+                 uint simd [[simdgroup_index_in_threadgroup]],
+                 uint lane [[thread_index_in_simdgroup]]) {
     constexpr uint MAX_DIM = 256, PARTS = MAX_DIM / 32;
     threadgroup float normalized[8][MAX_DIM];
     const uint heads = p[0], pairs = p[1], half_out = p[2], dim = p[4], inner = heads * dim;
@@ -495,6 +500,20 @@ kernel void attention_inputs(
                     d < pairs ? first * cos(a) - second * sin(a) : first * sin(a) + second * cos(a);
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (p[6] && tensor < 2) {
+            float maximum = 0;
+            for (uint c = 0; c < PARTS; ++c)
+                maximum = max(maximum, abs(x[c]));
+            const float scale = max(simd_max(maximum), 1e-30f) / 127.0f;
+            if (lane == 0)
+                scales[(tensor * p[7] + token) * heads + head] = scale;
+            device char *out8 = tensor == 0 ? q8 : k8;
+            for (uint c = 0; c < PARTS; ++c) {
+                const uint d = lane + c * 32;
+                if (d < dim)
+                    out8[(token * heads + head) * dim + d] = char(rint(x[c] / scale));
+            }
         }
         device uchar *out = tensor == 0 ? q : tensor == 1 ? k : v;
         for (uint c = 0; c < PARTS; ++c) {

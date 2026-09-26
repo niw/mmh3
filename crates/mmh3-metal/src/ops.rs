@@ -843,7 +843,7 @@ impl Array {
         causal: bool,
         precision: AttentionPrecision,
     ) -> Result<Self> {
-        if precision == AttentionPrecision::Fp16
+        if precision.on_matrix_units()
             && heads > 0
             && kv_heads > 0
             && heads.is_multiple_of(kv_heads)
@@ -884,8 +884,10 @@ impl Array {
     /// A block's attention inputs from its qkv projection's output, rows of `[3][heads][dim]`, or
     /// of `[heads][3][dim]` with `per_head`, for heads of up to 256:
     /// the queries and keys RMS-normalized per head by `q_norm` and `k_norm` and rotated by
-    /// `angles`, and all three in FP16 for the matrix units with `half`. One pass reads the
-    /// projection and writes what the attention reads.
+    /// `angles`, and all three in FP16 for the matrix units with `half`. With `int8`, which takes
+    /// `half`, the queries and keys are also quantized to INT8 for the scores, one scale a token
+    /// and head. One pass reads the projection and writes what the attention reads.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_inputs(
         &self,
         heads: usize,
@@ -894,6 +896,7 @@ impl Array {
         angles: Option<&Self>,
         half: bool,
         per_head: bool,
+        int8: bool,
     ) -> Result<AttentionInputs> {
         let dim = self.cols / 3 / heads.max(1);
         let inner = heads * dim;
@@ -904,6 +907,7 @@ impl Array {
             || q_norm.len() != dim
             || k_norm.len() != dim
             || angles.is_some_and(|angles| angles.rows != self.rows || 2 * pairs > dim)
+            || (int8 && !half)
         {
             return Err(Error::new("invalid attention input shapes".into()));
         }
@@ -915,6 +919,15 @@ impl Array {
             device.alloc(bytes, None)?,
             device.alloc(bytes, None)?,
         );
+        let quantized = int8
+            .then(|| -> Result<QuantizedQueryKeys> {
+                Ok(QuantizedQueryKeys {
+                    query: device.alloc(self.rows * inner, None)?,
+                    key: device.alloc(self.rows * inner, None)?,
+                    scales: device.alloc(2 * self.rows * heads * 4, None)?,
+                })
+            })
+            .transpose()?;
         device.run(
             "attention_inputs",
             &[
@@ -925,6 +938,9 @@ impl Array {
                 &query,
                 &key,
                 &value,
+                quantized.as_ref().map_or(&value, |q| &q.query),
+                quantized.as_ref().map_or(&value, |q| &q.key),
+                quantized.as_ref().map_or(&value, |q| &q.scales),
             ],
             &[
                 heads as u32,
@@ -933,6 +949,8 @@ impl Array {
                 epsilon.to_bits(),
                 dim as u32,
                 per_head as u32,
+                int8 as u32,
+                self.rows as u32,
             ],
             self.rows,
             true,
@@ -945,6 +963,7 @@ impl Array {
             heads,
             dim,
             half,
+            quantized,
         })
     }
 
@@ -1267,9 +1286,7 @@ enum Packing {
 /// Whether attention at `precision` over heads of `dim` runs on the matrix units, which read FP16
 /// inputs.
 pub(crate) fn attends_in_half(device: &Device, precision: AttentionPrecision, dim: usize) -> bool {
-    precision == AttentionPrecision::Fp16
-        && [64, 128].contains(&dim)
-        && device.supports_tensor_ops()
+    precision.on_matrix_units() && [64, 128].contains(&dim) && device.supports_tensor_ops()
 }
 
 /// `flash_attention` over FP16 query, key and value rows of `rows` = [queries, keys].
@@ -1300,8 +1317,17 @@ fn half_attention(
     Ok(out)
 }
 
+/// A block's queries and keys in INT8, `[tokens, heads × dim]`, with one FP32 scale a token and
+/// head, the queries' first.
+pub(crate) struct QuantizedQueryKeys {
+    pub(crate) query: Buffer,
+    pub(crate) key: Buffer,
+    pub(crate) scales: Buffer,
+}
+
 /// A block's query, key and value, `[tokens, heads × dim]` each, in FP16 for the attention on the
-/// matrix units or in FP32 for the FP32 attention.
+/// matrix units or in FP32 for the FP32 attention. The scores take INT8 queries and keys when
+/// they are quantized.
 pub struct AttentionInputs {
     pub(crate) query: Buffer,
     pub(crate) key: Buffer,
@@ -1310,6 +1336,7 @@ pub struct AttentionInputs {
     pub(crate) heads: usize,
     pub(crate) dim: usize,
     pub(crate) half: bool,
+    pub(crate) quantized: Option<QuantizedQueryKeys>,
 }
 
 impl AttentionInputs {
@@ -1343,6 +1370,7 @@ impl AttentionInputs {
             heads,
             dim: query.cols / heads,
             half,
+            quantized: None,
         })
     }
 
@@ -1353,6 +1381,35 @@ impl AttentionInputs {
     /// Dense attention of every row over every row.
     pub(crate) fn attend(&self) -> Result<Array> {
         let device = &self.query.0.device;
+        if let Some(quantized) = &self.quantized {
+            if self.dim != 128 {
+                return Err(Error::new("INT8 scores take heads of 128".into()));
+            }
+            let out = Array::empty(device, self.rows, self.width())?;
+            device.run(
+                "mpp_attention_int8_128",
+                &[
+                    &self.query,
+                    &self.key,
+                    &self.value,
+                    &out.buffer,
+                    &quantized.query,
+                    &quantized.key,
+                    &quantized.scales,
+                ],
+                &[
+                    self.rows as u32,
+                    self.heads as u32,
+                    self.heads as u32,
+                    self.dim as u32,
+                    0,
+                    self.rows as u32,
+                ],
+                self.rows.div_ceil(TENSOR_ATTENTION_QUERIES) * self.heads,
+                true,
+            )?;
+            return Ok(out);
+        }
         if self.half {
             return half_attention(
                 device,
@@ -1486,7 +1543,15 @@ mod tests {
                     .unwrap();
                 for (layout, input) in [(false, &qkv), (true, &per_head)] {
                     let got = input
-                        .attention_inputs(heads, (&q_norm, &k_norm), 1e-5, angles, half, layout)
+                        .attention_inputs(
+                            heads,
+                            (&q_norm, &k_norm),
+                            1e-5,
+                            angles,
+                            half,
+                            layout,
+                            false,
+                        )
                         .unwrap()
                         .attend()
                         .unwrap()
@@ -1502,6 +1567,31 @@ mod tests {
                         "FP16 {half}, angles {}, per head {layout}: {worst}",
                         angles.is_some()
                     );
+                }
+                // INT8 scores round the queries and keys to 127 steps of each token's and head's
+                // largest value, which moves the output further, but not far.
+                if half {
+                    let got = qkv
+                        .attention_inputs(
+                            heads,
+                            (&q_norm, &k_norm),
+                            1e-5,
+                            angles,
+                            true,
+                            false,
+                            true,
+                        )
+                        .unwrap()
+                        .attend()
+                        .unwrap()
+                        .to_f32()
+                        .unwrap();
+                    let worst = got
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f32::max);
+                    assert!(worst < 2e-2, "INT8, angles {}: {worst}", angles.is_some());
                 }
             }
         }
