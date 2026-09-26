@@ -33,24 +33,13 @@ pub fn validate_options(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Err
 /// that asks for what only another backend runs. What a rank of this backend refuses it refuses
 /// for itself, when the session opens, and says so there.
 pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
-    for option in ["patch", "sparse-tau", "sparse-start", "vsa-sparsity"] {
-        if options.contains_key(option) {
-            return Err(format!(
-                "Metal cannot run a step that --{option} asks for. Hand every step to a worker with --worker, or drop it"
-            )
-            .into());
-        }
-    }
-
-    for (option, supported) in [("attention", "dense"), ("lora-mode", "adapter")] {
-        if let Some(value) = options.get(option)
-            && *value != supported
-        {
-            return Err(format!(
-                "Metal runs --{option} {supported}, not {value}. Hand every step to a worker with --worker, or drop it"
-            )
-            .into());
-        }
+    if let Some(value) = options.get("lora-mode")
+        && *value != "adapter"
+    {
+        return Err(format!(
+            "Metal runs --lora-mode adapter, not {value}. Hand every step to a worker with --worker, or drop it"
+        )
+        .into());
     }
 
     if let Some(value) = options.get("attention-precision")
@@ -137,13 +126,12 @@ pub fn load_dit(
     let attention = attention_precision(options)?;
     dit.set_attention_precision(attention)?;
     println!("Metal DiT INT8-weight products: {precision:?}, attention: {attention:?}");
-    if dit.has_vsa_gates() {
-        return Err(
-            "VSA/FastH3 checkpoints need VSA attention, which is not implemented on Metal yet"
-                .into(),
-        );
+    // NOTE: a patch is a LoRA file whose other tensors replace or add checkpoint tensors, and it
+    // applies as adapters at full strength.
+    if let Some(patch) = model_file(options, "patch", &["patches", "loras"])? {
+        let count = dit.add_lora(&SafeTensors::open(Path::new(&patch))?, 1.0)?;
+        println!("applied {patch} to {count} layers and tensors");
     }
-
     if let Some(path) = model_file(options, "lora", &["loras"])? {
         let count = dit.add_lora(
             &SafeTensors::open(Path::new(&path))?,
@@ -173,14 +161,7 @@ mod tests {
     /// check has to let through everything that is only a step's business.
     #[test]
     fn a_coordinator_may_ask_for_what_it_cannot_run_itself() {
-        for (option, value) in [
-            ("attention", "sol"),
-            ("attention", "vsa"),
-            ("attention-precision", "int8-fp8"),
-            ("lora-mode", "merge"),
-            ("patch", "some.safetensors"),
-            ("vsa-sparsity", "0.9"),
-        ] {
+        for (option, value) in [("attention-precision", "int8-fp8"), ("lora-mode", "merge")] {
             let options = options(&[(option, value)]);
             assert!(
                 validate_options(&options).is_ok(),
@@ -189,6 +170,25 @@ mod tests {
             assert!(
                 validate_step_options(&options).is_err(),
                 "--{option} {value} must be refused by the machine that runs the step"
+            );
+        }
+    }
+
+    /// Sol-Attn, VSA and the patches that bring VSA's gates run here.
+    #[test]
+    fn a_step_may_attend_sparsely_and_take_a_patch() {
+        for (option, value) in [
+            ("attention", "sol"),
+            ("attention", "vsa"),
+            ("sparse-tau", "1.3"),
+            ("sparse-start", "0"),
+            ("vsa-sparsity", "0.9"),
+            ("patch", "some.safetensors"),
+        ] {
+            let options = options(&[(option, value)]);
+            assert!(
+                validate_step_options(&options).is_ok(),
+                "--{option} {value} runs on Metal"
             );
         }
     }

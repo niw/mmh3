@@ -14,7 +14,8 @@
 
 use crate::model::{Weight, Weights};
 use crate::{Error, Result, free_bytes};
-use mmh3_core::streaming::{Files, Unit, UnitReader};
+use mmh3_core::safetensors::{SafeTensors, TensorInfo};
+use mmh3_core::streaming::{Arrangement, Files, Unit, UnitReader};
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
@@ -128,6 +129,36 @@ impl Stream {
             loader: None,
             spare: Vec::new(),
         }
+    }
+
+    /// Adds `file`'s tensor to unit `index` or replaces the unit's own, which a patch does. The
+    /// units kept back are let go of, and the reader and its host buffers are made again, since the
+    /// units' files and sizes have changed.
+    pub(crate) fn insert(
+        &mut self,
+        weights: &Weights,
+        index: usize,
+        name: &str,
+        file: &SafeTensors,
+        info: &TensorInfo,
+    ) {
+        for (unit, kept) in self.units.iter().zip(&mut self.kept) {
+            if *kept {
+                weights.unload_unit(unit.tensors().iter().map(|tensor| tensor.name.as_str()));
+                *kept = false;
+            }
+        }
+        self.settled = None;
+        self.loader = None;
+        self.spare.clear();
+        let piece = self.files.piece(file, info);
+        self.units[index].insert(
+            name,
+            info.dtype,
+            info.shape.clone(),
+            vec![piece],
+            Arrangement::Contiguous,
+        );
     }
 
     fn largest(&self) -> usize {

@@ -242,16 +242,14 @@ mixed run is a different video rather than a noisier one, and is reproducible on
 
 ## Limits
 
-- A Metal rank refuses an attention precision other than its own, a merged LoRA patch, video
-  sparse attention, and a DiT that carries VSA gate projections. All four are answered when the
-  session opens and each says which, so the leader keeps the run and shares nothing: it costs a
-  machine rather than a run.
-- The VSA gates are a property of the checkpoint rather than of the run. A DiT carrying them,
-  which is any run with the FastH3 patch, cannot be shared with a Metal rank whatever
-  `--attention` names.
-- A Metal build refuses sparse attention, a merged LoRA and an attention precision other than its
-  own only when it will run the steps itself. Handing every step out, it can ask for any of them,
-  which is how a Mac runs FastH3 on a machine that has the kernels for it.
+- A Metal rank refuses an attention precision other than its own, a merged LoRA patch, and sparse
+  attention: it takes a share of a step that attends densely, though a whole step on a Mac runs
+  Sol-Attn and VSA. All three are answered when the session opens and each says which, so the
+  leader keeps the run and shares nothing: it costs a machine rather than a run.
+- A DiT carrying VSA gates, which is any run with the FastH3 patch, attends with VSA unless
+  `--attention` names another, so it is shared with a Metal rank only with `--attention dense`.
+- A Metal build refuses a merged LoRA and an attention precision other than its own only when it
+  will run the steps itself. Handing every step out, it can ask for any of them.
 - A share is cut once when the session opens and does not move between steps.
 - A run that meant to share and could not reads the DiT after the refusal rather than before it,
   so falling back costs the load it had skipped.

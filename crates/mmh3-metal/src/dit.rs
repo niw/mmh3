@@ -1,9 +1,11 @@
-//! Dense DiT on Metal, including the shared keyframe and reference token layouts.
+//! DiT on Metal, with dense or block-sparse attention, including the shared keyframe and reference
+//! token layouts.
 use crate::{
     Device, Error, Result,
     model::Weights,
     ops::{Array, RowMap},
     shard::ShardContext,
+    sparse::SparsePass,
     streaming::{Pass, Stream, fits},
 };
 use mmh3_core::{
@@ -12,7 +14,9 @@ use mmh3_core::{
         inputs::DitInputs,
         latent::{pack_audio, patchify_video, unpack_audio, unpatchify_video},
         layout::{PackedLayout, SegmentKind},
+        sparse::{SparseMethod, SparseSinks},
         timestep::StepTimesteps,
+        vsa::VsaPlan,
     },
     safetensors::SafeTensors,
     shard::{ExchangeError, Region, VelocityRows, regions as shard_regions},
@@ -209,11 +213,52 @@ impl MetalDit {
             .contains("blocks.0.attn.to_gate_compress.weight")
     }
 
+    /// Adds the LoRA layers of `file` as adapters. Its other tensors replace the checkpoint's of
+    /// the same name, or add new ones, as they are, whatever the strength: that is a patch, such as
+    /// FastH3's, which brings the VSA gates. Returns the number of layers with an adapter and of
+    /// tensors replaced or added.
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize> {
-        self.weights.add_lora(file, strength)
+        const PREFIX: &str = "diffusion_model.";
+        let mut replaced = 0;
+        for info in file.tensors() {
+            let Some(name) = info.name.strip_prefix(PREFIX) else {
+                continue;
+            };
+            if [".lora_A.weight", ".lora_B.weight", ".alpha"]
+                .iter()
+                .any(|suffix| name.ends_with(suffix))
+            {
+                continue;
+            }
+            match (&mut self.stream, Self::unit_index(&self.config, name)) {
+                (Some(stream), Some(unit)) => {
+                    self.weights.replace_absent(name, info)?;
+                    stream
+                        .get_mut()
+                        .insert(&self.weights, unit, name, file, info);
+                }
+                _ => self.weights.replace(name, file, info)?,
+            }
+            replaced += 1;
+        }
+        if replaced > 0 {
+            self.time_table = self.weights.host("adaln_t_table")?;
+        }
+        let added = self.weights.add_lora(file, strength)? + replaced;
+        if added == 0 {
+            return Err(Error::new("no LoRA layers or tensors found".into()));
+        }
+        Ok(added)
     }
 
-    fn attention(&self, x: &Array, prefix: &str, angles: Option<&Array>) -> Result<Array> {
+    /// A block's attention, block-sparse with `sparse`.
+    fn attention(
+        &self,
+        x: &Array,
+        prefix: &str,
+        angles: Option<&Array>,
+        sparse: Option<&SparsePass>,
+    ) -> Result<Array> {
         let c = &self.config;
         let qkv = self.weights.linear(x, &format!("{prefix}.attn.qkv_proj"))?;
         let norm = |offset, name: &str| -> Result<Array> {
@@ -234,8 +279,15 @@ impl MetalDit {
         let q = norm(0, "q")?;
         let k = norm(c.inner(), "k")?;
         let v = qkv.slice(0, x.rows, 2 * c.inner(), c.inner())?;
-        self.weights.linear(
-            &q.attention_at(
+        let attended = match sparse {
+            Some(sparse) => {
+                let gate = format!("{prefix}.attn.to_gate_compress");
+                let gate = (sparse.is_vsa() && self.weights.contains(&format!("{gate}.weight")))
+                    .then(|| self.weights.linear(x, &gate))
+                    .transpose()?;
+                sparse.attend(&q, &k, &v, gate.as_ref(), self.weights.attention_precision)?
+            }
+            None => q.attention_at(
                 &k,
                 &v,
                 c.heads,
@@ -243,8 +295,9 @@ impl MetalDit {
                 false,
                 self.weights.attention_precision,
             )?,
-            &format!("{prefix}.attn.out_proj"),
-        )
+        };
+        self.weights
+            .linear(&attended, &format!("{prefix}.attn.out_proj"))
     }
 
     /// This rank's heads of a block's attention inputs, projected from the rotated INT8 rows the
@@ -576,6 +629,7 @@ impl MetalDit {
                 &w.norm(&text, &format!("{p}.norm1"), c.norm_eps)?,
                 &p,
                 None,
+                None,
             )?)?;
             text = text.add(&self.mlp(&w.norm(&text, &format!("{p}.norm2"), c.norm_eps)?, &p)?)?;
             if let Some(pass) = &mut pass {
@@ -651,12 +705,6 @@ impl MetalDit {
         capture_text: bool,
         mut shard: Option<&mut ShardContext>,
     ) -> Result<DitOutput> {
-        if sparse.is_some() || self.has_vsa_gates() {
-            return Err(Error::new(
-                "Metal currently supports dense attention without VSA gates".into(),
-            ));
-        }
-
         let c = &self.config;
         if inputs.context.shape.len() != 2
             || inputs.context.shape[1] != c.text_dim
@@ -687,6 +735,34 @@ impl MetalDit {
         };
 
         let layout = PackedLayout::for_inputs(inputs);
+        let method = sparse
+            .filter(|settings| layout.len() >= settings.min_tokens)
+            .map(|settings| settings.method);
+        if method.is_some() && shard.is_some() {
+            return Err(Error::new(
+                "a share of a step on Metal attends densely".into(),
+            ));
+        }
+        // VSA runs the blocks on the sequence with the video in cube order.
+        let plan =
+            matches!(method, Some(SparseMethod::Vsa { .. })).then(|| VsaPlan::for_layout(&layout));
+        let sparse = match (method, &plan) {
+            (Some(SparseMethod::Sol { tau }), _) => Some(SparsePass::sol(
+                d,
+                layout.len(),
+                c.heads,
+                tau,
+                SparseSinks::for_layout(&layout),
+            )?),
+            (Some(SparseMethod::Vsa { sparsity }), Some(plan)) => Some(SparsePass::vsa(
+                d,
+                plan,
+                c.heads,
+                plan.kept_video_tiles(sparsity),
+            )?),
+            _ => None,
+        };
+        let video_rows = layout.segment(SegmentKind::Video);
         // The rows this rank carries. Without a shard that is every row, and nothing below knows
         // the difference.
         let carried = match &shard {
@@ -767,6 +843,12 @@ impl MetalDit {
             } else {
                 (pack_audio(latent), c.audio_channels, "audio_patch_proj")
             };
+            let values = match &plan {
+                Some(plan) if segment.kind == SegmentKind::Video => {
+                    plan.reorder_video(&values, features)
+                }
+                _ => values,
+            };
 
             parts.push(w.linear(&upload(&values, features)?, name)?);
         }
@@ -777,7 +859,14 @@ impl MetalDit {
             hidden = hidden.slice(carried.start, carried.len(), 0, width)?;
         }
         let time = upload(&timesteps.time_embedding(&self.time_table), c.adaln_rank)?;
-        let angles = upload(&layout.rope_angles(&self.inv_freq), c.rope_dims() / 2)?;
+        let mut angles = layout.rope_angles(&self.inv_freq);
+        if let Some(plan) = &plan {
+            let width = c.rope_dims() / 2;
+            let video = video_rows.start * width..video_rows.end * width;
+            let reordered = plan.reorder_video(&angles[video.clone()], width);
+            angles[video].copy_from_slice(&reordered);
+        }
+        let angles = upload(&angles, c.rope_dims() / 2)?;
         let modulation = |name: &str, chunks: usize| -> Result<Array> {
             // The table has one row per timestep. Projections concatenate each modality's chunks.
             let a = w.linear(&time, name)?;
@@ -806,7 +895,7 @@ impl MetalDit {
                 .modulate(&m, &rows, 0, 1)?;
             let attended = match &mut shard {
                 Some(context) => self.sharded_attention(&norm, &p, Some(&angles), context)?,
-                None => self.attention(&norm, &p, Some(&angles))?,
+                None => self.attention(&norm, &p, Some(&angles), sparse.as_ref())?,
             };
             hidden = hidden.add_gated(&attended, &m, &rows, 2)?;
             let norm = w
@@ -818,7 +907,13 @@ impl MetalDit {
             }
 
             if capture.contains(&layer) {
-                blocks.push((layer, hidden.to_f32()?));
+                let mut states = hidden.to_f32()?;
+                if let Some(plan) = &plan {
+                    let video = video_rows.start * width..video_rows.end * width;
+                    let restored = plan.restore_video(&states[video.clone()], width);
+                    states[video].copy_from_slice(&restored);
+                }
+                blocks.push((layer, states));
             }
         }
 
@@ -840,7 +935,10 @@ impl MetalDit {
             w.linear(&x.modulate(&m, &rows, 0, 1)?, name)?.to_f32()
         };
 
-        let video = project(SegmentKind::Video, "final_layer.video_out")?;
+        let mut video = project(SegmentKind::Video, "final_layer.video_out")?;
+        if let Some(plan) = &plan {
+            video = plan.restore_video(&video, c.video_patch_features());
+        }
         let audio = project(SegmentKind::Audio, "final_layer.audio_out")?;
         // The rows of one rank cannot be unpatchified on their own, so a share answers with the
         // parts as the projections left them and a leader puts them together.
@@ -868,7 +966,11 @@ impl MetalDit {
             blocks,
             video,
             audio,
-            routed_fraction: None,
+            routed_fraction: sparse
+                .as_ref()
+                .map(SparsePass::routed_fraction)
+                .transpose()?
+                .flatten(),
         })
     }
 }
@@ -1433,7 +1535,7 @@ mod tests {
         let x = Array::from_f32(&device, tokens, c.hidden, &values).unwrap();
 
         let whole = dit
-            .attention(&x, "blocks.0", None)
+            .attention(&x, "blocks.0", None, None)
             .unwrap()
             .to_f32()
             .unwrap();

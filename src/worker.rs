@@ -2942,17 +2942,14 @@ fn accept_sparse_attention(
 
 #[cfg(feature = "metal")]
 fn accept_sparse_attention(
-    dit: &Dit,
+    _dit: &Dit,
     sparse: Option<&mmh3_core::dit::sparse::SparseAttention>,
 ) -> Result<(), Box<dyn Error>> {
     if sparse.is_some() {
-        return Err("this build attends densely, and this run asks for sparse attention".into());
-    }
-    // NOTE: the gates are a property of the checkpoint rather than of the run, so a leader that
-    // names dense attention still hands out a DiT this backend cannot run. Every FastH3 patch
-    // carries them.
-    if dit.has_vsa_gates() {
-        return Err("this build cannot run a DiT that carries VSA gate projections".into());
+        return Err(
+            "this build shares steps that attend densely, and this run asks for sparse attention"
+                .into(),
+        );
     }
     Ok(())
 }

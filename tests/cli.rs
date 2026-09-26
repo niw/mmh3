@@ -157,15 +157,12 @@ fn webm_feature_error_precedes_model_loading() {
 #[test]
 fn metal_rejects_unsupported_options_before_reading_models_or_pictures() {
     for (option, value) in [
-        ("--attention", "sol"),
-        ("--attention", "vsa"),
         ("--attention-precision", "int8-fp8"),
         ("--linear-precision", "nvfp4"),
         ("--lora-mode", "merge"),
         ("--reference", "missing.png"),
         ("--reference-audio", "missing.wav"),
         ("--first-frame", "missing.png"),
-        ("--patch", "missing.safetensors"),
     ] {
         let output = run(
             TOOLS,

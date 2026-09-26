@@ -90,12 +90,25 @@ attention.
 Changing precision can change the generated sample even with the same seed. The other layers
 compute in FP32.
 
-Text prompts, precomputed `--context` tensors and adapter LoRAs are supported. Image, audio and
-video conditioning (`--first-frame`, `--last-frame`, `--reference`, `--reference-audio`,
-`--reference-video`), sparse attention, FastH3/VSA, replacement-weight patches, NVFP4 and LoRA
-merge mode are not yet supported.
+Text prompts, precomputed `--context` tensors, adapter LoRAs, patches such as
+[FastH3](fasth3.md)'s, and Sol-Attn and VSA sparse attention are supported. Image, audio and video
+conditioning (`--first-frame`, `--last-frame`, `--reference`, `--reference-audio`,
+`--reference-video`), INT8/FP8 attention, NVFP4 and LoRA merge mode are not yet supported.
 The Metal CLI supports `generate`, `latent`, `device` and checkpoint inspection. The `bench` and
 `check` are not yet available. See [Usage](usage.md) for general command options.
+
+## Sparse attention
+
+`--attention sol` and `--attention vsa` run as on CUDA, with the options in [Usage](usage.md), over
+the DiT's heads of 128. The routing runs in FP32 and the attention over the routed tiles in the
+precision of `--attention-precision`, FP16 on the matrix units or FP32. A share of a step handed out
+by a [distributed](distributed.md) run still attends densely.
+
+Both attend over a fraction of the tiles, so a step at a large size takes much less time than with
+dense attention. From the same context and noise, a step's video latent stays close to CUDA's BF16
+one with Sol-Attn, whose routing follows a threshold. With VSA it moves as far as CUDA's own moves
+when its attention changes to INT8/FP8: VSA keeps a tenth of the video tiles by their pooled scores,
+so a small difference in the scores keeps a different tenth.
 
 ## Approximate speed
 

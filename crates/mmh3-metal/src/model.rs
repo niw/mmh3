@@ -5,7 +5,7 @@ use crate::{
 use mmh3_core::{
     json,
     numeric::f32_to_f16,
-    safetensors::{DType, SafeTensors},
+    safetensors::{DType, SafeTensors, TensorInfo},
     tensor::Tensor,
 };
 use std::cell::RefCell;
@@ -559,6 +559,55 @@ impl Weights {
         Ok(y)
     }
 
+    /// Replaces a tensor with `file`'s of the same name, or adds it, which is how a patch changes
+    /// a model.
+    pub(crate) fn replace(
+        &mut self,
+        name: &str,
+        file: &SafeTensors,
+        info: &TensorInfo,
+    ) -> Result<()> {
+        self.check_replacement(name, info)?;
+        let weight = Weight {
+            buffer: self
+                .device
+                .alloc(info.byte_count(), Some(file.data(info)))?,
+            shape: info.shape.clone(),
+            dtype: info.dtype,
+        };
+        self.tensors.insert(name.to_owned(), weight);
+        Ok(())
+    }
+
+    /// `replace` for a tensor of a unit read on the way, which reads the new one from then on.
+    pub(crate) fn replace_absent(&mut self, name: &str, info: &TensorInfo) -> Result<()> {
+        self.check_replacement(name, info)?;
+        self.tensors.remove(name);
+        self.absent
+            .insert(name.to_owned(), (info.dtype, info.shape.clone()));
+        Ok(())
+    }
+
+    fn check_replacement(&self, name: &str, info: &TensorInfo) -> Result<()> {
+        dtype_code(info.dtype)?;
+        if let Some((dtype, shape)) = self.describe(name)
+            && (dtype != info.dtype || shape != info.shape)
+        {
+            return Err(Error::new(format!(
+                "{name} in the patch does not match the checkpoint's"
+            )));
+        }
+        if info.dtype == DType::I8 && (info.shape.len() != 2 || !info.shape[1].is_multiple_of(256))
+        {
+            return Err(Error::new(format!(
+                "{name}: expected an INT8 ConvRot weight"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Adds the LoRA layers of `file` as adapters and returns how many there are. The file's other
+    /// tensors are the model's business, which a patch replaces.
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize> {
         if !strength.is_finite() {
             return Err(Error::new("LoRA strength must be finite".into()));
@@ -571,12 +620,8 @@ impl Weights {
                 return Err(Error::new(format!("unsupported LoRA tensor {}", info.name)));
             };
 
-            if name.ends_with(".lora_B.weight") || name.ends_with(".alpha") {
-                continue;
-            }
-
             let Some(layer) = name.strip_suffix(".lora_A.weight") else {
-                return Err(Error::new("Metal supports adapter LoRAs. Replacement-weight patches are not supported yet".into()));
+                continue;
             };
 
             let load = |name: &str| -> Result<Tensor> {
@@ -618,10 +663,6 @@ impl Weights {
                     self.device.supports_tensor_ops(),
                 )?,
             ));
-        }
-
-        if adapters.is_empty() {
-            return Err(Error::new("no supported LoRA layers found".into()));
         }
 
         let count = adapters.len();
