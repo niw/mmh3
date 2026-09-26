@@ -958,7 +958,7 @@ impl RemoteAudio {
     pub fn start(addresses: Vec<String>, token: String, role: &str, latent: &Tensor) -> Self {
         let (sender, receiver) = channel();
         let (role, latent) = (role.to_owned(), latent.clone());
-        std::thread::spawn(move || {
+        keep_until_exit(std::thread::spawn(move || {
             let mut candidates: Vec<Worker> = Vec::new();
             for address in &addresses {
                 let Ok(worker) = Worker::connect(address, &token) else {
@@ -980,7 +980,7 @@ impl RemoteAudio {
                 None => Ok(None),
             };
             let _ = sender.send(answer);
-        });
+        }));
         RemoteAudio { receiver }
     }
 
@@ -1042,7 +1042,7 @@ impl RemoteCanvases {
             let sender = sender.clone();
             let latent = Arc::clone(&latent);
             let role = role.to_owned();
-            std::thread::spawn(move || {
+            keep_until_exit(std::thread::spawn(move || {
                 for chunk in mine {
                     let result = worker
                         .decode_chunk(&role, &latent, chunk, tile_size, tile_overlap)
@@ -1053,7 +1053,7 @@ impl RemoteCanvases {
                         return;
                     }
                 }
-            });
+            }));
         }
         RemoteCanvases {
             receiver,
@@ -1152,6 +1152,49 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     serve_on(listener, models, token, bare, true)
 }
 
+/// The threads of this process that talk to workers, so that the process can wait for them before
+/// it exits: the sessions of the worker in it, and the threads a run asks others for chunks and
+/// audio on. A session thread ends by saving the chosen algorithms and tearing down its cuBLASLt
+/// state, and one that asked a worker ends by closing its connection, which may be registered for
+/// RDMA. The exit handlers tearing the libraries down under either crash the process after its
+/// work is done.
+static THREADS: std::sync::Mutex<Vec<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Keeps `thread` for `end_threads_here`, and lets go of the ones already ended, so that a worker
+/// that serves for days keeps only the threads still running.
+fn keep_until_exit(thread: std::thread::JoinHandle<()>) {
+    let mut threads = THREADS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    threads.retain(|thread| !thread.is_finished());
+    threads.push(thread);
+}
+
+/// Waits, for up to `THREADS_END` in all, for the threads `keep_until_exit` kept to end, which
+/// they do once the run that started them has closed its connections. A process calls it before it
+/// exits.
+pub fn end_threads_here() {
+    let threads = std::mem::take(
+        &mut *THREADS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    );
+    let deadline = Instant::now() + THREADS_END;
+    for thread in threads {
+        while !thread.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if thread.is_finished() {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// How long a process waits at exit for those threads. They end within a second of their run
+/// closing them, and one that has not after this is left to the exit.
+const THREADS_END: Duration = Duration::from_secs(10);
+
 /// A worker on this machine, for a run that shares its steps out. The machine handing the work
 /// out runs no block, so without this its own GPU sits out every step it hands to somebody else.
 /// It is an ordinary rank: it waits on loopback, takes the session the coordinator opens like any
@@ -1234,7 +1277,7 @@ fn serve_on(
         let checkpoints = checkpoints.clone();
         let token = token.clone();
         let models = models.clone();
-        std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || {
             let peer = stream
                 .peer_addr()
                 .map_or_else(|_| "?".to_owned(), |address| address.to_string());
@@ -1244,6 +1287,7 @@ fn serve_on(
             #[cfg(feature = "cuda")]
             crate::models::save_algorithm_cache();
         });
+        keep_until_exit(handle);
     }
     Ok(())
 }

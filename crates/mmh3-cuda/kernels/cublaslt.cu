@@ -100,14 +100,21 @@ constexpr int MATMUL_ALGORITHM_FORMAT = 2;
 
 using Shape = std::tuple<int64_t, int64_t, int64_t>;
 
+// NOTE: the tables of chosen algorithms below and their locks are made once and never destroyed. A
+// worker's session thread saves them when its session ends, which can be while the process is
+// already exiting, and a table the exit handlers destroyed under it would crash the process after
+// its work is done.
+
 // The algorithm chosen for each NVFP4 GEMM shape (m, n, k), shared by the threads of the process.
-std::mutex nvfp4_algorithms_mutex;
-std::map<Shape, cublasLtMatmulAlgo_t> nvfp4_algorithms;
+std::mutex &nvfp4_algorithms_mutex = *new std::mutex;
+std::map<Shape, cublasLtMatmulAlgo_t> &nvfp4_algorithms =
+    *new std::map<Shape, cublasLtMatmulAlgo_t>;
 
 // The same for the plain GEMMs, keyed by kind, shape and whether a bias is added.
 using MatmulKey = std::tuple<int, int64_t, int64_t, int64_t, bool>;
-std::mutex matmul_algorithms_mutex;
-std::map<MatmulKey, cublasLtMatmulAlgo_t> matmul_algorithms;
+std::mutex &matmul_algorithms_mutex = *new std::mutex;
+std::map<MatmulKey, cublasLtMatmulAlgo_t> &matmul_algorithms =
+    *new std::map<MatmulKey, cublasLtMatmulAlgo_t>;
 
 // How many heuristic candidates a new shape times against each other. cuBLASLt offers only a few
 // for the convolution shapes of the VAE encoder, so the list is as long as it will fill.
@@ -135,9 +142,11 @@ bool consistent() {
 // The algorithm consistency runs for each kind, n, k and bias of the plain GEMMs, and for each n
 // and k of the NVFP4 ones. It is derived rather than measured, so it is not kept between runs.
 using ConsistentKey = std::tuple<int, int64_t, int64_t, bool>;
-std::mutex consistent_mutex;
-std::map<ConsistentKey, cublasLtMatmulAlgo_t> consistent_matmul;
-std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t> consistent_nvfp4;
+std::mutex &consistent_mutex = *new std::mutex;
+std::map<ConsistentKey, cublasLtMatmulAlgo_t> &consistent_matmul =
+    *new std::map<ConsistentKey, cublasLtMatmulAlgo_t>;
+std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t> &consistent_nvfp4 =
+    *new std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t>;
 
 // Asks the heuristic for the algorithm of `operation` over `weight` at CONSISTENT_ROWS rows.
 cublasStatus_t consistent_algorithm(cublasLtHandle_t handle, cublasLtMatmulDesc_t operation,

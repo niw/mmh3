@@ -79,5 +79,6 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    mmh3::worker::end_threads_here();
     mmh3::cli::exit_code(result)
 }
