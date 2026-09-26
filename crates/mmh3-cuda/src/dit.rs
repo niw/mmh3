@@ -250,6 +250,72 @@ struct ForwardBuffers {
     text: Option<TextStates>,
 }
 
+/// An exchange that remembers whether a share has reached its peers yet, which is what decides
+/// whether the share can run again. Asking for a region reaches nobody.
+struct Watched<'a> {
+    exchange: &'a mut dyn shard::Exchange<Memory = *mut c_void>,
+    touched: bool,
+}
+
+impl shard::Exchange for Watched<'_> {
+    type Memory = *mut c_void;
+
+    fn rank(&self) -> usize {
+        self.exchange.rank()
+    }
+
+    fn ranks(&self) -> usize {
+        self.exchange.ranks()
+    }
+
+    fn region(
+        &mut self,
+        region: Region,
+        bytes: usize,
+    ) -> Result<*mut c_void, shard::ExchangeError> {
+        self.exchange.region(region, bytes)
+    }
+
+    fn write(
+        &mut self,
+        peer: usize,
+        from: Region,
+        offset: usize,
+        into: Region,
+        peer_offset: usize,
+        bytes: usize,
+    ) -> Result<(), shard::ExchangeError> {
+        self.touched = true;
+        self.exchange
+            .write(peer, from, offset, into, peer_offset, bytes)
+    }
+
+    fn publish(
+        &mut self,
+        region: Region,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), shard::ExchangeError> {
+        self.touched = true;
+        self.exchange.publish(region, offset, bytes)
+    }
+
+    fn receive(
+        &mut self,
+        region: Region,
+        offset: usize,
+        bytes: usize,
+    ) -> Result<(), shard::ExchangeError> {
+        self.touched = true;
+        self.exchange.receive(region, offset, bytes)
+    }
+
+    fn barrier(&mut self) -> Result<(), shard::ExchangeError> {
+        self.touched = true;
+        self.exchange.barrier()
+    }
+}
+
 /// Refined text states `[text tokens, hidden]` in FP32 and the context they came from. The refiner
 /// sees only the context, so the steps of a generation share them.
 struct TextStates {
@@ -2091,16 +2157,44 @@ impl CudaDit {
 
     /// One rank's share of a step. Ulysses gives this rank a run of the sequence to carry through
     /// the blocks and a run of the heads to attend with, and `context` carries the two exchanges
-    /// each block needs. Rank 0 returns the velocity; the others return nothing to unpatchify. A
-    /// share that runs out of memory is not run again, since the other ranks are part way through
-    /// the same step.
+    /// each block needs. Rank 0 returns the velocity; the others return nothing to unpatchify.
+    ///
+    /// A share that runs out of memory before it has exchanged anything runs again for as long as
+    /// `room` lets go of something the caller holds beside this DiT, and says so. That is where the
+    /// buffers of a larger canvas are made, and the peers only wait for it. A share that has
+    /// exchanged something is not run again, since the other ranks are part way through the same
+    /// step.
+    ///
+    /// NOTE: this DiT does not read more of its blocks on the way to make room, as `forward` does.
+    /// Two ranks on one card would each keep back what the other just gave up, and try forever.
     pub fn forward_shard(
         &self,
         inputs: &DitInputs,
         sparse: Option<&SparseAttention>,
         context: &mut ShardContext<'_>,
+        room: &mut dyn FnMut() -> bool,
     ) -> Result<DitOutputs, Error> {
-        self.run(inputs, &[], sparse, Some(context))
+        loop {
+            let mut watched = Watched {
+                exchange: &mut *context.exchange,
+                touched: false,
+            };
+            let mut attempt = ShardContext {
+                shard: context.shard.clone(),
+                exchange: &mut watched,
+                timing: Default::default(),
+            };
+            let result = self.run(inputs, &[], sparse, Some(&mut attempt));
+            let timing = attempt.timing;
+            context.timing.gather += timing.gather;
+            context.timing.barrier += timing.barrier;
+            context.timing.read += timing.read;
+            context.timing.attend += timing.attend;
+            match result {
+                Err(error) if error.is_out_of_memory() && !watched.touched && room() => {}
+                result => return result,
+            }
+        }
     }
 
     fn run(

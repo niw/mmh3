@@ -1643,6 +1643,8 @@ fn session(
                     }
                 };
                 let served = lent.and_then(|(key, dit)| {
+                    // What else this card holds goes before a step runs short of memory, since the
+                    // DiT is lent and a step that has reached its peers cannot run again.
                     let served = serve_shard(
                         &mut reader,
                         &mut writer,
@@ -1650,6 +1652,7 @@ fn session(
                         &open,
                         &body[payload..],
                         token,
+                        &mut || table.let_go_of_one(),
                     );
                     table.borrow().return_dit(key, dit);
                     served
@@ -3481,13 +3484,14 @@ pub fn share_a_step(
     shard: &Shard,
     exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
     elapsed: impl Fn() -> Duration,
+    room: &mut dyn FnMut() -> bool,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
     let mut context = mmh3_cuda::shard::ShardContext {
         shard: shard.clone(),
         exchange,
         timing: Default::default(),
     };
-    let outputs = dit.forward_shard(inputs, sparse, &mut context)?;
+    let outputs = dit.forward_shard(inputs, sparse, &mut context, room)?;
     let part = outputs.part.ok_or("a shared step returned no rows")?;
     let timing = describe_timing(&context.timing, elapsed());
     Ok((part, timing))
@@ -3501,6 +3505,8 @@ pub fn share_a_step(
     shard: &Shard,
     exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
     elapsed: impl Fn() -> Duration,
+    // A Metal share that runs out of memory is not run again, so it has no room to ask for.
+    _room: &mut dyn FnMut() -> bool,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
     let mut context = mmh3_metal::shard::ShardContext {
         shard: shard.clone(),
@@ -3648,6 +3654,7 @@ fn serve_shard(
     open: &OpenSession,
     payload: &[u8],
     token: &str,
+    room: &mut dyn FnMut() -> bool,
 ) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::layout::PackedLayout;
     use mmh3_core::dit::timestep::Modality;
@@ -3787,6 +3794,7 @@ fn serve_shard(
             &shard,
             &mut exchanger,
             || started.elapsed(),
+            room,
         )?;
         println!(
             "step {} of rank {} in {:.1} s{}{timing}",

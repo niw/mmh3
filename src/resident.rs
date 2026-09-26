@@ -439,6 +439,22 @@ impl Table {
         }
     }
 
+    /// Lets go of the model used least on this device, and says whether there was one, for work
+    /// that ran out of memory and can run again but cannot wait for a DiT to come back: a step,
+    /// whose own DiT is the one lent out.
+    pub fn let_go_of_one(&mut self) -> bool {
+        let mut models = self.borrow();
+        let Some(kind) = models.release_oldest() else {
+            return false;
+        };
+        println!(
+            "device {} had no memory left for a step, so let go of {} and tried again",
+            models.device,
+            kind.name()
+        );
+        true
+    }
+
     /// Runs a request that may be run again, letting go of the model used least and trying again
     /// each time the device runs out of memory, as a read does. A decode reads its decoder and then
     /// needs room to work in besides, which a DiT kept from the steps before it may be holding.
