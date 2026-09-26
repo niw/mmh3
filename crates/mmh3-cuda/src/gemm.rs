@@ -15,8 +15,10 @@ unsafe extern "C" {
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_int8_gemm_config_count() -> c_int;
+    fn mmh3_int8_gemm_group_heights(heights: *mut c_int, capacity: c_int) -> c_int;
     fn mmh3_int8_gemm(
         config: c_int,
+        group_m: c_int,
         activations: *const c_void,
         weights: *const c_void,
         activation_scales: *const c_void,
@@ -120,6 +122,25 @@ pub fn rotate_quantize(
 pub fn int8_config_count() -> usize {
     // SAFETY: no arguments.
     unsafe { mmh3_int8_gemm_config_count() as usize }
+}
+
+/// The heights of the bands of tiles the INT8 GEMM tries for a new shape.
+pub fn int8_group_heights() -> Vec<usize> {
+    // SAFETY: a capacity of 0 writes nothing.
+    let count = unsafe { mmh3_int8_gemm_group_heights(ptr::null_mut(), 0) };
+    let mut heights = vec![0; count as usize];
+    // SAFETY: the vector holds `count` values.
+    unsafe { mmh3_int8_gemm_group_heights(heights.as_mut_ptr(), count) };
+    heights.into_iter().map(|height| height as usize).collect()
+}
+
+/// How the INT8 GEMM covers its output: the tile configuration, 256 × 128 for config 0 and
+/// 128 × 256 for config 1, and how many rows of tiles it walks down before moving right. Every
+/// tiling gives the same output bits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Int8Tiling {
+    pub config: usize,
+    pub group_m: usize,
 }
 
 /// A low-rank adapter added to an INT8 GEMM: `scale · down · upᵀ` with `down` `[m, rank]`, its rows
@@ -237,11 +258,10 @@ pub fn interleave_swiglu_rows(
     Ok(destination)
 }
 
-/// Raw form of `int8_bf16` that picks the tile shape: 128 × 256 for inputs shorter than 256 rows,
-/// such as prompts, and for reductions longer than 8,192, and 256 × 128 otherwise.
+/// Raw form of `int8` with the tiling chosen for the shape, which the first call of a shape times.
 ///
 /// # Safety
-/// The pointers must cover the extents described for `int8_bf16`.
+/// The pointers must cover the extents described for `int8`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn int8_pointers(
     activations: *const c_void,
@@ -254,18 +274,10 @@ pub(crate) unsafe fn int8_pointers(
     k: usize,
     adapter: Option<AdapterPointers>,
 ) -> Result<(), CudaError> {
-    // NOTE: in the DiT at 768p, the MLP down projection (K = 14,336) takes 35 ms per layer with
-    // 128 × 256 tiles and 47 ms with 256 × 128 tiles, although both take about 31 ms when timed
-    // alone.
-    let config = if (m < 256 || k > 8192) && n.is_multiple_of(256) {
-        1
-    } else {
-        0
-    };
     // SAFETY: the caller guarantees the extents.
     unsafe {
-        int8_config(
-            config,
+        int8_tiling(
+            None,
             activations,
             weights,
             activation_scales,
@@ -279,11 +291,13 @@ pub(crate) unsafe fn int8_pointers(
     }
 }
 
+/// Runs `tiling`, or the one chosen for the shape without it.
+///
 /// # Safety
-/// The pointers must cover the extents described for `int8_bf16`.
+/// The pointers must cover the extents described for `int8`.
 #[allow(clippy::too_many_arguments)]
-unsafe fn int8_config(
-    config: usize,
+unsafe fn int8_tiling(
+    tiling: Option<Int8Tiling>,
     activations: *const c_void,
     weights: *const c_void,
     activation_scales: *const c_void,
@@ -304,7 +318,8 @@ unsafe fn int8_config(
     // SAFETY: the caller guarantees the extents.
     check(unsafe {
         mmh3_int8_gemm(
-            config as c_int,
+            tiling.map_or(-1, |tiling| tiling.config as c_int),
+            tiling.map_or(0, |tiling| tiling.group_m as c_int),
             activations,
             weights,
             activation_scales,
@@ -352,11 +367,11 @@ pub struct ColumnMaxima<'a> {
 /// weight_scales[n] + the adapter + the bias).
 ///
 /// Activations and weights are row-major INT8 with K contiguous, scales are f32. K must be a
-/// multiple of 128 and N a multiple of the config's tile width, 128 for config 0 and 256 for
-/// config 1.
+/// multiple of 128 and N a multiple of the tile width, 128 for config 0 and 256 for config 1.
+/// Without a tiling, it runs the one chosen for the shape.
 #[allow(clippy::too_many_arguments)]
 pub fn int8(
-    config: usize,
+    tiling: Option<Int8Tiling>,
     activations: &DeviceBuffer,
     weights: &DeviceBuffer,
     activation_scales: &DeviceBuffer,
@@ -431,8 +446,8 @@ pub fn int8(
     };
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
     unsafe {
-        int8_config(
-            config,
+        int8_tiling(
+            tiling,
             activations.pointer(),
             weights.pointer(),
             activation_scales.pointer(),

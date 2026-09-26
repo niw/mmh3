@@ -12,9 +12,11 @@ extern "C" int mmh3_attention_bf16(const __nv_bfloat16 *query, const __nv_bfloat
                                    int64_t value_stride, int64_t output_stride, float scale,
                                    cudaStream_t stream);
 extern "C" int mmh3_int8_gemm_config_count();
-extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t *activations, const int8_t *weights,
-                                   const float *activation_scales, const float *weight_scales,
-                                   __nv_bfloat16 *output, int m, int n, int k, cudaStream_t stream);
+extern "C" int mmh3_int8_gemm_group_heights(int *heights, int capacity);
+extern "C" int mmh3_int8_gemm_bf16(int config, int group_m, const int8_t *activations,
+                                   const int8_t *weights, const float *activation_scales,
+                                   const float *weight_scales, __nv_bfloat16 *output, int m, int n,
+                                   int k, cudaStream_t stream);
 
 namespace {
 
@@ -366,7 +368,8 @@ extern "C" int mmh3_bench_memory_copy(size_t bytes, int iterations,
     return 0;
 }
 
-// Times the mmh3 INT8 GEMM kernel over every tile configuration and reports the fastest one.
+// Times the mmh3 INT8 GEMM kernel over every tile configuration and band height and reports the
+// fastest one, as config × band heights + the index of the height.
 extern "C" int mmh3_bench_int8_gemm(int64_t m, int64_t n, int64_t k, int iterations,
                                     float *best_milliseconds, int *configs_timed, int *best_config,
                                     char *message, size_t message_size) {
@@ -392,8 +395,11 @@ extern "C" int mmh3_bench_int8_gemm(int64_t m, int64_t n, int64_t k, int iterati
     EventPair events;
     cudaEventCreate(&events.start);
     cudaEventCreate(&events.stop);
-    auto run = [&](int config) {
-        return mmh3_int8_gemm_bf16(config, static_cast<const int8_t *>(activations.pointer),
+    int heights[8];
+    const int height_count = mmh3_int8_gemm_group_heights(heights, 8);
+    auto run = [&](int tiling) {
+        return mmh3_int8_gemm_bf16(tiling / height_count, heights[tiling % height_count],
+                                   static_cast<const int8_t *>(activations.pointer),
                                    static_cast<const int8_t *>(weights.pointer),
                                    static_cast<const float *>(activation_scales.pointer),
                                    static_cast<const float *>(weight_scales.pointer),
@@ -401,10 +407,10 @@ extern "C" int mmh3_bench_int8_gemm(int64_t m, int64_t n, int64_t k, int iterati
                                    static_cast<int>(m), static_cast<int>(n), static_cast<int>(k),
                                    nullptr);
     };
-    for (int config = 0; config < mmh3_int8_gemm_config_count(); config++) {
+    for (int tiling = 0; tiling < mmh3_int8_gemm_config_count() * height_count; tiling++) {
         bool usable = true;
         for (int warmup = 0; warmup < WARMUP_RUNS && usable; warmup++) {
-            usable = run(config) == 0;
+            usable = run(tiling) == 0;
         }
         if (!usable || cudaDeviceSynchronize() != cudaSuccess) {
             cudaGetLastError();
@@ -412,7 +418,7 @@ extern "C" int mmh3_bench_int8_gemm(int64_t m, int64_t n, int64_t k, int iterati
         }
         cudaEventRecord(events.start);
         for (int index = 0; index < iterations; index++) {
-            run(config);
+            run(tiling);
         }
         cudaEventRecord(events.stop);
         if ((status = cudaEventSynchronize(events.stop)) != cudaSuccess) {
@@ -423,7 +429,7 @@ extern "C" int mmh3_bench_int8_gemm(int64_t m, int64_t n, int64_t k, int iterati
         float average = elapsed / iterations;
         if (*configs_timed == 0 || average < *best_milliseconds) {
             *best_milliseconds = average;
-            *best_config = config;
+            *best_config = tiling;
         }
         (*configs_timed)++;
     }

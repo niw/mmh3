@@ -139,22 +139,33 @@ fn algorithm_cache(table: &str) -> Option<PathBuf> {
     Some(directory.join(format!("mmh3/cublaslt-{table}-algorithms.txt")))
 }
 
-/// Takes over the cuBLASLt algorithms earlier runs chose for the ordinary GEMM shapes. A run that
-/// has met its shapes before then times none of them, which is a second of its first step, and two
-/// ranks that read the same file choose alike rather than each timing under the other's load.
+/// File that keeps the tilings the INT8 GEMM chose for its shapes between runs.
+#[cfg(feature = "cuda")]
+const INT8_TILING_CACHE: &str = "int8-gemm-tilings.txt";
+
+/// Takes over the cuBLASLt algorithms earlier runs chose for the ordinary GEMM shapes, and the
+/// tilings they chose for the INT8 GEMM shapes. A run that has met its shapes before then times
+/// none of them, which is a second of its first step, and two ranks that read the same file choose
+/// alike rather than each timing under the other's load.
 #[cfg(feature = "cuda")]
 pub fn load_algorithm_cache() {
-    let Some(cache) = algorithm_cache("matmul") else {
-        return;
-    };
-    match mmh3_cuda::algorithms::load_matmul(&cache) {
-        Ok(0) => {}
-        Ok(count) => println!("took {count} cuBLASLt algorithms from {}", cache.display()),
-        Err(error) => eprintln!("warning: reading {}: {error}", cache.display()),
+    if let Some(cache) = algorithm_cache("matmul") {
+        match mmh3_cuda::algorithms::load_matmul(&cache) {
+            Ok(0) => {}
+            Ok(count) => println!("took {count} cuBLASLt algorithms from {}", cache.display()),
+            Err(error) => eprintln!("warning: reading {}: {error}", cache.display()),
+        }
+    }
+    if let Some(cache) = cache_file(INT8_TILING_CACHE) {
+        match mmh3_cuda::algorithms::load_int8(&cache) {
+            Ok(0) => {}
+            Ok(count) => println!("took {count} INT8 GEMM tilings from {}", cache.display()),
+            Err(error) => eprintln!("warning: reading {}: {error}", cache.display()),
+        }
     }
 }
 
-/// Keeps the cuBLASLt algorithms this run chose for later runs.
+/// Keeps the cuBLASLt algorithms and INT8 GEMM tilings this run chose for later runs.
 #[cfg(feature = "cuda")]
 pub fn save_algorithm_cache() {
     // Two sessions of one worker can end at once, and both write the same temporary file before
@@ -163,16 +174,31 @@ pub fn save_algorithm_cache() {
     let _saving = SAVING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let saved = |cache: &PathBuf, result: std::io::Result<bool>| match result {
-        Ok(true) => println!("saved the cuBLASLt algorithms to {}", cache.display()),
+    let saved = |what: &str, cache: &PathBuf, result: std::io::Result<bool>| match result {
+        Ok(true) => println!("saved the {what} to {}", cache.display()),
         Ok(false) => {}
         Err(error) => eprintln!("warning: writing {}: {error}", cache.display()),
     };
     if let Some(cache) = algorithm_cache("matmul") {
-        saved(&cache, mmh3_cuda::algorithms::save_matmul(&cache));
+        saved(
+            "cuBLASLt algorithms",
+            &cache,
+            mmh3_cuda::algorithms::save_matmul(&cache),
+        );
     }
     if let Some(cache) = algorithm_cache("nvfp4") {
-        saved(&cache, mmh3_cuda::algorithms::save_nvfp4(&cache));
+        saved(
+            "cuBLASLt algorithms",
+            &cache,
+            mmh3_cuda::algorithms::save_nvfp4(&cache),
+        );
+    }
+    if let Some(cache) = cache_file(INT8_TILING_CACHE) {
+        saved(
+            "INT8 GEMM tilings",
+            &cache,
+            mmh3_cuda::algorithms::save_int8(&cache),
+        );
     }
 }
 

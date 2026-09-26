@@ -1,7 +1,8 @@
 #![cfg(target_os = "linux")]
 use mmh3_core::numeric::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 use mmh3_cuda::DeviceBuffer;
-use mmh3_cuda::gemm::{self, Adapter, ColumnMaxima, Output};
+use mmh3_cuda::algorithms;
+use mmh3_cuda::gemm::{self, Adapter, ColumnMaxima, Int8Tiling, Output};
 
 struct Random(u64);
 
@@ -47,8 +48,22 @@ fn u16_bytes(values: &[u16]) -> Vec<u8> {
         .collect()
 }
 
-/// Runs every config on random operands, with a random adapter of `rank` when it is not zero, and
-/// compares the output with an f64 reference within BF16 rounding. The adapter's down rows lie
+/// Every tiling that can run `n` outputs, and none for the one chosen for the shape.
+fn every_tiling(n: usize) -> Vec<Option<Int8Tiling>> {
+    let mut tilings = vec![None];
+    for config in 0..gemm::int8_config_count() {
+        if n.is_multiple_of(128 << config) {
+            for group_m in gemm::int8_group_heights() {
+                tilings.push(Some(Int8Tiling { config, group_m }));
+            }
+        }
+    }
+    tilings
+}
+
+/// Runs every tiling on random operands, with a random adapter of `rank` when it is not zero,
+/// compares the output with an f64 reference within BF16 rounding, and checks that every tiling
+/// gives the same bits. The adapter's down rows lie
 /// `down_stride` values apart, with values the kernel must skip in between. `f16_with_bias`
 /// switches to FP16 output with a random bias.
 fn check_every_config(
@@ -133,11 +148,12 @@ fn check_every_config(
     } else {
         (n - first_column) / 128
     };
-    for config in 0..gemm::int8_config_count() {
+    let mut first_output: Option<Vec<u8>> = None;
+    for tiling in every_tiling(n) {
         let mut output = DeviceBuffer::new(m * n * 2).unwrap();
         let maxima = DeviceBuffer::zeroed(groups.max(1) * 4).unwrap();
         gemm::int8(
-            config,
+            tiling,
             &activation_buffer,
             &weight_buffer,
             &activation_scale_buffer,
@@ -172,7 +188,7 @@ fn check_every_config(
         assert_eq!(
             maxima.to_f32().unwrap()[..groups],
             expected_maxima,
-            "{m} × {n} × {k}, rank {rank}, config {config}: column maxima"
+            "{m} × {n} × {k}, rank {rank}, {tiling:?}: column maxima"
         );
 
         for (index, &expected) in expected.iter().enumerate() {
@@ -185,10 +201,17 @@ fn check_every_config(
             let tolerance = expected.abs() / 256.0 + 1e-4;
             assert!(
                 (actual - expected).abs() <= tolerance,
-                "{m} × {n} × {k}, rank {rank}, config {config}, row {}, column {}: expected {expected}, got {actual}",
+                "{m} × {n} × {k}, rank {rank}, {tiling:?}, row {}, column {}: expected {expected}, got {actual}",
                 index / n,
                 index % n
             );
+        }
+        match &first_output {
+            Some(first) => assert!(
+                *first == output_bytes,
+                "{m} × {n} × {k}, rank {rank}: {tiling:?} differs from the first tiling"
+            ),
+            None => first_output = Some(output_bytes),
         }
     }
 }
@@ -273,28 +296,39 @@ fn writes_swiglu_of_interleaved_rows() {
             scale: adapter_scale,
         };
 
-        let mut output = DeviceBuffer::new(m * features * 2).unwrap();
-        gemm::int8(
-            0,
-            &activation_buffer,
-            &weight_buffer,
-            &activation_scale_buffer,
-            &weight_scale_buffer,
-            Output {
-                buffer: &mut output,
-                f16,
-                bias: Some(&bias_buffer),
-                swiglu: true,
-                column_maxima: None,
-            },
-            m,
-            n,
-            k,
-            Some(&adapter),
-        )
-        .unwrap();
-        let mut output_bytes = vec![0; m * features * 2];
-        output.copy_to_host(&mut output_bytes).unwrap();
+        let mut outputs = Vec::new();
+        for tiling in every_tiling(n) {
+            let mut output = DeviceBuffer::new(m * features * 2).unwrap();
+            gemm::int8(
+                tiling,
+                &activation_buffer,
+                &weight_buffer,
+                &activation_scale_buffer,
+                &weight_scale_buffer,
+                Output {
+                    buffer: &mut output,
+                    f16,
+                    bias: Some(&bias_buffer),
+                    swiglu: true,
+                    column_maxima: None,
+                },
+                m,
+                n,
+                k,
+                Some(&adapter),
+            )
+            .unwrap();
+            let mut output_bytes = vec![0; m * features * 2];
+            output.copy_to_host(&mut output_bytes).unwrap();
+            outputs.push((tiling, output_bytes));
+        }
+        let output_bytes = &outputs[0].1;
+        for (tiling, other) in &outputs[1..] {
+            assert!(
+                other == output_bytes,
+                "f16 {f16}: {tiling:?} differs from the first tiling"
+            );
+        }
 
         let product = |row: usize, column: usize| -> f32 {
             let dot: i32 = (0..k)
@@ -332,4 +366,48 @@ fn writes_swiglu_of_interleaved_rows() {
             }
         }
     }
+}
+
+#[test]
+fn keeps_the_chosen_tilings() {
+    // A shape no other test runs, with more rows of tiles than the shortest band.
+    let (m, n, k) = (1300, 1024, 256);
+    let mut random = Random(14);
+    let activations: Vec<u8> = (0..m * k).map(|_| random.int8() as u8).collect();
+    let weights: Vec<u8> = (0..n * k).map(|_| random.int8() as u8).collect();
+    let mut output = DeviceBuffer::new(m * n * 2).unwrap();
+    gemm::int8(
+        None,
+        &upload(&activations),
+        &upload(&weights),
+        &upload(&f32_bytes(&vec![1.0; m])),
+        &upload(&f32_bytes(&vec![0.001; n])),
+        Output {
+            buffer: &mut output,
+            f16: false,
+            bias: None,
+            swiglu: false,
+            column_maxima: None,
+        },
+        m,
+        n,
+        k,
+        None,
+    )
+    .unwrap();
+
+    let directory = std::env::temp_dir().join(format!("mmh3-int8-{}", std::process::id()));
+    let path = directory.join("tilings.txt");
+    assert!(algorithms::save_int8(&path).unwrap());
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with(&format!("{m} {n} {k} 0 ")))
+    );
+    let saved = text.lines().count() - 2;
+    assert!(algorithms::load_int8(&path).unwrap() >= saved);
+
+    std::fs::write(&path, text.replacen("format", "other format", 1)).unwrap();
+    assert_eq!(algorithms::load_int8(&path).unwrap(), 0);
+    std::fs::remove_dir_all(&directory).unwrap();
 }

@@ -227,7 +227,8 @@ and the exchange carries a block's input in the INT8 its layers already consume.
 cuBLASLt, whose algorithm for a GEMM depends on its shape, and a rank's share of the rows is another
 shape. `--consistent` runs one algorithm for every shape of a layer, never splits K and times
 nothing, and the leader tells every worker to do the same. It costs no measurable speed at 448×256
-or at 768p.
+or at 768p. The INT8 GEMM also times its tilings for each shape and keeps the fastest in
+`int8-gemm-tilings.txt`, but every tiling gives the same bits, so `--consistent` leaves it alone.
 
 Without it, each shape takes the fastest algorithm timed for it, which a later run takes over from
 `cublaslt-matmul-algorithms.txt` in `$XDG_CACHE_HOME/mmh3`. A split run then differs from the same

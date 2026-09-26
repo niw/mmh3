@@ -120,7 +120,7 @@ fn matches_the_exact_product_within_fp4_rounding() {
     let quantized_activations = quantize(&activations, m, k);
     let mut int8_output = DeviceBuffer::new(m * n * 2).unwrap();
     gemm::int8(
-        0,
+        None,
         &quantized_activations.0,
         &int8_weights,
         &quantized_activations.1,

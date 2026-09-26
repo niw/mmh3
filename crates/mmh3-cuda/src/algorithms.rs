@@ -3,7 +3,8 @@
 //!
 //! A choice comes from timing the heuristic's candidates on the shape's own operands, which costs
 //! about a second on the first step of a run. A file taken over at startup spares it: a run that
-//! has met its shapes before times none of them.
+//! has met its shapes before times none of them. The tilings the INT8 GEMM chose for its shapes
+//! are kept the same way.
 
 use crate::{CudaError, check};
 use std::ffi::{CStr, c_char, c_int};
@@ -19,6 +20,9 @@ unsafe extern "C" {
     fn mmh3_cublaslt_nvfp4_algorithm_key(key: *mut c_char, capacity: c_int) -> c_int;
     fn mmh3_cublaslt_consistent_by_default(consistent: c_int);
     fn mmh3_cublaslt_consistent_on_this_thread(consistent: c_int);
+    fn mmh3_int8_gemm_tilings(tilings: *mut Int8Tiling, capacity: c_int) -> c_int;
+    fn mmh3_int8_gemm_adopt(tilings: *const Int8Tiling, count: c_int);
+    fn mmh3_int8_gemm_tiling_key(key: *mut c_char, capacity: c_int) -> c_int;
 }
 
 /// Makes the GEMMs of every thread that has not been told otherwise consistent, or not. A
@@ -61,10 +65,26 @@ struct Nvfp4Algorithm {
     data: [u64; 8],
 }
 
+/// The tiling the INT8 GEMM chose for `m × k` activations, `n` outputs and an adapter of `rank`,
+/// or 0 without one.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Int8Tiling {
+    m: i64,
+    n: i64,
+    k: i64,
+    rank: i64,
+    config: i64,
+    group_m: i64,
+}
+
 /// First line of a file of chosen algorithms, followed by the line its key writes and a line per
 /// shape: the fields that name the shape and the eight words of the algorithm in hexadecimal.
 const MATMUL_HEADER: &str = "mmh3 cuBLASLt matmul algorithms";
 const NVFP4_HEADER: &str = "mmh3 cuBLASLt NVFP4 algorithms";
+/// First line of a file of INT8 GEMM tilings, followed by the line its key writes and a line per
+/// shape: m, n, k, the adapter rank, the config and the band height.
+const INT8_HEADER: &str = "mmh3 INT8 GEMM tilings";
 
 fn parse(line: &str, fields: usize) -> Option<(Vec<i64>, [u64; 8])> {
     let columns: Vec<&str> = line.split_whitespace().collect();
@@ -251,4 +271,56 @@ pub fn save_nvfp4(path: &Path) -> io::Result<bool> {
         ));
     }
     write(path, NVFP4_HEADER, &key, &entries)
+}
+
+/// Takes over the tilings that `save_int8` left in `path` for INT8 GEMM shapes and returns how
+/// many it took.
+pub fn load_int8(path: &Path) -> io::Result<usize> {
+    let key = key_of(|key, capacity| unsafe { mmh3_int8_gemm_tiling_key(key, capacity) })
+        .map_err(io::Error::other)?;
+    let Some(tilings) = read(path, INT8_HEADER, &key)?
+        .iter()
+        .map(|entry| {
+            let fields = entry
+                .split_whitespace()
+                .map(|text| text.parse().ok())
+                .collect::<Option<Vec<i64>>>()?;
+            let [m, n, k, rank, config, group_m] = fields[..] else {
+                return None;
+            };
+            Some(Int8Tiling {
+                m,
+                n,
+                k,
+                rank,
+                config,
+                group_m,
+            })
+        })
+        .collect::<Option<Vec<Int8Tiling>>>()
+    else {
+        return Ok(0);
+    };
+    // SAFETY: the slice holds `tilings.len()` tilings.
+    unsafe { mmh3_int8_gemm_adopt(tilings.as_ptr(), tilings.len() as c_int) };
+    Ok(tilings.len())
+}
+
+/// Writes the tilings this process chose for INT8 GEMM shapes to `path` for `load_int8`, and
+/// returns whether it wrote.
+pub fn save_int8(path: &Path) -> io::Result<bool> {
+    let tilings = chosen(|tilings, capacity| unsafe { mmh3_int8_gemm_tilings(tilings, capacity) });
+    if tilings.is_empty() {
+        return Ok(false);
+    }
+    let key = key_of(|key, capacity| unsafe { mmh3_int8_gemm_tiling_key(key, capacity) })
+        .map_err(io::Error::other)?;
+    let mut entries = String::new();
+    for tiling in &tilings {
+        entries.push_str(&format!(
+            "{} {} {} {} {} {}\n",
+            tiling.m, tiling.n, tiling.k, tiling.rank, tiling.config, tiling.group_m
+        ));
+    }
+    write(path, INT8_HEADER, &key, &entries)
 }

@@ -54,7 +54,7 @@ fn product(
 ) -> Vec<f32> {
     let mut output = DeviceBuffer::new(m * n * 2).unwrap();
     gemm::int8(
-        0,
+        None,
         &activations.0,
         &weights.0,
         &activations.1,
