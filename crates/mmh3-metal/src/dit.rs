@@ -3,7 +3,7 @@
 use crate::{
     Device, Error, Result,
     model::Weights,
-    ops::{Array, RowMap},
+    ops::{Array, RowMap, attends_in_half},
     shard::ShardContext,
     sparse::SparsePass,
     streaming::{Pass, Stream, fits},
@@ -261,40 +261,30 @@ impl MetalDit {
     ) -> Result<Array> {
         let c = &self.config;
         let qkv = self.weights.linear(x, &format!("{prefix}.attn.qkv_proj"))?;
-        let norm = |offset, name: &str| -> Result<Array> {
-            let x = qkv
-                .slice(0, x.rows, offset, c.inner())?
-                .reshape(x.rows * c.heads, c.head_dim)?;
-            let x = self
-                .weights
-                .norm(&x, &format!("{prefix}.attn.{name}_norm"), c.norm_eps)?
-                .reshape(qkv.rows, c.inner())?;
-            if let Some(angles) = angles {
-                x.rope(c.heads, angles)
-            } else {
-                Ok(x)
+        let norm = |name: &str| -> Result<Array> {
+            let name = format!("{prefix}.attn.{name}_norm");
+            if self.weights.contains(&format!("{name}.bias")) {
+                return Err(Error::new(format!("{name}: expected an RMS norm")));
             }
+            self.weights.vector(&format!("{name}.weight"))
         };
-
-        let q = norm(0, "q")?;
-        let k = norm(c.inner(), "k")?;
-        let v = qkv.slice(0, x.rows, 2 * c.inner(), c.inner())?;
+        let half = attends_in_half(self.device(), self.weights.attention_precision, c.head_dim);
+        let inputs = qkv.attention_inputs(
+            c.heads,
+            (&norm("q")?, &norm("k")?),
+            c.norm_eps,
+            angles,
+            half,
+        )?;
         let attended = match sparse {
             Some(sparse) => {
                 let gate = format!("{prefix}.attn.to_gate_compress");
                 let gate = (sparse.is_vsa() && self.weights.contains(&format!("{gate}.weight")))
                     .then(|| self.weights.linear(x, &gate))
                     .transpose()?;
-                sparse.attend(&q, &k, &v, gate.as_ref(), self.weights.attention_precision)?
+                sparse.attend(&inputs, gate.as_ref())?
             }
-            None => q.attention_at(
-                &k,
-                &v,
-                c.heads,
-                c.heads,
-                false,
-                self.weights.attention_precision,
-            )?,
+            None => inputs.attend()?,
         };
         self.weights
             .linear(&attended, &format!("{prefix}.attn.out_proj"))

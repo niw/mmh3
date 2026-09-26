@@ -375,6 +375,75 @@ kernel void pack_linear_input(device const float *x [[buffer(0)]],
     }
 }
 
+// SiLU of the first half of a row times its second half, the MLP's gate: rows of 2 × p[1] values
+// in, of p[1] out.
+kernel void swiglu(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                   constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint width = p[1], at = i / width * 2 * width + i % width;
+    const float gate = x[at];
+    y[i] = gate / (1 + exp(-gate)) * x[at + width];
+}
+
+// A block's attention inputs from its qkv projection, rows of [3][heads][p[4]] for heads of up to
+// 256: the queries and keys RMS-normalized per head by their weights, and with p[1] pairs of angles
+// a token rotated in the first 2 × p[1] dimensions of each head. All three are written as FP16 for
+// the matrix units, or as FP32. Eight SIMD groups a token, a head at a time.
+kernel void attention_inputs(
+    device const float *qkv [[buffer(0)]], device const float *q_norm [[buffer(1)]],
+    device const float *k_norm [[buffer(2)]], device const float *angles [[buffer(3)]],
+    device uchar *q [[buffer(4)]], device uchar *k [[buffer(5)]], device uchar *v [[buffer(6)]],
+    constant uint *p [[buffer(7)]], uint token [[threadgroup_position_in_grid]],
+    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint MAX_DIM = 256, PARTS = MAX_DIM / 32;
+    threadgroup float normalized[8][MAX_DIM];
+    const uint heads = p[0], pairs = p[1], half_out = p[2], dim = p[4], inner = heads * dim;
+    const float epsilon = as_type<float>(p[3]);
+    for (uint h = simd; h < 3 * heads; h += 8) {
+        const uint tensor = h / heads, head = h % heads;
+        device const float *row = qkv + token * 3 * inner + tensor * inner + head * dim;
+        float x[PARTS], squares = 0;
+        for (uint c = 0; c < PARTS; ++c) {
+            const uint d = lane + c * 32;
+            x[c] = d < dim ? row[d] : 0;
+            squares += x[c] * x[c];
+        }
+        if (tensor < 2) {
+            const float inverse = rsqrt(simd_sum(squares) / dim + epsilon);
+            device const float *weight = tensor == 0 ? q_norm : k_norm;
+            for (uint c = 0; c < PARTS; ++c)
+                if (lane + c * 32 < dim)
+                    x[c] *= inverse * weight[lane + c * 32];
+        }
+        if (tensor < 2 && pairs) {
+            for (uint c = 0; c < PARTS; ++c)
+                normalized[simd][lane + c * 32] = x[c];
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint c = 0; c < PARTS; ++c) {
+                const uint d = lane + c * 32, pair = d % pairs;
+                if (d >= 2 * pairs)
+                    continue;
+                const float a = angles[token * pairs + pair];
+                const float first = normalized[simd][pair], second = normalized[simd][pair + pairs];
+                x[c] =
+                    d < pairs ? first * cos(a) - second * sin(a) : first * sin(a) + second * cos(a);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        device uchar *out = tensor == 0 ? q : tensor == 1 ? k : v;
+        for (uint c = 0; c < PARTS; ++c) {
+            const uint d = lane + c * 32, i = (token * heads + head) * dim + d;
+            if (d >= dim)
+                continue;
+            if (half_out)
+                ((device half *)out)[i] = half(x[c]);
+            else
+                ((device float *)out)[i] = x[c];
+        }
+    }
+}
+
 // The FP16 copy of an attention input that the tensor-product attention reads.
 kernel void float_to_half(device const float *x [[buffer(0)]], device half *y [[buffer(1)]],
                           constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
@@ -507,9 +576,9 @@ float group_reduce(float value, threadgroup float *scratch, uint simd, uint lane
     return result;
 }
 
-// Two heads a threadgroup, a thread a dimension.
-kernel void sparse_pool(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],
-                        device const float *v [[buffer(2)]],
+// Two heads a threadgroup, a thread a dimension. The inputs are FP32, or FP16 with p[2] = 1.
+kernel void sparse_pool(device const uchar *q [[buffer(0)]], device const uchar *k [[buffer(1)]],
+                        device const uchar *v [[buffer(2)]],
                         device const uint *starts [[buffer(3)]],
                         device const uint *lengths [[buffer(4)]],
                         device float *pooled_q [[buffer(5)]], device float *pooled_k [[buffer(6)]],
@@ -525,9 +594,9 @@ kernel void sparse_pool(device const float *q [[buffer(0)]], device const float 
     float queries = 0, keys = 0, values = 0;
     for (uint r = 0; r < rows; ++r) {
         const uint i = ((start + r) * heads + head) * SPARSE_HEAD + d;
-        queries += q[i];
-        keys += k[i];
-        values += v[i];
+        queries += load_value(q, i, p[2]);
+        keys += load_value(k, i, p[2]);
+        values += load_value(v, i, p[2]);
     }
     const uint o = (head * tiles + tile) * SPARSE_HEAD + d;
     pooled_q[o] = queries / rows;

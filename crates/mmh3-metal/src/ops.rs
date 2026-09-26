@@ -785,23 +785,80 @@ impl Array {
         causal: bool,
     ) -> Result<Self> {
         let (q, k, v) = (self.to_half()?, key.to_half()?, value.to_half()?);
-        let dim = self.cols / heads;
-        let out = Self::empty(self.device(), self.rows, self.cols)?;
-        self.device().run(
-            &format!("mpp_attention_{dim}"),
-            &[&q, &k, &v, &out.buffer],
+        half_attention(
+            self.device(),
+            [&q, &k, &v],
+            [self.rows, key.rows],
+            heads,
+            kv_heads,
+            self.cols / heads,
+            causal,
+        )
+    }
+
+    /// A block's attention inputs from its qkv projection's output, rows of `[3][heads][dim]` for
+    /// heads of up to 256:
+    /// the queries and keys RMS-normalized per head by `q_norm` and `k_norm` and rotated by
+    /// `angles`, and all three in FP16 for the matrix units with `half`. One pass reads the
+    /// projection and writes what the attention reads.
+    pub(crate) fn attention_inputs(
+        &self,
+        heads: usize,
+        (q_norm, k_norm): (&Self, &Self),
+        epsilon: f32,
+        angles: Option<&Self>,
+        half: bool,
+    ) -> Result<AttentionInputs> {
+        let dim = self.cols / 3 / heads.max(1);
+        let inner = heads * dim;
+        let pairs = angles.map_or(0, |angles| angles.cols);
+        if heads == 0
+            || self.cols != 3 * inner
+            || dim > 256
+            || q_norm.len() != dim
+            || k_norm.len() != dim
+            || angles.is_some_and(|angles| angles.rows != self.rows || 2 * pairs > dim)
+        {
+            return Err(Error::new("invalid attention input shapes".into()));
+        }
+
+        let device = self.device();
+        let bytes = self.rows * inner * if half { 2 } else { 4 };
+        let (query, key, value) = (
+            device.alloc(bytes, None)?,
+            device.alloc(bytes, None)?,
+            device.alloc(bytes, None)?,
+        );
+        device.run(
+            "attention_inputs",
             &[
-                key.rows as u32,
-                heads as u32,
-                kv_heads as u32,
-                dim as u32,
-                causal as u32,
-                self.rows as u32,
+                &self.buffer,
+                &q_norm.buffer,
+                &k_norm.buffer,
+                &angles.unwrap_or(q_norm).buffer,
+                &query,
+                &key,
+                &value,
             ],
-            self.rows.div_ceil(TENSOR_ATTENTION_QUERIES) * heads,
+            &[
+                heads as u32,
+                pairs as u32,
+                half as u32,
+                epsilon.to_bits(),
+                dim as u32,
+            ],
+            self.rows,
             true,
         )?;
-        Ok(out)
+        Ok(AttentionInputs {
+            query,
+            key,
+            value,
+            rows: self.rows,
+            heads,
+            dim,
+            half,
+        })
     }
 
     /// The FP16 copy of an input that the attention on the matrix units reads.
@@ -822,9 +879,15 @@ impl Array {
             return Err(Error::new("SwiGLU requires two equal halves".into()));
         }
 
-        self.slice(0, self.rows, 0, self.cols / 2)?
-            .unary(1, 1.0)?
-            .mul(&self.slice(0, self.rows, self.cols / 2, self.cols / 2)?)
+        let out = Self::empty(self.device(), self.rows, self.cols / 2)?;
+        self.device().run(
+            "swiglu",
+            &[&self.buffer, &out.buffer],
+            &[out.len() as u32, out.cols as u32],
+            out.len(),
+            false,
+        )?;
+        Ok(out)
     }
 
     pub(crate) fn modulate(
@@ -907,6 +970,121 @@ impl Array {
         Ok(out)
     }
 }
+/// Whether attention at `precision` over heads of `dim` runs on the matrix units, which read FP16
+/// inputs.
+pub(crate) fn attends_in_half(device: &Device, precision: AttentionPrecision, dim: usize) -> bool {
+    precision == AttentionPrecision::Fp16
+        && [64, 128].contains(&dim)
+        && device.supports_tensor_ops()
+}
+
+/// `flash_attention` over FP16 query, key and value rows of `rows` = [queries, keys].
+fn half_attention(
+    device: &Device,
+    [q, k, v]: [&Buffer; 3],
+    [queries, keys]: [usize; 2],
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+    causal: bool,
+) -> Result<Array> {
+    let out = Array::empty(device, queries, heads * dim)?;
+    device.run(
+        &format!("mpp_attention_{dim}"),
+        &[q, k, v, &out.buffer],
+        &[
+            keys as u32,
+            heads as u32,
+            kv_heads as u32,
+            dim as u32,
+            causal as u32,
+            queries as u32,
+        ],
+        queries.div_ceil(TENSOR_ATTENTION_QUERIES) * heads,
+        true,
+    )?;
+    Ok(out)
+}
+
+/// A block's query, key and value, `[tokens, heads × dim]` each, in FP16 for the attention on the
+/// matrix units or in FP32 for the FP32 attention.
+pub struct AttentionInputs {
+    pub(crate) query: Buffer,
+    pub(crate) key: Buffer,
+    pub(crate) value: Buffer,
+    pub(crate) rows: usize,
+    pub(crate) heads: usize,
+    pub(crate) dim: usize,
+    pub(crate) half: bool,
+}
+
+impl AttentionInputs {
+    /// The inputs of FP32 arrays, converted to FP16 with `half`.
+    pub fn from_arrays(
+        query: &Array,
+        key: &Array,
+        value: &Array,
+        heads: usize,
+        half: bool,
+    ) -> Result<Self> {
+        if heads == 0
+            || !query.cols.is_multiple_of(heads)
+            || key.shape() != query.shape()
+            || value.shape() != query.shape()
+        {
+            return Err(Error::new("invalid attention input shapes".into()));
+        }
+        let buffer = |x: &Array| {
+            if half {
+                x.to_half()
+            } else {
+                Ok(x.buffer.clone())
+            }
+        };
+        Ok(Self {
+            query: buffer(query)?,
+            key: buffer(key)?,
+            value: buffer(value)?,
+            rows: query.rows,
+            heads,
+            dim: query.cols / heads,
+            half,
+        })
+    }
+
+    pub fn width(&self) -> usize {
+        self.heads * self.dim
+    }
+
+    /// Dense attention of every row over every row.
+    pub(crate) fn attend(&self) -> Result<Array> {
+        let device = &self.query.0.device;
+        if self.half {
+            return half_attention(
+                device,
+                [&self.query, &self.key, &self.value],
+                [self.rows, self.rows],
+                self.heads,
+                self.heads,
+                self.dim,
+                false,
+            );
+        }
+        let array = |buffer: &Buffer| Array {
+            buffer: buffer.clone(),
+            rows: self.rows,
+            cols: self.width(),
+        };
+        array(&self.query).attention(
+            &array(&self.key),
+            &array(&self.value),
+            self.heads,
+            self.heads,
+            false,
+        )
+    }
+}
+
 pub(crate) fn dtype_code(dtype: DType) -> Result<u32> {
     match dtype {
         DType::F32 => Ok(0),
@@ -955,6 +1133,72 @@ pub(crate) fn convert(
 mod tests {
     use super::*;
     use mmh3_core::numeric::{f32_to_bf16, f32_to_f16};
+
+    /// The fused pass gives what slicing the projection, normalizing, rotating and attending give
+    /// one step at a time, in both precisions and with and without angles.
+    #[test]
+    fn attention_inputs_match_the_steps_they_fuse() {
+        let device = Device::new().unwrap();
+        let (rows, heads, dim, pairs) = (150, 3, 128, 48);
+        let inner = heads * dim;
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
+                .collect()
+        };
+        let qkv = Array::from_f32(&device, rows, 3 * inner, &fill(rows * 3 * inner, 31)).unwrap();
+        let q_norm = Array::from_f32(&device, 1, dim, &fill(dim, 17)).unwrap();
+        let k_norm = Array::from_f32(&device, 1, dim, &fill(dim, 13)).unwrap();
+        let angles = Array::from_f32(&device, rows, pairs, &fill(rows * pairs, 7)).unwrap();
+        for angles in [None, Some(&angles)] {
+            let step = |offset: usize, weight: &Array| {
+                let x = qkv
+                    .slice(0, rows, offset, inner)
+                    .unwrap()
+                    .reshape(rows * heads, dim)
+                    .unwrap()
+                    .norm(weight, 1e-5, false)
+                    .unwrap()
+                    .reshape(rows, inner)
+                    .unwrap();
+                angles.map_or(x.clone(), |angles| x.rope(heads, angles).unwrap())
+            };
+            let (q, k) = (step(0, &q_norm), step(inner, &k_norm));
+            let v = qkv.slice(0, rows, 2 * inner, inner).unwrap();
+            for half in [false, true]
+                .into_iter()
+                .take(1 + device.supports_tensor_ops() as usize)
+            {
+                let precision = if half {
+                    AttentionPrecision::Fp16
+                } else {
+                    AttentionPrecision::Fp32
+                };
+                let expected = q
+                    .attention_at(&k, &v, heads, heads, false, precision)
+                    .unwrap()
+                    .to_f32()
+                    .unwrap();
+                let got = qkv
+                    .attention_inputs(heads, (&q_norm, &k_norm), 1e-5, angles, half)
+                    .unwrap()
+                    .attend()
+                    .unwrap()
+                    .to_f32()
+                    .unwrap();
+                let worst = got
+                    .iter()
+                    .zip(&expected)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0, f32::max);
+                assert!(
+                    worst < 1e-4,
+                    "FP16 {half}, angles {}: {worst}",
+                    angles.is_some()
+                );
+            }
+        }
+    }
 
     #[test]
     fn tensor_attention_matches_reference() {

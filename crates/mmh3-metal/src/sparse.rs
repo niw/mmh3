@@ -1,7 +1,10 @@
 //! Block-sparse attention over the DiT's heads of 128: Sol-Attn and VSA, as mmh3-core's
 //! `dit::sparse` and `dit::vsa` describe them. ops.metal says what each kernel does.
 
-use crate::{AttentionPrecision, Buffer, Device, Error, Result, ops::Array};
+use crate::{
+    Buffer, Device, Error, Result,
+    ops::{Array, AttentionInputs},
+};
 use mmh3_core::dit::{
     sparse::{SPARSE_BLOCK, SparseSinks},
     vsa::VsaPlan,
@@ -139,21 +142,14 @@ impl SparsePass {
         matches!(self.routing, Routing::Vsa { .. })
     }
 
-    /// Attention of `query`, `key` and `value`, `[tokens, heads × 128]` in the sequence's order.
-    /// VSA adds `gate`, in the same layout, times its coarse output.
-    pub fn attend(
-        &self,
-        query: &Array,
-        key: &Array,
-        value: &Array,
-        gate: Option<&Array>,
-        precision: AttentionPrecision,
-    ) -> Result<Array> {
+    /// Attention of `inputs`, in the sequence's order and in their precision: FP16 on the matrix
+    /// units or FP32. VSA adds `gate`, `[tokens, heads × 128]`, times its coarse output.
+    pub fn attend(&self, inputs: &AttentionInputs, gate: Option<&Array>) -> Result<Array> {
         let width = self.heads * HEAD;
-        if [query, key, value]
-            .into_iter()
-            .chain(gate)
-            .any(|x| x.shape() != [self.tokens, width])
+        if inputs.rows != self.tokens
+            || inputs.heads != self.heads
+            || inputs.dim != HEAD
+            || gate.is_some_and(|gate| gate.shape() != [self.tokens, width])
         {
             return Err(Error::new(
                 "sparse attention inputs do not match its sequence".into(),
@@ -162,22 +158,22 @@ impl SparsePass {
         if gate.is_some() && !self.is_vsa() {
             return Err(Error::new("only VSA takes a gate".into()));
         }
-        let device = query.device();
+        let device = &inputs.query.0.device;
         let (tiles, heads) = (self.tiles as u32, self.heads as u32);
         let pairs = self.tiles * self.heads.div_ceil(2);
         device.run(
             "sparse_pool",
             &[
-                &query.buffer,
-                &key.buffer,
-                &value.buffer,
+                &inputs.query,
+                &inputs.key,
+                &inputs.value,
                 &self.starts,
                 &self.lengths,
                 &self.pooled_queries,
                 &self.pooled_keys,
                 &self.pooled_values,
             ],
-            &[tiles, heads],
+            &[tiles, heads, inputs.half as u32],
             pairs,
             true,
         )?;
@@ -253,14 +249,13 @@ impl SparsePass {
             scale_log2.to_bits(),
         ];
         let gate = gate.map_or(&self.starts, |gate| &gate.buffer);
-        if precision == AttentionPrecision::Fp16 && device.supports_tensor_ops() {
-            let (q, k, v) = (query.to_half()?, key.to_half()?, value.to_half()?);
+        if inputs.half {
             device.run(
                 "mpp_sparse_attention_128",
                 &[
-                    &q,
-                    &k,
-                    &v,
+                    &inputs.query,
+                    &inputs.key,
+                    &inputs.value,
                     &out.buffer,
                     &self.starts,
                     &self.lengths,
@@ -278,9 +273,9 @@ impl SparsePass {
             device.run(
                 "attention_sparse_128",
                 &[
-                    &query.buffer,
-                    &key.buffer,
-                    &value.buffer,
+                    &inputs.query,
+                    &inputs.key,
+                    &inputs.value,
                     &out.buffer,
                     &self.starts,
                     &self.lengths,
@@ -336,10 +331,11 @@ mod tests {
             .fold(0.0, f32::max)
     }
 
-    fn precisions(device: &Device) -> Vec<(AttentionPrecision, f32)> {
-        let mut precisions = vec![(AttentionPrecision::Fp32, 1e-4)];
+    /// Whether the inputs are FP16, and how far from the reference the output may be.
+    fn precisions(device: &Device) -> Vec<(bool, f32)> {
+        let mut precisions = vec![(false, 1e-4)];
         if device.supports_tensor_ops() {
-            precisions.push((AttentionPrecision::Fp16, 5e-3));
+            precisions.push((true, 5e-3));
         }
         precisions
     }
@@ -360,17 +356,16 @@ mod tests {
             mmh3_core::dit::sparse::reference(&q, &k, &v, tokens, heads, HEAD, 1.3, scale, sinks);
         assert!(routed < 1.0, "every block routed, which tests nothing");
         let upload = |x: &[f32]| Array::from_f32(&device, tokens, heads * HEAD, x).unwrap();
-        for (precision, tolerance) in precisions(&device) {
+        for (half, tolerance) in precisions(&device) {
             let sparse = SparsePass::sol(&device, tokens, heads, 1.3, sinks).unwrap();
-            let out = sparse
-                .attend(&upload(&q), &upload(&k), &upload(&v), None, precision)
-                .unwrap()
-                .to_f32()
-                .unwrap();
+            let inputs =
+                AttentionInputs::from_arrays(&upload(&q), &upload(&k), &upload(&v), heads, half)
+                    .unwrap();
+            let out = sparse.attend(&inputs, None).unwrap().to_f32().unwrap();
             let difference = largest_difference(&out, &expected);
             assert!(
                 difference < tolerance,
-                "{precision:?} is {difference} from the reference"
+                "FP16 {half}: {difference} from the reference"
             );
             let fraction = sparse.routed_fraction().unwrap().unwrap();
             assert!(
@@ -413,23 +408,25 @@ mod tests {
                 scale,
                 kept,
             );
-            for (precision, tolerance) in precisions(&device) {
+            for (half, tolerance) in precisions(&device) {
                 let sparse = SparsePass::vsa(&device, &plan, heads, kept).unwrap();
+                let inputs = AttentionInputs::from_arrays(
+                    &upload(&q),
+                    &upload(&k),
+                    &upload(&v),
+                    heads,
+                    half,
+                )
+                .unwrap();
                 let out = sparse
-                    .attend(
-                        &upload(&q),
-                        &upload(&k),
-                        &upload(&v),
-                        gate.map(|g| upload(g)).as_ref(),
-                        precision,
-                    )
+                    .attend(&inputs, gate.map(|g| upload(g)).as_ref())
                     .unwrap()
                     .to_f32()
                     .unwrap();
                 let difference = largest_difference(&out, &expected);
                 assert!(
                     difference < tolerance,
-                    "{precision:?} with a gate {} is {difference} from the reference",
+                    "FP16 {half} with a gate {}: {difference} from the reference",
                     gate.is_some()
                 );
             }
