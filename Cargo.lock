@@ -618,6 +618,9 @@ dependencies = [
 [[package]]
 name = "mmh3-rdma"
 version = "0.1.0"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "moxcms"

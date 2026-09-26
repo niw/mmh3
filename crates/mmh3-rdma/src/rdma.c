@@ -73,6 +73,9 @@ typedef struct {
 #define READ_CHUNK_BYTES (8u << 20)
 #define READ_DEPTH 16
 
+void mmh3_rdma_close(Mmh3Rdma *rdma);
+void mmh3_rdma_link_close(Mmh3RdmaLink *link);
+
 // Whether a GID is an IPv4 address mapped into IPv6, which is how RoCE v2 carries one.
 static int is_mapped_v4(const union ibv_gid *global_id) {
     static const uint8_t prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};

@@ -6,3 +6,6 @@ license.workspace = true
 publish = false
 build = "build.rs"
 links = "mmh3_rdma"
+
+[build-dependencies]
+cc = "1"

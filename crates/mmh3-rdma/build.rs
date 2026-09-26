@@ -1,27 +1,27 @@
 use std::env;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 
 fn main() {
+    println!("cargo:rerun-if-changed=src/rdma.c");
+    println!("cargo:rustc-check-cfg=cfg(mmh3_rdma_without_verbs)");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
         // The crate is empty off Linux, so the workspace builds without libibverbs.
         return;
     }
-    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let source = manifest.join("src/rdma.c");
-    println!("cargo:rerun-if-changed={}", source.display());
 
-    println!("cargo:rerun-if-env-changed=CC");
-    println!("cargo:rustc-check-cfg=cfg(mmh3_rdma_without_verbs)");
-
-    let compiler = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
-    if !has_verbs(&compiler) {
+    let mut build = cc::Build::new();
+    build
+        .file("src/rdma.c")
+        .std("c11")
+        .define("_POSIX_C_SOURCE", "200809L")
+        .opt_level(2);
+    if !has_verbs(&build) {
         // Without the headers the crate builds with no device to open, and the socket carries
         // everything. The directories the compiler searches are watched, so installing
         // libibverbs later runs this again.
-        for directory in include_directories(&compiler) {
+        for directory in include_directories(&build) {
             println!("cargo:rerun-if-changed={}", directory.display());
         }
         println!("cargo:warning=infiniband/verbs.h was not found, so mmh3 builds without RDMA");
@@ -29,40 +29,15 @@ fn main() {
         return;
     }
 
-    let object = out.join("rdma.o");
-    let status = Command::new(&compiler)
-        .args([
-            "-O2",
-            "-fPIC",
-            "-std=c11",
-            "-D_POSIX_C_SOURCE=200809L",
-            "-Wall",
-            "-c",
-        ])
-        .arg(&source)
-        .arg("-o")
-        .arg(&object)
-        .status()
-        .expect("failed to run the C compiler");
-    assert!(status.success(), "{compiler} failed");
-
-    let library = out.join("libmmh3_rdma.a");
-    let status = Command::new("ar")
-        .arg("crs")
-        .arg(&library)
-        .arg(&object)
-        .status()
-        .expect("failed to run ar");
-    assert!(status.success(), "ar failed");
-
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=mmh3_rdma");
+    build.compile("mmh3_rdma");
     println!("cargo:rustc-link-lib=dylib=ibverbs");
 }
 
 /// Whether the compiler finds the libibverbs headers.
-fn has_verbs(compiler: &str) -> bool {
-    let Ok(mut child) = Command::new(compiler)
+fn has_verbs(build: &cc::Build) -> bool {
+    let Ok(mut child) = build
+        .get_compiler()
+        .to_command()
         .args(["-E", "-x", "c", "-", "-o", "/dev/null"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -81,8 +56,10 @@ fn has_verbs(compiler: &str) -> bool {
 }
 
 /// The existing directories the compiler searches for `#include <...>`.
-fn include_directories(compiler: &str) -> Vec<PathBuf> {
-    let Ok(output) = Command::new(compiler)
+fn include_directories(build: &cc::Build) -> Vec<PathBuf> {
+    let Ok(output) = build
+        .get_compiler()
+        .to_command()
         .args(["-E", "-v", "-x", "c", "/dev/null", "-o", "/dev/null"])
         .output()
     else {
