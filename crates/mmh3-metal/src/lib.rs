@@ -92,8 +92,8 @@ pub enum LinearPrecision {
     MpsFp16,
 }
 
-/// Precision of dense attention over heads of 128, which the DiT and the text encoder use. Other
-/// head widths use FP32 either way.
+/// Precision of dense attention over heads of 64 or 128, which the DiT, the text encoder and the
+/// video VAE use. Other head widths use FP32 either way.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AttentionPrecision {
     #[default]

@@ -129,10 +129,10 @@ kernel void mpp_lora(device float *a [[buffer(0)]], device half *b [[buffer(1)]]
     }
 }
 
-// Flash attention on the matrix units for heads of 128. A threadgroup of eight SIMD groups owns
-// 128 queries of one head and walks the keys 64 at a time. Q·Kᵀ and P·V are tensor products in
-// FP16 with FP32 accumulation, which the eight groups run together: that is the shape that keeps
-// the matrix units busy, where a group running its own rows leaves them mostly idle.
+// Flash attention on the matrix units for heads of D, 64 or 128. A threadgroup of eight SIMD
+// groups owns 128 queries of one head and walks the keys 64 at a time. Q·Kᵀ and P·V are tensor
+// products in FP16 with FP32 accumulation, which the eight groups run together: that is the shape
+// that keeps the matrix units busy, where a group running its own rows leaves them mostly idle.
 //
 // The online softmax runs between the products, two threads a query row. The scores go to
 // threadgroup memory as FP32, and the FP16 probabilities are written back over them, so the
@@ -143,24 +143,20 @@ kernel void mpp_lora(device float *a [[buffer(0)]], device half *b [[buffer(1)]]
 // reference only when a score passes it by more than RAISE. Probabilities then reach e^RAISE,
 // which FP16 holds, and a tile where no row moved skips the rescale. Whether any row of a SIMD
 // group moved goes in the float before the correction of the group's first row.
-constant constexpr int ATTENTION_QUERIES = 128, ATTENTION_KEYS = 64, ATTENTION_D = 128;
+constant constexpr int ATTENTION_QUERIES = 128, ATTENTION_KEYS = 64;
 constant constexpr float RAISE = 8;
 
-kernel void mpp_attention(device half *q [[buffer(0)]], device half *k [[buffer(1)]],
-                          device half *v [[buffer(2)]], device float *o [[buffer(3)]],
-                          constant uint *p [[buffer(4)]], uint g [[threadgroup_position_in_grid]],
-                          uint tid [[thread_index_in_threadgroup]],
-                          uint simd [[simdgroup_index_in_threadgroup]],
-                          uint lane [[thread_index_in_simdgroup]]) {
-    constexpr int QUERIES = ATTENTION_QUERIES, KEYS = ATTENTION_KEYS, D = ATTENTION_D;
+template <int D>
+void flash_attention(device half *q, device half *k, device half *v, device float *o,
+                     constant uint *p, uint g, uint tid, uint simd, uint lane,
+                     threadgroup float *scores) {
+    constexpr int QUERIES = ATTENTION_QUERIES, KEYS = ATTENTION_KEYS;
     constexpr int SPAN = KEYS / 2, LAST = KEYS - 1;
     const int count = p[0], heads = p[1], kv_heads = p[2], causal = p[4], rows = p[5];
     const int head = g % heads, first = (g / heads) * QUERIES;
     const int kv_head = head / (heads / kv_heads);
     const int limit = causal ? min(count, first + QUERIES) : count;
     const float scale = rsqrt(float(D));
-
-    threadgroup float scores[QUERIES * KEYS];
     threadgroup half *probabilities = (threadgroup half *)scores;
 
     using Tile = tensor<device half, dextents<int, 2>, tensor_inline>;
@@ -270,3 +266,16 @@ kernel void mpp_attention(device half *q [[buffer(0)]], device half *k [[buffer(
         }
     }
 }
+
+#define ATTENTION(D)                                                                               \
+    kernel void mpp_attention_##D(                                                                 \
+        device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],  \
+        device float *o [[buffer(3)]], constant uint *p [[buffer(4)]],                             \
+        uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],         \
+        uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {   \
+        threadgroup float scores[ATTENTION_QUERIES * ATTENTION_KEYS];                              \
+        flash_attention<D>(q, k, v, o, p, g, tid, simd, lane, scores);                             \
+    }
+ATTENTION(64)
+ATTENTION(128)
+#undef ATTENTION

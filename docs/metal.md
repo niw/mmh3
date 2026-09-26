@@ -64,11 +64,12 @@ feature selects CUDA/NVENC. Use `--ffmpeg` for an external encoder override. See
 
 ## Options and current limits
 
-On macOS 26 and later, the DiT and the text encoder run on the GPU's matrix units by default,
-the Neural Accelerators on an M5 or later. The DiT's INT8-weight layers take INT8 activations,
-rotated and quantized a row at a time as on CUDA, and dense attention over heads of 128 takes FP16
-products with FP32 softmax and accumulation. A LoRA adapter's two products read FP16 copies of its
-weights. On an older macOS the defaults are FP16 products through MPS and FP32 attention.
+On macOS 26 and later, the DiT, the text encoder and the video VAE's transformer run on the GPU's
+matrix units by default, the Neural Accelerators on an M5 or later. Their INT8-weight layers take
+INT8 activations, rotated and quantized a row at a time as on CUDA, and their dense attention
+takes FP16 products with FP32 softmax and accumulation. A LoRA adapter's two products read FP16
+copies of its weights. On an older macOS the defaults are FP16 products through MPS and FP32
+attention.
 
 `--linear-precision` selects the product of the DiT's INT8-weight layers:
 
@@ -79,15 +80,15 @@ weights. On an older macOS the defaults are FP16 products through MPS and FP32 a
 | `mps-fp16` | FP16 through MPS (default before macOS 26) |
 | `fp32` | FP32 reference mode |
 
-`--attention-precision` selects attention over heads of 128 in the DiT and the text encoder:
+`--attention-precision` selects the attention of the DiT, the text encoder and the video VAE:
 
 | Value | Mode |
 | --- | --- |
 | `fp16` | FP16 products through MPP (default on macOS 26+) |
 | `fp32` | FP32 reference mode (default before macOS 26) |
 
-Changing precision can change the generated sample even with the same seed. The video VAE's
-attention and the other layers compute in FP32.
+Changing precision can change the generated sample even with the same seed. The other layers
+compute in FP32.
 
 Text prompts, precomputed `--context` tensors and adapter LoRAs are supported. Image, audio and
 video conditioning (`--first-frame`, `--last-frame`, `--reference`, `--reference-audio`,

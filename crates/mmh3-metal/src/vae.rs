@@ -1,5 +1,7 @@
 //! Video VAE decoding, unpatchification and spatial/temporal blending on Metal.
-use crate::{Device, Error, Result, model::Weights, ops::Array};
+use crate::{
+    AttentionPrecision, Device, Error, LinearPrecision, Result, model::Weights, ops::Array,
+};
 use mmh3_core::{
     media::Yuv420,
     safetensors::SafeTensors,
@@ -37,6 +39,8 @@ pub struct MetalVideoDecoder {
     latents_std: Vec<f32>,
     tile_size: usize,
     overlap: usize,
+    /// The precisions of the transformer's INT8 layers and attention, FP32 unless set.
+    precision: (LinearPrecision, AttentionPrecision),
 }
 
 pub struct VideoDecoding {
@@ -196,6 +200,7 @@ impl MetalVideoDecoder {
             registers,
             latents_mean,
             latents_std,
+            precision: Default::default(),
             tile_size,
             overlap,
         })
@@ -211,10 +216,25 @@ impl MetalVideoDecoder {
         // NOTE: OnceCell::get_or_try_init is unstable, so the upload happens outside the cell and
         // a second caller racing to it would only build weights that are then dropped. Nothing
         // shares a decoder across threads: the table that keeps one holds it behind a lock.
-        let weights = Weights::load_selected(&self.file, &self.prefix, |name| {
+        let mut weights = Weights::load_selected(&self.file, &self.prefix, |name| {
             name.starts_with("decoder.") || name.starts_with("post_quant_conv.")
         })?;
+        weights.set_precision(self.precision)?;
         Ok(self.weights.get_or_init(|| weights))
+    }
+
+    /// Select the precisions of the transformer's INT8 layers and of its attention, whether the
+    /// weights are on the device yet or not.
+    pub fn set_precision(
+        &mut self,
+        linear: LinearPrecision,
+        attention: AttentionPrecision,
+    ) -> Result<()> {
+        if let Some(weights) = self.weights.get_mut() {
+            weights.set_precision((linear, attention))?;
+        }
+        self.precision = (linear, attention);
+        Ok(())
     }
 
     fn tile(
@@ -266,7 +286,7 @@ impl MetalVideoDecoder {
                 .slice(0, tokens * heads, 128, 64)?
                 .reshape(tokens, self.dim)?;
             let attended = w.linear(
-                &q.attention(&k, &v, heads, heads, false)?,
+                &q.attention_at(&k, &v, heads, heads, false, w.attention_precision)?,
                 &format!("{p}.attn.to_out"),
             )?;
             x = x.add(&attended.mul(&w.vector(&format!("{p}.scale1"))?)?)?;

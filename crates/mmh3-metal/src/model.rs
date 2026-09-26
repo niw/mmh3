@@ -321,6 +321,23 @@ impl Weights {
         convert(&self.device, &w.buffer, rows, count / rows, w.dtype)
     }
 
+    /// Both precisions at once, refused as the two setters refuse them.
+    pub(crate) fn set_precision(
+        &mut self,
+        (linear, attention): (LinearPrecision, AttentionPrecision),
+    ) -> Result<()> {
+        if matches!(linear, LinearPrecision::Fp16 | LinearPrecision::Int8)
+            && !self.device.supports_tensor_ops()
+        {
+            return Err(Error::new(
+                "low-precision Metal products require macOS 26 and Apple silicon".into(),
+            ));
+        }
+        self.set_attention_precision(attention)?;
+        self.linear_precision = linear;
+        Ok(())
+    }
+
     /// FP16 attention runs on the matrix units, so a device without them refuses it here rather
     /// than quietly running FP32.
     pub fn set_attention_precision(&mut self, precision: AttentionPrecision) -> Result<()> {

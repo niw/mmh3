@@ -90,6 +90,15 @@ pub fn default_linear_precision() -> LinearPrecision {
     }
 }
 
+/// The default of `--attention-precision`: FP16 on the matrix units, FP32 on a Mac without them.
+pub fn default_attention_precision() -> AttentionPrecision {
+    if has_tensor_ops() {
+        AttentionPrecision::Fp16
+    } else {
+        AttentionPrecision::Fp32
+    }
+}
+
 /// `--attention-precision`, FP16 on the matrix units by default and FP32 on a Mac without them.
 pub fn attention_precision(
     options: &HashMap<&str, &str>,
@@ -102,8 +111,7 @@ pub fn attention_precision(
                 format!("Metal runs --attention-precision fp32 or fp16, not {value}").into(),
             );
         }
-        None if has_tensor_ops() => AttentionPrecision::Fp16,
-        None => AttentionPrecision::Fp32,
+        None => default_attention_precision(),
     })
 }
 

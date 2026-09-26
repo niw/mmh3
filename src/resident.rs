@@ -160,7 +160,14 @@ impl Models {
             let (_, tile_size, tile_overlap) = key;
             let decoder = self.read(|| {
                 load(path, || {
-                    VideoDecoder::load(&file, "", tile_size, tile_overlap)
+                    #[allow(unused_mut)]
+                    let mut decoder = VideoDecoder::load(&file, "", tile_size, tile_overlap)?;
+                    #[cfg(feature = "metal")]
+                    decoder.set_precision(
+                        crate::metal::default_linear_precision(),
+                        crate::metal::default_attention_precision(),
+                    )?;
+                    Ok::<_, Box<dyn Error>>(decoder)
                 })
             })?;
             self.video_decoder.kept = Some((key, decoder));

@@ -74,10 +74,16 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
     // A run with workers hands every chunk out and only puts the canvases together, so it reads
     // the weights that made them only if one never arrives.
     let chunks_out = settings.workers_for(CAPABILITY_DECODE_VIDEO);
-    let decoder = match chunks_out.is_empty() {
+    #[allow(unused_mut)]
+    let mut decoder = match chunks_out.is_empty() {
         true => VideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?,
         false => VideoDecoder::to_assemble(&file, "", DEFAULT_TILE_SIZE, DEFAULT_TILE_OVERLAP_MIN)?,
     };
+    #[cfg(feature = "metal")]
+    decoder.set_precision(
+        crate::metal::default_linear_precision(),
+        crate::metal::attention_precision(&options)?,
+    )?;
     // Chunks of the decode go to whichever machines answer, and this one walks the rest while
     // they work. A chunk that does not come back is decoded here.
     let mut remote = crate::worker::RemoteCanvases::start(

@@ -66,9 +66,13 @@ impl MetalTextEncoder {
 
     /// `load`, or, without the room for the whole encoder, an encoder that reads its layers on the
     /// way and keeps back what fits once it knows the prompt.
-    /// Select the precision of attention over the encoder's heads.
-    pub fn set_attention_precision(&mut self, precision: crate::AttentionPrecision) -> Result<()> {
-        self.weights.set_attention_precision(precision)
+    /// Select the precisions of the encoder's INT8 layers and of its attention.
+    pub fn set_precision(
+        &mut self,
+        linear: crate::LinearPrecision,
+        attention: crate::AttentionPrecision,
+    ) -> Result<()> {
+        self.weights.set_precision((linear, attention))
     }
 
     pub fn load_fitting(file: &SafeTensors) -> Result<Self> {

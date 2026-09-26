@@ -47,7 +47,7 @@ fn size(rows: usize, cols: usize) -> Result<usize> {
         .ok_or_else(|| Error::new("Metal allocation size overflow".into()))
 }
 
-/// Queries one threadgroup of `mpp_attention` answers.
+/// Queries one threadgroup of `flash_attention` answers.
 const TENSOR_ATTENTION_QUERIES: usize = 128;
 
 /// Output rows and columns one threadgroup of `mpp_int8` or `mpp_fp16` answers.
@@ -747,8 +747,8 @@ impl Array {
         Ok(out)
     }
 
-    /// `attention` at `precision`. FP16 takes the matrix units for heads of 128 where the device
-    /// has them, and anything else is the FP32 attention.
+    /// `attention` at `precision`. FP16 takes the matrix units for heads of 64 or 128 where the
+    /// device has them, and anything else is the FP32 attention.
     pub fn attention_at(
         &self,
         key: &Self,
@@ -762,8 +762,9 @@ impl Array {
             && heads > 0
             && kv_heads > 0
             && heads.is_multiple_of(kv_heads)
-            && self.cols == heads * 128
-            && key.cols == kv_heads * 128
+            && self.cols.is_multiple_of(heads)
+            && [64, 128].contains(&(self.cols / heads))
+            && key.cols == kv_heads * (self.cols / heads)
             && key.shape() == value.shape()
             && !(causal && self.rows != key.rows)
             && self.device().supports_tensor_ops()
@@ -773,8 +774,8 @@ impl Array {
         self.attention(key, value, heads, kv_heads, causal)
     }
 
-    /// Attention over heads of 128 on the matrix units: FP16 copies of the inputs, FP32 softmax
-    /// and accumulation. See `mpp_attention`.
+    /// Attention over heads of 64 or 128 on the matrix units: FP16 copies of the inputs, FP32
+    /// softmax and accumulation. See `flash_attention`.
     fn tensor_attention(
         &self,
         key: &Self,
@@ -795,15 +796,16 @@ impl Array {
             Ok(copy)
         };
         let (q, k, v) = (half(self)?, half(key)?, half(value)?);
+        let dim = self.cols / heads;
         let out = Self::empty(self.device(), self.rows, self.cols)?;
         self.device().run(
-            "mpp_attention",
+            &format!("mpp_attention_{dim}"),
             &[&q, &k, &v, &out.buffer],
             &[
                 key.rows as u32,
                 heads as u32,
                 kv_heads as u32,
-                128,
+                dim as u32,
                 causal as u32,
                 self.rows as u32,
             ],
@@ -968,68 +970,69 @@ mod tests {
             (130, 300, 2, 1, false, 0.1),
             (200, 200, 2, 2, true, 0.1),
         ] {
-            let dim = 128;
-            let fill = |n: usize, seed: usize| -> Vec<f32> {
-                (0..n)
-                    .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
-                    .collect()
-            };
-            let q = fill(rows * heads * dim, 31);
-            let mut k = fill(keys * kv_heads * dim, 17);
-            // Every query has a positive first feature, so a key's score grows with its own.
-            let q: Vec<f32> = q
-                .iter()
-                .enumerate()
-                .map(|(i, &x)| if i % dim == 0 { 1.0 } else { x })
-                .collect();
-            for (i, x) in k.iter_mut().enumerate() {
-                if i % dim == 0 {
-                    *x += slope * (i / (kv_heads * dim)) as f32 * (dim as f32).sqrt();
+            for dim in [64, 128] {
+                let fill = |n: usize, seed: usize| -> Vec<f32> {
+                    (0..n)
+                        .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
+                        .collect()
+                };
+                let q = fill(rows * heads * dim, 31);
+                let mut k = fill(keys * kv_heads * dim, 17);
+                // Every query has a positive first feature, so a key's score grows with its own.
+                let q: Vec<f32> = q
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &x)| if i % dim == 0 { 1.0 } else { x })
+                    .collect();
+                for (i, x) in k.iter_mut().enumerate() {
+                    if i % dim == 0 {
+                        *x += slope * (i / (kv_heads * dim)) as f32 * (dim as f32).sqrt();
+                    }
                 }
-            }
-            let v = fill(keys * kv_heads * dim, 53);
-            let got = Array::from_f32(&device, rows, heads * dim, &q)
-                .unwrap()
-                .attention_at(
-                    &Array::from_f32(&device, keys, kv_heads * dim, &k).unwrap(),
-                    &Array::from_f32(&device, keys, kv_heads * dim, &v).unwrap(),
-                    heads,
-                    kv_heads,
-                    causal,
-                    AttentionPrecision::Fp16,
-                )
-                .unwrap()
-                .to_f32()
-                .unwrap();
+                let v = fill(keys * kv_heads * dim, 53);
+                let got = Array::from_f32(&device, rows, heads * dim, &q)
+                    .unwrap()
+                    .attention_at(
+                        &Array::from_f32(&device, keys, kv_heads * dim, &k).unwrap(),
+                        &Array::from_f32(&device, keys, kv_heads * dim, &v).unwrap(),
+                        heads,
+                        kv_heads,
+                        causal,
+                        AttentionPrecision::Fp16,
+                    )
+                    .unwrap()
+                    .to_f32()
+                    .unwrap();
 
-            for row in 0..rows {
-                for head in 0..heads {
-                    let kh = head / (heads / kv_heads);
-                    let seen = if causal { row + 1 } else { keys };
-                    let scores: Vec<f64> = (0..seen)
-                        .map(|t| {
-                            (0..dim)
-                                .map(|c| {
-                                    q[(row * heads + head) * dim + c] as f64
-                                        * k[(t * kv_heads + kh) * dim + c] as f64
-                                })
+                for row in 0..rows {
+                    for head in 0..heads {
+                        let kh = head / (heads / kv_heads);
+                        let seen = if causal { row + 1 } else { keys };
+                        let scores: Vec<f64> = (0..seen)
+                            .map(|t| {
+                                (0..dim)
+                                    .map(|c| {
+                                        q[(row * heads + head) * dim + c] as f64
+                                            * k[(t * kv_heads + kh) * dim + c] as f64
+                                    })
+                                    .sum::<f64>()
+                                    / (dim as f64).sqrt()
+                            })
+                            .collect();
+                        let top = scores.iter().cloned().fold(f64::MIN, f64::max);
+                        let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+                        let total: f64 = weights.iter().sum();
+                        for c in 0..dim {
+                            let expected = (0..seen)
+                                .map(|t| weights[t] * v[(t * kv_heads + kh) * dim + c] as f64)
                                 .sum::<f64>()
-                                / (dim as f64).sqrt()
-                        })
-                        .collect();
-                    let top = scores.iter().cloned().fold(f64::MIN, f64::max);
-                    let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
-                    let total: f64 = weights.iter().sum();
-                    for c in 0..dim {
-                        let expected = (0..seen)
-                            .map(|t| weights[t] * v[(t * kv_heads + kh) * dim + c] as f64)
-                            .sum::<f64>()
-                            / total;
-                        let actual = got[(row * heads + head) * dim + c] as f64;
-                        assert!(
-                            (actual - expected).abs() < 1e-2,
-                            "{rows}×{keys} causal {causal} slope {slope}: row {row} head {head} col {c}: {actual} != {expected}"
-                        );
+                                / total;
+                            let actual = got[(row * heads + head) * dim + c] as f64;
+                            assert!(
+                                (actual - expected).abs() < 1e-2,
+                                "{rows}×{keys}×{dim} causal {causal} slope {slope}: row {row} head {head} col {c}: {actual} != {expected}"
+                            );
+                        }
                     }
                 }
             }
