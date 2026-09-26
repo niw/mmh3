@@ -29,9 +29,15 @@ const DIT_BLOCK_COUNT: usize = 50;
 fn bench_gemm(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_cuda::bench::{GemmKind, gemm};
 
-    let options = parse_options(arguments, &["tokens", "iterations", "kinds"], &[], USAGE)?;
+    let options = parse_options(
+        arguments,
+        &["tokens", "iterations", "kinds"],
+        &["no-tma"],
+        USAGE,
+    )?;
     let tokens = option_number(&options, "tokens", 38_710)?;
     let iterations = option_number(&options, "iterations", 10)?;
+    mmh3_cuda::use_tma_on_this_thread(!options.contains_key("no-tma"));
     let kinds = match options.get("kinds") {
         Some(list) => list
             .split(',')
@@ -121,10 +127,16 @@ fn bench_mma(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn bench_attention(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    let options = parse_options(arguments, &["tokens", "heads", "iterations"], &[], USAGE)?;
+    let options = parse_options(
+        arguments,
+        &["tokens", "heads", "iterations"],
+        &["no-tma"],
+        USAGE,
+    )?;
     let tokens = option_number(&options, "tokens", 38_710)?;
     let heads = option_number(&options, "heads", 56)?;
     let iterations = option_number(&options, "iterations", 3)?;
+    mmh3_cuda::use_tma_on_this_thread(!options.contains_key("no-tma"));
     let milliseconds = mmh3_cuda::bench::attention(tokens, heads, iterations)?;
     let operations = 4.0 * (tokens as f64).powi(2) * 128.0 * heads as f64;
     let teraflops = operations / (milliseconds as f64 * 1e-3) / 1e12;

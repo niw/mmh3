@@ -5,8 +5,9 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-// Tensor core building blocks shared by the attention kernels: cp.async copies, ldmatrix loads, the
-// m16n8k16 MMA with FP32 accumulation, and 64-row tiles of K or V swizzled in shared memory.
+// Tensor core building blocks shared by the attention kernels, whose cp.async copies and ldmatrix
+// loads the INT8 GEMM takes too: the m16n8k16 MMA with FP32 accumulation, and 64-row tiles of K or
+// V swizzled in shared memory.
 
 // Element (batch, token, head, dimension) of the query, key, value and output tensors, in that
 // order, lives at base + batch * batch_stride + token * token_stride + head * head_stride +

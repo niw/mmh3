@@ -61,9 +61,18 @@ fn every_tiling(n: usize) -> Vec<Option<Int8Tiling>> {
     tilings
 }
 
-/// Runs every tiling on random operands, with a random adapter of `rank` when it is not zero,
-/// compares the output with an f64 reference within BF16 rounding, and checks that every tiling
-/// gives the same bits. The adapter's down rows lie
+/// Every tiling of `every_tiling`, first with TMA and then with the cp.async copies of a device
+/// without it (sm_89), and whether TMA is on.
+fn every_tiling_and_copy(n: usize) -> Vec<(Option<Int8Tiling>, bool)> {
+    [true, false]
+        .into_iter()
+        .flat_map(|tma| every_tiling(n).into_iter().map(move |tiling| (tiling, tma)))
+        .collect()
+}
+
+/// Runs every tiling, with TMA and with cp.async copies, on random operands, with a random adapter
+/// of `rank` when it is not zero, compares the output with an f64 reference within BF16 rounding,
+/// and checks that every run gives the same bits. The adapter's down rows lie
 /// `down_stride` values apart, with values the kernel must skip in between. `f16_with_bias`
 /// switches to FP16 output with a random bias.
 fn check_every_config(
@@ -149,10 +158,11 @@ fn check_every_config(
         (n - first_column) / 128
     };
     let mut first_output: Option<Vec<u8>> = None;
-    for tiling in every_tiling(n) {
+    for (tiling, tma) in every_tiling_and_copy(n) {
         let mut output = DeviceBuffer::new(m * n * 2).unwrap();
         let maxima = DeviceBuffer::zeroed(groups.max(1) * 4).unwrap();
-        gemm::int8(
+        mmh3_cuda::use_tma_on_this_thread(tma);
+        let result = gemm::int8(
             tiling,
             &activation_buffer,
             &weight_buffer,
@@ -172,8 +182,9 @@ fn check_every_config(
             n,
             k,
             (rank > 0).then_some(&adapter),
-        )
-        .unwrap();
+        );
+        mmh3_cuda::use_tma_on_this_thread(true);
+        result.unwrap();
         let mut output_bytes = vec![0; m * n * 2];
         output.copy_to_host(&mut output_bytes).unwrap();
         let mut expected_maxima = vec![0.0f32; groups];
@@ -188,7 +199,7 @@ fn check_every_config(
         assert_eq!(
             maxima.to_f32().unwrap()[..groups],
             expected_maxima,
-            "{m} × {n} × {k}, rank {rank}, {tiling:?}: column maxima"
+            "{m} × {n} × {k}, rank {rank}, {tiling:?}, TMA {tma}: column maxima"
         );
 
         for (index, &expected) in expected.iter().enumerate() {
@@ -201,7 +212,7 @@ fn check_every_config(
             let tolerance = expected.abs() / 256.0 + 1e-4;
             assert!(
                 (actual - expected).abs() <= tolerance,
-                "{m} × {n} × {k}, rank {rank}, {tiling:?}, row {}, column {}: expected {expected}, got {actual}",
+                "{m} × {n} × {k}, rank {rank}, {tiling:?}, TMA {tma}, row {}, column {}: expected {expected}, got {actual}",
                 index / n,
                 index % n
             );
@@ -209,7 +220,7 @@ fn check_every_config(
         match &first_output {
             Some(first) => assert!(
                 *first == output_bytes,
-                "{m} × {n} × {k}, rank {rank}: {tiling:?} differs from the first tiling"
+                "{m} × {n} × {k}, rank {rank}: {tiling:?} with TMA {tma} differs from the first run"
             ),
             None => first_output = Some(output_bytes),
         }
@@ -297,9 +308,10 @@ fn writes_swiglu_of_interleaved_rows() {
         };
 
         let mut outputs = Vec::new();
-        for tiling in every_tiling(n) {
+        for (tiling, tma) in every_tiling_and_copy(n) {
             let mut output = DeviceBuffer::new(m * features * 2).unwrap();
-            gemm::int8(
+            mmh3_cuda::use_tma_on_this_thread(tma);
+            let result = gemm::int8(
                 tiling,
                 &activation_buffer,
                 &weight_buffer,
@@ -316,17 +328,18 @@ fn writes_swiglu_of_interleaved_rows() {
                 n,
                 k,
                 Some(&adapter),
-            )
-            .unwrap();
+            );
+            mmh3_cuda::use_tma_on_this_thread(true);
+            result.unwrap();
             let mut output_bytes = vec![0; m * features * 2];
             output.copy_to_host(&mut output_bytes).unwrap();
-            outputs.push((tiling, output_bytes));
+            outputs.push((tiling, tma, output_bytes));
         }
-        let output_bytes = &outputs[0].1;
-        for (tiling, other) in &outputs[1..] {
+        let output_bytes = &outputs[0].2;
+        for (tiling, tma, other) in &outputs[1..] {
             assert!(
                 other == output_bytes,
-                "f16 {f16}: {tiling:?} differs from the first tiling"
+                "f16 {f16}: {tiling:?} with TMA {tma} differs from the first run"
             );
         }
 

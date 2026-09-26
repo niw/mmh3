@@ -80,6 +80,30 @@ inline cudaError_t mmh3_raise_shared_memory(Mmh3SharedMemoryLimit &state, Kernel
     return status;
 }
 
+// Whether this thread's launches leave TMA out even where the device has it, so that a card with
+// TMA can check the copies a card without it takes.
+inline thread_local bool mmh3_tma_turned_off = false;
+
+// Whether a launch on this thread's device may copy through TMA, which compute capability 9 and
+// later have. Launches on an Ada card (sm_89) take their cp.async copies instead.
+inline bool mmh3_tma_available() {
+    static std::atomic<int> answers[MMH3_MAX_DEVICES];
+    const int device = mmh3_current_device();
+    if (mmh3_tma_turned_off || device < 0 || device >= MMH3_MAX_DEVICES) {
+        return false;
+    }
+    // One plus whether the device has TMA, so that zero means unasked.
+    if (const int kept = answers[device].load(std::memory_order_relaxed); kept != 0) {
+        return kept == 2;
+    }
+    int major = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess) {
+        return false;
+    }
+    answers[device].store(major >= 9 ? 2 : 1, std::memory_order_relaxed);
+    return major >= 9;
+}
+
 // Multiprocessors on the device this thread computes on, or zero where it cannot be asked.
 inline int mmh3_multiprocessor_count() {
     static std::atomic<int> counts[MMH3_MAX_DEVICES];

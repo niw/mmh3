@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "device.cuh"
+#include "tensor_core.cuh"
 #include "tma.cuh"
 
 // Scaled INT8 GEMM for the DiT, text encoder and video VAE linear layers:
@@ -31,6 +32,10 @@
 // An adapter adds stages of 64 ranks of its BF16 operands after the K blocks of each tile,
 // multiplied with BF16 MMAs into the scaled FP32 result before the single rounding.
 //
+// Devices without TMA (sm_89) fill the same swizzled stages with cp.async instead: every thread
+// copies its share of the next stage while the warps multiply the current one, and the whole CTA
+// synchronizes around each stage.
+//
 // NOTE: Every output element goes through the same integer products and the same FP32 operations
 // in the same order whatever the tile shape and the order of the tiles, so every tiling gives the
 // same bits. The first call of each shape times the tilings and keeps the fastest.
@@ -40,16 +45,6 @@ namespace {
 constexpr int BLOCK_K = 128;
 constexpr int STAGES = 2;
 constexpr int WARPS = 8;
-
-__device__ __forceinline__ uint32_t shared_address(const void *pointer) {
-    return static_cast<uint32_t>(__cvta_generic_to_shared(pointer));
-}
-
-__device__ __forceinline__ void load_matrix_x4(uint32_t (&registers)[4], uint32_t address) {
-    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0, %1, %2, %3}, [%4];\n"
-                 : "=r"(registers[0]), "=r"(registers[1]), "=r"(registers[2]), "=r"(registers[3])
-                 : "r"(address));
-}
 
 __device__ __forceinline__ void mma_s8(int32_t (&accumulator)[4], const uint32_t (&a)[4],
                                        uint32_t b0, uint32_t b1) {
@@ -102,6 +97,16 @@ struct TensorMaps {
     CUtensorMap adapter_up;
 };
 
+// The same operands for the cp.async path, with the adapter's rank and the stride of its down rows.
+struct Operands {
+    const int8_t *activations;
+    const int8_t *weights;
+    const __nv_bfloat16 *adapter_down;
+    const __nv_bfloat16 *adapter_up;
+    int rank;
+    int down_stride;
+};
+
 // The maximum of |output| over each group of 128 columns from `first_column` on, as the FP32 bits
 // of the BF16 magnitude, raised with atomicMax. The caller zeroes `values` first. Null for none.
 struct ColumnMaxima {
@@ -151,6 +156,52 @@ __device__ void fill_stage(const TileGrid &grid, int sequence, uint32_t stage, u
         copy_tile(stage, &maps.adapter_down, barrier, rank, tile_m * Config::block_m);
         copy_tile(stage + Config::a_bytes, &maps.adapter_up, barrier, rank,
                   tile_n * Config::block_n);
+    }
+}
+
+// fill_stage with cp.async from every thread of the CTA, into the same swizzled layout TMA writes.
+// Activation rows past `m` are zero-filled, as TMA fills them.
+template <typename Config>
+__device__ void copy_stage(const TileGrid &grid, int sequence, uint32_t stage,
+                           const Operands &operands, int m, int k) {
+    const int tile = blockIdx.x + sequence / grid.blocks_per_tile * gridDim.x;
+    if (tile >= grid.tiles) {
+        return;
+    }
+    const int block = sequence % grid.blocks_per_tile;
+    int tile_m, tile_n;
+    grid.coordinates(tile, tile_m, tile_n);
+    const uint8_t *a_base;
+    const uint8_t *b_base;
+    int64_t a_stride, b_stride;
+    if (block < grid.k_blocks) {
+        a_base = reinterpret_cast<const uint8_t *>(operands.activations) + block * BLOCK_K;
+        b_base = reinterpret_cast<const uint8_t *>(operands.weights) + block * BLOCK_K;
+        a_stride = k;
+        b_stride = k;
+    } else {
+        const int rank = (block - grid.k_blocks) * BLOCK_K / 2;
+        a_base = reinterpret_cast<const uint8_t *>(operands.adapter_down + rank);
+        b_base = reinterpret_cast<const uint8_t *>(operands.adapter_up + rank);
+        a_stride = static_cast<int64_t>(operands.down_stride) * 2;
+        b_stride = static_cast<int64_t>(operands.rank) * 2;
+    }
+    constexpr int CHUNKS_PER_ROW = BLOCK_K / 16;
+    constexpr int CHUNKS = (Config::block_m + Config::block_n) * CHUNKS_PER_ROW;
+    for (int index = threadIdx.x; index < CHUNKS; index += WARPS * 32) {
+        const int row = index / CHUNKS_PER_ROW;
+        const int chunk = index % CHUNKS_PER_ROW;
+        if (row < Config::block_m) {
+            const int source_row = tile_m * Config::block_m + row;
+            const bool valid = source_row < m;
+            copy_async_16(stage + swizzled_offset(row, chunk),
+                          a_base + (valid ? source_row * a_stride : 0) + chunk * 16, valid);
+        } else {
+            const int b_row = row - Config::block_m;
+            copy_async_16(stage + Config::a_bytes + swizzled_offset(b_row, chunk),
+                          b_base + (tile_n * Config::block_n + b_row) * b_stride + chunk * 16,
+                          true);
+        }
     }
 }
 
@@ -245,9 +296,9 @@ struct Ring {
     }
 };
 
-template <typename Config, typename Output, bool SWIGLU>
+template <typename Config, typename Output, bool SWIGLU, bool TMA>
 __global__ void __launch_bounds__(WARPS * 32, 1)
-    int8_gemm_kernel(const __grid_constant__ TensorMaps maps,
+    int8_gemm_kernel(const __grid_constant__ TensorMaps maps, const Operands operands,
                      const float *__restrict__ activation_scales,
                      const float *__restrict__ weight_scales, const float *__restrict__ bias,
                      Output *__restrict__ output, int m, int n, int k, int output_stride,
@@ -266,18 +317,27 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     grid.blocks_per_tile = grid.k_blocks + adapter_blocks;
     grid.group_m = group_m;
 
-    if (threadIdx.x == 0) {
-        for (int stage = 0; stage < STAGES; stage++) {
-            barrier_init(barriers + stage * 8, 1);
-            release_counts[stage] = 0;
+    if constexpr (TMA) {
+        if (threadIdx.x == 0) {
+            for (int stage = 0; stage < STAGES; stage++) {
+                barrier_init(barriers + stage * 8, 1);
+                release_counts[stage] = 0;
+            }
+            barrier_init_fence();
+            for (int stage = 0; stage < STAGES; stage++) {
+                fill_stage<Config>(grid, stage, shared_base + stage * Config::stage_bytes,
+                                   barriers + stage * 8, maps);
+            }
         }
-        asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
-        for (int stage = 0; stage < STAGES; stage++) {
-            fill_stage<Config>(grid, stage, shared_base + stage * Config::stage_bytes,
-                               barriers + stage * 8, maps);
+        __syncthreads();
+    } else {
+        // Every stage but the last starts filling. Each consume then fills the one after them.
+        for (int stage = 0; stage < STAGES - 1; stage++) {
+            copy_stage<Config>(grid, stage, shared_base + stage * Config::stage_bytes, operands, m,
+                               k);
+            copy_async_commit();
         }
     }
-    __syncthreads();
 
     const int lane = threadIdx.x % 32;
     const int warp = threadIdx.x / 32;
@@ -287,22 +347,35 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int group_id = lane / 4;
     const int quad_lane = lane % 4;
 
-    // Waits for the ring's current stage, multiplies it and releases it. The warp that releases it
-    // last refills it.
+    // Waits for the ring's current stage, multiplies it and releases it. With TMA, the warp that
+    // releases it last refills it. Without, the CTA starts filling the stage that follows the
+    // ones in flight before it waits for the current one.
     Ring ring;
     auto consume = [&](auto &accumulators) {
-        const uint32_t barrier = barriers + ring.stage * 8;
-        barrier_wait(barrier, ring.phase);
         const uint32_t stage_a = shared_base + ring.stage * Config::stage_bytes;
-        multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane);
-        __syncwarp();
-        if (lane == 0) {
-            __threadfence_block();
-            if (atomicAdd(release_counts + ring.stage, 1) == WARPS - 1) {
-                release_counts[ring.stage] = 0;
-                async_proxy_fence();
-                fill_stage<Config>(grid, ring.sequence + STAGES, stage_a, barrier, maps);
+        if constexpr (TMA) {
+            const uint32_t barrier = barriers + ring.stage * 8;
+            barrier_wait(barrier, ring.phase);
+            multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane);
+            __syncwarp();
+            if (lane == 0) {
+                __threadfence_block();
+                if (atomicAdd(release_counts + ring.stage, 1) == WARPS - 1) {
+                    release_counts[ring.stage] = 0;
+                    async_proxy_fence();
+                    fill_stage<Config>(grid, ring.sequence + STAGES, stage_a, barrier, maps);
+                }
             }
+        } else {
+            const int next_stage = (ring.stage + STAGES - 1) % STAGES;
+            copy_stage<Config>(grid, ring.sequence + STAGES - 1,
+                               shared_base + next_stage * Config::stage_bytes, operands, m, k);
+            copy_async_commit();
+            copy_async_wait<STAGES - 1>();
+            __syncthreads();
+            multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane);
+            // The next consume refills this stage.
+            __syncthreads();
         }
         ring.advance();
     };
@@ -482,6 +555,9 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             }
         }
     }
+    if constexpr (!TMA) {
+        copy_async_wait<0>();
+    }
 }
 
 using TallTile = Int8GemmConfig<256, 128, 4>;
@@ -541,27 +617,41 @@ int launch(int group_m, const int8_t *activations, const int8_t *weights,
                      adapter.down_stride < adapter.rank || adapter.down_stride % 8 != 0))) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
-    TensorMaps maps;
-    if (!encode_tensor_map(&maps.activations, activations, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, m, k,
-                           Config::block_m, k) ||
-        !encode_tensor_map(&maps.weights, weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, n, k,
-                           Config::block_n, k)) {
-        return static_cast<int>(cudaErrorInvalidValue);
-    }
-    if (adapted) {
-        if (!encode_tensor_map(&maps.adapter_down, adapter.down, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-                               2, m, adapter.rank, Config::block_m, adapter.down_stride) ||
-            !encode_tensor_map(&maps.adapter_up, adapter.up, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, n,
-                               adapter.rank, Config::block_n, adapter.rank)) {
+    const Operands operands{activations, weights,      adapter.down,
+                            adapter.up,  adapter.rank, adapter.down_stride};
+    const bool tma = mmh3_tma_available();
+    TensorMaps maps = {};
+    if (tma) {
+        if (!encode_tensor_map(&maps.activations, activations, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, m,
+                               k, Config::block_m, k) ||
+            !encode_tensor_map(&maps.weights, weights, CU_TENSOR_MAP_DATA_TYPE_UINT8, 1, n, k,
+                               Config::block_n, k)) {
             return static_cast<int>(cudaErrorInvalidValue);
         }
-    } else {
-        maps.adapter_down = maps.activations;
-        maps.adapter_up = maps.weights;
+        if (adapted) {
+            if (!encode_tensor_map(&maps.adapter_down, adapter.down,
+                                   CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, m, adapter.rank,
+                                   Config::block_m, adapter.down_stride) ||
+                !encode_tensor_map(&maps.adapter_up, adapter.up, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+                                   2, n, adapter.rank, Config::block_n, adapter.rank)) {
+                return static_cast<int>(cudaErrorInvalidValue);
+            }
+        } else {
+            maps.adapter_down = maps.activations;
+            maps.adapter_up = maps.weights;
+        }
+    } else if (reinterpret_cast<uintptr_t>(activations) % 16 != 0 ||
+               reinterpret_cast<uintptr_t>(weights) % 16 != 0 ||
+               (adapted && (reinterpret_cast<uintptr_t>(adapter.down) % 16 != 0 ||
+                            reinterpret_cast<uintptr_t>(adapter.up) % 16 != 0))) {
+        // cp.async copies 16 bytes from 16-byte aligned addresses, as TMA needs its bases.
+        return static_cast<int>(cudaErrorInvalidValue);
     }
-    static Mmh3SharedMemory shared_memory;
-    const cudaError_t configured = mmh3_configure_shared_memory(
-        shared_memory, int8_gemm_kernel<Config, Output, SWIGLU>, Config::shared_bytes);
+    auto kernel = tma ? int8_gemm_kernel<Config, Output, SWIGLU, true>
+                      : int8_gemm_kernel<Config, Output, SWIGLU, false>;
+    static Mmh3SharedMemory shared_memory[2];
+    const cudaError_t configured =
+        mmh3_configure_shared_memory(shared_memory[tma], kernel, Config::shared_bytes);
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }
@@ -571,8 +661,8 @@ int launch(int group_m, const int8_t *activations, const int8_t *weights,
         return static_cast<int>(cudaErrorInvalidDevice);
     }
     const int blocks = tiles < processors ? tiles : processors;
-    int8_gemm_kernel<Config, Output, SWIGLU><<<blocks, WARPS * 32, Config::shared_bytes, stream>>>(
-        maps, activation_scales, weight_scales, bias, output, m, n, k, output_stride,
+    kernel<<<blocks, WARPS * 32, Config::shared_bytes, stream>>>(
+        maps, operands, activation_scales, weight_scales, bias, output, m, n, k, output_stride,
         adapter_blocks, adapter.scale, maxima, group_m);
     return static_cast<int>(cudaGetLastError());
 }
