@@ -19,7 +19,11 @@ fn main() {
     let compiler = env::var("CC").unwrap_or_else(|_| "cc".to_owned());
     if !has_verbs(&compiler) {
         // Without the headers the crate builds with no device to open, and the socket carries
-        // everything. Installing libibverbs later needs `cargo clean -p mmh3-rdma` to be noticed.
+        // everything. The directories the compiler searches are watched, so installing
+        // libibverbs later runs this again.
+        for directory in include_directories(&compiler) {
+            println!("cargo:rerun-if-changed={}", directory.display());
+        }
         println!("cargo:warning=infiniband/verbs.h was not found, so mmh3 builds without RDMA");
         println!("cargo:rustc-cfg=mmh3_rdma_without_verbs");
         return;
@@ -74,4 +78,22 @@ fn has_verbs(compiler: &str) -> bool {
         .write_all(b"#include <infiniband/verbs.h>\n")
         .is_ok();
     child.wait().is_ok_and(|status| status.success()) && written
+}
+
+/// The existing directories the compiler searches for `#include <...>`.
+fn include_directories(compiler: &str) -> Vec<PathBuf> {
+    let Ok(output) = Command::new(compiler)
+        .args(["-E", "-v", "-x", "c", "/dev/null", "-o", "/dev/null"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .skip_while(|line| !line.starts_with("#include <...> search starts here:"))
+        .skip(1)
+        .take_while(|line| !line.starts_with("End of search list."))
+        .map(|line| PathBuf::from(line.trim()))
+        .filter(|directory| directory.is_dir())
+        .collect()
 }
