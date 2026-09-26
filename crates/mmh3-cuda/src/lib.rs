@@ -156,12 +156,6 @@ pub fn device_info(device: usize) -> Result<DeviceInfo, CudaError> {
     })
 }
 
-/// Free and total device memory in bytes.
-///
-/// NOTE: this is the whole device's, not this process's. What another program on the same GPU
-/// holds is missing from the free figure, and what this process holds is missing from it too.
-/// The Metal backend answers a different question under the same name, since a Mac has no figure
-/// like this one to give.
 /// Checks that the current device has the shared memory and registers per SM the kernels were
 /// tuned for, which every sm_12x device has.
 pub fn check_device() -> Result<(), CudaError> {
@@ -184,6 +178,12 @@ pub fn check_device() -> Result<(), CudaError> {
     })
 }
 
+/// Free and total device memory in bytes.
+///
+/// NOTE: this is the whole device's, not this process's. What another program on the same GPU
+/// holds is missing from the free figure, and what this process holds is missing from it too.
+/// The Metal backend answers a different question under the same name, since a Mac has no figure
+/// like this one to give.
 pub fn memory_info() -> Result<(usize, usize), CudaError> {
     let (mut free_bytes, mut total_bytes) = (0, 0);
     // SAFETY: both are valid out pointers.
