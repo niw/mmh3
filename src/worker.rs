@@ -266,9 +266,13 @@ fn road() -> &'static str {
     }
     #[cfg(feature = "metal")]
     {
-        // NOTE: the default of `--linear-precision` on Metal. A run told to take another road is
-        // measured against this one, which `Welcome` is sent too early to know about.
-        "mps-fp16"
+        // NOTE: the defaults of `--linear-precision` and `--attention-precision` on Metal. A run
+        // told to take another road is measured against this one, which `Welcome` is sent too
+        // early to know about.
+        match crate::metal::default_linear_precision() {
+            mmh3_metal::LinearPrecision::Int8 => "int8",
+            _ => "mps-fp16",
+        }
     }
     #[cfg(not(any(feature = "cuda", feature = "metal")))]
     {
@@ -310,9 +314,15 @@ fn measure_now() -> Option<worker::Speed> {
     // them. The road differs and that is the point: each machine times the one it will take.
     let (m, n, k) = (4096, 5376, 5376);
     let device = mmh3_metal::Device::new().ok()?;
-    let operations =
-        gemm_operations_per_second(&device, mmh3_metal::LinearPrecision::MpsFp16, m, n, k, 10)
-            .ok()?;
+    let operations = gemm_operations_per_second(
+        &device,
+        crate::metal::default_linear_precision(),
+        m,
+        n,
+        k,
+        10,
+    )
+    .ok()?;
     let copy = memory_copy_bytes_per_second(&device, 1 << 28, 5).ok()?;
 
     // The other half of a block, and the half a token cut does not shrink, measured at the same

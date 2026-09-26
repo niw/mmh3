@@ -64,18 +64,30 @@ feature selects CUDA/NVENC. Use `--ffmpeg` for an external encoder override. See
 
 ## Options and current limits
 
-The default is dense FP32 attention with MPS FP16 linear products. The DiT's INT8-weight layers
-can use another product mode with `--linear-precision`:
+On macOS 26 and later, the DiT and the text encoder run on the GPU's matrix units by default,
+the Neural Accelerators on an M5 or later. The DiT's INT8-weight layers take INT8 activations,
+rotated and quantized a row at a time as on CUDA, and dense attention over heads of 128 takes FP16
+products with FP32 softmax and accumulation. A LoRA adapter's two products read FP16 copies of its
+weights. On an older macOS the defaults are FP16 products through MPS and FP32 attention.
+
+`--linear-precision` selects the product of the DiT's INT8-weight layers:
 
 | Value | Mode |
 | --- | --- |
-| `mps-fp16` | FP16 through MPS (default) |
+| `int8` | INT8 through MPP (default on macOS 26+) |
 | `fp16` | FP16 through MPP (macOS 26+) |
-| `int8` | Experimental INT8 through MPP (macOS 26+) |
+| `mps-fp16` | FP16 through MPS (default before macOS 26) |
 | `fp32` | FP32 reference mode |
 
-Changing precision can change the generated sample even with the same seed. These options
-apply to the DiT's INT8-weight layers. Other layers and LoRA adapters retain FP32 computation.
+`--attention-precision` selects attention over heads of 128 in the DiT and the text encoder:
+
+| Value | Mode |
+| --- | --- |
+| `fp16` | FP16 products through MPP (default on macOS 26+) |
+| `fp32` | FP32 reference mode (default before macOS 26) |
+
+Changing precision can change the generated sample even with the same seed. The video VAE's
+attention and the other layers compute in FP32.
 
 Text prompts, precomputed `--context` tensors and adapter LoRAs are supported. Image, audio and
 video conditioning (`--first-frame`, `--last-frame`, `--reference`, `--reference-audio`,

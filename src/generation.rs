@@ -503,7 +503,11 @@ pub fn sample(
                         #[cfg(any(feature = "cuda", feature = "metal"))]
                         let file = SafeTensors::open(Path::new(&path))?;
                         #[cfg(any(feature = "cuda", feature = "metal"))]
-                        let encoder = TextEncoder::load_fitting(&file)?;
+                        #[allow(unused_mut)]
+                        let mut encoder = TextEncoder::load_fitting(&file)?;
+                        #[cfg(feature = "metal")]
+                        encoder
+                            .set_attention_precision(crate::metal::attention_precision(options)?)?;
                         #[cfg(any(feature = "cuda", feature = "metal"))]
                         let context = if prompt_references.is_empty() {
                             let ids = Tokenizer::h3().encode(&prompt);

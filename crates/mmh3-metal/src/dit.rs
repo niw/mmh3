@@ -168,10 +168,16 @@ impl MetalDit {
     }
 
     /// Memory a call over `tokens` rows computes in: FP32 rows of the residual, the attention and
-    /// the MLP, several of each alive at once.
+    /// the MLP, several of each alive at once, and the FP16 copies of the query, key and value
+    /// that attention on the matrix units reads.
     fn work_bytes(&self, tokens: usize) -> usize {
         let c = &self.config;
-        tokens * (c.hidden * 32 + c.inner() * 24 + c.ffn * 16)
+        tokens * (c.hidden * 32 + c.inner() * 30 + c.ffn * 16)
+    }
+
+    /// Select the precision of attention over the DiT's heads.
+    pub fn set_attention_precision(&mut self, precision: crate::AttentionPrecision) -> Result<()> {
+        self.weights.set_attention_precision(precision)
     }
 
     /// Select computation for INT8 ConvRot layers before preparing the prompt.
@@ -229,7 +235,14 @@ impl MetalDit {
         let k = norm(c.inner(), "k")?;
         let v = qkv.slice(0, x.rows, 2 * c.inner(), c.inner())?;
         self.weights.linear(
-            &q.attention(&k, &v, c.heads, c.heads, false)?,
+            &q.attention_at(
+                &k,
+                &v,
+                c.heads,
+                c.heads,
+                false,
+                self.weights.attention_precision,
+            )?,
             &format!("{prefix}.attn.out_proj"),
         )
     }
@@ -367,7 +380,14 @@ impl MetalDit {
         };
         let (q, k) = (part(0, "q")?, part(own_inner, "k")?);
         let v = qkv.slice(0, tokens, 2 * own_inner, own_inner)?;
-        let attended = q.attention(&k, &v, own.len(), own.len(), false)?;
+        let attended = q.attention_at(
+            &k,
+            &v,
+            own.len(),
+            own.len(),
+            false,
+            self.weights.attention_precision,
+        )?;
         self.weights.device.synchronize()?;
         context.timing.attend += started.elapsed();
 

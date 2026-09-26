@@ -4,7 +4,7 @@ use crate::{
     models::{model_file, option_path},
 };
 use mmh3_core::safetensors::SafeTensors;
-use mmh3_metal::dit::MetalDit;
+use mmh3_metal::{AttentionPrecision, LinearPrecision, dit::MetalDit};
 use std::{collections::HashMap, error::Error, path::Path};
 
 /// Reject what this machine cannot do however a run is arranged, before reading images or weights.
@@ -42,11 +42,7 @@ pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dy
         }
     }
 
-    for (option, supported) in [
-        ("attention", "dense"),
-        ("attention-precision", "fp32"),
-        ("lora-mode", "adapter"),
-    ] {
+    for (option, supported) in [("attention", "dense"), ("lora-mode", "adapter")] {
         if let Some(value) = options.get(option)
             && *value != supported
         {
@@ -55,6 +51,15 @@ pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dy
             )
             .into());
         }
+    }
+
+    if let Some(value) = options.get("attention-precision")
+        && !["fp32", "fp16"].contains(value)
+    {
+        return Err(format!(
+            "Metal runs --attention-precision fp32 or fp16, not {value}. Hand every step to a worker with --worker, or drop it"
+        )
+        .into());
     }
 
     if let Some(value) = options.get("linear-precision")
@@ -69,6 +74,39 @@ pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dy
     Ok(())
 }
 
+/// Whether this Mac's GPU has the matrix units the defaults run on: the tensor operations of
+/// macOS 26, the Neural Accelerators on an M5 or later.
+fn has_tensor_ops() -> bool {
+    mmh3_metal::Device::shared().is_ok_and(|device| device.supports_tensor_ops())
+}
+
+/// The default of `--linear-precision`: INT8 activations on the matrix units, as CUDA runs them,
+/// and FP16 through MPS on a Mac without them.
+pub fn default_linear_precision() -> LinearPrecision {
+    if has_tensor_ops() {
+        LinearPrecision::Int8
+    } else {
+        LinearPrecision::MpsFp16
+    }
+}
+
+/// `--attention-precision`, FP16 on the matrix units by default and FP32 on a Mac without them.
+pub fn attention_precision(
+    options: &HashMap<&str, &str>,
+) -> Result<AttentionPrecision, Box<dyn Error>> {
+    Ok(match options.get("attention-precision").copied() {
+        Some("fp32") => AttentionPrecision::Fp32,
+        Some("fp16") => AttentionPrecision::Fp16,
+        Some(value) => {
+            return Err(
+                format!("Metal runs --attention-precision fp32 or fp16, not {value}").into(),
+            );
+        }
+        None if has_tensor_ops() => AttentionPrecision::Fp16,
+        None => AttentionPrecision::Fp32,
+    })
+}
+
 pub fn load_dit(
     options: &HashMap<&str, &str>,
     name: &str,
@@ -79,19 +117,18 @@ pub fn load_dit(
     let path = option_path(options, name, default_file)?;
     let started = std::time::Instant::now();
     let mut dit = MetalDit::load_fitting(&SafeTensors::open(Path::new(&path))?, "")?;
-    let precision = match options
-        .get("linear-precision")
-        .copied()
-        .unwrap_or("mps-fp16")
-    {
-        "fp16" => mmh3_metal::LinearPrecision::Fp16,
-        "int8" => mmh3_metal::LinearPrecision::Int8,
-        "mps-fp16" => mmh3_metal::LinearPrecision::MpsFp16,
-        _ => mmh3_metal::LinearPrecision::Fp32,
+    let precision = match options.get("linear-precision").copied() {
+        Some("fp16") => LinearPrecision::Fp16,
+        Some("int8") => LinearPrecision::Int8,
+        Some("mps-fp16") => LinearPrecision::MpsFp16,
+        Some(_) => LinearPrecision::Fp32,
+        None => default_linear_precision(),
     };
 
     dit.set_linear_precision(precision)?;
-    println!("Metal DiT INT8-weight products: {precision:?}");
+    let attention = attention_precision(options)?;
+    dit.set_attention_precision(attention)?;
+    println!("Metal DiT INT8-weight products: {precision:?}, attention: {attention:?}");
     if dit.has_vsa_gates() {
         return Err(
             "VSA/FastH3 checkpoints need VSA attention, which is not implemented on Metal yet"

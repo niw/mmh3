@@ -375,6 +375,13 @@ kernel void pack_linear_input(device const float *x [[buffer(0)]],
     }
 }
 
+// The FP16 copy of an attention input that the tensor-product attention reads.
+kernel void float_to_half(device const float *x [[buffer(0)]], device half *y [[buffer(1)]],
+                          constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p[0])
+        y[i] = half(x[i]);
+}
+
 // MPS comparison path: INT8 is exactly representable as FP16.
 kernel void int8_to_half(device const char *x [[buffer(0)]], device half *y [[buffer(1)]],
                          constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
@@ -382,11 +389,24 @@ kernel void int8_to_half(device const char *x [[buffer(0)]], device half *y [[bu
         y[i] = half(x[p[1] + i]);
 }
 
-kernel void scale_linear_rows(device float *x [[buffer(0)]],
-                              device const float *scales [[buffer(1)]],
-                              constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
-    if (i < p[0])
-        x[i] *= scales[i / p[1]];
+// The MPS product's result, finished the way the MPP kernels finish theirs: the rows' scales,
+// and by the flags the outputs' scales, a bias and a result to add.
+kernel void finish_linear(device float *x [[buffer(0)]], device const float *scales [[buffer(1)]],
+                          device const float *outputs [[buffer(2)]],
+                          device const float *bias [[buffer(3)]],
+                          device const float *addend [[buffer(4)]], constant uint *p [[buffer(5)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint n = i % p[1];
+    float value = x[i] * scales[i / p[1]];
+    if (p[2] & 1)
+        value *= outputs[n];
+    if (p[2] & 2)
+        value += bias[n];
+    if (p[2] & 4)
+        value += addend[i];
+    x[i] = value;
 }
 
 // Gathers the heads one rank owns out of [tokens][tensors][heads][dim] into

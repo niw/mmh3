@@ -75,7 +75,8 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// Precision of INT8-checkpoint linear layers. Residuals, attention and LoRAs stay FP32.
+/// Precision of INT8-checkpoint linear layers. Residuals stay FP32, and attention takes a
+/// precision of its own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum LinearPrecision {
     #[default]
@@ -89,6 +90,17 @@ pub enum LinearPrecision {
 
     /// FP16 inputs through MPS, for comparison with the direct MPP path.
     MpsFp16,
+}
+
+/// Precision of dense attention over heads of 128, which the DiT and the text encoder use. Other
+/// head widths use FP32 either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AttentionPrecision {
+    #[default]
+    Fp32,
+
+    /// FP16 products on the matrix units, with FP32 softmax and accumulation. Needs macOS 26.
+    Fp16,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -331,7 +343,11 @@ impl Device {
             ));
         }
 
-        let group_size = if name.starts_with("mpp_") { 128 } else { 256 };
+        // The tensor kernels run on the number of SIMD groups their products share.
+        let group_size = match name {
+            "mpp_int8" | "mpp_lora" => 128,
+            _ => 256,
+        };
         let name = CString::new(name).unwrap();
         let pointers: Vec<_> = buffers.iter().map(|b| b.0.pointer.as_ptr()).collect();
         // SAFETY: internal callers validate the kernel's shapes and buffer extents. The call is

@@ -48,7 +48,8 @@ const USAGE: &str = "usage:
                     [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker] [--token FILE]
                     [--consistent] [--vram-budget GB]
 
-Metal linear precision: mps-fp16 (default), fp16 (MPP), int8 (MPP), or fp32.
+Metal linear precision: int8 (MPP, default on macOS 26), fp16 (MPP), mps-fp16 (default before macOS 26), or fp32.
+Metal attention precision: fp16 (MPP, default on macOS 26) or fp32.
 
 Checkpoints default to their ComfyUI names inside the models directory given by --models or MMH3_MODELS.
 latent samples like the generate command of mmh3, with the same defaults and the same options, and writes the

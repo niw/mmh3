@@ -66,6 +66,11 @@ impl MetalTextEncoder {
 
     /// `load`, or, without the room for the whole encoder, an encoder that reads its layers on the
     /// way and keeps back what fits once it knows the prompt.
+    /// Select the precision of attention over the encoder's heads.
+    pub fn set_attention_precision(&mut self, precision: crate::AttentionPrecision) -> Result<()> {
+        self.weights.set_attention_precision(precision)
+    }
+
     pub fn load_fitting(file: &SafeTensors) -> Result<Self> {
         match Self::load(file) {
             Err(error) if error.is_out_of_memory() => {}
@@ -205,7 +210,14 @@ impl MetalTextEncoder {
             let k = project("k", self.kv_heads)?;
             let v = w.linear(&normalized, &format!("{p}.self_attn.v_proj"))?;
             hidden = hidden.add(&w.linear(
-                &q.attention(&k, &v, self.heads, self.kv_heads, true)?,
+                &q.attention_at(
+                    &k,
+                    &v,
+                    self.heads,
+                    self.kv_heads,
+                    true,
+                    w.attention_precision,
+                )?,
                 &format!("{p}.self_attn.o_proj"),
             )?)?;
             let normalized = w.norm(&hidden, &format!("{p}.post_attention_layernorm"), 1e-6)?;

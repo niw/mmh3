@@ -620,6 +620,7 @@ mod tests {
             cols,
             outputs,
             LinearPrecision::Int8,
+            Default::default(),
         )
         .unwrap()
         .to_f32()
@@ -627,7 +628,7 @@ mod tests {
         let here = x
             .rotate()
             .unwrap()
-            .linear_int8(&weight, outputs, LinearPrecision::Int8)
+            .linear_int8(&weight, outputs, LinearPrecision::Int8, Default::default())
             .unwrap()
             .to_f32()
             .unwrap();

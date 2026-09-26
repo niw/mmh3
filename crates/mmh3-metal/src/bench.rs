@@ -27,7 +27,7 @@ pub fn gemm_operations_per_second(
     let seconds = median(
         trials,
         || {
-            let product = input.linear_int8(&weight, n, precision)?;
+            let product = input.linear_int8(&weight, n, precision, Default::default())?;
             std::hint::black_box(&product);
             Ok(())
         },
@@ -106,7 +106,15 @@ pub fn attention_milliseconds(
     let seconds = median(
         trials,
         || {
-            let attended = query.attention(&key, &value, heads, heads, false)?;
+            // The attention a run takes by default: on the matrix units where the device has them.
+            let attended = query.attention_at(
+                &key,
+                &value,
+                heads,
+                heads,
+                false,
+                crate::AttentionPrecision::Fp16,
+            )?;
             std::hint::black_box(&attended);
             Ok(())
         },

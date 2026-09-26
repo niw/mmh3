@@ -1,5 +1,7 @@
 //! FP32 tensor operations, with packed low-precision inputs used inside matrix products.
-use crate::{Buffer, Device, Error, LinearPrecision, Result, check, mmh3_metal_matmul};
+use crate::{
+    AttentionPrecision, Buffer, Device, Error, LinearPrecision, Result, check, mmh3_metal_matmul,
+};
 use mmh3_core::safetensors::DType;
 
 #[derive(Clone)]
@@ -43,6 +45,92 @@ fn size(rows: usize, cols: usize) -> Result<usize> {
         .ok_or_else(|| Error::new("Metal array shape is empty or too large".into()))?;
     n.checked_mul(4)
         .ok_or_else(|| Error::new("Metal allocation size overflow".into()))
+}
+
+/// Queries one threadgroup of `mpp_attention` answers.
+const TENSOR_ATTENTION_QUERIES: usize = 128;
+
+/// Output rows and columns one threadgroup of `mpp_int8` or `mpp_fp16` answers.
+const PRODUCT_TILE: (usize, usize) = (128, 64);
+
+/// What a product of INT8 weights does to its result besides restoring the rows' scales. Each
+/// step is a pass over the whole output when it runs on its own, so the products on the matrix
+/// units and the MPS product's one pass after it take them all at once.
+#[derive(Default)]
+pub(crate) struct Finish<'a> {
+    /// One scale an output: the weight's own.
+    pub scales: Option<&'a Array>,
+    /// One bias an output.
+    pub bias: Option<&'a Array>,
+    /// A result of the product's shape to add, such as a LoRA's. The products on the matrix units
+    /// write theirs over it.
+    pub addend: Option<Array>,
+    /// A LoRA whose up projection is still to run. The products on the matrix units run it a tile
+    /// at a time, so its output is never written whole.
+    pub lora: Option<Lora<'a>>,
+}
+
+/// The result of a LoRA's down projection, `mid`, and the FP16 weights of its up projection, with
+/// the adapter's scale in them.
+pub(crate) struct Lora<'a> {
+    pub mid: Array,
+    pub up: &'a Buffer,
+}
+
+impl Finish<'_> {
+    fn check(&self, rows: usize, outputs: usize) -> Result<()> {
+        let vector = |v: Option<&Array>| v.is_none_or(|v| v.shape() == [1, outputs]);
+        if !vector(self.scales)
+            || !vector(self.bias)
+            || self
+                .addend
+                .as_ref()
+                .is_some_and(|a| a.shape() != [rows, outputs])
+            || self
+                .lora
+                .as_ref()
+                .is_some_and(|l| l.mid.rows != rows || l.up.0.bytes != outputs * l.mid.cols * 2)
+        {
+            return Err(Error::new("product finish shapes mismatch".into()));
+        }
+        Ok(())
+    }
+
+    fn flags(&self) -> u32 {
+        self.scales.is_some() as u32
+            | (self.bias.is_some() as u32) << 1
+            | (self.addend.is_some() as u32) << 2
+            | (self.lora.is_some() as u32) << 3
+    }
+
+    /// The LoRA's up projection run whole and added to the addend, for a product that cannot run
+    /// it a tile at a time.
+    fn lora_into_addend(mut self, outputs: usize) -> Result<Self> {
+        if let Some(lora) = self.lora.take() {
+            let part = lora.mid.linear_half(lora.up, outputs)?;
+            self.addend = Some(match self.addend.take() {
+                Some(addend) => addend.add(&part)?,
+                None => part,
+            });
+        }
+        Ok(self)
+    }
+
+    /// The same steps, a pass each, for a product that cannot take them itself.
+    pub(crate) fn apply(self, mut result: Array) -> Result<Array> {
+        self.check(result.rows, result.cols)?;
+        let this = self.lora_into_addend(result.cols)?;
+        if let Some(scales) = this.scales {
+            result = result.mul(scales)?;
+        }
+        if let Some(bias) = this.bias {
+            result = result.add(bias)?;
+        }
+        if let Some(addend) = &this.addend {
+            result = result.add(addend)?;
+        }
+        Ok(result)
+    }
 }
 
 impl Array {
@@ -214,6 +302,7 @@ impl Array {
         weight: &Buffer,
         outputs: usize,
         precision: LinearPrecision,
+        finish: Finish,
     ) -> Result<Self> {
         if !std::sync::Arc::ptr_eq(&self.device().0, &weight.0.device.0)
             || outputs.checked_mul(self.cols) != Some(weight.0.bytes)
@@ -233,7 +322,7 @@ impl Array {
                 .is_none_or(|n| n > i32::MAX as usize)
             || (precision == LinearPrecision::Int8 && self.cols > i32::MAX as usize / (127 * 128))
         {
-            return self.linear_packed(weight, outputs, DType::I8);
+            return finish.apply(self.linear_packed(weight, outputs, DType::I8)?);
         }
 
         let int8 = precision == LinearPrecision::Int8;
@@ -257,6 +346,7 @@ impl Array {
             self.cols,
             outputs,
             precision,
+            finish,
         )
     }
 
@@ -274,6 +364,7 @@ impl Array {
         cols: usize,
         outputs: usize,
         precision: LinearPrecision,
+        finish: Finish,
     ) -> Result<Self> {
         let values = size(rows, cols)? / 4;
         if input.0.bytes < values
@@ -301,14 +392,16 @@ impl Array {
                 halves
             };
             return Self::product_of_packed(
-                device, &packed, scales, weight, rows, cols, outputs, precision,
+                device, &packed, scales, weight, rows, cols, outputs, precision, finish,
             );
         }
 
-        Self::from_quantized(device, input, scales, rows, cols)?.linear_packed(
-            weight,
-            outputs,
-            DType::I8,
+        finish.apply(
+            Self::from_quantized(device, input, scales, rows, cols)?.linear_packed(
+                weight,
+                outputs,
+                DType::I8,
+            )?,
         )
     }
 
@@ -351,9 +444,20 @@ impl Array {
         cols: usize,
         outputs: usize,
         precision: LinearPrecision,
+        finish: Finish,
     ) -> Result<Self> {
-        let out = Self::empty(device, rows, outputs)?;
+        finish.check(rows, outputs)?;
+        let finish = if precision == LinearPrecision::MpsFp16 {
+            finish.lora_into_addend(outputs)?
+        } else {
+            finish
+        };
+        let flags = finish.flags();
+        // An absent vector binds the row scales in its place, which the flags then never read.
+        let output_scales = finish.scales.map_or(&scales.buffer, |v| &v.buffer);
+        let bias = finish.bias.map_or(&scales.buffer, |v| &v.buffer);
         if precision == LinearPrecision::MpsFp16 {
+            let out = Self::empty(device, rows, outputs)?;
             let slab_rows = (32 * 1024 * 1024 / 2 / cols).max(1);
             let scratch = device.alloc(slab_rows.min(outputs) * cols * 2, None)?;
             for first in (0..outputs).step_by(slab_rows) {
@@ -382,25 +486,71 @@ impl Array {
                 })?;
             }
 
+            let addend = finish.addend.as_ref().map_or(&out.buffer, |a| &a.buffer);
             device.run(
-                "scale_linear_rows",
-                &[&out.buffer, &scales.buffer],
-                &[out.len() as u32, outputs as u32],
+                "finish_linear",
+                &[&out.buffer, &scales.buffer, output_scales, bias, addend],
+                &[out.len() as u32, outputs as u32, flags],
                 out.len(),
                 false,
             )?;
             return Ok(out);
         }
 
+        // The products on the matrix units add what their output holds, so an addend is theirs.
+        let (mid, up, rank) = match &finish.lora {
+            Some(lora) => (&lora.mid.buffer, lora.up, lora.mid.cols),
+            None => (&scales.buffer, &scales.buffer, 0),
+        };
+        let out = match finish.addend {
+            Some(addend) => addend,
+            None => Self::empty(device, rows, outputs)?,
+        };
         device.run(
             if precision == LinearPrecision::Int8 {
                 "mpp_int8"
             } else {
                 "mpp_fp16"
             },
-            &[packed, weight, &out.buffer, &scales.buffer],
-            &[rows as u32, outputs as u32, cols as u32],
-            rows.div_ceil(64) * outputs.div_ceil(64),
+            &[
+                packed,
+                weight,
+                &out.buffer,
+                &scales.buffer,
+                output_scales,
+                bias,
+                mid,
+                up,
+            ],
+            &[rows as u32, outputs as u32, cols as u32, flags, rank as u32],
+            rows.div_ceil(PRODUCT_TILE.0) * outputs.div_ceil(PRODUCT_TILE.1),
+            true,
+        )?;
+        Ok(out)
+    }
+
+    /// `self · weightᵀ` on the matrix units for `outputs` rows of FP16 weights, `self.cols` each,
+    /// with the FP32 rows as they are: the two products of a LoRA.
+    pub(crate) fn linear_half(&self, weight: &Buffer, outputs: usize) -> Result<Self> {
+        if !std::sync::Arc::ptr_eq(&self.device().0, &weight.0.device.0)
+            || outputs.checked_mul(self.cols * 2) != Some(weight.0.bytes)
+        {
+            return Err(Error::new("FP16 weight shape or device mismatch".into()));
+        }
+        // TensorOps uses signed extents and indices.
+        if [self.len(), outputs * self.cols, self.rows * outputs]
+            .iter()
+            .any(|&n| n > i32::MAX as usize)
+        {
+            return Err(Error::new("FP16 weight product too large".into()));
+        }
+
+        let out = Self::empty(self.device(), self.rows, outputs)?;
+        self.device().run(
+            "mpp_lora",
+            &[&self.buffer, weight, &out.buffer],
+            &[self.rows as u32, outputs as u32, self.cols as u32],
+            self.rows.div_ceil(64) * outputs.div_ceil(64),
             true,
         )?;
         Ok(out)
@@ -597,6 +747,72 @@ impl Array {
         Ok(out)
     }
 
+    /// `attention` at `precision`. FP16 takes the matrix units for heads of 128 where the device
+    /// has them, and anything else is the FP32 attention.
+    pub fn attention_at(
+        &self,
+        key: &Self,
+        value: &Self,
+        heads: usize,
+        kv_heads: usize,
+        causal: bool,
+        precision: AttentionPrecision,
+    ) -> Result<Self> {
+        if precision == AttentionPrecision::Fp16
+            && heads > 0
+            && kv_heads > 0
+            && heads.is_multiple_of(kv_heads)
+            && self.cols == heads * 128
+            && key.cols == kv_heads * 128
+            && key.shape() == value.shape()
+            && !(causal && self.rows != key.rows)
+            && self.device().supports_tensor_ops()
+        {
+            return self.tensor_attention(key, value, heads, kv_heads, causal);
+        }
+        self.attention(key, value, heads, kv_heads, causal)
+    }
+
+    /// Attention over heads of 128 on the matrix units: FP16 copies of the inputs, FP32 softmax
+    /// and accumulation. See `mpp_attention`.
+    fn tensor_attention(
+        &self,
+        key: &Self,
+        value: &Self,
+        heads: usize,
+        kv_heads: usize,
+        causal: bool,
+    ) -> Result<Self> {
+        let half = |x: &Self| -> Result<Buffer> {
+            let copy = self.device().alloc(x.len() * 2, None)?;
+            self.device().run(
+                "float_to_half",
+                &[&x.buffer, &copy],
+                &[x.len() as u32],
+                x.len(),
+                false,
+            )?;
+            Ok(copy)
+        };
+        let (q, k, v) = (half(self)?, half(key)?, half(value)?);
+        let out = Self::empty(self.device(), self.rows, self.cols)?;
+        self.device().run(
+            "mpp_attention",
+            &[&q, &k, &v, &out.buffer],
+            &[
+                key.rows as u32,
+                heads as u32,
+                kv_heads as u32,
+                128,
+                causal as u32,
+                self.rows as u32,
+            ],
+            self.rows.div_ceil(TENSOR_ATTENTION_QUERIES) * heads,
+            true,
+        )?;
+        Ok(out)
+    }
+
     pub fn swiglu(&self) -> Result<Self> {
         if !self.cols.is_multiple_of(2) {
             return Err(Error::new("SwiGLU requires two equal halves".into()));
@@ -737,6 +953,90 @@ mod tests {
     use mmh3_core::numeric::{f32_to_bf16, f32_to_f16};
 
     #[test]
+    fn tensor_attention_matches_reference() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        // Ragged tiles on both sides, grouped heads, and both masks. With a slope, scores climb
+        // key by key far past the margin the kernel lets a row's maximum grow before rescaling.
+        for (rows, keys, heads, kv_heads, causal, slope) in [
+            (150, 200, 4, 2, false, 0.0),
+            (150, 150, 4, 2, true, 0.0),
+            (1, 70, 2, 2, false, 0.0),
+            (64, 64, 1, 1, true, 0.0),
+            (130, 300, 2, 1, false, 0.1),
+            (200, 200, 2, 2, true, 0.1),
+        ] {
+            let dim = 128;
+            let fill = |n: usize, seed: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
+                    .collect()
+            };
+            let q = fill(rows * heads * dim, 31);
+            let mut k = fill(keys * kv_heads * dim, 17);
+            // Every query has a positive first feature, so a key's score grows with its own.
+            let q: Vec<f32> = q
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| if i % dim == 0 { 1.0 } else { x })
+                .collect();
+            for (i, x) in k.iter_mut().enumerate() {
+                if i % dim == 0 {
+                    *x += slope * (i / (kv_heads * dim)) as f32 * (dim as f32).sqrt();
+                }
+            }
+            let v = fill(keys * kv_heads * dim, 53);
+            let got = Array::from_f32(&device, rows, heads * dim, &q)
+                .unwrap()
+                .attention_at(
+                    &Array::from_f32(&device, keys, kv_heads * dim, &k).unwrap(),
+                    &Array::from_f32(&device, keys, kv_heads * dim, &v).unwrap(),
+                    heads,
+                    kv_heads,
+                    causal,
+                    AttentionPrecision::Fp16,
+                )
+                .unwrap()
+                .to_f32()
+                .unwrap();
+
+            for row in 0..rows {
+                for head in 0..heads {
+                    let kh = head / (heads / kv_heads);
+                    let seen = if causal { row + 1 } else { keys };
+                    let scores: Vec<f64> = (0..seen)
+                        .map(|t| {
+                            (0..dim)
+                                .map(|c| {
+                                    q[(row * heads + head) * dim + c] as f64
+                                        * k[(t * kv_heads + kh) * dim + c] as f64
+                                })
+                                .sum::<f64>()
+                                / (dim as f64).sqrt()
+                        })
+                        .collect();
+                    let top = scores.iter().cloned().fold(f64::MIN, f64::max);
+                    let weights: Vec<f64> = scores.iter().map(|s| (s - top).exp()).collect();
+                    let total: f64 = weights.iter().sum();
+                    for c in 0..dim {
+                        let expected = (0..seen)
+                            .map(|t| weights[t] * v[(t * kv_heads + kh) * dim + c] as f64)
+                            .sum::<f64>()
+                            / total;
+                        let actual = got[(row * heads + head) * dim + c] as f64;
+                        assert!(
+                            (actual - expected).abs() < 1e-2,
+                            "{rows}×{keys} causal {causal} slope {slope}: row {row} head {head} col {c}: {actual} != {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "real-model-size product timing; run alone on an idle GPU in release mode"]
     fn profile_packed_products() {
         use std::time::Instant;
@@ -770,7 +1070,9 @@ mod tests {
                 for trial in 0..6 {
                     device.synchronize().unwrap();
                     let start = Instant::now();
-                    let result = x.linear_int8(&weights, outputs, precision).unwrap();
+                    let result = x
+                        .linear_int8(&weights, outputs, precision, Finish::default())
+                        .unwrap();
                     device.synchronize().unwrap();
                     let elapsed = start.elapsed().as_secs_f64() * 1000.0;
                     std::hint::black_box(result);
@@ -995,7 +1297,15 @@ mod tests {
             }
 
             let found = Array::linear_quantized(
-                &device, &packed, &scales, &weight, rows, cols, outputs, precision,
+                &device,
+                &packed,
+                &scales,
+                &weight,
+                rows,
+                cols,
+                outputs,
+                precision,
+                Finish::default(),
             )
             .unwrap()
             .to_f32()
@@ -1044,7 +1354,7 @@ mod tests {
                 LinearPrecision::MpsFp16,
             ] {
                 let actual = x
-                    .linear_int8(&weight, outputs, precision)
+                    .linear_int8(&weight, outputs, precision, Finish::default())
                     .unwrap()
                     .to_f32()
                     .unwrap();

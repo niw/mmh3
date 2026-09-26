@@ -1,9 +1,10 @@
 use crate::{
-    Buffer, Device, Error, LinearPrecision, Result,
-    ops::{Array, convert, dtype_code},
+    AttentionPrecision, Buffer, Device, Error, LinearPrecision, Result,
+    ops::{Array, Finish, Lora, convert, dtype_code},
 };
 use mmh3_core::{
     json,
+    numeric::f32_to_f16,
     safetensors::{DType, SafeTensors},
     tensor::Tensor,
 };
@@ -17,14 +18,72 @@ pub(crate) struct Weight {
     pub(crate) dtype: DType,
 }
 
-struct Adapter {
-    down: Array,
-    up: Array,
-    scale: f32,
+/// A LoRA's two projections: FP16 on a Mac with matrix units to read them, FP32 on one without.
+/// Never both, since the adapters of a real LoRA take gigabytes.
+enum Adapter {
+    Fp32 {
+        down: Array,
+        up: Array,
+        scale: f32,
+    },
+    /// `down` is `rank × inputs` halves and `up` is `outputs × rank`, with the scale in it.
+    Fp16 {
+        down: Buffer,
+        up: Buffer,
+        rank: usize,
+        outputs: usize,
+    },
 }
+
+impl Adapter {
+    /// `down` is `rank × inputs` and `up` is `outputs × rank`, row-major.
+    fn new(
+        device: &Device,
+        down: (&[f32], usize, usize),
+        up: (&[f32], usize, usize),
+        scale: f32,
+        half: bool,
+    ) -> Result<Self> {
+        if !half {
+            return Ok(Self::Fp32 {
+                down: Array::from_f32(device, down.1, down.2, down.0)?,
+                up: Array::from_f32(device, up.1, up.2, up.0)?,
+                scale,
+            });
+        }
+
+        let halves = |values: &mut dyn Iterator<Item = f32>| -> Vec<u8> {
+            values.flat_map(|v| f32_to_f16(v).to_le_bytes()).collect()
+        };
+        let down_bytes = halves(&mut down.0.iter().copied());
+        let up_bytes = halves(&mut up.0.iter().map(|&v| v * scale));
+        Ok(Self::Fp16 {
+            down: device.alloc(down_bytes.len(), Some(&down_bytes))?,
+            up: device.alloc(up_bytes.len(), Some(&up_bytes))?,
+            rank: down.1,
+            outputs: up.1,
+        })
+    }
+
+    /// What the adapter adds to the product of `x`. On the matrix units the FP16 weights read the
+    /// FP32 rows as they are.
+    fn apply(&self, x: &Array) -> Result<Array> {
+        match self {
+            Self::Fp32 { down, up, scale } => x.linear(down)?.linear(up)?.unary(0, *scale),
+            Self::Fp16 {
+                down,
+                up,
+                rank,
+                outputs,
+            } => x.linear_half(down, *rank)?.linear_half(up, *outputs),
+        }
+    }
+}
+
 pub(crate) struct Weights {
     pub device: Device,
     pub linear_precision: LinearPrecision,
+    pub attention_precision: AttentionPrecision,
     tensors: HashMap<String, Weight>,
     /// Tensors of the units read on the way, while their units are on the device.
     loaded: RefCell<HashMap<String, Weight>>,
@@ -142,6 +201,7 @@ impl Weights {
             absent,
             adapters: HashMap::new(),
             linear_precision: LinearPrecision::Fp32,
+            attention_precision: AttentionPrecision::Fp32,
         })
     }
 
@@ -261,6 +321,18 @@ impl Weights {
         convert(&self.device, &w.buffer, rows, count / rows, w.dtype)
     }
 
+    /// FP16 attention runs on the matrix units, so a device without them refuses it here rather
+    /// than quietly running FP32.
+    pub fn set_attention_precision(&mut self, precision: AttentionPrecision) -> Result<()> {
+        if precision == AttentionPrecision::Fp16 && !self.device.supports_tensor_ops() {
+            return Err(Error::new(
+                "FP16 Metal attention requires macOS 26 and Apple silicon".into(),
+            ));
+        }
+        self.attention_precision = precision;
+        Ok(())
+    }
+
     pub fn vector(&self, name: &str) -> Result<Array> {
         let a = self.array(name)?;
         a.reshape(1, a.len())
@@ -277,35 +349,53 @@ impl Weights {
             return Err(Error::new(format!("{name}: linear input shape mismatch")));
         }
 
-        let mut result = if w.dtype == DType::I8 {
-            let rotated = x.rotate()?;
-            let product = if self.linear_precision == LinearPrecision::Fp32 {
-                rotated.linear_packed(&w.buffer, w.shape[0], w.dtype)?
-            } else {
-                rotated.linear_int8(&w.buffer, w.shape[0], self.linear_precision)?
-            };
+        let bias = format!("{name}.bias");
+        let bias = if self.contains(&bias) {
+            Some(self.vector(&bias)?)
+        } else {
+            None
+        };
+        // An FP16 adapter's up projection is left to the product, which runs it a tile at a time.
+        let (addend, lora) = match self.adapters.get(name) {
+            None => (None, None),
+            Some(Adapter::Fp16 { down, up, rank, .. }) => (
+                None,
+                Some(Lora {
+                    mid: x.linear_half(down, *rank)?,
+                    up,
+                }),
+            ),
+            Some(adapter) => (Some(adapter.apply(x)?), None),
+        };
 
-            product.mul(&self.vector(&format!("{name}.weight_scale"))?)?
-        } else if w.dtype != DType::F32 {
+        if w.dtype == DType::I8 {
+            let rotated = x.rotate()?;
+            let scales = self.vector(&format!("{name}.weight_scale"))?;
+            let finish = Finish {
+                scales: Some(&scales),
+                bias: bias.as_ref(),
+                addend,
+                lora,
+            };
+            return if self.linear_precision == LinearPrecision::Fp32 {
+                finish.apply(rotated.linear_packed(&w.buffer, w.shape[0], w.dtype)?)
+            } else {
+                rotated.linear_int8(&w.buffer, w.shape[0], self.linear_precision, finish)
+            };
+        }
+
+        let result = if w.dtype != DType::F32 {
             x.linear_packed(&w.buffer, w.shape[0], w.dtype)?
         } else {
             x.linear(&self.array(&key)?)?
         };
-
-        let bias = format!("{name}.bias");
-        if self.contains(&bias) {
-            result = result.add(&self.vector(&bias)?)?;
+        Finish {
+            scales: None,
+            bias: bias.as_ref(),
+            addend,
+            lora,
         }
-
-        if let Some(adapter) = self.adapters.get(name) {
-            result = result.add(
-                &x.linear(&adapter.down)?
-                    .linear(&adapter.up)?
-                    .unary(0, adapter.scale)?,
-            )?;
-        }
-
-        Ok(result)
+        .apply(result)
     }
 
     /// `linear` for an input another rank has already rotated and quantized, which is how a
@@ -348,7 +438,46 @@ impl Weights {
             Some(buffer) => (buffer, kept),
             None => (&w.buffer, outputs),
         };
-        let mut result = Array::linear_quantized(
+        // A LoRA's down projection runs on the rows this rank was handed, so the rows suffice. The
+        // up projection answers one column per output, so it is cut the way the weight was.
+        let cut_up;
+        let (addend, lora) = match self.adapters.get(name) {
+            None => (None, None),
+            // FP32 weights are rotated to meet the rows: the product of two rotated sides is the
+            // product of the unrotated pair.
+            Some(Adapter::Fp32 { down, up, scale }) => (
+                Some(
+                    Array::from_quantized(&self.device, input, scales, rows, cols)?
+                        .linear(&down.rotate()?)?
+                        .linear(&self.kept_up(up, keep)?)?
+                        .unary(0, *scale)?,
+                ),
+                None,
+            ),
+            // FP16 weights stay as they are and the rows are rotated back instead: ConvRot's
+            // Hadamard transform is symmetric and orthogonal, so it undoes itself. The up
+            // projection is left to the product, which runs it a tile at a time.
+            Some(Adapter::Fp16 { down, up, rank, .. }) => {
+                let up = if keep.is_empty() {
+                    up
+                } else {
+                    cut_up = gather_rows(&self.device, up, rank * 2, keep)?;
+                    &cut_up
+                };
+                let mid = Array::from_quantized(&self.device, input, scales, rows, cols)?
+                    .rotate()?
+                    .linear_half(down, *rank)?;
+                (None, Some(Lora { mid, up }))
+            }
+        };
+        let bias = format!("{name}.bias");
+        let bias = if self.contains(&bias) {
+            Some(self.kept_vector(&bias, keep)?)
+        } else {
+            None
+        };
+        let weight_scales = self.kept_vector(&format!("{name}.weight_scale"), keep)?;
+        Array::linear_quantized(
             &self.device,
             input,
             scales,
@@ -357,30 +486,13 @@ impl Weights {
             cols,
             outputs,
             self.linear_precision,
-        )?
-        .mul(&self.kept_vector(&format!("{name}.weight_scale"), keep)?)?;
-
-        let bias = format!("{name}.bias");
-        if self.contains(&bias) {
-            result = result.add(&self.kept_vector(&bias, keep)?)?;
-        }
-
-        // A LoRA's down projection runs on the rows this rank was handed, so the rows suffice.
-        // Its weights are rotated to meet them: the activations arrive rotated, and the product of
-        // two rotated sides is the product of the unrotated pair.
-        if let Some(adapter) = self.adapters.get(name) {
-            let rotated = Array::from_quantized(&self.device, input, scales, rows, cols)?;
-            // The up projection answers one column per output, so it is cut the same way.
-            let up = self.kept_up(&adapter.up, keep)?;
-            result = result.add(
-                &rotated
-                    .linear(&adapter.down.rotate()?)?
-                    .linear(&up)?
-                    .unary(0, adapter.scale)?,
-            )?;
-        }
-
-        Ok(result)
+            Finish {
+                scales: Some(&weight_scales),
+                bias: bias.as_ref(),
+                addend,
+                lora,
+            },
+        )
     }
 
     /// `vector`, cut to `keep` the way the weight beside it was. An empty `keep` is the whole of
@@ -481,11 +593,13 @@ impl Weights {
 
             adapters.push((
                 layer.to_owned(),
-                Adapter {
-                    down: Array::from_f32(&self.device, down.shape[0], down.shape[1], &down.data)?,
-                    up: Array::from_f32(&self.device, up.shape[0], up.shape[1], &up.data)?,
-                    scale: strength * alpha.data[0] / down.shape[0] as f32,
-                },
+                Adapter::new(
+                    &self.device,
+                    (&down.data, down.shape[0], down.shape[1]),
+                    (&up.data, up.shape[0], up.shape[1]),
+                    strength * alpha.data[0] / down.shape[0] as f32,
+                    self.device.supports_tensor_ops(),
+                )?,
             ));
         }
 
@@ -547,6 +661,7 @@ mod tests {
             absent: HashMap::new(),
             adapters: HashMap::new(),
             linear_precision: LinearPrecision::Fp32,
+            attention_precision: AttentionPrecision::Fp32,
         };
 
         let actual = w
@@ -592,18 +707,21 @@ mod tests {
 
         if device.supports_tensor_ops() {
             // LoRA must still use the original (unrotated, unquantized) activation.
+            // Both roads of the adapter: FP32, and FP16 weights on the matrix units.
             let down: Vec<f32> = (0..inputs).map(|i| (i % 7) as f32 / 100.0).collect();
             let up = [0.5, -0.2, 0.1, 0.0, 1.0];
-            w.adapters.insert(
-                "linear".into(),
-                Adapter {
-                    down: Array::from_f32(&device, 1, inputs, &down).unwrap(),
-                    up: Array::from_f32(&device, outputs, 1, &up).unwrap(),
-                    scale: 0.7,
-                },
-            );
-
-            for precision in [LinearPrecision::Fp16, LinearPrecision::Int8] {
+            let cases = [
+                (LinearPrecision::Fp16, true),
+                (LinearPrecision::Int8, true),
+                (LinearPrecision::MpsFp16, true),
+                (LinearPrecision::Int8, false),
+            ];
+            for (precision, half) in cases {
+                w.adapters.insert(
+                    "linear".into(),
+                    Adapter::new(&device, (&down, 1, inputs), (&up, outputs, 1), 0.7, half)
+                        .unwrap(),
+                );
                 w.linear_precision = precision;
                 let got = w
                     .linear(
@@ -636,9 +754,168 @@ mod tests {
                         } else {
                             0.002
                         },
-                    "{precision:?} ConvRot + LoRA relative L2 {relative}"
+                    "{precision:?} ConvRot + LoRA (FP16 adapter {half}) relative L2 {relative}"
                 );
             }
+
+            // An exchanged input arrives rotated and quantized, and a rank may want a few of the
+            // outputs. The FP16 adapter rotates the rows back where the FP32 one rotates its
+            // weights, and the two must agree, whole or cut.
+            use crate::shard::WholeExchange;
+            use mmh3_core::shard::{Exchange, Region};
+            let mut exchange = WholeExchange::new(&device);
+            let region = exchange.region(Region::Normalized, rows * inputs).unwrap();
+            let scales = region
+                .write_quantized(0, &Array::from_f32(&device, rows, inputs, &x).unwrap())
+                .unwrap();
+            w.linear_precision = LinearPrecision::Int8;
+            for keep in [vec![], vec![1..2, 3..5]] {
+                let mut answers = Vec::new();
+                for half in [false, true] {
+                    w.adapters.insert(
+                        "linear".into(),
+                        Adapter::new(&device, (&down, 1, inputs), (&up, outputs, 1), 0.7, half)
+                            .unwrap(),
+                    );
+                    answers.push(
+                        w.linear_quantized(region.buffer(), &scales, rows, "linear", &keep)
+                            .unwrap()
+                            .to_f32()
+                            .unwrap(),
+                    );
+                }
+                let largest = answers[0].iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                for (a, b) in answers[0].iter().zip(&answers[1]) {
+                    assert!(
+                        (a - b).abs() <= largest * 2e-3,
+                        "exchanged LoRA, keep {keep:?}: FP32 {a} against FP16 {b}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// What an adapter adds, alone: the layer with it less the layer without it, over several
+    /// tiles of the product and a rank that is not a whole tile, on every road.
+    #[test]
+    fn a_lora_adds_what_its_two_products_make() {
+        let device = Device::new().unwrap();
+        let (rows, inputs, outputs, rank) = (200, 512, 130, 24);
+        let x: Vec<f32> = (0..rows * inputs)
+            .map(|i| ((i * 13 % 97) as f32 - 48.0) / 31.0)
+            .collect();
+        let weight: Vec<u8> = (0..inputs * outputs)
+            .map(|i| ((i * 7 % 255) as i32 - 127) as i8 as u8)
+            .collect();
+        let scales: Vec<f32> = (0..outputs).map(|i| 0.001 + i as f32 * 1e-5).collect();
+        let down: Vec<f32> = (0..rank * inputs)
+            .map(|i| ((i * 11 % 23) as f32 - 11.0) / 40.0)
+            .collect();
+        let up: Vec<f32> = (0..outputs * rank)
+            .map(|i| ((i * 5 % 17) as f32 - 8.0) / 30.0)
+            .collect();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "linear.weight".into(),
+            Weight {
+                buffer: device.alloc(weight.len(), Some(&weight)).unwrap(),
+                shape: vec![outputs, inputs],
+                dtype: DType::I8,
+            },
+        );
+        tensors.insert(
+            "linear.weight_scale".into(),
+            Weight {
+                buffer: Array::from_f32(&device, 1, outputs, &scales)
+                    .unwrap()
+                    .buffer,
+                shape: vec![outputs],
+                dtype: DType::F32,
+            },
+        );
+        let mut w = Weights {
+            device: device.clone(),
+            tensors,
+            loaded: RefCell::default(),
+            absent: HashMap::new(),
+            adapters: HashMap::new(),
+            linear_precision: LinearPrecision::Fp32,
+            attention_precision: AttentionPrecision::Fp32,
+        };
+        let input = Array::from_f32(&device, rows, inputs, &x).unwrap();
+        let expected: Vec<f64> = (0..rows)
+            .flat_map(|r| {
+                let hidden: Vec<f64> = (0..rank)
+                    .map(|k| {
+                        (0..inputs)
+                            .map(|i| x[r * inputs + i] as f64 * down[k * inputs + i] as f64)
+                            .sum()
+                    })
+                    .collect();
+                let up = &up;
+                (0..outputs).map(move |n| {
+                    (0..rank)
+                        .map(|k| hidden[k] * up[n * rank + k] as f64 * 0.5)
+                        .sum::<f64>()
+                })
+            })
+            .collect();
+        let largest = expected.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+
+        let tensor_ops = device.supports_tensor_ops();
+        for (precision, half) in [
+            (LinearPrecision::Fp32, false),
+            (LinearPrecision::MpsFp16, false),
+            (LinearPrecision::MpsFp16, tensor_ops),
+            (LinearPrecision::Fp16, tensor_ops),
+            (LinearPrecision::Int8, tensor_ops),
+        ] {
+            if matches!(precision, LinearPrecision::Fp16 | LinearPrecision::Int8) && !tensor_ops {
+                continue;
+            }
+            w.linear_precision = precision;
+            w.adapters.clear();
+            let without = w.linear(&input, "linear").unwrap().to_f32().unwrap();
+            w.adapters.insert(
+                "linear".into(),
+                Adapter::new(
+                    &device,
+                    (&down, rank, inputs),
+                    (&up, outputs, rank),
+                    0.5,
+                    half,
+                )
+                .unwrap(),
+            );
+            let with = w.linear(&input, "linear").unwrap().to_f32().unwrap();
+            for (index, want) in expected.iter().enumerate() {
+                let got = (with[index] - without[index]) as f64;
+                assert!(
+                    (got - want).abs() <= largest * 3e-3,
+                    "{precision:?}, FP16 adapter {half}: at {index} the LoRA added {got}, not {want}"
+                );
+            }
+        }
+    }
+
+    /// ConvRot's Hadamard transform is symmetric as well as orthogonal, so it undoes itself. An
+    /// FP16 LoRA leans on that to take back the rows an exchange delivers rotated.
+    #[test]
+    fn convrot_undoes_itself() {
+        let device = Device::new().unwrap();
+        let values: Vec<f32> = (0..3 * 512)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 7.0)
+            .collect();
+        let twice = Array::from_f32(&device, 3, 512, &values)
+            .unwrap()
+            .rotate()
+            .unwrap()
+            .rotate()
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        for (a, b) in values.iter().zip(&twice) {
+            assert!((a - b).abs() < 1e-5, "{a} came back as {b}");
         }
     }
 }
