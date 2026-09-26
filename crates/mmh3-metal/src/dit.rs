@@ -861,7 +861,7 @@ mod tests {
     use std::path::Path;
 
     /// The real checkpoint, with the turbo LoRA on it when `with_lora`, or nothing when the models
-    /// are not here.
+    /// are not here or the GPU's share of memory cannot hold the whole DiT, as on a 24 GB Mac.
     /// The tiny fixture cannot stand in: ConvRot wants a multiple of 256 features and its weights
     /// are FP32 rather than INT8, so it fails the sharded path on both counts.
     fn checkpoint(with_lora: bool) -> Option<MetalDit> {
@@ -873,7 +873,14 @@ mod tests {
         }
 
         let started = std::time::Instant::now();
-        let mut dit = MetalDit::load(&SafeTensors::open(&path).unwrap(), "").unwrap();
+        let mut dit = match MetalDit::load(&SafeTensors::open(&path).unwrap(), "") {
+            Ok(dit) => dit,
+            Err(error) if error.is_out_of_memory() => {
+                eprintln!("{error}, skipping");
+                return None;
+            }
+            Err(error) => panic!("{error}"),
+        };
         eprintln!("loaded in {:.1} s", started.elapsed().as_secs_f64());
 
         // The turbo LoRA is in every real run here, so a rank that cannot take an adapted layer
