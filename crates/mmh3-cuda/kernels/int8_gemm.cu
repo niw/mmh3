@@ -34,7 +34,7 @@
 //
 // Devices without TMA (sm_89) fill the same swizzled stages with cp.async instead: every thread
 // copies its share of the next stage while the warps multiply the current one, and the whole CTA
-// synchronizes around each stage.
+// synchronizes once per stage.
 //
 // NOTE: Every output element goes through the same integer products and the same FP32 operations
 // in the same order whatever the tile shape and the order of the tiles, so every tiling gives the
@@ -160,63 +160,85 @@ __device__ void fill_stage(const TileGrid &grid, int sequence, uint32_t stage, u
 }
 
 // fill_stage with cp.async from every thread of the CTA, into the same swizzled layout TMA writes.
-// Activation rows past `m` are zero-filled, as TMA fills them.
-template <typename Config>
-__device__ void copy_stage(const TileGrid &grid, int sequence, uint32_t stage,
-                           const Operands &operands, int m, int k) {
-    const int tile = blockIdx.x + sequence / grid.blocks_per_tile * gridDim.x;
-    if (tile >= grid.tiles) {
-        return;
-    }
-    const int block = sequence % grid.blocks_per_tile;
-    int tile_m, tile_n;
-    grid.coordinates(tile, tile_m, tile_n);
-    const uint8_t *a_base;
-    const uint8_t *b_base;
-    int64_t a_stride, b_stride;
-    if (block < grid.k_blocks) {
-        a_base = reinterpret_cast<const uint8_t *>(operands.activations) + block * BLOCK_K;
-        b_base = reinterpret_cast<const uint8_t *>(operands.weights) + block * BLOCK_K;
-        a_stride = k;
-        b_stride = k;
-    } else {
-        const int rank = (block - grid.k_blocks) * BLOCK_K / 2;
-        a_base = reinterpret_cast<const uint8_t *>(operands.adapter_down + rank);
-        b_base = reinterpret_cast<const uint8_t *>(operands.adapter_up + rank);
-        a_stride = static_cast<int64_t>(operands.down_stride) * 2;
-        b_stride = static_cast<int64_t>(operands.rank) * 2;
-    }
-    constexpr int CHUNKS_PER_ROW = BLOCK_K / 16;
-    constexpr int CHUNKS = (Config::block_m + Config::block_n) * CHUNKS_PER_ROW;
-    for (int index = threadIdx.x; index < CHUNKS; index += WARPS * 32) {
-        const int row = index / CHUNKS_PER_ROW;
-        const int chunk = index % CHUNKS_PER_ROW;
-        if (row < Config::block_m) {
-            const int source_row = tile_m * Config::block_m + row;
-            const bool valid = source_row < m;
-            copy_async_16(stage + swizzled_offset(row, chunk),
-                          a_base + (valid ? source_row * a_stride : 0) + chunk * 16, valid);
+// Activation rows past `m` are zero-filled, as TMA fills them. The copies go out in parts between
+// the k-steps of a multiply: issued at once, they hold up every warp's MMAs until the load queue
+// drains, and the copies and the MMAs barely overlap.
+template <typename Config> struct StageCopy {
+    const uint8_t *a_base = nullptr;
+    const uint8_t *b_base = nullptr;
+    int64_t a_stride = 0;
+    int64_t b_stride = 0;
+    // Activation rows of the tile that lie inside `m`.
+    int a_rows = 0;
+    uint32_t stage = 0;
+
+    __device__ StageCopy(const TileGrid &grid, int sequence, uint32_t stage_address,
+                         const Operands &operands, int m, int k) {
+        const int tile = blockIdx.x + sequence / grid.blocks_per_tile * gridDim.x;
+        if (tile >= grid.tiles) {
+            return;
+        }
+        const int block = sequence % grid.blocks_per_tile;
+        int tile_m, tile_n;
+        grid.coordinates(tile, tile_m, tile_n);
+        if (block < grid.k_blocks) {
+            a_base = reinterpret_cast<const uint8_t *>(operands.activations) + block * BLOCK_K;
+            b_base = reinterpret_cast<const uint8_t *>(operands.weights) + block * BLOCK_K;
+            a_stride = k;
+            b_stride = k;
         } else {
-            const int b_row = row - Config::block_m;
-            copy_async_16(stage + Config::a_bytes + swizzled_offset(b_row, chunk),
-                          b_base + (tile_n * Config::block_n + b_row) * b_stride + chunk * 16,
-                          true);
+            const int rank = (block - grid.k_blocks) * BLOCK_K / 2;
+            a_base = reinterpret_cast<const uint8_t *>(operands.adapter_down + rank);
+            b_base = reinterpret_cast<const uint8_t *>(operands.adapter_up + rank);
+            a_stride = static_cast<int64_t>(operands.down_stride) * 2;
+            b_stride = static_cast<int64_t>(operands.rank) * 2;
+        }
+        a_base += tile_m * Config::block_m * a_stride;
+        b_base += tile_n * Config::block_n * b_stride;
+        a_rows = m - tile_m * Config::block_m;
+        stage = stage_address;
+    }
+
+    // Issues this thread's copies of part `part` of `PARTS`.
+    template <int PARTS> __device__ __forceinline__ void issue(int part) const {
+        constexpr int CHUNKS_PER_ROW = BLOCK_K / 16;
+        constexpr int CHUNKS = (Config::block_m + Config::block_n) * CHUNKS_PER_ROW;
+        static_assert(CHUNKS % (WARPS * 32 * PARTS) == 0, "every part copies as many chunks");
+        if (a_base == nullptr) {
+            return;
+        }
+        #pragma unroll
+        for (int index = threadIdx.x + part * WARPS * 32; index < CHUNKS;
+             index += PARTS * WARPS * 32) {
+            const int row = index / CHUNKS_PER_ROW;
+            const int chunk = index % CHUNKS_PER_ROW;
+            if (row < Config::block_m) {
+                const bool valid = row < a_rows;
+                copy_async_16(stage + swizzled_offset(row, chunk),
+                              a_base + (valid ? row * a_stride : 0) + chunk * 16, valid);
+            } else {
+                const int b_row = row - Config::block_m;
+                copy_async_16(stage + Config::a_bytes + swizzled_offset(b_row, chunk),
+                              b_base + b_row * b_stride + chunk * 16, true);
+            }
         }
     }
-}
+};
 
 // Multiplies one stage into the warp's accumulators: INT8 m16n8k32 MMAs for int32 accumulators,
 // BF16 m16n8k16 MMAs for float ones. Both read 32 bytes of K per step, so the fragments load the
 // same way.
-template <typename Config, typename Accumulator>
+// `before_step` runs before each k-step.
+template <typename Config, typename Accumulator, typename BeforeStep>
 __device__ __forceinline__ void
 multiply_stage(Accumulator (&accumulators)[Config::m_tiles][Config::n_tiles][4], uint32_t stage_a,
-               int warp_row, int warp_column, int lane) {
+               int warp_row, int warp_column, int lane, BeforeStep before_step) {
     const uint32_t stage_b = stage_a + Config::a_bytes;
     const int matrix = lane / 8;
     const int matrix_row = lane % 8;
     #pragma unroll
     for (int k_step = 0; k_step < BLOCK_K / 32; k_step++) {
+        before_step(k_step);
         uint32_t a_fragments[Config::m_tiles][4];
         uint32_t b_fragments[Config::n_tiles][2];
         #pragma unroll
@@ -333,8 +355,9 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     } else {
         // Every stage but the last starts filling. Each consume then fills the one after them.
         for (int stage = 0; stage < STAGES - 1; stage++) {
-            copy_stage<Config>(grid, stage, shared_base + stage * Config::stage_bytes, operands, m,
-                               k);
+            StageCopy<Config>(grid, stage, shared_base + stage * Config::stage_bytes, operands, m,
+                              k)
+                .template issue<1>(0);
             copy_async_commit();
         }
     }
@@ -348,15 +371,15 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     const int quad_lane = lane % 4;
 
     // Waits for the ring's current stage, multiplies it and releases it. With TMA, the warp that
-    // releases it last refills it. Without, the CTA starts filling the stage that follows the
-    // ones in flight before it waits for the current one.
+    // releases it last refills it. Without, the CTA refills the stage before it while multiplying
+    // it.
     Ring ring;
     auto consume = [&](auto &accumulators) {
         const uint32_t stage_a = shared_base + ring.stage * Config::stage_bytes;
         if constexpr (TMA) {
             const uint32_t barrier = barriers + ring.stage * 8;
             barrier_wait(barrier, ring.phase);
-            multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane);
+            multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane, [](int) {});
             __syncwarp();
             if (lane == 0) {
                 __threadfence_block();
@@ -367,15 +390,17 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
                 }
             }
         } else {
+            // One barrier both publishes the current stage and tells that every warp is done with
+            // the one before it.
+            copy_async_wait<STAGES - 2>();
+            __syncthreads();
             const int next_stage = (ring.stage + STAGES - 1) % STAGES;
-            copy_stage<Config>(grid, ring.sequence + STAGES - 1,
-                               shared_base + next_stage * Config::stage_bytes, operands, m, k);
+            const StageCopy<Config> copy(grid, ring.sequence + STAGES - 1,
+                                         shared_base + next_stage * Config::stage_bytes, operands,
+                                         m, k);
+            multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane,
+                                   [&](int k_step) { copy.template issue<BLOCK_K / 32>(k_step); });
             copy_async_commit();
-            copy_async_wait<STAGES - 1>();
-            __syncthreads();
-            multiply_stage<Config>(accumulators, stage_a, warp_row, warp_column, lane);
-            // The next consume refills this stage.
-            __syncthreads();
         }
         ring.advance();
     };
