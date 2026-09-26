@@ -785,6 +785,14 @@ impl CudaDit {
     /// produce them. The adapters of these layers go into their NVFP4 weights too, so LoRAs come
     /// first. The INT8 weights and adapters stay for the text and audio rows.
     pub fn use_nvfp4(&mut self) -> Result<usize, Error> {
+        let device = crate::device_info(crate::current_device()?)?;
+        if device.compute_capability.0 < 10 {
+            return Err(Error::Model(format!(
+                "NVFP4 needs cuBLASLt's block-scaled FP4 GEMM, which only Blackwell GPUs have, not \
+                 the {}",
+                device.name
+            )));
+        }
         if self.stream.get_mut().reads() {
             return Err(Error::Model(
                 "NVFP4 needs the DiT's blocks on the device, and this device reads them from the \

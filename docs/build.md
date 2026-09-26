@@ -12,9 +12,10 @@ On Linux, the default builds CUDA, native MP4 output and the ffmpeg CLI output:
 `cargo build --release --features cuda,mp4 --bin mmh3`. `make FEATURES=cuda,webm` builds native WebM
 output instead of MP4, for GPUs without NVENC. It needs the VP9/Opus dependencies and the libvpx
 download. `make FEATURES=cuda,mp4,webm` builds both. `CUDA_HOME` points at the CUDA toolkit (default
-`/usr/local/cuda`) and `MMH3_CUDA_ARCH` sets the GPU architecture (default `sm_120f`). Without
-either GPU feature (`cuda` or `metal`), both commands can build with the CPU-side crates. In that
-case, only `mmh3-tools inspect` is available.
+`/usr/local/cuda`) and `MMH3_CUDA_ARCH` lists the GPU architectures, separated by commas (default
+`sm_120f,sm_90a,sm_89`: Blackwell, Hopper and Ada). Without either GPU feature (`cuda` or
+`metal`), both commands can build with the CPU-side crates. In that case, only `mmh3-tools inspect`
+is available.
 
 Build the inspection and development tools separately with:
 

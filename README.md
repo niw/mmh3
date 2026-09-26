@@ -53,7 +53,7 @@ See [Usage](docs/usage.md) for the other settings.
 - Videos from a first frame, a last frame or both ([FL2VA](docs/fl2va.md)) work too.
 - NVIDIA Blackwell GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for
   `sm_120f`, so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been
-  tested yet.
+  tested yet. The build also targets Hopper (`sm_90a`) and Ada (`sm_89`), untested so far.
 - Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
 - Metal text-to-video support on macOS. See [Metal](docs/metal.md) for its current limits.

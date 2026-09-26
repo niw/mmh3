@@ -5,7 +5,9 @@ The `cuda` backend runs every part of a generation on an NVIDIA Blackwell GPU, w
 
 ## Requirements
 
-- Linux with an NVIDIA Blackwell GPU (developed on aarch64).
+- Linux with an NVIDIA Blackwell GPU (developed on aarch64). The build also holds code for Hopper
+  (`sm_90a`, such as H100) and Ada (`sm_89`, such as RTX 4090) GPUs, which has not run on those
+  cards yet. Ada cards copy tiles without TMA, and NVFP4 needs Blackwell.
 - The CUDA toolkit with `nvcc` and cuBLASLt (developed with CUDA 13.0).
 - Rust with edition 2024 support (developed with 1.98).
 - The Hugging Face CLI (`hf`) to download the models, for example installed with
