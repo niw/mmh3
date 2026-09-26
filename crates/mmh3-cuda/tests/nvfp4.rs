@@ -41,6 +41,15 @@ impl Random {
     }
 }
 
+/// Whether this device runs NVFP4, which only Blackwell does. The tests skip elsewhere.
+fn runs_nvfp4() -> bool {
+    let supported = nvfp4::supported().unwrap();
+    if !supported {
+        eprintln!("NVFP4 needs a Blackwell GPU, skipping");
+    }
+    supported
+}
+
 fn bf16_buffer(values: &[f32]) -> DeviceBuffer {
     let bytes: Vec<u8> = values
         .iter()
@@ -86,6 +95,9 @@ fn relative_error(actual: &[f32], expected: &[f64]) -> f64 {
 
 #[test]
 fn matches_the_exact_product_within_fp4_rounding() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k) = (300, 512, 1024);
     let mut random = Random(5);
     let activations = random.bf16_values(m * k);
@@ -146,6 +158,9 @@ fn matches_the_exact_product_within_fp4_rounding() {
 
 #[test]
 fn undoes_the_swiglu_interleave() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k, rank) = (130, 256, 512, 64);
     let mut random = Random(6);
     let activations = random.bf16_values(m * k);
@@ -281,6 +296,9 @@ fn fake_quantize(rows: &mut [f64], tensor_scale: f64) {
 
 #[test]
 fn matches_a_host_model_of_the_quantization() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k) = (200, 256, 512);
     let mut random = Random(7);
     let activations = random.bf16_values(m * k);
@@ -340,6 +358,9 @@ fn matches_a_host_model_of_the_quantization() {
 
 #[test]
 fn keeps_the_result_with_the_delayed_scale() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k) = (200, 256, 512);
     let mut random = Random(8);
     let activations = random.bf16_values(m * k);
@@ -371,6 +392,9 @@ fn keeps_the_result_with_the_delayed_scale() {
 
 #[test]
 fn quantizes_the_swiglu_of_its_input() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, ffn) = (130, 256, 512);
     let mut random = Random(9);
     let expanded = random.bf16_values(m * 2 * ffn);
@@ -454,6 +478,9 @@ fn product(left: &[f64], right: &[f64], rows: usize, columns: usize, inner: usiz
 
 #[test]
 fn matches_a_host_model_with_an_adapter() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k, rank, scale) = (200, 256, 512, 64, 0.05f32);
     let mut random = Random(10);
     let activations = random.bf16_values(m * k);
@@ -553,6 +580,9 @@ fn matches_a_host_model_with_an_adapter() {
 
 #[test]
 fn ignores_zero_columns() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k) = (200, 256, 512);
     let mut random = Random(11);
     let input = bf16_buffer(&random.bf16_values(m * k));
@@ -587,6 +617,9 @@ fn ignores_zero_columns() {
 
 #[test]
 fn saves_and_loads_the_chosen_algorithms() {
+    if !runs_nvfp4() {
+        return;
+    }
     let (m, n, k) = (72, 128, 256);
     let mut random = Random(12);
     let (int8_weights, row_scales) = quantize(&random.bf16_values(n * k), n, k);

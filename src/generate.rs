@@ -46,6 +46,10 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
     #[cfg(feature = "cuda")]
     {
         mmh3_cuda::check_device()?;
+        // Before the models load, which takes seconds a run that cannot compute would waste.
+        if options.get("linear-precision").copied() == Some("nvfp4") {
+            mmh3_cuda::nvfp4::check_supported()?;
+        }
         crate::models::load_algorithm_cache();
     }
     let video_path = Path::new(options.get("out").ok_or(usage)?).to_path_buf();

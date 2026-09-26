@@ -10,6 +10,7 @@
 //! its down projection A runs as an NVFP4 GEMM of its own on the quantized input and writes z into
 //! the activations' columns after the inputs.
 
+use crate::model::Error;
 use crate::{CudaError, DeviceBuffer, check};
 use std::cell::Cell;
 use std::ffi::{c_int, c_void};
@@ -533,6 +534,26 @@ pub unsafe fn gemm_pointers(
             ptr::null_mut(),
         ))
     }
+}
+
+/// Whether the device this thread computes on has cuBLASLt's block-scaled FP4 GEMM, which only
+/// Blackwell GPUs (compute capability 10 and later) have.
+pub fn supported() -> Result<bool, CudaError> {
+    Ok(crate::device_info(crate::current_device()?)?
+        .compute_capability
+        .0
+        >= 10)
+}
+
+/// Fails, naming the card, where the device this thread computes on has no block-scaled FP4 GEMM.
+pub fn check_supported() -> Result<(), Error> {
+    if supported()? {
+        return Ok(());
+    }
+    Err(Error::Model(format!(
+        "NVFP4 needs cuBLASLt's block-scaled FP4 GEMM, which only Blackwell GPUs have, not the {}",
+        crate::device_info(crate::current_device()?)?.name
+    )))
 }
 
 /// Quantizes BF16 rows `input` with `scale` and multiplies them with `weight` into `output`, both

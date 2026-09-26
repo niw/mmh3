@@ -844,6 +844,7 @@ impl CudaDit {
     /// produce them. The adapters of these layers go into their NVFP4 weights too, so LoRAs come
     /// first. The INT8 weights and adapters stay for the text and audio rows.
     pub fn use_nvfp4(&mut self) -> Result<usize, Error> {
+        crate::nvfp4::check_supported()?;
         if self.stream.get_mut().reads() {
             return Err(Error::Model(
                 "NVFP4 needs the DiT's blocks on the device, and this device reads them from the \
