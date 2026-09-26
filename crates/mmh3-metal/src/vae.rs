@@ -8,8 +8,7 @@ use mmh3_core::{
 };
 use std::cell::OnceCell;
 
-pub const DEFAULT_TILE_SIZE: usize = 256;
-pub const DEFAULT_TILE_OVERLAP_MIN: usize = 64;
+pub use mmh3_core::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
 
 /// What a decode is told when it asks for a chunk: the canvas another machine decoded, nothing
 /// when the chunk was never handed out and this machine is to decode it, or why a chunk that was

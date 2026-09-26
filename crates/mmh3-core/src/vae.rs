@@ -33,6 +33,19 @@ pub struct TileAxis {
     pub overlaps: Vec<usize>,
 }
 
+/// Side of the square tiles a decode takes, the one the decoder was trained on. Its RoPE spans a
+/// tile whatever the tile's size, so a larger tile spaces its tokens closer than the decoder knows,
+/// and it decodes in blocks.
+pub const DEFAULT_TILE_SIZE: usize = 256;
+
+/// Pixels neighboring tiles overlap by at least, on every backend, so that a canvas is cut and
+/// blended the same way whichever decodes it.
+///
+/// The grid this and a tile size produce, not the overlap itself, sets the decode cost: 32 gives
+/// 6 × 4 tiles of 256 at 1344 × 768 where 48 and above give 7 × 4, and two rows rather than three
+/// at 480.
+pub const DEFAULT_TILE_OVERLAP_MIN: usize = 32;
+
 pub fn split_tiles(length: usize, tile_size: usize, overlap_min: usize) -> TileAxis {
     if tile_size >= length {
         return TileAxis {
