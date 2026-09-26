@@ -10,5 +10,8 @@ links = "mmh3_metal"
 [dependencies]
 mmh3-core = { path = "../mmh3-core" }
 
+[build-dependencies]
+mmh3-swift-build = { path = "../mmh3-swift-build" }
+
 [dev-dependencies]
 mmh3-cpu = { path = "../mmh3-cpu" }

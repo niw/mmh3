@@ -13,6 +13,9 @@ mmh3-metal = { path = "../mmh3-metal", optional = true }
 mmh3-core = { path = "../mmh3-core" }
 mmh3-output = { path = "../mmh3-output", default-features = false, features = ["mp4"] }
 
+[build-dependencies]
+mmh3-swift-build = { path = "../mmh3-swift-build" }
+
 [dev-dependencies]
 tempfile = "3"
 serde_json = "1"

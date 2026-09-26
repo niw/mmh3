@@ -577,6 +577,7 @@ version = "0.1.0"
 dependencies = [
  "mmh3-core",
  "mmh3-cpu",
+ "mmh3-swift-build",
 ]
 
 [[package]]
@@ -611,6 +612,7 @@ dependencies = [
  "mmh3-core",
  "mmh3-metal",
  "mmh3-output",
+ "mmh3-swift-build",
  "serde_json",
  "tempfile",
 ]
@@ -621,6 +623,10 @@ version = "0.1.0"
 dependencies = [
  "cc",
 ]
+
+[[package]]
+name = "mmh3-swift-build"
+version = "0.1.0"
 
 [[package]]
 name = "moxcms"
