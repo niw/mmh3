@@ -308,6 +308,12 @@ impl DeviceBuffer {
         Ok(buffer)
     }
 
+    /// Fills the buffer with zero bytes, ordered after the work queued before it.
+    pub fn clear(&self) -> Result<(), CudaError> {
+        // SAFETY: the allocation holds `bytes` bytes.
+        check(unsafe { mmh3_cuda_memset(self.pointer, 0, self.bytes) })
+    }
+
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CudaError> {
         let mut buffer = Self::new(bytes.len())?;
         buffer.copy_from_host(bytes)?;

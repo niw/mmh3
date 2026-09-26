@@ -93,6 +93,13 @@ struct TensorMaps {
     CUtensorMap adapter_up;
 };
 
+// The maximum of |output| over each group of 128 columns from `first_column` on, as the FP32 bits
+// of the BF16 magnitude, raised with atomicMax. The caller zeroes `values` first. Null for none.
+struct ColumnMaxima {
+    unsigned *values;
+    int first_column;
+};
+
 struct TileGrid {
     int tiles_m;
     int tiles_n;
@@ -234,7 +241,7 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
                      const float *__restrict__ activation_scales,
                      const float *__restrict__ weight_scales, const float *__restrict__ bias,
                      Output *__restrict__ output, int m, int n, int k, int output_stride,
-                     int adapter_blocks, float adapter_scale) {
+                     int adapter_blocks, float adapter_scale, ColumnMaxima maxima) {
     extern __shared__ __align__(1024) uint8_t shared_memory[];
     const uint32_t shared_base = (shared_address(shared_memory) + 1023) & ~1023u;
     const uint32_t barriers = shared_base + STAGES * Config::stage_bytes;
@@ -392,6 +399,11 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
             }
         }
 
+        // A warp's columns lie in one group of 128.
+        const int warp_first_column = tile_n * Config::block_n + warp_column;
+        const bool track_maxima =
+            !SWIGLU && maxima.values != nullptr && warp_first_column >= maxima.first_column;
+        uint32_t magnitude = 0;
         #pragma unroll
         for (int quad = 0; quad < Config::n_tiles / 4; quad++) {
             const int column = tile_n * Config::block_n + warp_column + quad * 32 + quad_lane * 8;
@@ -435,9 +447,27 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
                             *reinterpret_cast<uint4 *>(
                                 output + static_cast<size_t>(row) * output_stride + column) =
                                 make_uint4(words[0], words[1], words[2], words[3]);
+                            if (track_maxima) {
+                                // Magnitudes of non-negative BF16 values order like integers.
+                                #pragma unroll
+                                for (int slot = 0; slot < 4; slot++) {
+                                    magnitude = max(magnitude, max(words[slot] & 0x7fffu,
+                                                                   (words[slot] >> 16) & 0x7fffu));
+                                }
+                            }
                         }
                     }
                 }
+            }
+        }
+        if (track_maxima) {
+            #pragma unroll
+            for (int offset = 16; offset > 0; offset /= 2) {
+                magnitude = max(magnitude, __shfl_xor_sync(0xffffffff, magnitude, offset));
+            }
+            if (lane == 0) {
+                atomicMax(maxima.values + (warp_first_column - maxima.first_column) / 128,
+                          magnitude << 16);
             }
         }
     }
@@ -494,7 +524,7 @@ struct Adapter {
 template <typename Config, typename Output, bool SWIGLU>
 int launch(const int8_t *activations, const int8_t *weights, const float *activation_scales,
            const float *weight_scales, const float *bias, Output *output, int m, int n, int k,
-           int output_stride, Adapter adapter, cudaStream_t stream) {
+           int output_stride, Adapter adapter, ColumnMaxima maxima, cudaStream_t stream) {
     const bool has_adapter =
         adapter.down != nullptr && adapter.up != nullptr && adapter.scale != 0.0f;
     const int adapter_blocks = has_adapter ? adapter.rank * 2 / BLOCK_K : 0;
@@ -535,7 +565,7 @@ int launch(const int8_t *activations, const int8_t *weights, const float *activa
     const int blocks = tiles < processors ? tiles : processors;
     int8_gemm_kernel<Config, Output, SWIGLU><<<blocks, WARPS * 32, Config::shared_bytes, stream>>>(
         maps, activation_scales, weight_scales, bias, output, m, n, k, output_stride,
-        adapter_blocks, adapter.scale);
+        adapter_blocks, adapter.scale, maxima);
     return static_cast<int>(cudaGetLastError());
 }
 
@@ -543,16 +573,16 @@ template <typename Output, bool SWIGLU>
 int launch_config(int config, const int8_t *activations, const int8_t *weights,
                   const float *activation_scales, const float *weight_scales, const float *bias,
                   Output *output, int m, int n, int k, int output_stride, Adapter adapter,
-                  cudaStream_t stream) {
+                  ColumnMaxima maxima, cudaStream_t stream) {
     switch (config) {
     case 0:
         return launch<TallTile, Output, SWIGLU>(activations, weights, activation_scales,
                                                 weight_scales, bias, output, m, n, k, output_stride,
-                                                adapter, stream);
+                                                adapter, maxima, stream);
     case 1:
         return launch<WideTile, Output, SWIGLU>(activations, weights, activation_scales,
                                                 weight_scales, bias, output, m, n, k, output_stride,
-                                                adapter, stream);
+                                                adapter, maxima, stream);
     default:
         return static_cast<int>(cudaErrorInvalidValue);
     }
@@ -562,17 +592,20 @@ template <typename Output>
 int launch_output(int config, const int8_t *activations, const int8_t *weights,
                   const float *activation_scales, const float *weight_scales, const float *bias,
                   Output *output, bool swiglu, int m, int n, int k, int output_stride,
-                  Adapter adapter, cudaStream_t stream) {
+                  Adapter adapter, ColumnMaxima maxima, cudaStream_t stream) {
+    if (maxima.values != nullptr && (swiglu || maxima.first_column % 128 != 0)) {
+        return static_cast<int>(cudaErrorInvalidValue);
+    }
     // Zero means the rows sit side by side, which is every caller but a shared-out step writing one
     // rank's heads into a row that holds every rank's.
     if (swiglu) {
         return launch_config<Output, true>(
             config, activations, weights, activation_scales, weight_scales, bias, output, m, n, k,
-            output_stride > 0 ? output_stride : n / 2, adapter, stream);
+            output_stride > 0 ? output_stride : n / 2, adapter, maxima, stream);
     }
-    return launch_config<Output, false>(config, activations, weights, activation_scales,
-                                        weight_scales, bias, output, m, n, k,
-                                        output_stride > 0 ? output_stride : n, adapter, stream);
+    return launch_config<Output, false>(
+        config, activations, weights, activation_scales, weight_scales, bias, output, m, n, k,
+        output_stride > 0 ? output_stride : n, adapter, maxima, stream);
 }
 
 // Row r of the interleaved matrix is row 4g + p of the gates for p < 4 and row 4g + p - 4 of the up
@@ -601,9 +634,9 @@ extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t *activations, const 
                                    const float *activation_scales, const float *weight_scales,
                                    __nv_bfloat16 *output, int m, int n, int k,
                                    cudaStream_t stream) {
-    return launch_config<__nv_bfloat16, false>(config, activations, weights, activation_scales,
-                                               weight_scales, nullptr, output, m, n, k, n,
-                                               Adapter{nullptr, nullptr, 0, 0, 0.0f}, stream);
+    return launch_config<__nv_bfloat16, false>(
+        config, activations, weights, activation_scales, weight_scales, nullptr, output, m, n, k, n,
+        Adapter{nullptr, nullptr, 0, 0, 0.0f}, ColumnMaxima{nullptr, 0}, stream);
 }
 
 // The same product with an optional FP32 bias [n], BF16 or FP16 output, and an optional adapter
@@ -611,22 +644,30 @@ extern "C" int mmh3_int8_gemm_bf16(int config, const int8_t *activations, const 
 // adapter_down_stride elements apart (a multiple of 8), and adapter_up [n, rank] in BF16 and the
 // rank a multiple of 64. The result is rounded once. With `swiglu`, the output is silu(gate) · up,
 // [m, n / 2], for weights, weight scales, bias and adapter_up whose rows went through
-// mmh3_interleave_swiglu_rows.
+// mmh3_interleave_swiglu_rows. A non-null `column_maxima` receives the maximum |output| of each
+// group of 128 columns from `maxima_first_column` on, as ColumnMaxima describes, for BF16 output
+// without `swiglu`.
 extern "C" int mmh3_int8_gemm(int config, const int8_t *activations, const int8_t *weights,
                               const float *activation_scales, const float *weight_scales,
                               const float *bias, void *output, int output_is_f16, int swiglu, int m,
                               int n, int k, int output_stride, const __nv_bfloat16 *adapter_down,
                               const __nv_bfloat16 *adapter_up, int rank, int adapter_down_stride,
-                              float adapter_scale, cudaStream_t stream) {
+                              float adapter_scale, unsigned *column_maxima, int maxima_first_column,
+                              cudaStream_t stream) {
     const Adapter adapter{adapter_down, adapter_up, rank, adapter_down_stride, adapter_scale};
+    const ColumnMaxima maxima{column_maxima, maxima_first_column};
     if (output_is_f16) {
+        // The maxima hold BF16 magnitudes.
+        if (column_maxima != nullptr) {
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
         return launch_output(config, activations, weights, activation_scales, weight_scales, bias,
                              static_cast<__half *>(output), swiglu != 0, m, n, k, output_stride,
-                             adapter, stream);
+                             adapter, maxima, stream);
     }
     return launch_output(config, activations, weights, activation_scales, weight_scales, bias,
                          static_cast<__nv_bfloat16 *>(output), swiglu != 0, m, n, k, output_stride,
-                         adapter, stream);
+                         adapter, maxima, stream);
 }
 
 // Reorders the rows of a [rows, row_bytes] matrix whose first half are SwiGLU gates and second half

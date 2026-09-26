@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <cuda_runtime.h>
 
 #include "attention_workspace.cuh"
@@ -182,22 +183,21 @@ __device__ __forceinline__ float warp_max(float value) {
 //   sparse_attention.cu computes them.
 // - QUANTIZE: INT8 q and k with their block scales, and the block maximum of |v|, as quantize_qk
 // and value_max in
-//   quantized_attention.cu compute them.
+//   quantized_attention.cu compute them. With `value_head_maxima`, the per-head maxima of |v|,
+//   FP8 V and its scales instead of the block maxima, as value_scales and quantize_value compute
+//   them.
 //
 // Normalized q goes back to qkv in BF16 when the attention or the Sol-Attn row offsets read it, and
-// normalized k when the attention reads BF16 keys. q and k take turns in one tile, and the rows of
-// k load while q is normalized. The register limit fits four CTAs on an SM, so that the loads of
-// some overlap the arithmetic of others.
+// normalized k when the attention reads BF16 keys. q, k and then v take turns in one tile, and the
+// rows of each load while the one before is worked on. The register limit fits four CTAs on an SM,
+// so that the loads of some overlap the arithmetic of others.
 template <bool STATS, bool QUANTIZE>
-__global__ void __launch_bounds__(INPUT_THREADS, 4)
-    attention_inputs_kernel(__nv_bfloat16 *__restrict__ qkv,
-                            const __nv_bfloat16 *__restrict__ query_weight,
-                            const __nv_bfloat16 *__restrict__ key_weight,
-                            const float *__restrict__ angles, int pairs, int tokens, int heads,
-                            float epsilon, Mmh3SparseWorkspace sparse,
-                            Mmh3QuantizedWorkspace quantized,
-                            const int32_t *__restrict__ tile_starts,
-                            const int32_t *__restrict__ tile_lengths) {
+__global__ void __launch_bounds__(INPUT_THREADS, 4) attention_inputs_kernel(
+    __nv_bfloat16 *__restrict__ qkv, const __nv_bfloat16 *__restrict__ query_weight,
+    const __nv_bfloat16 *__restrict__ key_weight, const float *__restrict__ angles, int pairs,
+    int tokens, int heads, float epsilon, Mmh3SparseWorkspace sparse,
+    Mmh3QuantizedWorkspace quantized, const int32_t *__restrict__ tile_starts,
+    const int32_t *__restrict__ tile_lengths, const float *__restrict__ value_head_maxima) {
     // A row of 128 BF16 values is 16 chunks of 16 bytes.
     constexpr int CHUNKS_PER_THREAD = INPUT_BLOCK * 16 / INPUT_THREADS;
     __shared__ __align__(16) __nv_bfloat16 tile[INPUT_BLOCK][HEAD_DIM];
@@ -228,8 +228,11 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
             }
         }
     };
+    // With the maxima of |v|, v takes a third turn in the tile and leaves as FP8.
+    const bool values = QUANTIZE && value_head_maxima != nullptr;
+    const int parts = values ? 3 : 2;
     load(0);
-    for (int part = 0; part < 2; part++) {
+    for (int part = 0; part < parts; part++) {
         #pragma unroll
         for (int index = 0; index < CHUNKS_PER_THREAD; index++) {
             const int chunk = threadIdx.x + index * INPUT_THREADS;
@@ -238,8 +241,51 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
             }
         }
         __syncthreads();
-        if (part == 0) {
-            load(1);
+        if (part + 1 < parts) {
+            load(part + 1);
+        }
+        if (part == 2) {
+            // Sums as the turn of q takes them from global memory, then FP8 V transposed into 64
+            // columns per block as quantize_value and quantize_value_tiles write it, with the scale
+            // value_scales takes from the same maximum. Each thread writes one sector: 32 rows of
+            // one dimension.
+            const int dimension = threadIdx.x % HEAD_DIM;
+            const int first_row = threadIdx.x / HEAD_DIM * 32;
+            if constexpr (STATS) {
+                if (threadIdx.x < HEAD_DIM) {
+                    float sum = 0.0f;
+                    for (int row = 0; row < rows; row++) {
+                        sum += __bfloat162float(tile[row][dimension]);
+                    }
+                    sparse.value_sums[statistic + dimension] = sum;
+                }
+            }
+            const float scale = fmaxf(value_head_maxima[head] / 448.0f, 1e-30f);
+            if (block == 0 && threadIdx.x == 0) {
+                quantized.value_scales[head] = scale;
+            }
+            uint32_t words[8];
+            #pragma unroll
+            for (int word = 0; word < 8; word++) {
+                uint32_t packed = 0;
+                #pragma unroll
+                for (int byte = 0; byte < 4; byte++) {
+                    const int row = first_row + word * 4 + byte;
+                    const float element =
+                        row < rows ? __bfloat162float(tile[row][dimension]) : 0.0f;
+                    packed |= static_cast<uint32_t>(
+                                  __nv_cvt_float_to_fp8(element / scale, __NV_SATFINITE, __NV_E4M3))
+                              << (8 * byte);
+                }
+                words[word] = packed;
+            }
+            uint4 *destination = reinterpret_cast<uint4 *>(
+                quantized.value +
+                (static_cast<int64_t>(head) * HEAD_DIM + dimension) * blocks * INPUT_BLOCK +
+                static_cast<int64_t>(block) * INPUT_BLOCK + first_row);
+            destination[0] = make_uint4(words[0], words[1], words[2], words[3]);
+            destination[1] = make_uint4(words[4], words[5], words[6], words[7]);
+            break;
         }
         for (int row = warp; row < rows; row += INPUT_WARPS) {
             normalize_rotate_head(
@@ -269,7 +315,7 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
             if (lane == 0) {
                 maxima[0][warp] = maximum;
             }
-        } else if (part == 0) {
+        } else if (part == 0 && !values) {
             const int dimension = threadIdx.x - HEAD_DIM;
             const __nv_bfloat16 *value = block_rows + 2 * inner + dimension;
             float sum = 0.0f, maximum = 0.0f;
@@ -298,7 +344,7 @@ __global__ void __launch_bounds__(INPUT_THREADS, 4)
             if (threadIdx.x == 0) {
                 (part ? quantized.key_scales : quantized.query_scales)[head * blocks + block] =
                     scale;
-                if (part == 0) {
+                if (part == 0 && !values) {
                     float value_max = maxima[1][0];
                     for (int index = 1; index < HEAD_DIM / 32; index++) {
                         value_max = fmaxf(value_max, maxima[1][index]);
@@ -723,15 +769,19 @@ extern "C" int mmh3_qk_norm_rope(__nv_bfloat16 *qkv, const __nv_bfloat16 *query_
 // Sol-Attn block statistics when `sparse` is given and the INT8 q and k with the |v| block maxima
 // when `quantized` is given. The attention that follows skips those steps. Non-null tile tables
 // (`tiles` runs of at most 64 tokens covering the sequence) replace the 64-token blocks, for VSA.
+// With `value_head_maxima`, the maximum |v| of each head (as the qkv GEMM leaves it), the pass also
+// writes the FP8 V and its scales, and the attention runs with inputs_ready = 2.
 extern "C" int mmh3_attention_inputs(__nv_bfloat16 *qkv, const __nv_bfloat16 *query_weight,
                                      const __nv_bfloat16 *key_weight, const float *angles,
                                      int pairs, int tokens, int heads, float epsilon,
                                      const Mmh3SparseWorkspace *sparse,
                                      const Mmh3QuantizedWorkspace *quantized,
                                      const int32_t *tile_starts, const int32_t *tile_lengths,
-                                     int tiles, cudaStream_t stream) {
+                                     int tiles, const float *value_head_maxima,
+                                     cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0 || (sparse == nullptr && quantized == nullptr) ||
-        (tile_starts != nullptr && (tile_lengths == nullptr || tiles <= 0))) {
+        (tile_starts != nullptr && (tile_lengths == nullptr || tiles <= 0)) ||
+        (value_head_maxima != nullptr && quantized == nullptr)) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const dim3 grid(tile_starts != nullptr ? tiles : (tokens + INPUT_BLOCK - 1) / INPUT_BLOCK,
@@ -741,9 +791,9 @@ extern "C" int mmh3_attention_inputs(__nv_bfloat16 *qkv, const __nv_bfloat16 *qu
     const Mmh3QuantizedWorkspace quantized_workspace =
         quantized != nullptr ? *quantized : Mmh3QuantizedWorkspace{};
     auto launch = [&](auto kernel) {
-        kernel<<<grid, INPUT_THREADS, 0, stream>>>(qkv, query_weight, key_weight, angles, pairs,
-                                                   tokens, heads, epsilon, sparse_workspace,
-                                                   quantized_workspace, tile_starts, tile_lengths);
+        kernel<<<grid, INPUT_THREADS, 0, stream>>>(
+            qkv, query_weight, key_weight, angles, pairs, tokens, heads, epsilon, sparse_workspace,
+            quantized_workspace, tile_starts, tile_lengths, value_head_maxima);
     };
     if (sparse != nullptr && quantized != nullptr) {
         launch(attention_inputs_kernel<true, true>);

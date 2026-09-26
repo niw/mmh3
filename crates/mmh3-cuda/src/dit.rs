@@ -8,8 +8,8 @@ use crate::attention::{
     QuantizedWorkspace, RouteOverlap, SparseWorkspace, VsaWorkspace, dense_bf16_pointers,
     dense_quantized_pointers, prepare_inputs_pointers, sparse_pointers, vsa_pointers,
 };
-use crate::gemm::AdapterPointers;
 use crate::gemm::interleave_swiglu_rows;
+use crate::gemm::{AdapterPointers, Int8Output};
 use crate::loader::Uploader;
 use crate::model::{
     ADAPTER_RANK_MULTIPLE, DeviceTensors, Down, LowRank, check_quantization, host_tensor,
@@ -1279,6 +1279,7 @@ impl CudaDit {
                     own.len(),
                     config.norm_eps,
                     attention,
+                    ptr::null(),
                 )?,
                 None => check(mmh3_qk_norm_rope(
                     inputs,
@@ -1570,6 +1571,28 @@ impl CudaDit {
         // Modulated blocks normalize and quantize the inputs of their INT8 and NVFP4 layers in one
         // pass. NVFP4 layers keep their INT8 weights.
         let nvfp4_qkv = self.nvfp4.get(&qkv).filter(|_| modulation.is_some());
+        let quantized = workspace
+            .attention_quantized
+            .as_ref()
+            .filter(|_| modulation.is_some());
+        // Sparse and quantized attention take their per-block inputs from the pass that normalizes
+        // q and k.
+        let prepared = match (sparse, quantized) {
+            (Some(SparsePass::Sol { workspace, .. }), _) => {
+                Some(PreparedAttention::Sparse(workspace))
+            }
+            (Some(SparsePass::Vsa { workspace, .. }), _) => Some(PreparedAttention::Vsa(workspace)),
+            (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
+            (None, None) => None,
+        };
+        // When the fused INT8 qkv GEMM below covers every row, it also takes the maximum |v| of
+        // each head, so that pass writes the FP8 V of quantized attention too.
+        let value_quantized = prepared.and_then(PreparedAttention::quantized).filter(|_| {
+            modulation.is_some()
+                && shard.is_none()
+                && nvfp4_qkv.is_none()
+                && self.tensors().is_int8(&qkv)
+        });
         if let Some(modulation) = modulation.filter(|_| self.tensors().is_int8(&qkv)) {
             let pending_gate = pending.map(|table| (table, MLP_GATE_CHUNK));
             let int8_rows = if nvfp4_qkv.is_some() { head } else { tokens };
@@ -1587,14 +1610,18 @@ impl CudaDit {
                 // A shared-out block exchanges what this just quantized and projects afterwards,
                 // over the whole sequence and its own heads.
                 if shard.is_none() {
-                    self.tensors().linear_quantized(
+                    let mut output = Int8Output::bf16(workspace.qkv.pointer());
+                    if let Some(quantized) = value_quantized {
+                        output.column_maxima = quantized.clear_value_head_maxima()?;
+                        output.maxima_first_column = 2 * config.inner();
+                    }
+                    self.tensors().linear_quantized_output(
                         &qkv,
-                        workspace.qkv.pointer(),
+                        output,
                         int8_rows,
                         &workspace.quantized,
                         &workspace.scales,
                         adapter(&qkv),
-                        false,
                     )?;
                 }
             }
@@ -1656,26 +1683,10 @@ impl CudaDit {
             self.sharded_attention(prefix, workspace, context, whole, angles, sparse)?;
         } else {
             let pairs = 3 * config.rope_frequencies;
-            let quantized = workspace
-                .attention_quantized
-                .as_ref()
-                .filter(|_| modulation.is_some());
-            // Sparse and quantized attention take their per-block inputs from the pass that normalizes
-            // q and k.
-            let prepared = match (sparse, quantized) {
-                (Some(SparsePass::Sol { workspace, .. }), _) => {
-                    Some(PreparedAttention::Sparse(workspace))
-                }
-                (Some(SparsePass::Vsa { workspace, .. }), _) => {
-                    Some(PreparedAttention::Vsa(workspace))
-                }
-                (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
-                (None, None) => None,
-            };
-            let inputs = if prepared.is_some() {
-                AttentionInputs::Prepared
-            } else {
-                AttentionInputs::Raw
+            let inputs = match (prepared, value_quantized) {
+                (Some(_), Some(_)) => AttentionInputs::PreparedWithValues,
+                (Some(_), None) => AttentionInputs::Prepared,
+                (None, _) => AttentionInputs::Raw,
             };
             // SAFETY: qkv holds `tokens × 3 × heads × 128` values and the angles cover every token.
             unsafe {
@@ -1690,6 +1701,9 @@ impl CudaDit {
                         config.heads,
                         config.norm_eps,
                         attention,
+                        value_quantized.map_or(ptr::null(), |quantized| {
+                            quantized.value_head_maxima().cast_const()
+                        }),
                     )?,
                     None => check(mmh3_qk_norm_rope(
                         workspace.qkv.pointer(),

@@ -34,6 +34,8 @@ unsafe extern "C" {
         rank: c_int,
         adapter_down_stride: c_int,
         adapter_scale: f32,
+        column_maxima: *mut c_void,
+        maxima_first_column: c_int,
         stream: *mut c_void,
     ) -> c_int;
     fn mmh3_merge_low_rank(
@@ -152,6 +154,10 @@ pub(crate) struct Int8Output {
     /// Elements between the rows of the output, or zero for rows side by side. A shared-out step
     /// writes one rank's heads into a row that holds every rank's.
     pub(crate) stride: usize,
+    /// Zeroed FP32 values that receive the maximum |output| of each 128 columns from
+    /// `maxima_first_column` on, or null. BF16 output without `swiglu` only.
+    pub(crate) column_maxima: *mut c_void,
+    pub(crate) maxima_first_column: usize,
 }
 
 impl Int8Output {
@@ -162,6 +168,8 @@ impl Int8Output {
             bias: ptr::null(),
             swiglu: false,
             stride: 0,
+            column_maxima: ptr::null_mut(),
+            maxima_first_column: 0,
         }
     }
 }
@@ -314,6 +322,8 @@ unsafe fn int8_config(
             adapter.rank as c_int,
             adapter.down_stride as c_int,
             adapter.scale,
+            output.column_maxima,
+            output.maxima_first_column as c_int,
             ptr::null_mut(),
         )
     })
@@ -327,6 +337,15 @@ pub struct Output<'a> {
     pub f16: bool,
     pub bias: Option<&'a DeviceBuffer>,
     pub swiglu: bool,
+    /// BF16 output without `swiglu` only.
+    pub column_maxima: Option<ColumnMaxima<'a>>,
+}
+
+/// Zeroed FP32 values that receive the maximum |output| of each 128 columns from `first_column`, a
+/// multiple of 128, on.
+pub struct ColumnMaxima<'a> {
+    pub values: &'a DeviceBuffer,
+    pub first_column: usize,
 }
 
 /// output[m, n] = round(Σₖ activations[m, k] · weights[n, k] · activation_scales[m] ·
@@ -368,6 +387,13 @@ pub fn int8(
     if let Some(bias) = output.bias {
         assert!(bias.bytes() >= n * 4, "bias is smaller than n");
     }
+    if let Some(maxima) = &output.column_maxima {
+        assert!(
+            maxima.first_column <= n
+                && maxima.values.bytes() >= (n - maxima.first_column) / 128 * 4,
+            "column maxima are smaller than the groups of 128 columns from first_column"
+        );
+    }
     if let Some(adapter) = adapter {
         assert!(
             adapter.down_stride >= adapter.rank
@@ -394,6 +420,14 @@ pub fn int8(
             .map_or(ptr::null(), |bias| bias.pointer().cast_const()),
         swiglu: output.swiglu,
         stride: 0,
+        column_maxima: output
+            .column_maxima
+            .as_ref()
+            .map_or(ptr::null_mut(), |maxima| maxima.values.pointer()),
+        maxima_first_column: output
+            .column_maxima
+            .as_ref()
+            .map_or(0, |maxima| maxima.first_column),
     };
     // SAFETY: every buffer covers the extent the kernel touches, checked above.
     unsafe {

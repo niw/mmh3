@@ -64,6 +64,7 @@ fn product(
             f16: false,
             bias: None,
             swiglu: false,
+            column_maxima: None,
         },
         m,
         n,

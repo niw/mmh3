@@ -226,6 +226,19 @@ impl DeviceTensors {
     ) -> Result<(), Error> {
         let mut output = Int8Output::bf16(output);
         output.swiglu = swiglu;
+        self.linear_quantized_output(name, output, rows, quantized, activation_scales, adapter)
+    }
+
+    /// `linear_quantized` into any INT8 GEMM output.
+    pub(crate) fn linear_quantized_output(
+        &self,
+        name: &str,
+        output: Int8Output,
+        rows: usize,
+        quantized: &DeviceBuffer,
+        activation_scales: &DeviceBuffer,
+        adapter: Option<(&LowRank, &DeviceBuffer)>,
+    ) -> Result<(), Error> {
         self.int8_linear(
             name,
             ptr::null(),

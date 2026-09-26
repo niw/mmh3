@@ -45,7 +45,7 @@ struct Mmh3VsaWorkspace {
 
 // INT8 QK and FP8 PV, FP32 softmax/accumulation, BF16 output. A null sparse workspace means dense
 // attention. With `inputs_ready`, the workspace already holds INT8 q and k, their scales and the
-// |v| block maxima.
+// |v| block maxima, and with `inputs_ready` = 2 also the FP8 V and its scales.
 extern "C" int mmh3_attention_quantized(const void *query, const void *key, const void *value,
                                         void *output, int tokens, int heads,
                                         const Mmh3AttentionLayout *layout, float scale,
@@ -56,10 +56,10 @@ extern "C" int mmh3_attention_quantized(const void *query, const void *key, cons
 // VSA's token attention with INT8 QK and FP8 PV over the tiles the VSA workspace selected, plus
 // gate · coarse when `gate` is not null. The quantized workspace is laid out by tile: INT8 q and k
 // with per-tile scales and the |v| tile maxima from mmh3_attention_inputs, and V transposed into
-// 64 columns per tile.
+// 64 columns per tile, which mmh3_attention_inputs has written too when `inputs_ready` is 2.
 extern "C" int mmh3_vsa_attention_quantized(const void *value, const void *gate,
                                             int64_t gate_stride, void *output, int tokens,
                                             int heads, const Mmh3AttentionLayout *layout,
                                             float scale, int tiles, const Mmh3VsaWorkspace *vsa,
                                             const Mmh3QuantizedWorkspace *workspace,
-                                            cudaStream_t stream);
+                                            int inputs_ready, cudaStream_t stream);

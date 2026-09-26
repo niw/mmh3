@@ -533,7 +533,8 @@ extern "C" int mmh3_vsa_attention(const void *query, const void *key, const void
     }
     if (quantized != nullptr) {
         return mmh3_vsa_attention_quantized(value, gate, gate_stride, output, tokens, heads, layout,
-                                            scale, tiles, workspace, quantized, stream);
+                                            scale, tiles, workspace, quantized, inputs_ready,
+                                            stream);
     }
     attention_kernel<<<dim3(tiles, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
         q, k, v, static_cast<const __nv_bfloat16 *>(gate), gate_stride,

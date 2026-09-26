@@ -750,6 +750,8 @@ impl CudaVideoDecoder {
                 bias,
                 swiglu,
                 stride: 0,
+                column_maxima: ptr::null_mut(),
+                maxima_first_column: 0,
             };
             int8_pointers(
                 workspace.quantized.pointer(),

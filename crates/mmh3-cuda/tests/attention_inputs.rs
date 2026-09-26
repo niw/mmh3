@@ -97,6 +97,22 @@ impl Inputs {
     }
 }
 
+/// The maximum |v| of each head in BF16, as the qkv GEMM leaves it for `prepare_inputs_with_values`.
+fn value_head_maxima(qkv: &[f32], tokens: usize, heads: usize) -> DeviceBuffer {
+    let inner = heads * HEAD_DIM;
+    let mut maxima = vec![0.0f32; heads];
+    for token in 0..tokens {
+        for (index, &value) in qkv[token * 3 * inner + 2 * inner..][..inner]
+            .iter()
+            .enumerate()
+        {
+            let head = index / HEAD_DIM;
+            maxima[head] = maxima[head].max(bf16_to_f32(f32_to_bf16(value)).abs());
+        }
+    }
+    DeviceBuffer::from_f32(&maxima).unwrap()
+}
+
 /// The first `columns` of every qkv row.
 fn columns(qkv: &DeviceBuffer, tokens: usize, heads: usize, columns: usize) -> Vec<u8> {
     let row = 3 * heads * HEAD_DIM * 2;
@@ -177,6 +193,39 @@ fn check_sparse(tokens: usize, heads: usize, precision: AttentionPrecision) {
     )
     .unwrap();
 
+    if precision == AttentionPrecision::Int8Fp8 {
+        let mut with_values = bf16_buffer(&inputs.qkv);
+        let mut with_values_output = DeviceBuffer::new(tokens * inner * 2).unwrap();
+        let workspace = SparseWorkspace::with_precision(tokens, heads, precision).unwrap();
+        attention::prepare_inputs_with_values(
+            &mut with_values,
+            &inputs.norm(),
+            tokens,
+            heads,
+            PreparedAttention::Sparse(&workspace),
+            &value_head_maxima(&inputs.qkv, tokens, heads),
+        )
+        .unwrap();
+        attention::sparse(
+            &with_values,
+            &mut with_values_output,
+            offsets,
+            tokens,
+            heads,
+            &layout,
+            scale,
+            1.0,
+            sinks,
+            &workspace,
+            AttentionInputs::PreparedWithValues,
+        )
+        .unwrap();
+        assert!(
+            download(&separate_output) == download(&with_values_output),
+            "{tokens} tokens: outputs with the prepared values differ"
+        );
+    }
+
     let fraction = separate_workspace.routed_fraction().unwrap();
     assert_eq!(
         fraction,
@@ -253,6 +302,31 @@ fn dense_quantized_attention_with_prepared_inputs_matches_separate_passes() {
         assert!(
             download(&separate_output) == download(&fused_output),
             "{tokens} tokens: outputs differ"
+        );
+
+        let mut with_values = bf16_buffer(&inputs.qkv);
+        let mut with_values_output = DeviceBuffer::new(tokens * inner * 2).unwrap();
+        let workspace = QuantizedWorkspace::new(tokens, heads).unwrap();
+        attention::prepare_inputs_with_values(
+            &mut with_values,
+            &inputs.norm(),
+            tokens,
+            heads,
+            PreparedAttention::DenseQuantized(&workspace),
+            &value_head_maxima(&inputs.qkv, tokens, heads),
+        )
+        .unwrap();
+        attention::dense_quantized(
+            &with_values,
+            &mut with_values_output,
+            scale,
+            &workspace,
+            AttentionInputs::PreparedWithValues,
+        )
+        .unwrap();
+        assert!(
+            download(&separate_output) == download(&with_values_output),
+            "{tokens} tokens: outputs with the prepared values differ"
         );
     }
 }
@@ -433,6 +507,37 @@ fn quantized_vsa_matches_the_reference() {
             AttentionInputs::Prepared,
         )
         .unwrap();
+
+        let mut with_values = bf16_buffer(&inputs.qkv);
+        let mut with_values_output = DeviceBuffer::new(tokens * inner * 2).unwrap();
+        let values_workspace =
+            VsaWorkspace::with_precision(&plan, tokens, heads, AttentionPrecision::Int8Fp8)
+                .unwrap();
+        attention::prepare_inputs_with_values(
+            &mut with_values,
+            &inputs.norm(),
+            tokens,
+            heads,
+            PreparedAttention::Vsa(&values_workspace),
+            &value_head_maxima(&inputs.qkv, tokens, heads),
+        )
+        .unwrap();
+        attention::vsa(
+            &with_values,
+            Some(&gate),
+            &mut with_values_output,
+            offsets,
+            &attention_layout,
+            scale,
+            kept,
+            &values_workspace,
+            AttentionInputs::PreparedWithValues,
+        )
+        .unwrap();
+        assert!(
+            download(&output) == download(&with_values_output),
+            "sparsity {sparsity}: outputs with the prepared values differ"
+        );
         let actual: Vec<f32> = download(&output)
             .as_chunks::<2>()
             .0

@@ -589,10 +589,12 @@ extern "C" int mmh3_attention_quantized(const void *query, const void *key, cons
         value_max<<<dim3(blocks, heads), 256, 0, stream>>>(v, tokens, *layout,
                                                            workspace->value_maxima);
     }
-    value_scales<<<heads, 32, 0, stream>>>(workspace->value_maxima, workspace->value_scales,
-                                           blocks);
-    quantize_value<<<dim3(padded / 32, 4, heads), dim3(32, 8), 0, stream>>>(
-        v, workspace->value, workspace->value_scales, tokens, padded, *layout);
+    if (inputs_ready != 2) {
+        value_scales<<<heads, 32, 0, stream>>>(workspace->value_maxima, workspace->value_scales,
+                                               blocks);
+        quantize_value<<<dim3(padded / 32, 4, heads), dim3(32, 8), 0, stream>>>(
+            v, workspace->value, workspace->value_scales, tokens, padded, *layout);
+    }
     if (!inputs_ready) {
         quantize_qk<<<dim3(blocks, heads, 2), 256, 0, stream>>>(
             q, k, workspace->query, workspace->key, workspace->query_scales, workspace->key_scales,
@@ -611,16 +613,19 @@ extern "C" int mmh3_vsa_attention_quantized(const void *value, const void *gate,
                                             int heads, const Mmh3AttentionLayout *layout,
                                             float scale, int tiles, const Mmh3VsaWorkspace *vsa,
                                             const Mmh3QuantizedWorkspace *workspace,
-                                            cudaStream_t stream) {
+                                            int inputs_ready, cudaStream_t stream) {
     if (tokens <= 0 || heads <= 0 || tiles <= 0 || layout->causal ||
         layout->heads_per_key_value > 1) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const int padded = tiles * 64;
-    value_scales<<<heads, 32, 0, stream>>>(workspace->value_maxima, workspace->value_scales, tiles);
-    quantize_value_tiles<<<dim3(tiles * 2, 4, heads), dim3(32, 8), 0, stream>>>(
-        static_cast<const __nv_bfloat16 *>(value), workspace->value, workspace->value_scales,
-        padded, *layout, *vsa);
+    if (inputs_ready != 2) {
+        value_scales<<<heads, 32, 0, stream>>>(workspace->value_maxima, workspace->value_scales,
+                                               tiles);
+        quantize_value_tiles<<<dim3(tiles * 2, 4, heads), dim3(32, 8), 0, stream>>>(
+            static_cast<const __nv_bfloat16 *>(value), workspace->value, workspace->value_scales,
+            padded, *layout, *vsa);
+    }
     return launch_attention<Pattern::VSA>(
         *workspace, static_cast<__nv_bfloat16 *>(output), tokens, heads, *layout, scale, {}, tiles,
         *vsa, static_cast<const __nv_bfloat16 *>(gate), gate_stride, stream);

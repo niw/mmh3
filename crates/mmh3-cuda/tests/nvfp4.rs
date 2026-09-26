@@ -130,6 +130,7 @@ fn matches_the_exact_product_within_fp4_rounding() {
             f16: false,
             bias: None,
             swiglu: false,
+            column_maxima: None,
         },
         m,
         n,

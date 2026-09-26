@@ -68,6 +68,7 @@ pub struct QuantizedWorkspace {
     key_scales: DeviceBuffer,
     value_scales: DeviceBuffer,
     value_maxima: DeviceBuffer,
+    value_head_maxima: DeviceBuffer,
 }
 
 impl QuantizedWorkspace {
@@ -102,7 +103,19 @@ impl QuantizedWorkspace {
             key_scales: DeviceBuffer::new(scales)?,
             value_scales: DeviceBuffer::new(heads * 4)?,
             value_maxima: DeviceBuffer::new(scales)?,
+            value_head_maxima: DeviceBuffer::new(heads * 4)?,
         })
+    }
+
+    /// Zeroes and returns the per-head maxima of |v| that the qkv GEMM raises and
+    /// `prepare_inputs_pointers` then quantizes V with, `heads` FP32 values.
+    pub(crate) fn clear_value_head_maxima(&self) -> Result<*mut c_void, CudaError> {
+        self.value_head_maxima.clear()?;
+        Ok(self.value_head_maxima.pointer())
+    }
+
+    pub(crate) fn value_head_maxima(&self) -> *mut c_void {
+        self.value_head_maxima.pointer()
     }
 
     pub fn tokens(&self) -> usize {
@@ -184,6 +197,7 @@ unsafe extern "C" {
         tile_starts: *const c_void,
         tile_lengths: *const c_void,
         tiles: c_int,
+        value_head_maxima: *const c_void,
         stream: *mut c_void,
     ) -> c_int;
     #[allow(clippy::too_many_arguments)]
@@ -485,11 +499,17 @@ pub enum AttentionInputs {
     Raw,
     /// `prepare_inputs` has left them in the workspace.
     Prepared,
+    /// `prepare_inputs_pointers` has also left the FP8 V and its scales there.
+    PreparedWithValues,
 }
 
 impl AttentionInputs {
     fn ready(self) -> c_int {
-        c_int::from(self == AttentionInputs::Prepared)
+        match self {
+            AttentionInputs::Raw => 0,
+            AttentionInputs::Prepared => 1,
+            AttentionInputs::PreparedWithValues => 2,
+        }
     }
 }
 
@@ -566,6 +586,17 @@ pub enum PreparedAttention<'a> {
     Vsa(&'a VsaWorkspace),
 }
 
+impl<'a> PreparedAttention<'a> {
+    /// The INT8/FP8 workspace of the attention, if it is quantized.
+    pub(crate) fn quantized(self) -> Option<&'a QuantizedWorkspace> {
+        match self {
+            PreparedAttention::DenseQuantized(workspace) => Some(workspace),
+            PreparedAttention::Sparse(workspace) => workspace.quantized.as_ref(),
+            PreparedAttention::Vsa(workspace) => workspace.quantized.as_ref(),
+        }
+    }
+}
+
 /// `qk_norm_rope` fused with the per-block work of the attention that follows, which then runs with
 /// `AttentionInputs::Prepared`: Sol-Attn's block statistics, VSA's pooled tiles, and INT8 q and k
 /// with the block maxima of |v| for quantized attention. Normalized k stays unwritten in qkv when the attention reads
@@ -590,6 +621,40 @@ pub fn prepare_inputs(
             heads,
             norm.epsilon,
             attention,
+            ptr::null(),
+        )
+    }
+}
+
+/// `prepare_inputs` that also writes the FP8 V of quantized attention, which then runs with
+/// `AttentionInputs::PreparedWithValues`. `value_head_maxima` holds the maximum |v| of each head as
+/// FP32 values, which the DiT takes from its qkv GEMM.
+pub fn prepare_inputs_with_values(
+    qkv: &mut DeviceBuffer,
+    norm: &HeadNorm,
+    tokens: usize,
+    heads: usize,
+    attention: PreparedAttention,
+    value_head_maxima: &DeviceBuffer,
+) -> Result<(), CudaError> {
+    norm.check(qkv, tokens, heads);
+    assert!(
+        value_head_maxima.bytes() >= heads * 4,
+        "value_head_maxima holds fewer than heads values"
+    );
+    // SAFETY: the buffers cover every token and head, checked above.
+    unsafe {
+        prepare_inputs_pointers(
+            qkv.pointer(),
+            norm.query_weight.pointer(),
+            norm.key_weight.pointer(),
+            norm.angles(),
+            norm.pairs,
+            tokens,
+            heads,
+            norm.epsilon,
+            attention,
+            value_head_maxima.pointer().cast_const(),
         )
     }
 }
@@ -598,7 +663,9 @@ pub fn prepare_inputs(
 ///
 /// # Safety
 /// `qkv` must hold `tokens × 3 × heads × 128` BF16 values, the weights 128 BF16 values each and
-/// `angles`, unless null, `tokens × pairs` FP32 values.
+/// `angles`, unless null, `tokens × pairs` FP32 values. A non-null `value_head_maxima`, from
+/// `QuantizedWorkspace::clear_value_head_maxima` and then raised by the qkv GEMM, lets the pass also
+/// write the FP8 V of quantized attention, which then runs with `AttentionInputs::PreparedWithValues`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn prepare_inputs_pointers(
     qkv: *mut c_void,
@@ -610,7 +677,12 @@ pub(crate) unsafe fn prepare_inputs_pointers(
     heads: usize,
     epsilon: f32,
     attention: PreparedAttention,
+    value_head_maxima: *const c_void,
 ) -> Result<(), CudaError> {
+    assert!(
+        value_head_maxima.is_null() || attention.quantized().is_some(),
+        "V is quantized only for INT8/FP8 attention"
+    );
     let mut tiles = (ptr::null(), ptr::null(), 0);
     let (sparse, quantized) = match attention {
         PreparedAttention::DenseQuantized(workspace) => {
@@ -676,6 +748,7 @@ pub(crate) unsafe fn prepare_inputs_pointers(
             tiles.0,
             tiles.1,
             tiles.2,
+            value_head_maxima,
             ptr::null_mut(),
         )
     })
@@ -1088,7 +1161,7 @@ pub(crate) unsafe fn vsa_pointers(
     inputs: AttentionInputs,
 ) -> Result<(), CudaError> {
     assert!(
-        workspace.quantized.is_none() || inputs == AttentionInputs::Prepared,
+        workspace.quantized.is_none() || inputs != AttentionInputs::Raw,
         "quantized VSA needs prepared inputs"
     );
     let raw = workspace.raw();

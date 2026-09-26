@@ -1,7 +1,7 @@
 #![cfg(target_os = "linux")]
 use mmh3_core::numeric::{bf16_to_f32, f16_to_f32, f32_to_bf16, f32_to_f16};
 use mmh3_cuda::DeviceBuffer;
-use mmh3_cuda::gemm::{self, Adapter, Output};
+use mmh3_cuda::gemm::{self, Adapter, ColumnMaxima, Output};
 
 struct Random(u64);
 
@@ -126,8 +126,16 @@ fn check_every_config(
         })
         .collect();
 
+    // BF16 output also reports the maxima of the groups of 128 columns after the first.
+    let first_column = 128;
+    let groups = if f16_with_bias {
+        0
+    } else {
+        (n - first_column) / 128
+    };
     for config in 0..gemm::int8_config_count() {
         let mut output = DeviceBuffer::new(m * n * 2).unwrap();
+        let maxima = DeviceBuffer::zeroed(groups.max(1) * 4).unwrap();
         gemm::int8(
             config,
             &activation_buffer,
@@ -139,6 +147,10 @@ fn check_every_config(
                 f16: f16_with_bias,
                 bias: f16_with_bias.then_some(&bias_buffer),
                 swiglu: false,
+                column_maxima: (!f16_with_bias).then_some(ColumnMaxima {
+                    values: &maxima,
+                    first_column,
+                }),
             },
             m,
             n,
@@ -148,6 +160,20 @@ fn check_every_config(
         .unwrap();
         let mut output_bytes = vec![0; m * n * 2];
         output.copy_to_host(&mut output_bytes).unwrap();
+        let mut expected_maxima = vec![0.0f32; groups];
+        for (index, pair) in output_bytes.as_chunks::<2>().0.iter().enumerate() {
+            let column = index % n;
+            if column >= first_column && groups > 0 {
+                let group = (column - first_column) / 128;
+                let magnitude = bf16_to_f32(u16::from_le_bytes(*pair)).abs();
+                expected_maxima[group] = expected_maxima[group].max(magnitude);
+            }
+        }
+        assert_eq!(
+            maxima.to_f32().unwrap()[..groups],
+            expected_maxima,
+            "{m} × {n} × {k}, rank {rank}, config {config}: column maxima"
+        );
 
         for (index, &expected) in expected.iter().enumerate() {
             let bits = u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]]);
@@ -259,6 +285,7 @@ fn writes_swiglu_of_interleaved_rows() {
                 f16,
                 bias: Some(&bias_buffer),
                 swiglu: true,
+                column_maxima: None,
             },
             m,
             n,
