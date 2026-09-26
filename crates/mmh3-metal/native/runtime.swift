@@ -2,6 +2,18 @@ import Foundation
 import Metal
 import MetalPerformanceShaders
 
+// Bytes every context holds in its pool, which the memory a caller is told it may still fill
+// counts as free: a pooled buffer is handed out again, or let go of when the device needs the room.
+private let poolLock = NSLock()
+private let weightsLabel = "weights"
+private var pooledEverywhere = 0
+
+private func pooled(_ change: Int) {
+    poolLock.lock()
+    pooledEverywhere += change
+    poolLock.unlock()
+}
+
 // One context serves every thread of the process, one thread at a time: its lock is taken for the
 // whole of every call that touches it, since its queue, its pipelines and its batch are one of
 // each. Command buffers retain their inputs until completion. Host reads and foreign-queue exports
@@ -21,7 +33,14 @@ private final class Context {
     var products: [String: MPSMatrixMultiplication] = [:]
     var reusable: [MTLBuffer] = []
     var retired: [MTLBuffer] = []
-    var pooledBytes = 0
+    var pooledBytes = 0 {
+        didSet { pooled(pooledBytes - oldValue) }
+    }
+
+    // The pool holds buffers up to half of what the device recommends one process fill, up to 8 GB.
+    // A DiT block allocates the same few outputs of gigabytes each, and a fresh one costs its pages
+    // on first touch, so the pool gains most when it holds all of them.
+    let poolLimit: Int
     var submissions: UInt64 = 0
     var allocations: UInt64 = 0
     var reuses: UInt64 = 0
@@ -37,6 +56,7 @@ private final class Context {
 
         self.device = device
         self.queue = queue
+        poolLimit = min(Int(device.recommendedMaxWorkingSetSize) / 2, 8 << 30)
         let options = MTLCompileOptions()
         options.mathMode = .safe
         library = try device.makeLibrary(source: source, options: options)
@@ -140,9 +160,18 @@ private final class Context {
     }
 
     func recycle(_ buffer: MTLBuffer) {
-        // Never overwrite shared storage while the GPU can still be reading it.
-        guard pooledBytes + buffer.length <= 64 * 1024 * 1024,
-              reusable.count + retired.count < 128, executionError == nil
+        guard buffer.length <= poolLimit, buffer.label != weightsLabel, executionError == nil else {
+            return
+        }
+        // The oldest free buffers make room in bytes and in number, so a text encoder's many small
+        // outputs cannot crowd out the DiT's. Retired buffers stay, since the GPU may still read
+        // them.
+        while pooledBytes + buffer.length > poolLimit || reusable.count + retired.count >= 128,
+              !reusable.isEmpty
+        {
+            pooledBytes -= reusable.removeFirst().length
+        }
+        guard pooledBytes + buffer.length <= poolLimit, reusable.count + retired.count < 128
         else {
             return
         }
@@ -158,6 +187,7 @@ private final class Context {
     deinit {
         // Complete outstanding work even when unwinding an earlier Rust error.
         try? synchronize()
+        pooled(-pooledBytes)
         free(name)
     }
 }
@@ -383,8 +413,11 @@ func metalMemoryInfo(_ output: UnsafeMutablePointer<UInt64>) -> Int32 {
             return fail(BridgeError.message("No Metal GPU is available"))
         }
 
+        poolLock.lock()
+        let pooledBytes = pooledEverywhere
+        poolLock.unlock()
         output[0] = device.recommendedMaxWorkingSetSize
-        output[1] = UInt64(device.currentAllocatedSize)
+        output[1] = UInt64(max(device.currentAllocatedSize - pooledBytes, 0))
         return 0
     }
 }
@@ -424,6 +457,12 @@ func metalAlloc(_ pointer: UnsafeMutableRawPointer, _ bytes: Int, _ data: Unsafe
                 ctx.pooledBytes -= bytes
                 ctx.reuses += 1
             } else {
+                // Pooled buffers count as free, so they go before an allocation takes the device
+                // past what one process should fill.
+                let share = Int(ctx.device.recommendedMaxWorkingSetSize)
+                while !ctx.reusable.isEmpty, ctx.device.currentAllocatedSize + bytes > share {
+                    ctx.pooledBytes -= ctx.reusable.removeFirst().length
+                }
                 guard let allocated = ctx.device.makeBuffer(length: bytes, options: .storageModeShared)
                 else {
                     _ = fail(
@@ -441,6 +480,10 @@ func metalAlloc(_ pointer: UnsafeMutableRawPointer, _ bytes: Int, _ data: Unsafe
             ctx.allocatedSinceSync += bytes
             if let data {
                 result.contents().copyMemory(from: data, byteCount: bytes)
+                // A model's weights go back to the device with the model rather than into the pool.
+                result.label = weightsLabel
+            } else {
+                result.label = nil
             }
 
             return Unmanaged.passRetained(result as AnyObject).toOpaque()
