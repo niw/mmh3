@@ -116,6 +116,8 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
         })?;
         drop(decoder);
         output.write_cuda_video(&decoded)?;
+        // The sampling saved what it chose, and the decode has chosen for shapes of its own since.
+        crate::models::save_algorithm_cache();
     }
     #[cfg(feature = "metal")]
     if output.streams_metal_video() {
