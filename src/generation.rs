@@ -573,7 +573,9 @@ pub fn sample(
     // A prompt of plain text goes to a worker, which reads nothing ahead for it.
     let prompt_on_worker =
         prompt.is_some() && options.get("context").is_none() && prompt_references.is_empty();
-    let prepared_workers = prepare_workers(settings, options, dit_file, prompt_on_worker);
+    #[allow(unused_mut)]
+    let (mut prepared_workers, encoding_slots) =
+        prepare_workers(settings, options, dit_file, prompt_on_worker);
 
     let encode_context = || -> Result<(Tensor, Vec<mmh3_core::dit::timestep::Modality>), String> {
         #[allow(unused_mut)]
@@ -792,6 +794,7 @@ pub fn sample(
 
     let sparse = sparse_attention(options, gated)?;
     let schedule = &settings.schedule;
+    prepare_after_prompt(&mut prepared_workers, &encoding_slots, options, dit_file);
     // A machine that can take a share of every step, and a run whose shape one can be cut out of.
     let mut target = shard_target(
         settings,
@@ -1136,33 +1139,24 @@ struct ShardTarget {
 /// session opens on, since what a worker reads early is only there for the connection it came on.
 ///
 /// The card that encodes the prompt, when `prompt_on_worker` says a worker does, is not told, for
-/// any slot on it. Its reads take turns, so the DiT read ahead would only hold the prompt up, and on a card without
-/// the room for both it would be let go for the text encoder and read again for the steps.
+/// any slot on it. Its reads take turns, so the DiT read ahead would only hold the prompt up, and
+/// on a card without the room for both it would be let go for the text encoder and read again for
+/// the steps. Those slots come back as indices, for `prepare_after_prompt`.
 fn prepare_workers(
     settings: &Settings,
     options: &HashMap<&str, &str>,
     dit_file: &str,
     prompt_on_worker: bool,
-) -> Vec<crate::worker::Worker> {
-    use crate::worker::{TEXT_ENCODER_ROLE, Worker, digest};
-    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, CAPABILITY_ENCODE_TEXT, Checkpoint};
+) -> (Vec<crate::worker::Worker>, Vec<usize>) {
+    use crate::worker::{TEXT_ENCODER_ROLE, Worker};
+    use mmh3_core::worker::{CAPABILITY_DIT_SHARD, CAPABILITY_ENCODE_TEXT};
 
     let ranks = settings.workers_for(CAPABILITY_DIT_SHARD);
     if ranks.is_empty() {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
-    let Ok(path) = crate::models::option_path(options, "dit", dit_file) else {
-        return Vec::new();
-    };
-    let checkpoint = match mmh3_core::safetensors::SafeTensors::open(std::path::Path::new(&path)) {
-        Ok(file) => Checkpoint {
-            role: "dit.h3".to_owned(),
-            digest: digest(&file),
-        },
-        Err(error) => {
-            eprintln!("warning: reading {path}: {error}");
-            return Vec::new();
-        }
+    let Some(checkpoint) = dit_checkpoint(options, dit_file) else {
+        return (Vec::new(), Vec::new());
     };
     // The machine `encode_on_worker` asks first, which is the one that encodes.
     let encoder = prompt_on_worker
@@ -1175,6 +1169,7 @@ fn prepare_workers(
         .flatten();
     // A connection per card, since each card of a worker is a rank of its own.
     let mut workers = Vec::new();
+    let mut encoding = Vec::new();
     for address in ranks {
         let cards = match Worker::connect_every_card(address, &settings.token) {
             Ok(cards) => cards,
@@ -1195,6 +1190,7 @@ fn prepare_workers(
                 && worker.serves(CAPABILITY_ENCODE_TEXT)
                 && worker.checkpoint(TEXT_ENCODER_ROLE).is_some();
             if encodes {
+                encoding.push(workers.len());
                 workers.push(worker);
                 continue;
             }
@@ -1205,7 +1201,61 @@ fn prepare_workers(
             workers.push(worker);
         }
     }
-    workers
+    (workers, encoding)
+}
+
+/// The DiT a run shares, as the workers name it.
+fn dit_checkpoint(
+    options: &HashMap<&str, &str>,
+    dit_file: &str,
+) -> Option<mmh3_core::worker::Checkpoint> {
+    let path = crate::models::option_path(options, "dit", dit_file).ok()?;
+    match mmh3_core::safetensors::SafeTensors::open(std::path::Path::new(&path)) {
+        Ok(file) => Some(mmh3_core::worker::Checkpoint {
+            role: "dit.h3".to_owned(),
+            digest: crate::worker::digest(&file),
+        }),
+        Err(error) => {
+            eprintln!("warning: reading {path}: {error}");
+            None
+        }
+    }
+}
+
+/// Tells the slots on the card that encoded the prompt to read the DiT, now that the prompt is
+/// done. A slot whose process has another card that read it ahead copies it from that card, and
+/// this waits for the copy, since the other card's session would otherwise take its DiT out of
+/// reach first. Any other slot reads it as its session opens.
+fn prepare_after_prompt(
+    workers: &mut [crate::worker::Worker],
+    encoding: &[usize],
+    options: &HashMap<&str, &str>,
+    dit_file: &str,
+) {
+    if encoding.is_empty() {
+        return;
+    }
+    let Some(checkpoint) = dit_checkpoint(options, dit_file) else {
+        return;
+    };
+    for &index in encoding {
+        let (process, card) = (workers[index].welcome.process, workers[index].welcome.card);
+        let read_ahead = workers.iter().enumerate().any(|(other, worker)| {
+            !encoding.contains(&other)
+                && worker.welcome.process == process
+                && worker.welcome.card != card
+        });
+        if !read_ahead {
+            continue;
+        }
+        let worker = &mut workers[index];
+        if let Err(error) = worker
+            .prepare(&checkpoint)
+            .and_then(|()| worker.ping().map(drop))
+        {
+            eprintln!("warning: worker {}: {error}", worker.name());
+        }
+    }
 }
 
 /// The first worker that can take a share of the DiT, or `None` to keep the whole step here.

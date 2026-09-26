@@ -325,6 +325,24 @@ pub(crate) struct ScaleSlots {
     pub(crate) exact: bool,
 }
 
+impl Nvfp4Weight {
+    /// The weight again on the device this thread computes on, see `DeviceBuffer::copied`.
+    pub(crate) fn copied(&self) -> Result<Self, CudaError> {
+        Ok(Nvfp4Weight {
+            values: self.values.copied()?,
+            scales: self.scales.copied()?,
+            tensor_scale: self.tensor_scale,
+            outputs: self.outputs,
+            features: self.features,
+            columns: self.columns,
+            down: match &self.down {
+                Some(down) => Some(Box::new(down.copied()?)),
+                None => None,
+            },
+        })
+    }
+}
+
 impl Nvfp4Scale {
     pub fn new() -> Result<Self, CudaError> {
         Ok(Nvfp4Scale {

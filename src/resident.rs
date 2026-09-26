@@ -307,6 +307,38 @@ impl Models {
         self.dit.kept.take()
     }
 
+    /// A copy onto this table's device of a DiT from `checkpoint` that another device of this
+    /// process keeps and has not lent out, with the key it is kept under and that device. `None`
+    /// when no device does, or when the copy failed, which leaves the caller to read it from the
+    /// disk.
+    ///
+    /// NOTE: this holds its own table while it waits for another's, so a device that waits in here
+    /// is one the others do not wait for in turn.
+    #[cfg(feature = "cuda")]
+    pub fn copy_dit(&mut self, checkpoint: u64) -> Option<(DitKey, Dit, usize)> {
+        let own = self.device;
+        lock_copying().push(own);
+        let copied = (0..DEVICES)
+            .filter(|&device| device != own && MODELS[device].get().is_some())
+            .find_map(|device| {
+                let other = wait_for_table(device)?;
+                let (key, dit) = other
+                    .dit
+                    .kept
+                    .as_ref()
+                    .filter(|(key, _)| key.checkpoint == checkpoint)?;
+                match self.read_fitting(|| dit.copy_here(false), || dit.copy_here(true)) {
+                    Ok(copy) => Some((key.clone(), copy, device)),
+                    Err(error) => {
+                        eprintln!("warning: copying the DiT of device {device}: {error}");
+                        None
+                    }
+                }
+            });
+        lock_copying().retain(|&device| device != own);
+        copied
+    }
+
     /// The kept DiT, lent out of the table for a run, which puts it back with `return_dit`.
     pub fn lend_dit(&mut self) -> Option<(DitKey, Dit)> {
         let lent = self.dit.kept.take();
@@ -513,6 +545,40 @@ impl Table {
     /// still use them: what that session was in the middle of is its own business and not theirs.
     pub fn borrow(&mut self) -> impl std::ops::DerefMut<Target = Models> + '_ {
         locked(self.device)
+    }
+}
+
+/// The devices whose connection waits in `Models::copy_dit` for another device's table.
+#[cfg(feature = "cuda")]
+static COPYING: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "cuda")]
+fn lock_copying() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    COPYING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// How long a device waits for another's table, which covers that device still reading the DiT
+/// this one would copy.
+#[cfg(feature = "cuda")]
+const COPY_WAIT: Duration = Duration::from_secs(120);
+
+/// The table of `device` once nobody holds it, or `None` when it is the table of a device that
+/// waits for another in turn, or it stays held too long.
+#[cfg(feature = "cuda")]
+fn wait_for_table(device: usize) -> Option<std::sync::MutexGuard<'static, Models>> {
+    let deadline = Instant::now() + COPY_WAIT;
+    loop {
+        match shared(device).try_lock() {
+            Ok(models) => return Some(models),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => return Some(poisoned.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        if lock_copying().contains(&device) || Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 

@@ -528,6 +528,44 @@ impl CudaDit {
         })
     }
 
+    /// A copy of this DiT on the device this thread computes on, from the device it was read onto,
+    /// which spares reading and patching it again. The copy reads on the way the blocks this one
+    /// reads on the way, and with `fitting` also the blocks it finds no room for, where it would
+    /// otherwise fail for want of memory. What this one's calls learned stays behind, as a DiT
+    /// just read has learned nothing.
+    pub fn copy_here(&self, fitting: bool) -> Result<CudaDit, Error> {
+        let (stream, tensors) = self
+            .stream
+            .borrow()
+            .copy_here(&self.tensors.borrow(), fitting)?;
+        let mut adapters = HashMap::with_capacity(self.adapters.len());
+        for (name, adapter) in &self.adapters {
+            adapters.insert(name.clone(), adapter.copied()?);
+        }
+        let mut nvfp4 = HashMap::with_capacity(self.nvfp4.len());
+        for (name, weight) in &self.nvfp4 {
+            nvfp4.insert(name.clone(), weight.copied()?);
+        }
+        let mut nvfp4_scales = HashMap::with_capacity(self.nvfp4_scales.len());
+        for name in self.nvfp4_scales.keys() {
+            nvfp4_scales.insert(name.clone(), Nvfp4Scale::new()?);
+        }
+        crate::synchronize()?;
+        Ok(CudaDit {
+            attention_precision: self.attention_precision,
+            config: self.config.clone(),
+            tensors: RefCell::new(tensors),
+            stream: RefCell::new(stream),
+            merged: self.merged,
+            adapters,
+            nvfp4,
+            nvfp4_scales,
+            adaln_table: self.adaln_table.clone(),
+            inverse_frequencies: self.inverse_frequencies.clone(),
+            buffers: RefCell::default(),
+        })
+    }
+
     /// Selects quantized attention for the main DiT blocks. The text refiner stays in BF16.
     pub fn attention_precision(&self) -> AttentionPrecision {
         self.attention_precision

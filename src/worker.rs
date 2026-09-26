@@ -3715,10 +3715,23 @@ fn prepare_dit(kept: &mut Models, models: &Path, checkpoint: &worker::Checkpoint
     {
         return;
     }
+    let started = Instant::now();
+    // Another card of this process that already read it spares the disk and the patches.
+    #[cfg(feature = "cuda")]
+    if let Some((key, dit, device)) = {
+        kept.take_dit();
+        kept.copy_dit(checkpoint.digest)
+    } {
+        println!(
+            "copied the DiT from device {device} in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        kept.keep_dit(key, dit);
+        return;
+    }
     let Some(path) = find_checkpoint(models, checkpoint.digest, &["diffusion_models"]) else {
         return;
     };
-    let started = Instant::now();
     match read_dit(kept, &path) {
         Ok(dit) => {
             println!(

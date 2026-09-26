@@ -319,3 +319,43 @@ fn matches_comfyui_golden_with_references() {
         &unbatched(tensor(&file, "output.reference.audio")).data,
     );
 }
+
+#[test]
+fn copies_a_dit_that_reads_blocks_on_the_way() {
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let dit = CudaDit::load(&file, "weight.").unwrap();
+    let inputs = DitInputs {
+        video: unbatched(tensor(&file, "input.video")),
+        audio: unbatched(tensor(&file, "input.audio")),
+        context: unbatched(tensor(&file, "input.context")),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references: Vec::new(),
+        sigma: tensor(&file, "input.timestep").data[0] / 1000.0,
+        shift_video: metadata_number(&file, "shift_video"),
+        shift_audio: metadata_number(&file, "shift_audio"),
+    };
+    let whole = dit.forward(&inputs, &[], None).unwrap();
+    let same = |outputs: &mmh3_cuda::dit::DitOutputs| {
+        outputs.video == whole.video && outputs.audio == whole.audio
+    };
+    assert!(same(
+        &dit.copy_here(false)
+            .unwrap()
+            .forward(&inputs, &[], None)
+            .unwrap()
+    ));
+
+    // Right after giving its blocks up, every block is read on the way, and so is the copy's.
+    assert!(dit.give_up_blocks().unwrap());
+    let copy = dit.copy_here(false).unwrap();
+    assert!(same(&copy.forward(&inputs, &[], None).unwrap()));
+    // A call keeps blocks back again, which a copy then holds whole.
+    assert!(same(&dit.forward(&inputs, &[], None).unwrap()));
+    assert!(same(
+        &dit.copy_here(false)
+            .unwrap()
+            .forward(&inputs, &[], None)
+            .unwrap()
+    ));
+}

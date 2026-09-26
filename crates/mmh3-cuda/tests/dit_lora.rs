@@ -227,4 +227,10 @@ fn applies_a_lora_like_merged_weights() {
         );
         assert!(error < 0.02, "{name}: relative error {error}");
     }
+
+    // A copy carries the weights, the adapters and the replaced tensors, so it answers the same.
+    let copy = dit.copy_here(false).unwrap();
+    let copied = copy.forward(&inputs, &[], None).unwrap();
+    assert_eq!(copied.video, outputs.video);
+    assert_eq!(copied.audio, outputs.audio);
 }

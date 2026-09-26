@@ -100,11 +100,38 @@ pub(crate) struct DeviceTensor {
     pub(crate) shape: Vec<usize>,
 }
 
+impl DeviceTensor {
+    /// This tensor again on the device this thread computes on, see `DeviceBuffer::copied`.
+    fn copied(&self) -> Result<Self, CudaError> {
+        Ok(DeviceTensor {
+            buffer: self.buffer.copied()?,
+            dtype: self.dtype,
+            shape: self.shape.clone(),
+        })
+    }
+}
+
 /// Checkpoint tensors on the device, keyed by their names without the checkpoint prefix.
 #[derive(Default)]
 pub(crate) struct DeviceTensors(HashMap<String, DeviceTensor>);
 
 impl DeviceTensors {
+    /// The tensors `keep` names, again on the device this thread computes on.
+    pub(crate) fn copied_where(&self, keep: impl Fn(&str) -> bool) -> Result<Self, CudaError> {
+        let mut copies = HashMap::new();
+        for (name, tensor) in self.0.iter().filter(|(name, _)| keep(name)) {
+            copies.insert(name.clone(), tensor.copied()?);
+        }
+        Ok(DeviceTensors(copies))
+    }
+
+    /// Copies `name` of `from` here, on the device this thread computes on.
+    pub(crate) fn copy_from(&mut self, from: &DeviceTensors, name: &str) -> Result<(), Error> {
+        let copy = from.get(name)?.copied()?;
+        self.0.insert(name.to_owned(), copy);
+        Ok(())
+    }
+
     /// Allocates the tensor on the device and queues its bytes on `uploader`, which fills it when
     /// it runs.
     pub(crate) fn insert(
@@ -573,6 +600,26 @@ pub(crate) struct LowRank {
 }
 
 impl LowRank {
+    /// The adapter again on the device this thread computes on, see `DeviceBuffer::copied`.
+    pub(crate) fn copied(&self) -> Result<Self, CudaError> {
+        let down = match &self.down {
+            Down::Bf16(weights) => Down::Bf16(weights.copied()?),
+            Down::Int8 {
+                weights,
+                scales,
+                columns,
+            } => Down::Int8 {
+                weights: weights.copied()?,
+                scales: scales.copied()?,
+                columns: *columns,
+            },
+        };
+        Ok(LowRank {
+            down,
+            up: self.up.copied()?,
+            ..*self
+        })
+    }
     /// Quantizes a BF16 down projection `[rank, inputs]`, given as its little-endian bytes, for an
     /// INT8 ConvRot layer, see `Down::Int8`.
     pub(crate) fn quantize_down(

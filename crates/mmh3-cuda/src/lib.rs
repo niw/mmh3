@@ -538,6 +538,15 @@ impl DeviceBuffer {
         self.bytes
     }
 
+    /// A buffer of the same bytes on the device this thread computes on, which may be another
+    /// device than this one's. The copy is queued, and `synchronize` waits for it.
+    pub fn copied(&self) -> Result<DeviceBuffer, CudaError> {
+        let copy = DeviceBuffer::new(self.bytes)?;
+        // SAFETY: both allocations hold `self.bytes` bytes.
+        unsafe { copy_across(copy.pointer, self.pointer, self.bytes)? };
+        Ok(copy)
+    }
+
     /// The device this buffer lives on.
     pub fn device(&self) -> usize {
         self.device

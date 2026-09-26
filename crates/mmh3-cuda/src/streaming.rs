@@ -339,6 +339,78 @@ impl Stream {
         }
     }
 
+    /// The same units for a copy of the model on the device this thread computes on, with
+    /// `tensors`, this model's, copied beside them. The copy holds whole the units this one holds
+    /// on its device and reads the rest on the way from the same files. With `fitting` it holds
+    /// only as many of them as fit, those given up last first, where it would otherwise fail for
+    /// want of memory.
+    pub(crate) fn copy_here(
+        &self,
+        tensors: &DeviceTensors,
+        fitting: bool,
+    ) -> Result<(Stream, DeviceTensors), Error> {
+        let in_units: std::collections::HashSet<&str> = self
+            .units
+            .iter()
+            .flat_map(|unit| unit.tensors().iter().map(|tensor| tensor.name.as_str()))
+            .collect();
+        let mut copied = tensors.copied_where(|name| !in_units.contains(name))?;
+        let mut copy = Stream::new(
+            self.what,
+            self.files.clone(),
+            self.units.clone(),
+            self.give_up.clone(),
+            self.sized.clone(),
+        );
+        let mut full = false;
+        for &index in self.give_up.iter().rev() {
+            if full || matches!(self.kept[index], Kept::Read(_)) {
+                copy.kept[index] = Kept::Read(Region::Both);
+                continue;
+            }
+            let unit = &self.units[index];
+            let result = unit
+                .tensors()
+                .iter()
+                .try_for_each(|tensor| copied.copy_from(tensors, &tensor.name));
+            match result {
+                Ok(()) => {}
+                Err(error) if fitting && error.is_out_of_memory() => {
+                    for tensor in unit.tensors() {
+                        copied.remove(&tensor.name);
+                    }
+                    copy.kept[index] = Kept::Read(Region::Both);
+                    full = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if copy.kept.iter().any(|kept| matches!(kept, Kept::Read(_))) {
+            // The regions go where the last units copied were, when there is no other room.
+            loop {
+                let error = match copy.size_regions() {
+                    Ok(()) => break,
+                    Err(Error::Cuda(error)) if error.is_out_of_memory() => error,
+                    Err(error) => return Err(error),
+                };
+                let Some(index) = copy
+                    .give_up
+                    .iter()
+                    .copied()
+                    .find(|&index| fitting && matches!(copy.kept[index], Kept::Tensors))
+                else {
+                    return Err(error.into());
+                };
+                for tensor in copy.units[index].tensors() {
+                    copied.remove(&tensor.name);
+                }
+                copy.kept[index] = Kept::Read(Region::Both);
+            }
+            copy.assign(&mut copied);
+        }
+        Ok((copy, copied))
+    }
+
     pub(crate) fn files(&mut self) -> &mut Files {
         &mut self.files
     }
