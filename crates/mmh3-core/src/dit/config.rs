@@ -36,8 +36,6 @@ impl DitConfig {
         self.rope_frequencies * 6
     }
 
-    /// Infers the configuration of a pruned checkpoint from tensor shapes, keyed by checkpoint
-    /// tensor name.
     /// The shape of a DiT read from its checkpoint header alone, with no weights uploaded
     /// anywhere. A leader that hands every step to its ranks and only puts the parts back
     /// together needs this and none of the 21 GB behind it.
@@ -55,6 +53,8 @@ impl DitConfig {
             .is_some()
     }
 
+    /// Infers the configuration of a pruned checkpoint from tensor shapes, keyed by checkpoint
+    /// tensor name.
     pub fn from_shapes(shape_of: impl Fn(&str) -> Option<Vec<usize>>) -> Result<Self, String> {
         let shape = |name: &str| shape_of(name).ok_or_else(|| format!("missing tensor {name}"));
         let count = |prefix: &str| {

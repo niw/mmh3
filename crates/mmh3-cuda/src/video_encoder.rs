@@ -388,8 +388,9 @@ pub struct CudaVideoEncoder {
 
 impl CudaVideoEncoder {
     /// Loads the encoder of a video VAE checkpoint: `encoder.*`, `quant_conv` and the latent
-    /// statistics. `temporal` decides whether it encodes single frames or clips, and the tile
-    /// geometry is the reference's with `DEFAULT_TILE_SIZE` and `DEFAULT_TILE_OVERLAP_MIN`.
+    /// statistics. `temporal` decides whether it encodes single frames or clips, and `tile_size`
+    /// and `tile_overlap_min` set the tile geometry, which is the reference's with
+    /// `DEFAULT_TILE_SIZE` and `DEFAULT_TILE_OVERLAP_MIN`.
     pub fn load(
         file: &SafeTensors,
         temporal: Temporal,

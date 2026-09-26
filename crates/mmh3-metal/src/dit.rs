@@ -496,14 +496,6 @@ impl MetalDit {
         })
     }
 
-    /// Puts the parts of a shared-out step back together, which only the rank answering to the
-    /// caller needs to do. The parts may arrive in any order and must cover the sequence once.
-    ///
-    /// This is where the projections a rank answers with become the velocity: the negation
-    /// happens here, once, and a rank that negated its own rows would be counted twice.
-    ///
-    /// It reads the config and the layout and nothing else — no weights, no device — so a leader
-    /// can put a step together without holding a DiT it never runs.
     /// Puts the parts of a shared-out step back together, which only the rank that answers to the
     /// caller needs to do. It runs on the config alone, so mmh3-core holds it and this is where a
     /// backend's own output type goes round it.
@@ -747,7 +739,8 @@ mod tests {
     use mmh3_core::shard::Shard;
     use std::path::Path;
 
-    /// The real checkpoint with the turbo LoRA on it, or nothing when the models are not here.
+    /// The real checkpoint, with the turbo LoRA on it when `with_lora`, or nothing when the models
+    /// are not here.
     /// The tiny fixture cannot stand in: ConvRot wants a multiple of 256 features and its weights
     /// are FP32 rather than INT8, so it fails the sharded path on both counts.
     fn checkpoint(with_lora: bool) -> Option<MetalDit> {
@@ -1218,13 +1211,6 @@ mod tests {
         }
     }
 
-    /// One rank sharing a step with nobody has to come out as a block that never went near a
-    /// shard. It is not an equality: the exchange carries a block's attention output in bf16 and
-    /// an ordinary block keeps it in FP32, so the two differ by that rounding and nothing else.
-    ///
-    /// The tiny fixture cannot reach this path — ConvRot wants a multiple of 256 features and its
-    /// weights are FP32, not INT8 — so this runs against a real checkpoint when one is there.
-
     /// The narrow projection has to agree with taking the whole one apart, because that is what it
     /// replaced. A rank reading the wrong rows of the weight would still produce numbers of the
     /// right shape, and only a comparison against the old answer says they are the right ones.
@@ -1278,6 +1264,12 @@ mod tests {
         }
     }
 
+    /// One rank sharing a step with nobody has to come out as a block that never went near a
+    /// shard. It is not an equality: the exchange carries a block's attention output in bf16 and
+    /// an ordinary block keeps it in FP32, so the two differ by that rounding and nothing else.
+    ///
+    /// The tiny fixture cannot reach this path — ConvRot wants a multiple of 256 features and its
+    /// weights are FP32, not INT8 — so this runs against a real checkpoint when one is there.
     #[test]
     #[ignore = "loads a 20 GB checkpoint; run with --ignored when the models are present"]
     fn one_rank_attends_a_block_as_a_whole_one_does() {

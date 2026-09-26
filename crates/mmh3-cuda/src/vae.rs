@@ -1147,9 +1147,6 @@ impl CudaVideoDecoder {
         ))
     }
 
-    /// Decodes a normalized latent `[channels, frames, height, width]` into pixels
-    /// `[3, frames, height, width]` in [0, 1]. A latent of `f > 1` frames decodes in overlapping
-    /// chunks of 7 latent frames.
     /// How a latent divides: the chunks a decode runs and the canvas each one leaves, which is what
     /// a leader hands to another machine.
     pub fn plan(&self, latent: &Tensor) -> Result<DecodePlan, Error> {
@@ -1191,6 +1188,9 @@ impl CudaVideoDecoder {
         Ok(bytes)
     }
 
+    /// Decodes a normalized latent `[channels, frames, height, width]` into pixels
+    /// `[3, frames, height, width]` in [0, 1]. A latent of `f > 1` frames decodes in overlapping
+    /// chunks of 7 latent frames.
     pub fn decode(
         &self,
         latent: &Tensor,
@@ -1213,12 +1213,10 @@ impl CudaVideoDecoder {
     }
 
     /// `decode_device` where `remote` may answer with a canvas another machine decoded, which lets
-    /// the caller start those before this one walks its own chunks. A chunk `remote` declines is
-    /// decoded here.
-    /// `remote` answers with the canvas another machine decoded, `None` for a chunk this one
-    /// decodes itself, and an error for a chunk that was handed out and did not come back. A
-    /// caller that hands every chunk out never reads the weights, so that error is the whole of
-    /// what it can say about a chunk it will not see.
+    /// the caller start those before this one walks its own chunks. `remote` answers with that
+    /// canvas, `None` for a chunk this one decodes itself, and an error for a chunk that was handed
+    /// out and did not come back. A caller that hands every chunk out never reads the weights, so
+    /// that error is the whole of what it can say about a chunk it will not see.
     pub fn decode_device_with(
         &self,
         latent: &Tensor,
@@ -1236,8 +1234,6 @@ impl CudaVideoDecoder {
         Ok(yuv420(&pixels, frames, height, width)?)
     }
 
-    /// Decodes a latent into pixels `[3, frames, height, width]` on the device and returns them
-    /// with their shape.
     fn latent_extents(&self, latent: &Tensor) -> Result<[usize; 4], Error> {
         let &[channels, frames, height, width] = latent.shape.as_slice() else {
             return Err(Error::Model(format!(
@@ -1254,7 +1250,6 @@ impl CudaVideoDecoder {
         Ok([channels, frames, height, width])
     }
 
-    /// The canvases of `wanted`, for a caller that blends them itself.
     /// Everything a decode sets up before it walks the chunks, so that one chunk on its own and a
     /// whole video take the same path.
     fn context(&self, latent: &Tensor) -> Result<Decode, Error> {
@@ -1386,6 +1381,8 @@ impl CudaVideoDecoder {
         Ok(first_tile)
     }
 
+    /// Decodes a latent into pixels `[3, frames, height, width]` on the device and returns them
+    /// with their shape.
     fn decode_on_device(
         &self,
         latent: &Tensor,

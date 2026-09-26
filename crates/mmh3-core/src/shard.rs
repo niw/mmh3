@@ -187,11 +187,12 @@ impl Shard {
         }
     }
 
-    /// Cuts `tokens` and `heads` into shares of `weights`, one per rank, so that a machine carries
-    /// what it can rather than its turn. Tokens still divide on a multiple of `alignment`, and
-    /// what the rounding leaves goes to the rank with the largest weight rather than to the last,
-    /// which under a weighted cut may be the slowest. Every rank keeps at least one unit of each,
-    /// since a rank with no heads or no rows has nothing to run and nowhere to put it.
+    /// Cuts `tokens` and `heads` into shares weighted by `tokens_by` and `heads_by`, one weight per
+    /// rank in each, so that a machine carries what it can rather than its turn. Tokens still
+    /// divide on a multiple of `alignment`, and what the rounding leaves goes to the rank with the
+    /// largest weight rather than to the last, which under a weighted cut may be the slowest.
+    /// Every rank keeps at least one unit of each, since a rank with no heads or no rows has
+    /// nothing to run and nowhere to put it.
     pub fn weighted(
         rank: usize,
         tokens_by: &[f64],

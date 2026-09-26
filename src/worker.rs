@@ -332,9 +332,9 @@ fn measure_now() -> Option<worker::Speed> {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub const ATTENTION_TOKENS: usize = 8192;
 
-/// Multiply-accumulates one head of dense attention over `tokens` does, counted as two matrix
-/// products of `tokens × tokens × HEAD_DIM` and two operations each, which is what both backends
-/// have to count for the two numbers to be comparable.
+/// Multiply-accumulates `heads` heads of dense attention over `tokens` do, counted as two matrix
+/// products of `tokens × tokens × HEAD_DIM` per head and two operations each, which is what both
+/// backends have to count for the two numbers to be comparable.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn attention_operations(tokens: usize, heads: usize) -> f64 {
     4.0 * tokens as f64 * tokens as f64 * mmh3_core::shard::HEAD_DIM as f64 * heads as f64
@@ -559,7 +559,6 @@ impl Worker {
         })
     }
 
-    /// One chunk's canvas, decoded wherever the video VAE lives.
     /// The waveform of a run's audio latent, decoded on this worker. The latent and the samples
     /// are a megabyte or so each, so they go down the socket.
     pub fn decode_audio(&mut self, role: &str, latent: &Tensor) -> Result<Tensor, Box<dyn Error>> {
@@ -655,6 +654,7 @@ impl Worker {
         })
     }
 
+    /// One chunk's canvas, decoded wherever the video VAE lives.
     pub fn decode_chunk(
         &mut self,
         role: &str,
@@ -2324,12 +2324,6 @@ fn exchange_error(message: String) -> shard::ExchangeError {
 
 #[cfg(any(feature = "cuda", feature = "metal"))]
 impl Exchanger<'_> {
-    /// Sends what every peer with no connection is owed and takes in what it owes this rank. The
-    /// lower rank of a pair sends first and the higher takes first, since two ranks that both
-    /// sent hundreds of megabytes at once would fill each other's socket and stop.
-    ///
-    /// Both ends of a pair decide this the same way: a rank with no port registers nothing, so it
-    /// names no address, so neither side has a connection to the other and both queue.
     /// Opens a socket to every rank this one can reach by neither a socket nor a connection, so
     /// that what two ranks owe each other goes straight there rather than through anybody.
     ///
