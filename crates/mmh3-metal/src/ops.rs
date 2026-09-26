@@ -784,18 +784,7 @@ impl Array {
         kv_heads: usize,
         causal: bool,
     ) -> Result<Self> {
-        let half = |x: &Self| -> Result<Buffer> {
-            let copy = self.device().alloc(x.len() * 2, None)?;
-            self.device().run(
-                "float_to_half",
-                &[&x.buffer, &copy],
-                &[x.len() as u32],
-                x.len(),
-                false,
-            )?;
-            Ok(copy)
-        };
-        let (q, k, v) = (half(self)?, half(key)?, half(value)?);
+        let (q, k, v) = (self.to_half()?, key.to_half()?, value.to_half()?);
         let dim = self.cols / heads;
         let out = Self::empty(self.device(), self.rows, self.cols)?;
         self.device().run(
@@ -813,6 +802,19 @@ impl Array {
             true,
         )?;
         Ok(out)
+    }
+
+    /// The FP16 copy of an input that the attention on the matrix units reads.
+    pub(crate) fn to_half(&self) -> Result<Buffer> {
+        let copy = self.device().alloc(self.len() * 2, None)?;
+        self.device().run(
+            "float_to_half",
+            &[&self.buffer, &copy],
+            &[self.len() as u32],
+            self.len(),
+            false,
+        )?;
+        Ok(copy)
     }
 
     pub fn swiglu(&self) -> Result<Self> {

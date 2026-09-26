@@ -9,6 +9,7 @@ pub mod dit;
 mod model;
 pub mod ops;
 pub mod shard;
+pub mod sparse;
 mod streaming;
 pub mod text_encoder;
 pub mod vae;
@@ -351,7 +352,7 @@ impl Device {
 
         // The tensor kernels run on the number of SIMD groups their products share.
         let group_size = match name {
-            "mpp_int8" | "mpp_lora" => 128,
+            "mpp_int8" | "mpp_lora" | "mpp_sparse_attention_128" => 128,
             _ => 256,
         };
         let name = CString::new(name).unwrap();

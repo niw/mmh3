@@ -279,3 +279,158 @@ void flash_attention(device half *q, device half *k, device half *v, device floa
 ATTENTION(64)
 ATTENTION(128)
 #undef ATTENTION
+
+// Block-sparse attention on the matrix units over heads of 128, the last step of Sol-Attn and VSA
+// (see ops.metal): flash_attention over the tiles one query tile attends token by token, a
+// threadgroup of four SIMD groups a query tile of at most 64 tokens, with the scores in log2
+// units. Sol-Attn centers the keys by their mean, which a row takes off its scores, and merges the
+// pooled tail at the end. Gated VSA adds the gate times the coarse output.
+//
+// Parameters: tiles, heads, the method (0 for Sol-Attn, 1 for VSA), whether VSA is gated, and the
+// scale in log2 units.
+kernel void mpp_sparse_attention_128(
+    device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],
+    device float *o [[buffer(3)]], device const uint *starts [[buffer(4)]],
+    device const uint *lengths [[buffer(5)]], device const ushort *routes [[buffer(6)]],
+    device const uint *counts [[buffer(7)]], device const float *tails [[buffer(8)]],
+    device const float *key_mean [[buffer(9)]], device const float *gate [[buffer(10)]],
+    constant uint *p [[buffer(11)]], uint g [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int D = 128, QUERIES = 64, KEYS = 64, GROUPS = 4;
+    constexpr int SPAN = KEYS / 2, LAST = KEYS - 1, TAIL = D + 2;
+    threadgroup float scores[QUERIES * KEYS];
+    threadgroup half *probabilities = (threadgroup half *)scores;
+    const int tiles = p[0], heads = p[1], gated = p[3];
+    const bool sol = p[2] == 0;
+    const float scale_log2 = as_type<float>(p[4]);
+    const int tile = g % tiles, head = g / tiles, index = g;
+    const int first = starts[tile], rows = lengths[tile];
+
+    using Tile = tensor<device half, dextents<int, 2>, tensor_inline>;
+    using Shared = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
+    Tile queries(q + (first * heads + head) * D, dextents<int, 2>(D, rows),
+                 array<int, 2>{1, heads * D});
+    constexpr auto score_desc =
+        matmul2d_descriptor(QUERIES, KEYS, dynamic_length_v<int>, false, true, false);
+    matmul2d<score_desc, execution_simdgroups<GROUPS>> score_op;
+    constexpr auto value_desc =
+        matmul2d_descriptor(QUERIES, D, dynamic_length_v<int>, false, false, false,
+                            matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<value_desc, execution_simdgroups<GROUPS>> value_op;
+
+    auto out = value_op.template get_destination_cooperative_tensor<Shared, Tile, float>();
+#pragma unroll
+    for (uint i = 0; i < out.get_capacity(); ++i)
+        if (out.is_valid_element(i))
+            out[i] = 0;
+
+    const int row = tid / 2, column = (tid % 2) * SPAN;
+    const bool live = row < rows;
+    // Sol-Attn scores the keys centered by their mean. Each of a row's two threads takes half of
+    // the dimensions.
+    float offset = 0;
+    if (sol && live) {
+        device const half *query = q + ((first + row) * heads + head) * D + (tid % 2) * (D / 2);
+        device const float *mean = key_mean + head * D + (tid % 2) * (D / 2);
+        for (int c = 0; c < D / 2; ++c)
+            offset += float(query[c]) * mean[c];
+    }
+    offset = (offset + simd_shuffle_xor(offset, 1)) * scale_log2;
+
+    float reference = -INFINITY, total = 0;
+    device const ushort *route = routes + index * tiles;
+    const int count = counts[index];
+    for (int entry = 0; entry < count; ++entry) {
+        const int base = starts[route[entry]], length = lengths[route[entry]];
+        Tile keys(k + (base * heads + head) * D, dextents<int, 2>(D, length),
+                  array<int, 2>{1, heads * D});
+        auto s = score_op.template get_destination_cooperative_tensor<Tile, Tile, float>();
+        score_op.run(queries, keys, s);
+#pragma unroll
+        for (uint i = 0; i < s.get_capacity(); ++i) {
+            if (s.is_valid_element(i)) {
+                auto xy = s.get_multidimensional_index(i);
+                scores[xy[1] * KEYS + xy[0]] = s[i];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float x[SPAN], local = -INFINITY;
+#pragma unroll
+        for (int c = 0; c < SPAN; ++c) {
+            const bool seen = live && column + c < length;
+            x[c] = seen ? scores[row * KEYS + column + c] * scale_log2 - offset : -INFINITY;
+            local = max(local, x[c]);
+        }
+        local = max(local, simd_shuffle_xor(local, 1));
+        float correction = 1;
+        if (reference == -INFINITY) {
+            reference = local;
+        } else if (local > reference + RAISE) {
+            correction = exp2(reference - local);
+            reference = local;
+        }
+        const float offset_row = reference == -INFINITY ? 0.0f : reference;
+        float sum = 0;
+#pragma unroll
+        for (int c = 0; c < SPAN; ++c) {
+            x[c] = exp2(x[c] - offset_row);
+            sum += x[c];
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        total = total * correction + sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+#pragma unroll
+        for (int c = 0; c < SPAN; ++c)
+            probabilities[row * 2 * KEYS + column + c] = half(x[c]);
+        if (column == 0)
+            scores[row * KEYS + LAST] = correction;
+        const bool moved = simd_any(correction != 1);
+        if (lane == 0)
+            scores[simd * KEYS + LAST - 1] = moved;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        bool rescale = false;
+        for (int group = 0; group < GROUPS; ++group)
+            rescale |= scores[group * KEYS + LAST - 1] != 0;
+        if (rescale) {
+#pragma unroll
+            for (uint i = 0; i < out.get_capacity(); ++i)
+                if (out.is_valid_element(i))
+                    out[i] *= scores[out.get_multidimensional_index(i)[1] * KEYS + LAST];
+        }
+        Shared weights(probabilities, dextents<int, 2>(length, QUERIES),
+                       array<int, 2>{1, 2 * KEYS});
+        Tile values(v + (base * heads + head) * D, dextents<int, 2>(D, length),
+                    array<int, 2>{1, heads * D});
+        value_op.run(weights, values, out);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (column == 0) {
+        scores[row * KEYS + LAST - 1] = reference;
+        scores[row * KEYS + LAST] = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const float *tail = tails + index * TAIL;
+#pragma unroll
+    for (uint i = 0; i < out.get_capacity(); ++i) {
+        if (!out.is_valid_element(i))
+            continue;
+        auto xy = out.get_multidimensional_index(i);
+        const int r = xy[1], d = xy[0];
+        if (r >= rows || d >= D)
+            continue;
+        const float maximum = scores[r * KEYS + LAST - 1], sum = scores[r * KEYS + LAST];
+        const int at = ((first + r) * heads + head) * D + d;
+        if (sol) {
+            const float merged = max(maximum, tail[D]);
+            const float routed = exp2(maximum - merged), pooled = exp2(tail[D] - merged);
+            o[at] = (out[i] * routed + tail[d] * pooled) / (sum * routed + tail[D + 1] * pooled);
+        } else {
+            o[at] = out[i] / sum + (gated ? gate[at] * tail[d] : 0.0f);
+        }
+    }
+}

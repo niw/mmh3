@@ -472,3 +472,352 @@ kernel void copy_bytes(device const char *x [[buffer(0)]], device char *y [[buff
     if (i < p[0])
         y[p[2] + i] = x[p[1] + i];
 }
+
+// Block-sparse attention over heads of 128: Sol-Attn and VSA (see mmh3-core's dit/sparse.rs and
+// dit/vsa.rs). The sequence is cut into tiles of at most 64 consecutive tokens, whose starts and
+// lengths are tables of their own: 64-token blocks for Sol-Attn, and for VSA its tiles of the
+// sequence in the order it runs it.
+//
+// 1. sparse_pool: per head and tile, the mean query and key and the summed value.
+// 2. sparse_center_keys (Sol-Attn): per head, the mean and variance of the tile keys, which are
+//    then centered.
+// 3. sol_route or vsa_select: per head and query tile, the pooled scores against every tile and
+//    the tiles it attends token by token, in ascending order. Sol-Attn keeps the pooled tail of
+//    the other tiles as a softmax state: its maximum, its weighted sum and its weighted values.
+//    Gated VSA keeps its coarse output, softmax(scores) · mean values.
+// 4. attention_sparse_128, or mpp_sparse_attention_128 on the matrix units: attention over those
+//    tiles, merged with the tail, or plus the gate times the coarse output.
+//
+// A query tile's row in the tables is head × tiles + tile, and its tail row holds 128 values and,
+// for Sol-Attn, the tail's maximum and sum.
+constant constexpr uint SPARSE_HEAD = 128, SPARSE_TAIL = SPARSE_HEAD + 2;
+constant constexpr uint SPARSE_MAX_TILES = 4096;
+
+// The sum or the maximum over a threadgroup of eight SIMD groups, which every thread gets.
+template <bool MAXIMUM>
+float group_reduce(float value, threadgroup float *scratch, uint simd, uint lane) {
+    value = MAXIMUM ? simd_max(value) : simd_sum(value);
+    if (lane == 0)
+        scratch[simd] = value;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float result = scratch[0];
+    for (uint i = 1; i < 8; ++i)
+        result = MAXIMUM ? max(result, scratch[i]) : result + scratch[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return result;
+}
+
+// Two heads a threadgroup, a thread a dimension.
+kernel void sparse_pool(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],
+                        device const float *v [[buffer(2)]],
+                        device const uint *starts [[buffer(3)]],
+                        device const uint *lengths [[buffer(4)]],
+                        device float *pooled_q [[buffer(5)]], device float *pooled_k [[buffer(6)]],
+                        device float *pooled_v [[buffer(7)]], constant uint *p [[buffer(8)]],
+                        uint g [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]]) {
+    const uint tiles = p[0], heads = p[1];
+    const uint tile = g % tiles, head = g / tiles * 2 + tid / SPARSE_HEAD;
+    const uint d = tid % SPARSE_HEAD;
+    if (head >= heads)
+        return;
+    const uint start = starts[tile], rows = lengths[tile];
+    float queries = 0, keys = 0, values = 0;
+    for (uint r = 0; r < rows; ++r) {
+        const uint i = ((start + r) * heads + head) * SPARSE_HEAD + d;
+        queries += q[i];
+        keys += k[i];
+        values += v[i];
+    }
+    const uint o = (head * tiles + tile) * SPARSE_HEAD + d;
+    pooled_q[o] = queries / rows;
+    pooled_k[o] = keys / rows;
+    pooled_v[o] = values;
+}
+
+kernel void sparse_center_keys(device float *pooled_k [[buffer(0)]],
+                               device float *key_mean [[buffer(1)]],
+                               device float *key_variance [[buffer(2)]],
+                               constant uint *p [[buffer(3)]],
+                               uint g [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]]) {
+    const uint tiles = p[0], heads = p[1];
+    const uint head = g * 2 + tid / SPARSE_HEAD, d = tid % SPARSE_HEAD;
+    if (head >= heads)
+        return;
+    device float *keys = pooled_k + head * tiles * SPARSE_HEAD + d;
+    float sum = 0;
+    for (uint t = 0; t < tiles; ++t)
+        sum += keys[t * SPARSE_HEAD];
+    const float mean = sum / tiles;
+    float squares = 0;
+    for (uint t = 0; t < tiles; ++t) {
+        const float centered = keys[t * SPARSE_HEAD] - mean;
+        keys[t * SPARSE_HEAD] = centered;
+        squares += centered * centered;
+    }
+    key_mean[head * SPARSE_HEAD + d] = mean;
+    key_variance[head * SPARSE_HEAD + d] = squares / tiles;
+}
+
+// scores[t] = (query · pooled[t]) × scale for every tile, a SIMD group a tile at a time.
+void pooled_scores(threadgroup const float *query, device const float *pooled, uint tiles,
+                   float scale, threadgroup float *scores, uint simd, uint lane) {
+    for (uint t = simd; t < tiles; t += 8) {
+        device const float *row = pooled + t * SPARSE_HEAD;
+        float partial = 0;
+        for (uint c = 0; c < SPARSE_HEAD; c += 32)
+            partial += query[lane + c] * row[lane + c];
+        const float score = simd_sum(partial) * scale;
+        if (lane == 0)
+            scores[t] = score;
+    }
+}
+
+// Σ weights[t] · values[t] for this thread's dimension, the two halves of the threadgroup taking
+// every other tile. The first half answers.
+float weighted_values(threadgroup const float *weights, device const float *values, uint tiles,
+                      threadgroup float *halves, uint tid) {
+    const uint d = tid % SPARSE_HEAD;
+    float sum = 0;
+    for (uint t = tid / SPARSE_HEAD; t < tiles; t += 2)
+        sum += weights[t] * values[t * SPARSE_HEAD + d];
+    if (tid >= SPARSE_HEAD)
+        halves[d] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return sum + halves[d];
+}
+
+// A threadgroup a query tile of one head. The scores are in log2 units.
+kernel void
+sol_route(device const float *pooled_q [[buffer(0)]], device const float *pooled_k [[buffer(1)]],
+          device const float *pooled_v [[buffer(2)]],
+          device const float *key_variance [[buffer(3)]], device const uint *lengths [[buffer(4)]],
+          device ushort *routes [[buffer(5)]], device uint *counts [[buffer(6)]],
+          device float *tails [[buffer(7)]], device atomic_uint *routed [[buffer(8)]],
+          constant uint *p [[buffer(9)]], uint g [[threadgroup_position_in_grid]],
+          uint tid [[thread_index_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]],
+          uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float scores[SPARSE_MAX_TILES];
+    threadgroup bool exact[SPARSE_MAX_TILES];
+    threadgroup float centroid[SPARSE_HEAD], halves[SPARSE_HEAD], scratch[8];
+    const uint tiles = p[0];
+    const float tau = as_type<float>(p[2]), log2_scale = as_type<float>(p[3]);
+    const uint query = g % tiles, head = g / tiles, row = g;
+    const bool dense_query = query >= p[6] && query < p[7];
+
+    float spread = 0;
+    if (tid < SPARSE_HEAD) {
+        const float c = pooled_q[row * SPARSE_HEAD + tid];
+        centroid[tid] = c;
+        spread = c * c * key_variance[head * SPARSE_HEAD + tid];
+    }
+    spread = group_reduce<false>(spread, scratch, simd, lane);
+    const float threshold = tau * sqrt(spread * log2_scale * log2_scale + 1e-6f);
+    pooled_scores(centroid, pooled_k + head * tiles * SPARSE_HEAD, tiles, log2_scale, scores, simd,
+                  lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float maximum = -FLT_MAX;
+    for (uint t = tid; t < tiles; t += 256) {
+        const bool flag = dense_query || scores[t] > threshold ||
+                          max(query, t) - min(query, t) <= 1 || (t >= p[4] && t < p[5]);
+        exact[t] = flag;
+        if (!flag)
+            maximum = max(maximum, scores[t]);
+    }
+    maximum = group_reduce<true>(maximum, scratch, simd, lane);
+    float sum = 0;
+    for (uint t = tid; t < tiles; t += 256) {
+        const float weight = exact[t] ? 0.0f : exp2(scores[t] - maximum);
+        scores[t] = weight;
+        sum += weight * lengths[t];
+    }
+    sum = group_reduce<false>(sum, scratch, simd, lane);
+
+    const float tail =
+        weighted_values(scores, pooled_v + head * tiles * SPARSE_HEAD, tiles, halves, tid);
+    device float *out = tails + row * SPARSE_TAIL;
+    if (tid < SPARSE_HEAD)
+        out[tid] = tail;
+    if (tid == 0) {
+        out[SPARSE_HEAD] = maximum;
+        out[SPARSE_HEAD + 1] = sum;
+    }
+
+    if (simd == 0) {
+        device ushort *route = routes + row * tiles;
+        uint count = 0;
+        for (uint first = 0; first < tiles; first += 32) {
+            const uint t = first + lane;
+            const uint flag = t < tiles && exact[t];
+            const uint before = simd_prefix_exclusive_sum(flag);
+            if (flag)
+                route[count + before] = ushort(t);
+            count += simd_sum(flag);
+        }
+        if (lane == 0) {
+            counts[row] = count;
+            atomic_fetch_add_explicit(routed, count, memory_order_relaxed);
+        }
+    }
+}
+
+// A float's bits as an unsigned integer of the same order.
+uint ordered_bits(float value) {
+    const uint bits = as_type<uint>(value);
+    return (bits & 0x80000000u) ? ~bits : bits | 0x80000000u;
+}
+
+// A threadgroup a query tile of one head. A video query tile keeps the `kept` video tiles of the
+// highest scores, ties going to the lower tile, besides every tile before the video.
+kernel void
+vsa_select(device const float *pooled_q [[buffer(0)]], device const float *pooled_k [[buffer(1)]],
+           device const float *pooled_v [[buffer(2)]], device const uint *lengths [[buffer(3)]],
+           device ushort *routes [[buffer(4)]], device uint *counts [[buffer(5)]],
+           device float *coarse [[buffer(6)]], constant uint *p [[buffer(7)]],
+           uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+           uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float scores[SPARSE_MAX_TILES];
+    threadgroup float pooled[SPARSE_HEAD], halves[SPARSE_HEAD], scratch[8];
+    const uint tiles = p[0], prefix = p[2], kept = p[3], gated = p[5];
+    const float scale = as_type<float>(p[4]);
+    const uint query = g % tiles, head = g / tiles, row = g;
+
+    if (tid < SPARSE_HEAD)
+        pooled[tid] = pooled_q[row * SPARSE_HEAD + tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    pooled_scores(pooled, pooled_k + head * tiles * SPARSE_HEAD, tiles, scale, scores, simd, lane);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // The kept-th largest video score, a bit at a time from the top: `threshold` gathers its bits,
+    // and `ties` ends as how many video scores equal to it are kept.
+    const bool dense = query < prefix || kept >= tiles - prefix;
+    uint threshold = 0, ties = kept;
+    for (int bit = 31; bit >= 0 && !dense; --bit) {
+        const uint high = bit == 31 ? 0u : ~0u << (bit + 1);
+        float ones = 0;
+        for (uint t = prefix + tid; t < tiles; t += 256) {
+            const uint bits = ordered_bits(scores[t]);
+            ones += (bits & high) == threshold && (bits >> bit) & 1u;
+        }
+        const uint total = uint(group_reduce<false>(ones, scratch, simd, lane));
+        if (total >= ties)
+            threshold |= 1u << bit;
+        else
+            ties -= total;
+    }
+
+    if (simd == 0) {
+        device ushort *route = routes + row * tiles;
+        uint count = 0, seen = 0;
+        for (uint first = 0; first < tiles; first += 32) {
+            const uint t = first + lane;
+            const bool candidate = !dense && t >= prefix && t < tiles;
+            const uint bits = candidate ? ordered_bits(scores[t]) : 0;
+            const uint tie = candidate && bits == threshold;
+            const uint rank = seen + simd_prefix_exclusive_sum(tie);
+            seen += simd_sum(tie);
+            const uint flag = candidate ? bits > threshold || (tie && rank < ties) : t < tiles;
+            const uint before = simd_prefix_exclusive_sum(flag);
+            if (flag)
+                route[count + before] = ushort(t);
+            count += simd_sum(flag);
+        }
+        if (lane == 0)
+            counts[row] = count;
+    }
+    if (!gated)
+        return;
+
+    // The weights divide by the tile lengths, since the pooled values are sums.
+    float maximum = -FLT_MAX;
+    for (uint t = tid; t < tiles; t += 256)
+        maximum = max(maximum, scores[t]);
+    maximum = group_reduce<true>(maximum, scratch, simd, lane);
+    float sum = 0;
+    for (uint t = tid; t < tiles; t += 256) {
+        const float weight = exp(scores[t] - maximum);
+        scores[t] = weight / lengths[t];
+        sum += weight;
+    }
+    sum = group_reduce<false>(sum, scratch, simd, lane);
+    const float value =
+        weighted_values(scores, pooled_v + head * tiles * SPARSE_HEAD, tiles, halves, tid);
+    if (tid < SPARSE_HEAD)
+        coarse[row * SPARSE_TAIL + tid] = value / sum;
+}
+
+// The attention of step 4 in FP32. Eight queries of one tile share each key tile, a SIMD group a
+// query, as tiled_attention does. Parameters: tiles, heads, the method (0 for Sol-Attn, 1 for
+// VSA), whether VSA is gated, and the scale in log2 units.
+kernel void attention_sparse_128(
+    device const float *q [[buffer(0)]], device const float *k [[buffer(1)]],
+    device const float *v [[buffer(2)]], device float *o [[buffer(3)]],
+    device const uint *starts [[buffer(4)]], device const uint *lengths [[buffer(5)]],
+    device const ushort *routes [[buffer(6)]], device const uint *counts [[buffer(7)]],
+    device const float *tails [[buffer(8)]], device const float *key_mean [[buffer(9)]],
+    device const float *gate [[buffer(10)]], constant uint *p [[buffer(11)]],
+    uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr uint TILE = 16, D = SPARSE_HEAD, PARTS = D / 32;
+    threadgroup float keys[TILE * D], values[TILE * D];
+    const uint tiles = p[0], heads = p[1], sol = p[2] == 0, gated = p[3];
+    const float scale_log2 = as_type<float>(p[4]);
+    const uint head = g / (tiles * 8), tile = g / 8 % tiles, row = head * tiles + tile;
+    const uint r = g % 8 * 8 + simd, token = starts[tile] + r;
+    const bool live = r < lengths[tile];
+
+    float query[PARTS], acc[PARTS], offset = 0;
+    for (uint c = 0; c < PARTS; ++c) {
+        query[c] = live ? q[(token * heads + head) * D + lane + c * 32] : 0;
+        acc[c] = 0;
+        if (sol)
+            offset += query[c] * key_mean[head * D + lane + c * 32];
+    }
+    offset = simd_sum(offset) * scale_log2;
+
+    float maximum = -INFINITY, total = 0;
+    device const ushort *route = routes + row * tiles;
+    for (uint entry = 0; entry < counts[row]; ++entry) {
+        const uint first = starts[route[entry]], rows = lengths[route[entry]];
+        for (uint base = 0; base < rows; base += TILE) {
+            const uint length = min(TILE, rows - base);
+            for (uint i = tid; i < length * D; i += 256) {
+                const uint at = ((first + base + i / D) * heads + head) * D + i % D;
+                keys[i] = k[at];
+                values[i] = v[at];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (live) {
+                for (uint t = 0; t < length; ++t) {
+                    float dot = 0;
+                    for (uint c = 0; c < PARTS; ++c)
+                        dot += query[c] * keys[t * D + lane + c * 32];
+                    const float score = simd_sum(dot) * scale_log2 - offset;
+                    const float next = max(maximum, score), correction = exp2(maximum - next);
+                    const float probability = exp2(score - next);
+                    for (uint c = 0; c < PARTS; ++c)
+                        acc[c] = acc[c] * correction + probability * values[t * D + lane + c * 32];
+                    total = total * correction + probability;
+                    maximum = next;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+    if (!live)
+        return;
+
+    device const float *tail = tails + row * SPARSE_TAIL;
+    for (uint c = 0; c < PARTS; ++c) {
+        const uint d = lane + c * 32, i = (token * heads + head) * D + d;
+        if (sol) {
+            const float merged = max(maximum, tail[D]);
+            const float routed = exp2(maximum - merged), pooled = exp2(tail[D] - merged);
+            o[i] = (acc[c] * routed + tail[d] * pooled) / (total * routed + tail[D + 1] * pooled);
+        } else {
+            o[i] = acc[c] / total + (gated ? gate[i] * tail[d] : 0.0f);
+        }
+    }
+}
