@@ -305,6 +305,9 @@ pub(crate) struct Stream {
     regions: Option<Regions>,
     /// Whether the units kept back fit beside the buffers of the calls so far.
     settled: bool,
+    /// How many units a settle may keep back, fewer after each call that ran out of memory, so
+    /// that the next one does not fill the room that call was short of again.
+    most: usize,
 }
 
 impl Stream {
@@ -332,6 +335,7 @@ impl Stream {
             sized,
             regions: None,
             settled: false,
+            most: usize::MAX,
         }
     }
 
@@ -388,9 +392,15 @@ impl Stream {
             self.start_reading(tensors)?;
             return Ok(true);
         }
-        if !self.kept.iter().any(|kept| matches!(kept, Kept::Buffer(_))) {
+        let kept = self
+            .kept
+            .iter()
+            .filter(|kept| matches!(kept, Kept::Buffer(_)))
+            .count();
+        if kept == 0 {
             return Ok(false);
         }
+        self.most = kept - 1;
         self.let_go(tensors)?;
         Ok(true)
     }
@@ -477,7 +487,7 @@ impl Stream {
         }
         let mut kept = Vec::new();
         let mut free = free_bytes()?;
-        for &index in self.give_up.iter().rev() {
+        for &index in self.give_up.iter().rev().take(self.most) {
             let bytes = self.units[index].bytes();
             if free < bytes + HEADROOM {
                 break;
