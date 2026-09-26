@@ -1237,6 +1237,8 @@ fn serve_on(
     bare: bool,
     announce: bool,
 ) -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "cuda")]
+    mmh3_cuda::check_device()?;
     let checkpoints: Vec<(Checkpoint, PathBuf)> = ROLES
         .iter()
         .filter_map(|(role, _)| {

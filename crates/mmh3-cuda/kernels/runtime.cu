@@ -1,5 +1,6 @@
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <cuda_runtime.h>
 
@@ -37,6 +38,49 @@ extern "C" int mmh3_cuda_device_info(int device, Mmh3DeviceInfo *info) {
     info->integrated = properties.integrated;
     info->total_global_bytes = properties.totalGlobalMem;
     return 0;
+}
+
+// The shared memory and registers of an sm_12x SM, which the kernels' tile sizes, pipeline stages
+// and blocks per SM are chosen for.
+constexpr int EXPECTED_SHARED_MEMORY_PER_MULTIPROCESSOR = 100 * 1024;
+constexpr int EXPECTED_SHARED_MEMORY_PER_BLOCK = 99 * 1024;
+constexpr int EXPECTED_REGISTERS_PER_MULTIPROCESSOR = 64 * 1024;
+
+// Checks that the current device has the shared memory and registers the kernels assume. Returns 0
+// when it does, and otherwise writes what differs to `message`, which holds `capacity` bytes.
+extern "C" int mmh3_cuda_check_device(char *message, int capacity) {
+    int device = 0;
+    cudaError_t status = cudaGetDevice(&device);
+    int shared_per_multiprocessor = 0;
+    int shared_per_block = 0;
+    int registers_per_multiprocessor = 0;
+    if (status == cudaSuccess) {
+        status = cudaDeviceGetAttribute(&shared_per_multiprocessor,
+                                        cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    }
+    if (status == cudaSuccess) {
+        status = cudaDeviceGetAttribute(&shared_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                        device);
+    }
+    if (status == cudaSuccess) {
+        status = cudaDeviceGetAttribute(&registers_per_multiprocessor,
+                                        cudaDevAttrMaxRegistersPerMultiprocessor, device);
+    }
+    if (status != cudaSuccess) {
+        return static_cast<int>(status);
+    }
+    if (shared_per_multiprocessor == EXPECTED_SHARED_MEMORY_PER_MULTIPROCESSOR &&
+        shared_per_block == EXPECTED_SHARED_MEMORY_PER_BLOCK &&
+        registers_per_multiprocessor == EXPECTED_REGISTERS_PER_MULTIPROCESSOR) {
+        return 0;
+    }
+    std::snprintf(message, static_cast<size_t>(capacity),
+                  "this device has %d bytes of shared memory per SM, %d per block and %d registers "
+                  "per SM, but the CUDA kernels are tuned for the %d, %d and %d of sm_12x",
+                  shared_per_multiprocessor, shared_per_block, registers_per_multiprocessor,
+                  EXPECTED_SHARED_MEMORY_PER_MULTIPROCESSOR, EXPECTED_SHARED_MEMORY_PER_BLOCK,
+                  EXPECTED_REGISTERS_PER_MULTIPROCESSOR);
+    return static_cast<int>(cudaErrorInvalidDevice);
 }
 
 extern "C" int mmh3_cuda_memory_info(size_t *free_bytes, size_t *total_bytes) {

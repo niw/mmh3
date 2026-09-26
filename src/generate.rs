@@ -44,7 +44,10 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
         usage,
     )?;
     #[cfg(feature = "cuda")]
-    crate::models::load_algorithm_cache();
+    {
+        mmh3_cuda::check_device()?;
+        crate::models::load_algorithm_cache();
+    }
     let video_path = Path::new(options.get("out").ok_or(usage)?).to_path_buf();
     let settings = Settings::parse(&options, arguments)?;
     let spec = MediaSpec {

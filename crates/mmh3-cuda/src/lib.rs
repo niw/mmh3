@@ -46,6 +46,7 @@ struct RawDeviceInfo {
 unsafe extern "C" {
     fn mmh3_cuda_device_count(count: *mut c_int) -> c_int;
     fn mmh3_cuda_device_info(device: c_int, info: *mut RawDeviceInfo) -> c_int;
+    fn mmh3_cuda_check_device(message: *mut c_char, capacity: c_int) -> c_int;
     fn mmh3_cuda_memory_info(free_bytes: *mut usize, total_bytes: *mut usize) -> c_int;
     fn mmh3_cuda_reads_host_memory(reads: *mut c_int) -> c_int;
     fn mmh3_cuda_error_string(code: c_int) -> *const c_char;
@@ -161,6 +162,28 @@ pub fn device_info(device: usize) -> Result<DeviceInfo, CudaError> {
 /// holds is missing from the free figure, and what this process holds is missing from it too.
 /// The Metal backend answers a different question under the same name, since a Mac has no figure
 /// like this one to give.
+/// Checks that the current device has the shared memory and registers per SM the kernels were
+/// tuned for, which every sm_12x device has.
+pub fn check_device() -> Result<(), CudaError> {
+    let mut message = [0u8; 256];
+    // SAFETY: the message buffer holds `message.len()` bytes.
+    let code =
+        unsafe { mmh3_cuda_check_device(message.as_mut_ptr().cast(), message.len() as c_int) };
+    if code == 0 {
+        return Ok(());
+    }
+    let written = CStr::from_bytes_until_nul(&message)
+        .map(|text| text.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if written.is_empty() {
+        return check(code);
+    }
+    Err(CudaError {
+        code,
+        message: written,
+    })
+}
+
 pub fn memory_info() -> Result<(usize, usize), CudaError> {
     let (mut free_bytes, mut total_bytes) = (0, 0);
     // SAFETY: both are valid out pointers.

@@ -24,3 +24,8 @@ fn reports_a_device() {
     assert!(!info.name.is_empty());
     assert!(info.compute_capability.0 >= 12);
 }
+
+#[test]
+fn has_the_resources_the_kernels_assume() {
+    mmh3_cuda::check_device().unwrap();
+}

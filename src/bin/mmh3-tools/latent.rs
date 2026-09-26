@@ -12,7 +12,10 @@ pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     // The sampling saves the algorithms it chose when it ends, and a run that had not taken over
     // the ones already kept would write its own over them.
     #[cfg(feature = "cuda")]
-    mmh3::models::load_algorithm_cache();
+    {
+        mmh3_cuda::check_device()?;
+        mmh3::models::load_algorithm_cache();
+    }
     let path = Path::new(options.get("out").ok_or(USAGE)?);
     let settings = Settings::parse(&options, arguments)?;
     let (video, audio) = sample(&options, &settings)?;
