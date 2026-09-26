@@ -242,6 +242,22 @@ impl DecodePlan {
     }
 }
 
+/// A chunk's canvas that another rank decoded: its bytes from another process, or its buffer from
+/// a rank of this one, on whichever card that rank computes on.
+pub enum ChunkCanvas {
+    Bytes(Vec<u8>),
+    Device(DeviceBuffer),
+}
+
+impl ChunkCanvas {
+    pub fn bytes(&self) -> usize {
+        match self {
+            ChunkCanvas::Bytes(bytes) => bytes.len(),
+            ChunkCanvas::Device(buffer) => buffer.bytes(),
+        }
+    }
+}
+
 /// One decode's buffers and geometry, shared by a whole video and by a single chunk.
 struct Decode {
     /// The room the tiles are decoded in, with their rotary angles, made by the first chunk this
@@ -1173,6 +1189,19 @@ impl CudaVideoDecoder {
     /// machine and go straight onto its device. The arithmetic is the decode's own, so a canvas
     /// computed here and one computed elsewhere on the same backend are the same bytes.
     pub fn decode_chunk(&self, latent: &Tensor, chunk: usize) -> Result<Vec<u8>, Error> {
+        let canvas = self.decode_chunk_on_device(latent, chunk)?;
+        let mut bytes = vec![0u8; canvas.bytes()];
+        canvas.copy_to_host(&mut bytes)?;
+        Ok(bytes)
+    }
+
+    /// `decode_chunk`'s canvas left on the device, finished, for a decode in this process to copy
+    /// from whichever card it computes on.
+    pub fn decode_chunk_on_device(
+        &self,
+        latent: &Tensor,
+        chunk: usize,
+    ) -> Result<DeviceBuffer, Error> {
         let mut decode = self.context(latent)?;
         if chunk >= decode.chunks {
             return Err(Error::Model(format!(
@@ -1181,9 +1210,8 @@ impl CudaVideoDecoder {
             )));
         }
         self.fill_canvas(&mut decode, chunk, false)?;
-        let mut bytes = vec![0u8; decode.canvas.bytes()];
-        decode.canvas.copy_to_host(&mut bytes)?;
-        Ok(bytes)
+        crate::synchronize()?;
+        Ok(decode.canvas)
     }
 
     /// Decodes a normalized latent `[channels, frames, height, width]` into pixels
@@ -1218,7 +1246,7 @@ impl CudaVideoDecoder {
     pub fn decode_device_with(
         &self,
         latent: &Tensor,
-        remote: &mut dyn FnMut(usize) -> Result<Option<Vec<u8>>, String>,
+        remote: &mut dyn FnMut(usize) -> Result<Option<ChunkCanvas>, String>,
     ) -> Result<CudaVideoFrames, Error> {
         let (pixels, [frames, height, width], _) = self.decode_on_device(latent, false, remote)?;
         CudaVideoFrames::from_rgb(pixels, frames, height, width)
@@ -1385,7 +1413,7 @@ impl CudaVideoDecoder {
         &self,
         latent: &Tensor,
         capture_first_tile: bool,
-        remote: &mut dyn FnMut(usize) -> Result<Option<Vec<u8>>, String>,
+        remote: &mut dyn FnMut(usize) -> Result<Option<ChunkCanvas>, String>,
     ) -> Result<(DeviceBuffer, [usize; 3], Option<Tensor>), Error> {
         let mut decode = self.context(latent)?;
         let (plane, canvas_frames) = (decode.plane, decode.canvas_frames);
@@ -1429,16 +1457,29 @@ impl CudaVideoDecoder {
         let mut position = 0;
         for chunk in 0..chunks {
             match remote(chunk).map_err(Error::Model)? {
-                // A canvas another machine decoded, in the bytes this one would have produced.
-                Some(ref bytes) => {
+                // A canvas another rank decoded, in the bytes this one would have produced.
+                Some(canvas) => {
                     let expected = OUTPUT_CHANNELS * canvas_frames * plane * size_of::<f32>();
-                    if bytes.len() != expected {
+                    if canvas.bytes() != expected {
                         return Err(Error::Model(format!(
                             "chunk {chunk} arrived with {} bytes, not {expected}",
-                            bytes.len()
+                            canvas.bytes()
                         )));
                     }
-                    decode.canvas.copy_from_host(bytes)?;
+                    match canvas {
+                        ChunkCanvas::Bytes(bytes) => decode.canvas.copy_from_host(&bytes)?,
+                        ChunkCanvas::Device(buffer) => {
+                            // SAFETY: both buffers hold `expected` bytes and live past the wait.
+                            unsafe {
+                                crate::copy_across(
+                                    decode.canvas.pointer(),
+                                    buffer.pointer(),
+                                    expected,
+                                )?
+                            };
+                            crate::synchronize()?;
+                        }
+                    }
                 }
                 None => {
                     let captured =

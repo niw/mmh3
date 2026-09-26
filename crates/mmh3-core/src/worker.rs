@@ -355,6 +355,9 @@ pub struct DecodeVideo {
     pub tile_overlap: u32,
     /// `[channels, frames, height, width]` of the latent that follows as FP32.
     pub shape: [u32; 4],
+    /// Whether the canvas is to stay on the worker's card for the leader to take, which only a
+    /// leader in the worker's own process can.
+    pub hand_over: bool,
 }
 
 /// The frames a whole decode answers with, as 4:2:0 planes an encoder takes without a device.
@@ -463,6 +466,8 @@ pub struct Canvas {
     pub bytes: u64,
     pub remote_address: u64,
     pub remote_keys: Vec<u32>,
+    /// The canvas a worker left on its card for a leader in its own process, 0 for none.
+    pub handed: u64,
 }
 
 /// Which block-sparse attention a session runs, and on which of its steps. The whole schedule
@@ -1255,11 +1260,9 @@ impl DecodeVideo {
         for extent in self.shape {
             encoder.u32(extent);
         }
+        encoder.u8(u8::from(self.hand_over));
         encoder.finish()
     }
-
-    /// The descriptor's length, after which the latent's FP32 values begin.
-    pub const BYTES: usize = 4 + 4 + 8 + 4 + 4 + 4 + 16;
 
     pub fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
         let mut decoder = Decoder::new(bytes);
@@ -1278,6 +1281,7 @@ impl DecodeVideo {
                 decoder.u32()?,
                 decoder.u32()?,
             ],
+            hand_over: decoder.u8()? != 0,
         };
         Ok((request, decoder.position))
     }
@@ -1291,6 +1295,7 @@ impl Canvas {
             .u64(self.bytes)
             .u64(self.remote_address);
         encode_keys(&mut encoder, &self.remote_keys);
+        encoder.u64(self.handed);
         encoder.finish()
     }
 
@@ -1303,6 +1308,7 @@ impl Canvas {
             bytes: decoder.u64()?,
             remote_address: decoder.u64()?,
             remote_keys: decode_keys(&mut decoder)?,
+            handed: decoder.u64()?,
         };
         Ok((canvas, decoder.position))
     }

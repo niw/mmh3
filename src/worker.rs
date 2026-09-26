@@ -575,6 +575,7 @@ impl Worker {
                 bytes: bytes as u64,
                 remote_address: 0,
                 remote_keys: Vec::new(),
+                handed: 0,
             };
             let started = Instant::now();
             let (header, body) = self.call(Kind::Bandwidth, &request.encode(), &[])?;
@@ -719,6 +720,7 @@ impl Worker {
             tile_size: tile_size as u32,
             tile_overlap: tile_overlap as u32,
             shape: [channels as u32, frames as u32, height as u32, width as u32],
+            hand_over: false,
         };
         let payload: Vec<u8> = latent
             .data
@@ -756,7 +758,7 @@ impl Worker {
         chunk: usize,
         tile_size: usize,
         tile_overlap: usize,
-    ) -> Result<Vec<u8>, Box<dyn Error>> {
+    ) -> Result<ChunkCanvas, Box<dyn Error>> {
         let checkpoint = self
             .checkpoint(role)
             .ok_or_else(|| format!("{} has no {role}", self.address))?
@@ -770,6 +772,9 @@ impl Worker {
             tile_size: tile_size as u32,
             tile_overlap: tile_overlap as u32,
             shape: [channels as u32, frames as u32, height as u32, width as u32],
+            // A worker in this process leaves the canvas on its card, where a copy between the
+            // cards takes it, rather than sending it through the host and a socket.
+            hand_over: cfg!(feature = "cuda") && self.in_this_process(),
         };
         let payload: Vec<u8> = latent
             .data
@@ -781,14 +786,33 @@ impl Worker {
             return Err(format!("{} answered a chunk with {:?}", self.address, header.kind).into());
         }
         let (canvas, descriptor_bytes) = Canvas::decode(&body)?;
+        #[cfg(feature = "cuda")]
+        if canvas.handed != 0 {
+            return Ok(ChunkCanvas::Device(take_handed(canvas.handed).ok_or_else(
+                || {
+                    format!(
+                        "{} handed over a canvas this process does not hold",
+                        self.address
+                    )
+                },
+            )?));
+        }
         if !canvas.remote_keys.is_empty() {
-            return self.read_canvas(&canvas);
+            return Ok(chunk_canvas(self.read_canvas(&canvas)?));
         }
         let payload = &body[descriptor_bytes..];
         if payload.len() as u64 != canvas.bytes {
             return Err(format!("{} sent {} bytes of canvas", self.address, payload.len()).into());
         }
-        Ok(payload.to_vec())
+        Ok(chunk_canvas(payload.to_vec()))
+    }
+
+    /// Whether this worker is the one in this process, which a leader reaches by its cards.
+    fn in_this_process(&self) -> bool {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        return self.welcome.process == process_id();
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
+        return false;
     }
 
     /// Writes this side's memory into the worker's and tells it the memory is free, which is the
@@ -1012,9 +1036,48 @@ fn exchange(worker: &mut Worker) -> Result<(), Box<dyn Error>> {
 /// Chunks of a decode that other machines are working on. The leader asks for one when its own
 /// walk reaches it, and decodes it here if the machine that had it failed.
 pub struct RemoteCanvases {
-    receiver: Receiver<(usize, Result<Vec<u8>, String>)>,
+    receiver: Receiver<(usize, Result<ChunkCanvas, String>)>,
     delegated: Vec<usize>,
-    arrived: HashMap<usize, Vec<u8>>,
+    arrived: HashMap<usize, ChunkCanvas>,
+}
+
+/// A chunk's canvas as a decode here takes it: on CUDA, a buffer on its card when a worker in this
+/// process decoded it, and bytes otherwise.
+#[cfg(feature = "cuda")]
+pub type ChunkCanvas = mmh3_cuda::vae::ChunkCanvas;
+#[cfg(not(feature = "cuda"))]
+pub type ChunkCanvas = Vec<u8>;
+
+fn chunk_canvas(bytes: Vec<u8>) -> ChunkCanvas {
+    #[cfg(feature = "cuda")]
+    return ChunkCanvas::Bytes(bytes);
+    #[cfg(not(feature = "cuda"))]
+    return bytes;
+}
+
+/// Canvases the sessions of this process's worker left on their cards for the leader in this
+/// process, each until the leader's connection takes it with the answer that names it.
+#[cfg(feature = "cuda")]
+static HANDED: std::sync::Mutex<Vec<(u64, mmh3_cuda::DeviceBuffer)>> =
+    std::sync::Mutex::new(Vec::new());
+
+#[cfg(feature = "cuda")]
+fn hand_over(canvas: mmh3_cuda::DeviceBuffer) -> u64 {
+    let id = random_id().max(1);
+    HANDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((id, canvas));
+    id
+}
+
+#[cfg(feature = "cuda")]
+fn take_handed(id: u64) -> Option<mmh3_cuda::DeviceBuffer> {
+    let mut handed = HANDED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = handed.iter().position(|(handed_id, _)| *handed_id == id)?;
+    Some(handed.swap_remove(index).1)
 }
 
 /// Asks the first worker that can for the whole video, decoded and blended over there. A machine
@@ -1172,7 +1235,7 @@ impl RemoteCanvases {
     /// handshake and then failed is a machine to look at, and decoding its share here would mean
     /// reading the weights this machine was meant to be without, to finish a run that has already
     /// lost a rank of its steps.
-    pub fn take(&mut self, chunk: usize) -> Result<Option<Vec<u8>>, String> {
+    pub fn take(&mut self, chunk: usize) -> Result<Option<ChunkCanvas>, String> {
         if !self.delegated.contains(&chunk) {
             return Ok(None);
         }
@@ -1587,6 +1650,7 @@ fn session(
                         bytes: request.bytes,
                         remote_address: region.address(),
                         remote_keys: region.remote_keys().to_vec(),
+                        handed: 0,
                     };
                     reply(&mut writer, Kind::Canvas, &offer.encode(), &[])?;
                     let (release, _) = worker::receive(&mut reader, BODY_LIMIT)?;
@@ -1694,6 +1758,36 @@ fn session(
                     }
                 }
             }
+            #[cfg(feature = "cuda")]
+            Kind::DecodeVideo
+                if DecodeVideo::decode(&body).is_ok_and(|(request, _)| request.hand_over) =>
+            {
+                let started = Instant::now();
+                let decoded =
+                    table.with_room(|models| decode_video_on_device(checkpoints, &body, models));
+                table.let_go_if_out_of_memory(&decoded);
+                match decoded {
+                    Ok((chunk, canvas)) => {
+                        let bytes = canvas.bytes() as u64;
+                        let canvas = Canvas {
+                            chunk,
+                            bytes,
+                            remote_address: 0,
+                            remote_keys: Vec::new(),
+                            handed: hand_over(canvas),
+                        };
+                        println!(
+                            "decoded chunk {chunk} in {:.1} s, {} MiB left on the card",
+                            started.elapsed().as_secs_f64(),
+                            bytes >> 20
+                        );
+                        reply(&mut writer, Kind::Canvas, &canvas.encode(), &[])?;
+                    }
+                    Err(error) => {
+                        reply(&mut writer, Kind::Error, error.to_string().as_bytes(), &[])?
+                    }
+                }
+            }
             Kind::DecodeVideo => {
                 let started = Instant::now();
                 let decoded = table.with_room(|models| decode_video(checkpoints, &body, models));
@@ -1734,6 +1828,7 @@ fn session(
                                 bytes: payload.len() as u64,
                                 remote_address: region.address(),
                                 remote_keys: region.remote_keys().to_vec(),
+                                handed: 0,
                             };
                             println!(
                                 "decoded chunk {chunk} in {:.1} s, {megabytes} MiB to read",
@@ -1757,6 +1852,7 @@ fn session(
                             bytes: payload.len() as u64,
                             remote_address: 0,
                             remote_keys: Vec::new(),
+                            handed: 0,
                         };
                         println!(
                             "decoded chunk {chunk} in {:.1} s, {megabytes} MiB back",
@@ -1906,6 +2002,21 @@ fn decode_video(
     Ok((
         request.chunk,
         decoder.decode_chunk(&latent, request.chunk as usize)?,
+    ))
+}
+
+/// `decode_video`'s canvas left on this session's card for the leader in this process.
+#[cfg(feature = "cuda")]
+fn decode_video_on_device(
+    checkpoints: &[(Checkpoint, PathBuf)],
+    body: &[u8],
+    models: &mut Models,
+) -> Result<(u32, mmh3_cuda::DeviceBuffer), Box<dyn Error>> {
+    let (request, latent, path, key) = decode_request(checkpoints, body)?;
+    let decoder = models.video_decoder(path, key)?;
+    Ok((
+        request.chunk,
+        decoder.decode_chunk_on_device(&latent, request.chunk as usize)?,
     ))
 }
 
