@@ -154,7 +154,7 @@ fn native_error() -> Error {
     }
 }
 
-/// Bytes in live allocations of this process.
+/// Bytes in live allocations and reservations for allocations in progress in this process.
 ///
 /// NOTE: a buffer this process has let go of is not always a buffer the device has back. The
 /// runtime keeps a small pool of them to hand out again, and what that pool holds is counted here
@@ -186,7 +186,7 @@ pub fn free_bytes() -> Result<usize> {
     })
 }
 
-/// Bytes in live allocations of this process.
+/// Bytes in live allocations and reservations for allocations in progress in this process.
 pub fn allocated_bytes() -> usize {
     ALLOCATED.load(Ordering::Relaxed)
 }
@@ -298,16 +298,20 @@ impl Device {
             ));
         }
 
-        match LIMIT.load(Ordering::Relaxed) {
-            0 => {}
-            limit if ALLOCATED.load(Ordering::Relaxed) + bytes > limit => {
-                return Err(Error {
-                    message: format!("{bytes} bytes would take this process past its limit"),
-                    out_of_memory: true,
-                });
-            }
-            _ => {}
-        }
+        // Reserve before entering the native runtime: its lock does not cover this counter,
+        // and another thread must count this allocation even while it is waiting for that lock.
+        ALLOCATED
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+                let limit = LIMIT.load(Ordering::Relaxed);
+                allocated
+                    .checked_add(bytes)
+                    .filter(|&total| limit == 0 || total <= limit)
+            })
+            .map_err(|_| {
+                Error::out_of_memory(format!(
+                    "{bytes} bytes would take this process past its limit"
+                ))
+            })?;
         // SAFETY: optional data covers bytes, and the native call copies it before returning.
         let pointer = NonNull::new(unsafe {
             mmh3_metal_alloc(
@@ -316,8 +320,10 @@ impl Device {
                 data.map_or(std::ptr::null(), |data| data.as_ptr().cast()),
             )
         })
-        .ok_or_else(native_error)?;
-        ALLOCATED.fetch_add(bytes, Ordering::Relaxed);
+        .ok_or_else(|| {
+            ALLOCATED.fetch_sub(bytes, Ordering::Relaxed);
+            native_error()
+        })?;
         Ok(Buffer(Arc::new(Allocation {
             pointer,
             bytes,
