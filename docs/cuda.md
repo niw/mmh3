@@ -45,7 +45,8 @@ with either cannot read its blocks again and needs the memory for all of them.
 
 - Native MP4 requires the `mp4` feature, H.264 NVENC and a driver supporting NVENC API 12.2. The
   driver is loaded at runtime, so no separately installed Video Codec SDK is required. A GPU
-  without NVENC can write WebM or use ffmpeg from a build without `mp4`.
+  without NVENC, such as the H100, H200 or H20, can write WebM or use ffmpeg from a build without
+  `mp4`.
 - The optional `webm` feature needs CMake for the bundled Opus encoder, plus `curl`, `tar` and
   `sha256sum`. The VP9 binding downloads a versioned libvpx static library during the build and
   verifies its checksum, which needs network access to GitHub Releases. Its prebuilt libraries

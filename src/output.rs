@@ -61,7 +61,15 @@ pub fn prepare(
                             spec,
                             destination,
                             mmh3_output::AacOutput,
-                            || mmh3_output_nvenc::NvencEncoder::new(spec),
+                            || {
+                                mmh3_output_nvenc::NvencEncoder::new(spec).map_err(|error| {
+                                    format!(
+                                        "{error}. A GPU without NVENC, such as the H100, writes \
+                                         --out FILE.webm from a build with webm, or --ffmpeg"
+                                    )
+                                    .into()
+                                })
+                            },
                         )?,
                     ));
                 }
