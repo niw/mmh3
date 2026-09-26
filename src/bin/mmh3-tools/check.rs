@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::ffi::c_void;
 use std::path::Path;
-use std::sync::{Barrier, Mutex};
+use std::sync::{Condvar, Mutex};
 
 pub(crate) fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     match arguments.first().map(String::as_str) {
@@ -438,7 +438,93 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 /// other.
 struct SplitHub {
     regions: Mutex<HashMap<(usize, Region), (usize, usize)>>,
-    barrier: Barrier,
+    barrier: SplitBarrier,
+}
+
+/// A barrier that a rank can also leave for good, which fails every wait after it rather than
+/// leaving the other ranks waiting for a rank that will never come.
+struct SplitBarrier {
+    ranks: usize,
+    state: Mutex<BarrierState>,
+    turned: Condvar,
+}
+
+#[derive(Default)]
+struct BarrierState {
+    /// Ranks waiting at this round.
+    arrived: usize,
+    /// Rounds every rank has passed.
+    round: usize,
+    /// The rank that left, once one has.
+    left: Option<usize>,
+}
+
+impl SplitBarrier {
+    fn new(ranks: usize) -> Self {
+        Self {
+            ranks,
+            state: Mutex::new(BarrierState::default()),
+            turned: Condvar::new(),
+        }
+    }
+
+    /// Waits for every rank, or fails once one has left.
+    fn wait(&self) -> Result<(), String> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(rank) = state.left {
+            return Err(format!("rank {rank} stopped"));
+        }
+        let round = state.round;
+        state.arrived += 1;
+        if state.arrived == self.ranks {
+            state.arrived = 0;
+            state.round += 1;
+            self.turned.notify_all();
+            return Ok(());
+        }
+        loop {
+            // A round every rank reached is passed, even when one leaves right after it.
+            if state.round != round {
+                return Ok(());
+            }
+            if let Some(rank) = state.left {
+                return Err(format!("rank {rank} stopped"));
+            }
+            state = self
+                .turned
+                .wait(state)
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+
+    /// Says `rank` will wait no more, which fails the waits of the others.
+    fn leave(&self, rank: usize) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.left.get_or_insert(rank);
+        self.turned.notify_all();
+    }
+}
+
+/// Leaves the barrier when dropped before `stay`, which is what a rank that failed or panicked
+/// does on its way out.
+struct Leaving<'a> {
+    barrier: &'a SplitBarrier,
+    rank: usize,
+    armed: bool,
+}
+
+impl Leaving<'_> {
+    fn stay(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Leaving<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.barrier.leave(self.rank);
+        }
+    }
 }
 
 /// One rank's side of a split step in one process. A write goes through host memory, which is slow
@@ -538,16 +624,13 @@ impl Exchange for SplitExchange<'_> {
 
     fn barrier(&mut self) -> Result<(), ExchangeError> {
         mmh3_cuda::synchronize().map_err(|error| ExchangeError(error.to_string()))?;
-        self.hub.barrier.wait();
-        Ok(())
+        self.hub.barrier.wait().map_err(ExchangeError)
     }
 }
 
 /// The parts of one step split `ranks` ways across threads of this process, each with a DiT of its
-/// own, in rank order.
-///
-/// NOTE: a rank that fails leaves the others waiting at the next barrier for good. Every rank reads
-/// the same checkpoint and runs the same step, so they fail together or not at all.
+/// own, in rank order. A rank that fails or panics leaves the barrier, so the others fail at their
+/// next wait instead of waiting for it, and the error of the rank that failed first is the answer.
 fn split_step(
     options: &HashMap<&str, &str>,
     inputs: &mmh3_core::dit::inputs::DitInputs,
@@ -558,7 +641,7 @@ fn split_step(
 
     let hub = SplitHub {
         regions: Mutex::new(HashMap::new()),
-        barrier: Barrier::new(ranks),
+        barrier: SplitBarrier::new(ranks),
     };
     let tokens = PackedLayout::for_inputs(inputs).len();
     let parts = std::thread::scope(|scope| {
@@ -566,6 +649,11 @@ fn split_step(
             .map(|rank| {
                 let hub = &hub;
                 scope.spawn(move || -> Result<VelocityRows, String> {
+                    let leaving = Leaving {
+                        barrier: &hub.barrier,
+                        rank,
+                        armed: true,
+                    };
                     // The ranks take the cards in turn, so that a machine with several splits the
                     // step across them and one with a single card holds every rank on it.
                     mmh3::resident::bind_device(rank % mmh3::resident::device_count())
@@ -585,7 +673,7 @@ fn split_step(
                     for (region, bytes) in regions(&shard, tokens, dit.config().hidden, true) {
                         exchange.make(region, bytes).map_err(|error| error.0)?;
                     }
-                    hub.barrier.wait();
+                    hub.barrier.wait()?;
                     let mut context = ShardContext {
                         shard,
                         exchange: &mut exchange,
@@ -595,16 +683,44 @@ fn split_step(
                         .forward_shard(inputs, sparse.as_ref(), &mut context, &mut || false)
                         .map_err(|error| error.to_string())?;
                     // A peer may still read what this rank holds until every rank is done.
-                    hub.barrier.wait();
+                    hub.barrier.wait()?;
+                    leaving.stay();
                     part.part
                         .ok_or_else(|| format!("rank {rank} returned no part"))
                 })
             })
             .collect();
-        handles
+        let results: Vec<Result<VelocityRows, String>> = handles
             .into_iter()
-            .map(|handle| handle.join().expect("a rank panicked"))
-            .collect::<Result<Vec<_>, _>>()
+            .enumerate()
+            .map(|(rank, handle)| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(format!("rank {rank} panicked")))
+            })
+            .collect();
+        // The rank that stopped the others says why, rather than one that only saw it stop.
+        let first = hub
+            .barrier
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .left;
+        let mut parts = Vec::new();
+        let mut failed = None;
+        for (rank, result) in results.into_iter().enumerate() {
+            match result {
+                Ok(part) => parts.push(part),
+                Err(error) if failed.is_none() || first == Some(rank) => {
+                    failed = Some(format!("rank {rank}: {error}"));
+                }
+                Err(_) => {}
+            }
+        }
+        match failed {
+            Some(error) => Err(error),
+            None => Ok(parts),
+        }
     })?;
     Ok(parts)
 }
