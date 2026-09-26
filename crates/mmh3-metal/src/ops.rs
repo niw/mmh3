@@ -378,37 +378,8 @@ impl Array {
             ));
         }
 
-        let int8 = precision == LinearPrecision::Int8;
-        let packed = self
-            .device()
-            .alloc(self.rows * cols * if int8 { 1 } else { 2 }, None)?;
-        let scales = Self::empty(self.device(), self.rows, 1)?;
-        self.device().run(
-            if packing == Packing::Plain {
-                "pack_linear_input"
-            } else {
-                "rotate_pack_linear_input"
-            },
-            &[&self.buffer, &packed, &scales.buffer],
-            &[
-                cols as u32,
-                int8 as u32,
-                (packing == Packing::GatedRotate) as u32,
-            ],
-            self.rows,
-            true,
-        )?;
-        Self::product_of_packed(
-            self.device(),
-            &packed,
-            &scales,
-            weight,
-            self.rows,
-            cols,
-            outputs,
-            precision,
-            finish,
-        )
+        self.pack(packing, precision)?
+            .product(weight, outputs, finish)
     }
 
     /// The product of an input that another rank already rotated and quantized: INT8 values with
@@ -1094,6 +1065,49 @@ impl Array {
         ))
     }
 
+    /// These rows packed for a product at `precision`, INT8 or FP16 with one scale a row, as
+    /// `packing` has them: as they are, rotated, or SwiGLU of their halves rotated.
+    pub(crate) fn pack(&self, packing: Packing, precision: LinearPrecision) -> Result<PackedRows> {
+        let cols = if packing == Packing::GatedRotate {
+            self.cols / 2
+        } else {
+            self.cols
+        };
+        if precision == LinearPrecision::Fp32
+            || (packing == Packing::GatedRotate && !self.cols.is_multiple_of(2))
+            || (packing != Packing::Plain && !cols.is_multiple_of(256))
+        {
+            return Err(Error::new("rows that cannot be packed".into()));
+        }
+        let int8 = precision == LinearPrecision::Int8;
+        let packed = self
+            .device()
+            .alloc(self.rows * cols * if int8 { 1 } else { 2 }, None)?;
+        let scales = Self::empty(self.device(), self.rows, 1)?;
+        self.device().run(
+            if packing == Packing::Plain {
+                "pack_linear_input"
+            } else {
+                "rotate_pack_linear_input"
+            },
+            &[&self.buffer, &packed, &scales.buffer],
+            &[
+                cols as u32,
+                int8 as u32,
+                (packing == Packing::GatedRotate) as u32,
+            ],
+            self.rows,
+            true,
+        )?;
+        Ok(PackedRows {
+            buffer: packed,
+            scales,
+            rows: self.rows,
+            cols,
+            precision,
+        })
+    }
+
     /// `norm` without centering followed by `modulate`, in one pass.
     pub(crate) fn norm_modulate(
         &self,
@@ -1257,6 +1271,15 @@ impl PackedRows {
             && width <= ADD_NORM_PACK_WIDTH
     }
 
+    /// The rows as INT8 weights of a product and one scale an output, which is what a LoRA's
+    /// down projection packed at INT8 is to the rows of its layer.
+    pub(crate) fn as_weight(&self) -> Result<(&Buffer, Array)> {
+        if self.precision != LinearPrecision::Int8 {
+            return Err(Error::new("only INT8 rows are a product's weights".into()));
+        }
+        Ok((&self.buffer, self.scales.reshape(1, self.rows)?))
+    }
+
     /// The product of these rows with a ConvRot layer's INT8 `weight` of `outputs` rows.
     pub(crate) fn product(&self, weight: &Buffer, outputs: usize, finish: Finish) -> Result<Array> {
         if outputs.checked_mul(self.cols) != Some(weight.0.bytes)
@@ -1290,7 +1313,7 @@ const ADD_NORM_PACK_WIDTH: usize = 3 * 8 * 256;
 
 /// What a packed product does to its rows as it packs them.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Packing {
+pub(crate) enum Packing {
     Plain,
     /// ConvRot's Hadamard rotation.
     Rotate,

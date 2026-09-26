@@ -1,6 +1,6 @@
 use crate::{
     AttentionPrecision, Buffer, Device, Error, LinearPrecision, Result,
-    ops::{Array, Finish, Lora, convert, dtype_code},
+    ops::{Array, Finish, Lora, PackedRows, Packing, convert, dtype_code},
 };
 use mmh3_core::{
     json,
@@ -26,12 +26,15 @@ enum Adapter {
         up: Array,
         scale: f32,
     },
-    /// `down` is `rank × inputs` halves and `up` is `outputs × rank`, with the scale in it.
+    /// `down` is `rank × inputs` halves and `up` is `outputs × rank`, with the scale in it. For a
+    /// ConvRot layer, `rotated` is `down` rotated as the layer's input is and packed at INT8, so
+    /// that the down projection runs on the rows the layer's own product reads.
     Fp16 {
         down: Buffer,
         up: Buffer,
         rank: usize,
         outputs: usize,
+        rotated: Option<PackedRows>,
     },
 }
 
@@ -43,6 +46,7 @@ impl Adapter {
         up: (&[f32], usize, usize),
         scale: f32,
         half: bool,
+        convrot: bool,
     ) -> Result<Self> {
         if !half {
             return Ok(Self::Fp32 {
@@ -57,11 +61,19 @@ impl Adapter {
         };
         let down_bytes = halves(&mut down.0.iter().copied());
         let up_bytes = halves(&mut up.0.iter().map(|&v| v * scale));
+        let rotated = convrot
+            .then(|| {
+                Array::from_f32(device, down.1, down.2, down.0)?
+                    .rotate()?
+                    .pack(Packing::Plain, LinearPrecision::Int8)
+            })
+            .transpose()?;
         Ok(Self::Fp16 {
             down: device.alloc(down_bytes.len(), Some(&down_bytes))?,
             up: device.alloc(up_bytes.len(), Some(&up_bytes))?,
             rank: down.1,
             outputs: up.1,
+            rotated,
         })
     }
 
@@ -75,6 +87,7 @@ impl Adapter {
                 up,
                 rank,
                 outputs,
+                ..
             } => x.linear_half(down, *rank)?.linear_half(up, *outputs),
         }
     }
@@ -385,6 +398,22 @@ impl Weights {
             Some(adapter) => (Some(adapter.apply(x)?), None),
         };
 
+        if w.dtype == DType::I8
+            && self.linear_precision != LinearPrecision::Fp32
+            && matches!(
+                self.adapters.get(name),
+                Some(Adapter::Fp16 {
+                    rotated: Some(_),
+                    ..
+                })
+            )
+        {
+            return self.linear_prepacked(
+                &x.pack(Packing::Rotate, self.linear_precision)?,
+                None,
+                name,
+            );
+        }
         if w.dtype == DType::I8 {
             let scales = self.vector(&format!("{name}.weight_scale"))?;
             let finish = Finish {
@@ -414,9 +443,13 @@ impl Weights {
         .apply(result)
     }
 
-    /// Whether a layer carries an adapter, whose down projection reads the layer's input as it is.
-    pub fn has_adapter(&self, name: &str) -> bool {
-        self.adapters.contains_key(name)
+    /// Whether a layer carries an adapter whose down projection reads the layer's input as it
+    /// is, rather than the rows its product reads.
+    pub fn adapter_reads_rows(&self, name: &str) -> bool {
+        matches!(
+            self.adapters.get(name),
+            Some(Adapter::Fp32 { .. } | Adapter::Fp16 { rotated: None, .. })
+        )
     }
 
     /// `linear` of rows `add_norm_pack` packed for a ConvRot layer. An adapter's down projection
@@ -439,16 +472,30 @@ impl Weights {
         } else {
             None
         };
-        let adapter = self.adapters.get(name);
-        let normed = match (adapter, normed) {
-            (Some(_), None) => {
-                return Err(Error::new(format!(
-                    "{name}: an adapter needs the rows before their rotation"
-                )));
+        let (addend, lora) = match (self.adapters.get(name), normed) {
+            (None, _) => (None, None),
+            (
+                Some(Adapter::Fp16 {
+                    up,
+                    rank,
+                    rotated: Some(rotated),
+                    ..
+                }),
+                _,
+            ) => {
+                let (down, scales) = rotated.as_weight()?;
+                let finish = Finish {
+                    scales: Some(&scales),
+                    ..Finish::default()
+                };
+                (
+                    None,
+                    Some(Lora {
+                        mid: packed.product(down, *rank, finish)?,
+                        up,
+                    }),
+                )
             }
-            (_, normed) => normed,
-        };
-        let (addend, lora) = match (adapter, normed) {
             (Some(Adapter::Fp16 { down, up, rank, .. }), Some(x)) => (
                 None,
                 Some(Lora {
@@ -457,7 +504,11 @@ impl Weights {
                 }),
             ),
             (Some(adapter), Some(x)) => (Some(adapter.apply(x)?), None),
-            _ => (None, None),
+            (Some(_), None) => {
+                return Err(Error::new(format!(
+                    "{name}: an adapter needs the rows before their rotation"
+                )));
+            }
         };
         let scales = self.vector(&format!("{name}.weight_scale"))?;
         packed.product(
@@ -478,10 +529,17 @@ impl Weights {
     pub fn linear_gated(&self, x: &Array, name: &str) -> Result<Array> {
         let w = self.weight(&format!("{name}.weight"))?;
         if w.dtype != DType::I8
-            || self.adapters.contains_key(name)
+            || self.adapter_reads_rows(name)
             || self.linear_precision == LinearPrecision::Fp32
         {
             return self.linear(&x.swiglu()?, name);
+        }
+        if self.adapters.contains_key(name) {
+            return self.linear_prepacked(
+                &x.pack(Packing::GatedRotate, self.linear_precision)?,
+                None,
+                name,
+            );
         }
         if w.shape.len() < 2 || 2 * w.shape[1..].iter().product::<usize>() != x.cols {
             return Err(Error::new(format!("{name}: linear input shape mismatch")));
@@ -776,6 +834,7 @@ impl Weights {
                     (&up.data, up.shape[0], up.shape[1]),
                     strength * alpha.data[0] / down.shape[0] as f32,
                     self.device.supports_tensor_ops(),
+                    self.is_int8(layer) && shape[1].is_multiple_of(256),
                 )?,
             ));
         }
@@ -915,8 +974,15 @@ mod tests {
             for (precision, half) in cases {
                 w.adapters.insert(
                     "linear".into(),
-                    Adapter::new(&device, (&down, 1, inputs), (&up, outputs, 1), 0.7, half)
-                        .unwrap(),
+                    Adapter::new(
+                        &device,
+                        (&down, 1, inputs),
+                        (&up, outputs, 1),
+                        0.7,
+                        half,
+                        false,
+                    )
+                    .unwrap(),
                 );
                 w.linear_precision = precision;
                 let got = w
@@ -970,8 +1036,15 @@ mod tests {
                 for half in [false, true] {
                     w.adapters.insert(
                         "linear".into(),
-                        Adapter::new(&device, (&down, 1, inputs), (&up, outputs, 1), 0.7, half)
-                            .unwrap(),
+                        Adapter::new(
+                            &device,
+                            (&down, 1, inputs),
+                            (&up, outputs, 1),
+                            0.7,
+                            half,
+                            false,
+                        )
+                        .unwrap(),
                     );
                     answers.push(
                         w.linear_quantized(region.buffer(), &scales, rows, "linear", &keep)
@@ -1004,12 +1077,15 @@ mod tests {
             .map(|i| ((i * 7 % 255) as i32 - 127) as i8 as u8)
             .collect();
         let scales: Vec<f32> = (0..outputs).map(|i| 0.001 + i as f32 * 1e-5).collect();
-        let down: Vec<f32> = (0..rank * inputs)
-            .map(|i| ((i * 11 % 23) as f32 - 11.0) / 40.0)
-            .collect();
-        let up: Vec<f32> = (0..outputs * rank)
-            .map(|i| ((i * 5 % 17) as f32 - 8.0) / 30.0)
-            .collect();
+        // Weights with no period, as a trained LoRA's have: rotating a periodic row gathers it
+        // into a few large values, which INT8 then rounds coarsely.
+        let noise = |i: usize, seed: u64| {
+            let mut z = (i as u64 + seed).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            z = (z ^ (z >> 31)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            ((z >> 40) % 2001) as f32 / 1000.0 - 1.0
+        };
+        let down: Vec<f32> = (0..rank * inputs).map(|i| noise(i, 1) / 4.0).collect();
+        let up: Vec<f32> = (0..outputs * rank).map(|i| noise(i, 2) / 4.0).collect();
         let mut tensors = HashMap::new();
         tensors.insert(
             "linear.weight".into(),
@@ -1059,12 +1135,16 @@ mod tests {
         let largest = expected.iter().fold(0.0f64, |m, v| m.max(v.abs()));
 
         let tensor_ops = device.supports_tensor_ops();
-        for (precision, half) in [
-            (LinearPrecision::Fp32, false),
-            (LinearPrecision::MpsFp16, false),
-            (LinearPrecision::MpsFp16, tensor_ops),
-            (LinearPrecision::Fp16, tensor_ops),
-            (LinearPrecision::Int8, tensor_ops),
+        // The down projection on the packed rows, rotated INT8 weights and all, is further from
+        // the FP64 product than the one on the rows as they are.
+        for (precision, half, rotated, tolerance) in [
+            (LinearPrecision::Fp32, false, false, 3e-3),
+            (LinearPrecision::MpsFp16, false, false, 3e-3),
+            (LinearPrecision::MpsFp16, tensor_ops, false, 3e-3),
+            (LinearPrecision::Fp16, tensor_ops, false, 3e-3),
+            (LinearPrecision::Int8, tensor_ops, false, 3e-3),
+            (LinearPrecision::Fp16, tensor_ops, tensor_ops, 1e-2),
+            (LinearPrecision::Int8, tensor_ops, tensor_ops, 2e-2),
         ] {
             if matches!(precision, LinearPrecision::Fp16 | LinearPrecision::Int8) && !tensor_ops {
                 continue;
@@ -1080,6 +1160,7 @@ mod tests {
                     (&up, outputs, rank),
                     0.5,
                     half,
+                    rotated,
                 )
                 .unwrap(),
             );
@@ -1087,8 +1168,9 @@ mod tests {
             for (index, want) in expected.iter().enumerate() {
                 let got = (with[index] - without[index]) as f64;
                 assert!(
-                    (got - want).abs() <= largest * 3e-3,
-                    "{precision:?}, FP16 adapter {half}: at {index} the LoRA added {got}, not {want}"
+                    (got - want).abs() <= largest * tolerance,
+                    "{precision:?}, FP16 adapter {half}, rotated {rotated}: at {index} the LoRA \
+                     added {got}, not {want}"
                 );
             }
         }

@@ -894,7 +894,7 @@ impl MetalDit {
                 let keep = |parts: &[&str]| {
                     parts
                         .iter()
-                        .any(|part| w.has_adapter(&format!("{p}.{part}")))
+                        .any(|part| w.adapter_reads_rows(&format!("{p}.{part}")))
                 };
                 let (updated, normed, packed) = hidden.add_norm_pack(
                     pending.as_ref().map(|(delta, gates)| (delta, gates, 5)),
