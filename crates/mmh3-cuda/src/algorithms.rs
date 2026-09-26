@@ -129,7 +129,9 @@ fn write(path: &Path, header: &str, key: &str, entries: &str) -> io::Result<bool
     if let Some(directory) = path.parent() {
         fs::create_dir_all(directory)?;
     }
-    let temporary = path.with_extension("tmp");
+    // Another process may be saving the same file, so each writes a temporary file of its own and
+    // the rename decides whose lands, rather than two writing one file into a mix.
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     fs::write(&temporary, text)?;
     fs::rename(&temporary, path)?;
     Ok(true)

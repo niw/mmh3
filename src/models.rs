@@ -157,6 +157,12 @@ pub fn load_algorithm_cache() {
 /// Keeps the cuBLASLt algorithms this run chose for later runs.
 #[cfg(feature = "cuda")]
 pub fn save_algorithm_cache() {
+    // Two sessions of one worker can end at once, and both write the same temporary file before
+    // renaming it, so one save waits for the other.
+    static SAVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _saving = SAVING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let saved = |cache: &PathBuf, result: std::io::Result<bool>| match result {
         Ok(true) => println!("saved the cuBLASLt algorithms to {}", cache.display()),
         Ok(false) => {}

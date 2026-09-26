@@ -234,7 +234,12 @@ pub fn measure_speed() -> Option<worker::Speed> {
         if let Some(directory) = path.parent() {
             let _ = std::fs::create_dir_all(directory);
         }
-        if let Err(error) = std::fs::write(&path, text) {
+        // Written beside it and renamed over it, so that a process reading it never sees half of it,
+        // and under a name of this process's own, so that two measuring at once do not mix.
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if let Err(error) =
+            std::fs::write(&temporary, text).and_then(|()| std::fs::rename(&temporary, &path))
+        {
             eprintln!("warning: writing {}: {error}", path.display());
         }
     }
