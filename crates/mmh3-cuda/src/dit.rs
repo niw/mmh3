@@ -2230,7 +2230,12 @@ impl CudaDit {
                 workspace.residual.fill_f32(0.0)?;
                 workspace
             }
-            _ => Workspace::new(config, shape)?,
+            // The buffers of another shape go before the new ones are made, as the ones below do,
+            // or a larger canvas after a smaller one would need room for both.
+            stale => {
+                drop(stale);
+                Workspace::new(config, shape)?
+            }
         };
         let workspace = cached_workspace.insert(workspace);
         let wanted = quantized_dense.then(|| (tokens, heads.len()));
