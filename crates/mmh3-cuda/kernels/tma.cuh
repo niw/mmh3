@@ -44,9 +44,11 @@ __device__ __forceinline__ void async_proxy_fence() {
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 }
 
+// NOTE: the destination is this CTA's shared memory, not the cluster's. On sm_120 ptxas makes a
+// copy into shared::cluster a system call, whose first launch on a device takes 1.5 GiB of it.
 __device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMap *map,
                                           uint32_t barrier, int column, int row) {
-    asm volatile("cp.async.bulk.tensor.2d.shared::cluster.global.mbarrier::complete_tx::bytes "
+    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.mbarrier::complete_tx::bytes "
                  "[%0], [%1, {%2, %3}], [%4];\n" ::"r"(destination),
                  "l"(reinterpret_cast<uint64_t>(map)), "r"(column), "r"(row), "r"(barrier)
                  : "memory");
@@ -55,7 +57,7 @@ __device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMa
 __device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMap *map,
                                           uint32_t barrier, int column, int row, int head,
                                           int batch) {
-    asm volatile("cp.async.bulk.tensor.4d.shared::cluster.global.mbarrier::complete_tx::bytes "
+    asm volatile("cp.async.bulk.tensor.4d.shared::cta.global.mbarrier::complete_tx::bytes "
                  "[%0], [%1, {%2, %3, %4, %5}], [%6];\n" ::"r"(destination),
                  "l"(reinterpret_cast<uint64_t>(map)), "r"(column), "r"(row), "r"(head), "r"(batch),
                  "r"(barrier)

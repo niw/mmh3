@@ -263,22 +263,36 @@ __global__ void __launch_bounds__(THREADS, HEAD_DIM == 64 ? 2 : 1)
         // all-masked block.
         const bool masked_block = (block + 1) * BLOCK_N > tokens ||
                                   (layout.causal && (block + 1) * BLOCK_N - 1 > first_query);
+        #pragma unroll
+        for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
+            #pragma unroll
+            for (int element = 0; element < 4; element++) {
+                scores[key_tile_index][element] *= scale_log2;
+            }
+        }
+        // NOTE: the masking is a branch of its own, which keeps the compiler from turning it into
+        // selects that every block would pay for.
+        if (masked_block) {
+            #pragma unroll
+            for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
+                #pragma unroll
+                for (int element = 0; element < 4; element++) {
+                    const int key_index =
+                        block * BLOCK_N + key_tile_index * 8 + (lane % 4) * 2 + (element % 2);
+                    const int query_index = first_query + warp * 16 + (element / 2) * 8 + lane / 4;
+                    if (key_index >= tokens || (layout.causal && key_index > query_index)) {
+                        scores[key_tile_index][element] = -FLT_MAX;
+                    }
+                }
+            }
+        }
         float block_max[2] = {-FLT_MAX, -FLT_MAX};
         #pragma unroll
         for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
             #pragma unroll
             for (int element = 0; element < 4; element++) {
-                float score = scores[key_tile_index][element] * scale_log2;
-                if (masked_block) {
-                    const int key_index =
-                        block * BLOCK_N + key_tile_index * 8 + (lane % 4) * 2 + (element % 2);
-                    const int query_index = first_query + warp * 16 + (element / 2) * 8 + lane / 4;
-                    if (key_index >= tokens || (layout.causal && key_index > query_index)) {
-                        score = -FLT_MAX;
-                    }
-                }
-                scores[key_tile_index][element] = score;
-                block_max[element / 2] = fmaxf(block_max[element / 2], score);
+                block_max[element / 2] =
+                    fmaxf(block_max[element / 2], scores[key_tile_index][element]);
             }
         }
         float correction[2];
