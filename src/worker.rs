@@ -2984,7 +2984,14 @@ fn dit_key(open: &OpenSession) -> DitKey {
 fn read_dit(kept: &mut Models, path: &Path) -> Result<Dit, Box<dyn Error>> {
     let file = SafeTensors::open(path)?;
     kept.take_dit();
-    kept.read_fitting(|| Dit::load(&file, ""), || Dit::load_fitting(&file, ""))
+    #[allow(unused_mut)]
+    let mut dit = kept.read_fitting(|| Dit::load(&file, ""), || Dit::load_fitting(&file, ""))?;
+    #[cfg(feature = "metal")]
+    {
+        dit.set_linear_precision(crate::metal::default_linear_precision())?;
+        dit.set_attention_precision(crate::metal::default_attention_precision())?;
+    }
+    Ok(dit)
 }
 
 /// Reads the DiT a run is about to share, so that it is here when the session opens rather than

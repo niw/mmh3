@@ -138,9 +138,15 @@ impl Models {
         if self.text_encoder.kept.as_ref().map(|(kept, _)| *kept) != Some(key) {
             self.text_encoder.kept = None;
             let file = SafeTensors::open(path)?;
-            let encoder = self.read_fitting(
+            #[allow(unused_mut)]
+            let mut encoder = self.read_fitting(
                 || load(path, || TextEncoder::load(&file)),
                 || load(path, || TextEncoder::load_fitting(&file)),
+            )?;
+            #[cfg(feature = "metal")]
+            encoder.set_precision(
+                crate::metal::default_linear_precision(),
+                crate::metal::default_attention_precision(),
             )?;
             self.text_encoder.kept = Some((key, encoder));
         }
