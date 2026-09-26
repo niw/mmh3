@@ -1,6 +1,8 @@
 //! Video VAE decoding, unpatchification and spatial/temporal blending on Metal.
 use crate::{
-    AttentionPrecision, Device, Error, LinearPrecision, Result, model::Weights, ops::Array,
+    AttentionPrecision, Device, Error, LinearPrecision, Result,
+    model::Weights,
+    ops::{Array, attends_in_half},
 };
 use mmh3_core::{
     media::Yuv420,
@@ -267,35 +269,31 @@ impl MetalVideoDecoder {
 
         for i in 0..self.layers {
             let p = format!("decoder.transformer_blocks.{i}");
-            let qkv = w
-                .linear(
-                    &w.norm(&x, &format!("{p}.norm1"), 1e-5)?,
-                    &format!("{p}.attn.to_qkv"),
-                )?
-                .reshape(tokens * heads, 192)?;
-            let qk = |start| -> Result<Array> {
-                qkv.slice(0, tokens * heads, start, 64)?
-                    .norm(&ones, 1e-5, false)?
-                    .reshape(tokens, self.dim)?
-                    .rope(heads, &angles)
-            };
-
-            let q = qk(0)?;
-            let k = qk(64)?;
-            let v = qkv
-                .slice(0, tokens * heads, 128, 64)?
-                .reshape(tokens, self.dim)?;
+            let qkv = w.linear(
+                &w.norm(&x, &format!("{p}.norm1"), 1e-5)?,
+                &format!("{p}.attn.to_qkv"),
+            )?;
+            // Each head's query, key and value lie side by side, and the query and key norms
+            // have no weights of their own.
             let attended = w.linear(
-                &q.attention_at(&k, &v, heads, heads, false, w.attention_precision)?,
+                &qkv.attention_inputs(
+                    heads,
+                    (&ones, &ones),
+                    1e-5,
+                    Some(&angles),
+                    attends_in_half(&w.device, w.attention_precision, 64),
+                    true,
+                )?
+                .attend()?,
                 &format!("{p}.attn.to_out"),
             )?;
-            x = x.add(&attended.mul(&w.vector(&format!("{p}.scale1"))?)?)?;
+            x = x.add_scaled(&attended, &w.vector(&format!("{p}.scale1"))?)?;
             let expanded = w.linear(
                 &w.norm(&x, &format!("{p}.norm2"), 1e-5)?,
                 &format!("{p}.ff.w1"),
             )?;
-            let delta = w.linear(&expanded.swiglu()?, &format!("{p}.ff.w2"))?;
-            x = x.add(&delta.mul(&w.vector(&format!("{p}.scale2"))?)?)?;
+            let delta = w.linear_gated(&expanded, &format!("{p}.ff.w2"))?;
+            x = x.add_scaled(&delta, &w.vector(&format!("{p}.scale2"))?)?;
         }
 
         let projected = w

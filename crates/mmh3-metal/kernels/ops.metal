@@ -40,6 +40,14 @@ kernel void modulation(device const float *x [[buffer(0)]], device const float *
     out[i] = p[5] ? x[i] + delta[i] * a : x[i] * (1 + b) + a;
 }
 
+// x + delta × scale, with `scale` a row of p[1] values: a residual stream taking a scaled block.
+kernel void add_scaled(device const float *x [[buffer(0)]], device const float *delta [[buffer(1)]],
+                       device const float *scale [[buffer(2)]], device float *y [[buffer(3)]],
+                       constant uint *p [[buffer(4)]], uint i [[thread_position_in_grid]]) {
+    if (i < p[0])
+        y[i] = x[i] + delta[i] * scale[i % p[1]];
+}
+
 kernel void unary_op(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
                      constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p[0])
@@ -67,39 +75,94 @@ kernel void embedding(device const uchar *x [[buffer(0)]], device const uint *in
         y[i] = load_value(x, indices[i / p[1]] * p[1] + i % p[1], p[2]);
 }
 
-float reduce_sum(float v, threadgroup float *scratch, uint lane) {
-    scratch[lane] = v;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = 128; s > 0; s >>= 1) {
-        if (lane < s)
-            scratch[lane] += scratch[lane + s];
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
+// The values a thread keeps of a row it normalizes: rows of up to 256 × ROW_VALUES values, which
+// both models' are, are read once rather than once a pass.
+constant constexpr uint ROW_VALUES = 24;
 
-    float result = scratch[0];
+// The sum over a threadgroup of 256 threads, which every thread gets.
+float row_sum(float v, threadgroup float *scratch, uint tid) {
+    v = simd_sum(v);
+    if (tid % 32 == 0)
+        scratch[tid / 32] = v;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    return result;
+    float sum = 0;
+    for (uint i = 0; i < 8; ++i)
+        sum += scratch[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return sum;
+}
+
+// One row of normalize, and with MODULATE of normalize_modulate: `x` and `y` point at the row, and
+// `table` at its row of the modulation table.
+template <bool MODULATE>
+void normalize_row(device const float *x, device const float *w, device float *y, uint width,
+                   float epsilon, bool center, device const float *table, uint shift, uint scale,
+                   uint tid, threadgroup float *scratch) {
+    const bool kept = width <= 256 * ROW_VALUES;
+    float v[ROW_VALUES], sum = 0;
+    if (kept) {
+        _Pragma("clang loop unroll(full)") for (uint i = 0; i < ROW_VALUES; ++i) {
+            const uint c = tid + i * 256;
+            v[i] = c < width ? x[c] : 0;
+            sum += v[i];
+        }
+    } else {
+        for (uint c = tid; c < width; c += 256)
+            sum += x[c];
+    }
+    const float mean = center ? row_sum(sum, scratch, tid) / width : 0;
+
+    float squares = 0;
+    if (kept) {
+        _Pragma("clang loop unroll(full)") for (uint i = 0; i < ROW_VALUES; ++i) {
+            const float d = tid + i * 256 < width ? v[i] - mean : 0;
+            squares += d * d;
+        }
+    } else {
+        for (uint c = tid; c < width; c += 256)
+            squares += (x[c] - mean) * (x[c] - mean);
+    }
+    const float inv = rsqrt(row_sum(squares, scratch, tid) / width + epsilon);
+
+    auto write = [&](uint c, float value) {
+        float normalized = (value - mean) * inv * w[c];
+        if (MODULATE)
+            normalized = normalized * (1 + table[scale * width + c]) + table[shift * width + c];
+        y[c] = normalized;
+    };
+    if (kept) {
+        _Pragma("clang loop unroll(full)") for (uint i = 0; i < ROW_VALUES;
+                                                ++i) if (tid + i * 256 < width)
+            write(tid + i * 256, v[i]);
+    } else {
+        for (uint c = tid; c < width; c += 256)
+            write(c, x[c]);
+    }
 }
 
 kernel void normalize(device const float *x [[buffer(0)]], device const float *w [[buffer(1)]],
                       device float *y [[buffer(2)]], constant uint *p [[buffer(3)]],
                       uint row [[threadgroup_position_in_grid]],
                       uint lane [[thread_index_in_threadgroup]]) {
-    threadgroup float scratch[256];
-    uint width = p[0];
-    float sum = 0, squares = 0;
-    for (uint c = lane; c < width; c += 256)
-        sum += x[row * width + c];
-    float mean = p[2] ? reduce_sum(sum, scratch, lane) / width : 0;
+    threadgroup float scratch[8];
+    const uint width = p[0];
+    normalize_row<false>(x + row * width, w, y + row * width, width, as_type<float>(p[1]), p[2], x,
+                         0, 0, lane, scratch);
+}
 
-    for (uint c = lane; c < width; c += 256) {
-        float v = x[row * width + c] - mean;
-        squares += v * v;
-    }
-
-    float inv = rsqrt(reduce_sum(squares, scratch, lane) / width + as_type<float>(p[1]));
-    for (uint c = lane; c < width; c += 256)
-        y[row * width + c] = (x[row * width + c] - mean) * inv * w[c];
+// normalize without centering, followed by modulation's x × (1 + scale) + shift, in one pass over
+// a row. The row's scale and shift are chunks p[4] and p[3] of its row of the modulation table.
+kernel void normalize_modulate(device const float *x [[buffer(0)]],
+                               device const float *w [[buffer(1)]],
+                               device const float *m [[buffer(2)]],
+                               device const uint *rows [[buffer(3)]], device float *y [[buffer(4)]],
+                               constant uint *p [[buffer(5)]],
+                               uint row [[threadgroup_position_in_grid]],
+                               uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    const uint width = p[0];
+    normalize_row<true>(x + row * width, w, y + row * width, width, as_type<float>(p[1]), false,
+                        m + rows[row] * p[2], p[3], p[4], lane, scratch);
 }
 
 kernel void rotary(device const float *x [[buffer(0)]], device const float *angles [[buffer(1)]],
@@ -386,10 +449,11 @@ kernel void swiglu(device const float *x [[buffer(0)]], device float *y [[buffer
     y[i] = gate / (1 + exp(-gate)) * x[at + width];
 }
 
-// A block's attention inputs from its qkv projection, rows of [3][heads][p[4]] for heads of up to
-// 256: the queries and keys RMS-normalized per head by their weights, and with p[1] pairs of angles
-// a token rotated in the first 2 × p[1] dimensions of each head. All three are written as FP16 for
-// the matrix units, or as FP32. Eight SIMD groups a token, a head at a time.
+// A block's attention inputs from its qkv projection, rows of [3][heads][p[4]], or of
+// [heads][3][p[4]] with p[5] = 1, for heads of up to 256: the queries and keys RMS-normalized per
+// head by their weights, and with p[1] pairs of angles a token rotated in the first 2 × p[1]
+// dimensions of each head. All three are written as FP16 for the matrix units, or as FP32. Eight
+// SIMD groups a token, a head at a time.
 kernel void attention_inputs(
     device const float *qkv [[buffer(0)]], device const float *q_norm [[buffer(1)]],
     device const float *k_norm [[buffer(2)]], device const float *angles [[buffer(3)]],
@@ -402,7 +466,8 @@ kernel void attention_inputs(
     const float epsilon = as_type<float>(p[3]);
     for (uint h = simd; h < 3 * heads; h += 8) {
         const uint tensor = h / heads, head = h % heads;
-        device const float *row = qkv + token * 3 * inner + tensor * inner + head * dim;
+        device const float *row = qkv + token * 3 * inner +
+                                  (p[5] ? (head * 3 + tensor) * dim : tensor * inner + head * dim);
         float x[PARTS], squares = 0;
         for (uint c = 0; c < PARTS; ++c) {
             const uint d = lane + c * 32;
@@ -440,6 +505,214 @@ kernel void attention_inputs(
                 ((device half *)out)[i] = half(x[c]);
             else
                 ((device float *)out)[i] = x[c];
+        }
+    }
+}
+
+// The radix-4 butterfly of the Hadamard kernel: the output of digit `digit` from the four inputs
+// that differ only in that digit.
+float radix4(float a, float b, float c, float d, uint digit) {
+    return digit == 0   ? a + b + c - d
+           : digit == 1 ? a + b - c + d
+           : digit == 2 ? a - b + c + d
+                        : -a + b + c + d;
+}
+
+// ConvRot's rotation of one 256-value block in a SIMD group's registers, eight values a lane at
+// index lane + 32 j. The four digits of an index are its bit pairs: the first two are the lane's
+// low bits, the third the lane's top bit with j's lowest, and the last j's top bits. The stages and
+// their sums are the hadamard kernel's, in its order, so the results are the same.
+void hadamard_registers(thread float *x, uint lane) {
+    for (uint s = 1; s <= 4; s *= 4) {
+        const uint digit = lane / s % 4, base = lane - digit * s;
+        for (uint j = 0; j < 8; ++j) {
+            const float a = simd_shuffle(x[j], base), b = simd_shuffle(x[j], base + s),
+                        c = simd_shuffle(x[j], base + 2 * s), d = simd_shuffle(x[j], base + 3 * s);
+            x[j] = radix4(a, b, c, d, digit);
+        }
+    }
+    const uint low = lane & ~16u, high = lane | 16u, bit = lane / 16;
+    for (uint j = 0; j < 8; j += 2) {
+        const float a = simd_shuffle(x[j], low), b = simd_shuffle(x[j], high),
+                    c = simd_shuffle(x[j + 1], low), d = simd_shuffle(x[j + 1], high);
+        x[j] = radix4(a, b, c, d, bit);
+        x[j + 1] = radix4(a, b, c, d, 2 + bit);
+    }
+    for (uint j = 0; j < 2; ++j) {
+        const float a = x[j], b = x[j + 2], c = x[j + 4], d = x[j + 6];
+        for (uint digit = 0; digit < 4; ++digit)
+            x[j + 2 * digit] = radix4(a, b, c, d, digit);
+    }
+    for (uint j = 0; j < 8; ++j)
+        x[j] *= 1.0f / 16.0f;
+}
+
+// A row's value at `c`, or with `gated` SwiGLU of its gate at `c` and its up half at `cols` + `c`,
+// as the swiglu kernel computes it.
+float gated_value(device const float *row, uint c, uint cols, uint gated) {
+    if (!gated)
+        return row[c];
+    const float gate = row[c];
+    return gate / (1 + exp(-gate)) * row[cols + c];
+}
+
+// hadamard and pack_linear_input in one pass over a row: the first pass rotates each block to find
+// the row's maximum, and the second rotates it again to pack it rather than keeping the row. With
+// p[2] = 1 the rows are an MLP's gate and up halves, 2 × p[0] values, and SwiGLU of them is what
+// is rotated and packed, so the gated rows are never written out.
+// The 256-value blocks of a row a SIMD group of rotate_pack_linear_input keeps in registers: rows
+// of up to 14,336 values, which every DiT and VAE product reads, are read once rather than twice.
+constant constexpr uint ROTATE_BLOCKS = 7;
+
+// A value of block `k` packed as rotate_pack_linear_input packs it, at `i`.
+void pack_value(device uchar *packed, uint i, float value, float scale, bool int8) {
+    const float normalized = value / scale;
+    if (int8)
+        ((device char *)packed)[i] = char(rint(clamp(normalized * 127.0f, -127.0f, 127.0f)));
+    else
+        ((device half *)packed)[i] = half(normalized);
+}
+
+kernel void rotate_pack_linear_input(device const float *x [[buffer(0)]],
+                                     device uchar *packed [[buffer(1)]],
+                                     device float *scales [[buffer(2)]],
+                                     constant uint *p [[buffer(3)]],
+                                     uint row [[threadgroup_position_in_grid]],
+                                     uint simd [[simdgroup_index_in_threadgroup]],
+                                     uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float maxima[8];
+    const uint cols = p[0], blocks = cols / 256, gated = p[2];
+    device const float *in = x + row * cols * (gated ? 2 : 1);
+    const bool kept = blocks <= 8 * ROTATE_BLOCKS;
+    float v[ROTATE_BLOCKS][8], maximum = 0;
+    if (kept) {
+        _Pragma("clang loop unroll(full)") for (uint k = 0; k < ROTATE_BLOCKS; ++k) {
+            const uint block = simd + k * 8;
+            if (block >= blocks)
+                continue;
+            _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j) v[k][j] =
+                gated_value(in, block * 256 + j * 32 + lane, cols, gated);
+            hadamard_registers(v[k], lane);
+            _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j) maximum =
+                max(maximum, abs(v[k][j]));
+        }
+    } else {
+        for (uint block = simd; block < blocks; block += 8) {
+            float w[8];
+            for (uint j = 0; j < 8; ++j)
+                w[j] = gated_value(in, block * 256 + j * 32 + lane, cols, gated);
+            hadamard_registers(w, lane);
+            for (uint j = 0; j < 8; ++j)
+                maximum = max(maximum, abs(w[j]));
+        }
+    }
+    maximum = simd_max(maximum);
+    if (lane == 0)
+        maxima[simd] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maximum = simd_max(lane < 8 ? maxima[lane] : 0.0f);
+    const float scale = maximum == 0 ? 1.0f : maximum;
+    if (simd == 0 && lane == 0)
+        scales[row] = p[1] ? scale / 127.0f : scale;
+    if (kept) {
+        _Pragma("clang loop unroll(full)") for (uint k = 0; k < ROTATE_BLOCKS; ++k) {
+            const uint block = simd + k * 8;
+            if (block >= blocks)
+                continue;
+            _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j)
+                pack_value(packed, row * cols + block * 256 + j * 32 + lane, v[k][j], scale, p[1]);
+        }
+    } else {
+        for (uint block = simd; block < blocks; block += 8) {
+            float w[8];
+            for (uint j = 0; j < 8; ++j)
+                w[j] = gated_value(in, block * 256 + j * 32 + lane, cols, gated);
+            hadamard_registers(w, lane);
+            for (uint j = 0; j < 8; ++j)
+                pack_value(packed, row * cols + block * 256 + j * 32 + lane, w[j], scale, p[1]);
+        }
+    }
+}
+
+// The 256-value blocks of a row a SIMD group of add_norm_pack keeps: rows of up to 6,144 values.
+constant constexpr uint PACK_BLOCKS = 3;
+
+// A residual stream's next block input in one pass over a row, as add_gated, normalize_modulate and
+// rotate_pack_linear_input would make it in three: with p[5], the row takes `delta` times its gate,
+// chunk p[6] of its row of `gates`, and the new row is written to `hidden` with p[10]; it is then
+// RMS-normalized by `w`, modulated by chunks p[4] (scale) and p[3] (shift) of its row of `m`,
+// written to `normed` with p[9] for a LoRA's down projection, and rotated and packed as
+// rotate_pack_linear_input packs it, INT8 with p[8] and FP16 otherwise. The row stays in the SIMD
+// groups' registers, a group's blocks laid out as the Hadamard rotation wants them.
+kernel void
+add_norm_pack(device const float *x [[buffer(0)]], device const float *delta [[buffer(1)]],
+              device const float *gates [[buffer(2)]], device const float *m [[buffer(3)]],
+              device const uint *rows [[buffer(4)]], device const float *w [[buffer(5)]],
+              device float *hidden [[buffer(6)]], device float *normed [[buffer(7)]],
+              device uchar *packed [[buffer(8)]], device float *scales [[buffer(9)]],
+              constant uint *p [[buffer(10)]], uint row [[threadgroup_position_in_grid]],
+              uint tid [[thread_index_in_threadgroup]],
+              uint simd [[simdgroup_index_in_threadgroup]],
+              uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float scratch[8];
+    const uint width = p[0], blocks = width / 256;
+    device const float *table = m + rows[row] * p[2];
+    device const float *gate = gates + rows[row] * p[7] + p[6] * width;
+    float v[PACK_BLOCKS][8], squares = 0;
+    _Pragma("clang loop unroll(full)") for (uint k = 0; k < PACK_BLOCKS; ++k) {
+        const uint block = simd + k * 8;
+        if (block >= blocks)
+            continue;
+        _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j) {
+            const uint c = block * 256 + j * 32 + lane, i = row * width + c;
+            float value = x[i];
+            if (p[5]) {
+                value = value + delta[i] * gate[c];
+                if (p[10])
+                    hidden[i] = value;
+            }
+            v[k][j] = value;
+            squares += value * value;
+        }
+    }
+    const float inv = rsqrt(row_sum(squares, scratch, tid) / width + as_type<float>(p[1]));
+
+    float maximum = 0;
+    _Pragma("clang loop unroll(full)") for (uint k = 0; k < PACK_BLOCKS; ++k) {
+        const uint block = simd + k * 8;
+        if (block >= blocks)
+            continue;
+        _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j) {
+            const uint c = block * 256 + j * 32 + lane;
+            const float value = v[k][j] * inv * w[c];
+            v[k][j] = value * (1 + table[p[4] * width + c]) + table[p[3] * width + c];
+            if (p[9])
+                normed[row * width + c] = v[k][j];
+        }
+        hadamard_registers(v[k], lane);
+        _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j) maximum =
+            max(maximum, abs(v[k][j]));
+    }
+    maximum = simd_max(maximum);
+    if (lane == 0)
+        scratch[simd] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    maximum = simd_max(lane < 8 ? scratch[lane] : 0.0f);
+    const float scale = maximum == 0 ? 1.0f : maximum;
+    if (tid == 0)
+        scales[row] = p[8] ? scale / 127.0f : scale;
+    _Pragma("clang loop unroll(full)") for (uint k = 0; k < PACK_BLOCKS; ++k) {
+        const uint block = simd + k * 8;
+        if (block >= blocks)
+            continue;
+        _Pragma("clang loop unroll(full)") for (uint j = 0; j < 8; ++j) {
+            const uint i = row * width + block * 256 + j * 32 + lane;
+            const float normalized = v[k][j] / scale;
+            if (p[8])
+                ((device char *)packed)[i] =
+                    char(rint(clamp(normalized * 127.0f, -127.0f, 127.0f)));
+            else
+                ((device half *)packed)[i] = half(normalized);
         }
     }
 }

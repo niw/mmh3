@@ -304,36 +304,97 @@ impl Array {
         precision: LinearPrecision,
         finish: Finish,
     ) -> Result<Self> {
+        self.packed_product(Packing::Plain, weight, outputs, precision, finish)
+    }
+
+    /// `linear_int8` of these rows rotated by ConvRot's Hadamard transform, which a ConvRot
+    /// layer's weights expect. The rotation happens as the rows are packed.
+    pub(crate) fn rotate_linear_int8(
+        &self,
+        weight: &Buffer,
+        outputs: usize,
+        precision: LinearPrecision,
+        finish: Finish,
+    ) -> Result<Self> {
+        self.packed_product(Packing::Rotate, weight, outputs, precision, finish)
+    }
+
+    /// `rotate_linear_int8` of SwiGLU of these rows, an MLP's gate and up halves side by side.
+    /// SwiGLU happens as the rows are packed, so the gated rows are never written out.
+    pub(crate) fn swiglu_rotate_linear_int8(
+        &self,
+        weight: &Buffer,
+        outputs: usize,
+        precision: LinearPrecision,
+        finish: Finish,
+    ) -> Result<Self> {
+        self.packed_product(Packing::GatedRotate, weight, outputs, precision, finish)
+    }
+
+    fn packed_product(
+        &self,
+        packing: Packing,
+        weight: &Buffer,
+        outputs: usize,
+        precision: LinearPrecision,
+        finish: Finish,
+    ) -> Result<Self> {
+        if packing == Packing::GatedRotate && !self.cols.is_multiple_of(2) {
+            return Err(Error::new("SwiGLU requires two equal halves".into()));
+        }
+        let cols = if packing == Packing::GatedRotate {
+            self.cols / 2
+        } else {
+            self.cols
+        };
         if !std::sync::Arc::ptr_eq(&self.device().0, &weight.0.device.0)
-            || outputs.checked_mul(self.cols) != Some(weight.0.bytes)
+            || outputs.checked_mul(cols) != Some(weight.0.bytes)
         {
             return Err(Error::new("packed matrix shape or device mismatch".into()));
         }
 
-        size(outputs, self.cols)?;
+        size(outputs, cols)?;
         // TensorOps uses signed extents/indices. Bound the INT32 worst-case sum too:
         // quantized input is [-127,127], checkpoint weights can contain -128.
         if precision == LinearPrecision::Fp32
             || self.len() > i32::MAX as usize
-            || outputs * self.cols > i32::MAX as usize
+            || outputs * cols > i32::MAX as usize
             || self
                 .rows
                 .checked_mul(outputs)
                 .is_none_or(|n| n > i32::MAX as usize)
-            || (precision == LinearPrecision::Int8 && self.cols > i32::MAX as usize / (127 * 128))
+            || (precision == LinearPrecision::Int8 && cols > i32::MAX as usize / (127 * 128))
         {
-            return finish.apply(self.linear_packed(weight, outputs, DType::I8)?);
+            let input = match packing {
+                Packing::Plain => self.clone(),
+                Packing::Rotate => self.rotate()?,
+                Packing::GatedRotate => self.swiglu()?.rotate()?,
+            };
+            return finish.apply(input.linear_packed(weight, outputs, DType::I8)?);
+        }
+        if packing != Packing::Plain && !cols.is_multiple_of(256) {
+            return Err(Error::new(
+                "ConvRot requires a multiple of 256 features".into(),
+            ));
         }
 
         let int8 = precision == LinearPrecision::Int8;
         let packed = self
             .device()
-            .alloc(self.len() * if int8 { 1 } else { 2 }, None)?;
+            .alloc(self.rows * cols * if int8 { 1 } else { 2 }, None)?;
         let scales = Self::empty(self.device(), self.rows, 1)?;
         self.device().run(
-            "pack_linear_input",
+            if packing == Packing::Plain {
+                "pack_linear_input"
+            } else {
+                "rotate_pack_linear_input"
+            },
             &[&self.buffer, &packed, &scales.buffer],
-            &[self.cols as u32, int8 as u32],
+            &[
+                cols as u32,
+                int8 as u32,
+                (packing == Packing::GatedRotate) as u32,
+            ],
             self.rows,
             true,
         )?;
@@ -343,7 +404,7 @@ impl Array {
             &scales,
             weight,
             self.rows,
-            self.cols,
+            cols,
             outputs,
             precision,
             finish,
@@ -565,6 +626,23 @@ impl Array {
 
     pub fn add(&self, rhs: &Self) -> Result<Self> {
         self.binary(rhs, 0)
+    }
+
+    /// `self + delta × scale`, `scale` a row of `self.cols` values, in one pass.
+    pub(crate) fn add_scaled(&self, delta: &Self, scale: &Self) -> Result<Self> {
+        if delta.shape() != self.shape() || scale.len() != self.cols {
+            return Err(Error::new("incompatible elementwise shapes".into()));
+        }
+
+        let out = Self::empty(self.device(), self.rows, self.cols)?;
+        self.device().run(
+            "add_scaled",
+            &[&self.buffer, &delta.buffer, &scale.buffer, &out.buffer],
+            &[self.len() as u32, self.cols as u32],
+            self.len(),
+            false,
+        )?;
+        Ok(out)
     }
 
     pub fn mul(&self, rhs: &Self) -> Result<Self> {
@@ -803,8 +881,8 @@ impl Array {
         )
     }
 
-    /// A block's attention inputs from its qkv projection's output, rows of `[3][heads][dim]` for
-    /// heads of up to 256:
+    /// A block's attention inputs from its qkv projection's output, rows of `[3][heads][dim]`, or
+    /// of `[heads][3][dim]` with `per_head`, for heads of up to 256:
     /// the queries and keys RMS-normalized per head by `q_norm` and `k_norm` and rotated by
     /// `angles`, and all three in FP16 for the matrix units with `half`. One pass reads the
     /// projection and writes what the attention reads.
@@ -815,6 +893,7 @@ impl Array {
         epsilon: f32,
         angles: Option<&Self>,
         half: bool,
+        per_head: bool,
     ) -> Result<AttentionInputs> {
         let dim = self.cols / 3 / heads.max(1);
         let inner = heads * dim;
@@ -853,6 +932,7 @@ impl Array {
                 half as u32,
                 epsilon.to_bits(),
                 dim as u32,
+                per_head as u32,
             ],
             self.rows,
             true,
@@ -893,6 +973,139 @@ impl Array {
             &[out.len() as u32, out.cols as u32],
             out.len(),
             false,
+        )?;
+        Ok(out)
+    }
+
+    /// A residual stream's next block input in one pass, as `add_gated`, `norm_modulate` and the
+    /// packing of `rotate_linear_int8` would make it: `self`, plus `delta` gated by chunk `gate` of
+    /// its row of `gates` when there is one, normalized without centering by `weight`, modulated by
+    /// chunks `shift` and `scale` of its row of `m`, rotated and packed for `precision`. Returns
+    /// the new residual when there was a delta, the rows before rotation with `keep`, which a
+    /// LoRA's down projection reads, and the packed rows.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_norm_pack(
+        &self,
+        delta: Option<(&Self, &Self, usize)>,
+        weight: &Self,
+        epsilon: f32,
+        (m, rows, shift, scale): (&Self, &RowMap, usize, usize),
+        precision: LinearPrecision,
+        keep: bool,
+    ) -> Result<(Option<Self>, Option<Self>, PackedRows)> {
+        let chunks = |table: &Self| table.cols / self.cols;
+        if !PackedRows::fit(self.cols, precision)
+            || weight.len() != self.cols
+            || rows.len != self.rows
+            || rows.maximum >= m.rows
+            || !m.cols.is_multiple_of(self.cols)
+            || shift.max(scale) >= chunks(m)
+            || delta.is_some_and(|(delta, gates, gate)| {
+                delta.shape() != self.shape()
+                    || rows.maximum >= gates.rows
+                    || !gates.cols.is_multiple_of(self.cols)
+                    || gate >= chunks(gates)
+            })
+        {
+            return Err(Error::new("invalid add_norm_pack shapes".into()));
+        }
+
+        let device = self.device();
+        let int8 = precision == LinearPrecision::Int8;
+        let hidden = delta
+            .map(|_| Self::empty(device, self.rows, self.cols))
+            .transpose()?;
+        let normed = keep
+            .then(|| Self::empty(device, self.rows, self.cols))
+            .transpose()?;
+        let packed = device.alloc(self.len() * if int8 { 1 } else { 2 }, None)?;
+        let scales = Self::empty(device, self.rows, 1)?;
+        let (delta_buffer, gates, gate) = match delta {
+            Some((delta, gates, gate)) => (&delta.buffer, gates, gate),
+            None => (&self.buffer, m, 0),
+        };
+        device.run(
+            "add_norm_pack",
+            &[
+                &self.buffer,
+                delta_buffer,
+                &gates.buffer,
+                &m.buffer,
+                &rows.buffer,
+                &weight.buffer,
+                hidden.as_ref().map_or(&self.buffer, |h| &h.buffer),
+                normed.as_ref().map_or(&self.buffer, |n| &n.buffer),
+                &packed,
+                &scales.buffer,
+            ],
+            &[
+                self.cols as u32,
+                epsilon.to_bits(),
+                m.cols as u32,
+                shift as u32,
+                scale as u32,
+                delta.is_some() as u32,
+                gate as u32,
+                gates.cols as u32,
+                int8 as u32,
+                keep as u32,
+                delta.is_some() as u32,
+            ],
+            self.rows,
+            true,
+        )?;
+        Ok((
+            hidden,
+            normed,
+            PackedRows {
+                buffer: packed,
+                scales,
+                rows: self.rows,
+                cols: self.cols,
+                precision,
+            },
+        ))
+    }
+
+    /// `norm` without centering followed by `modulate`, in one pass.
+    pub(crate) fn norm_modulate(
+        &self,
+        weight: &Self,
+        epsilon: f32,
+        m: &Self,
+        rows: &RowMap,
+        shift: usize,
+        scale: usize,
+    ) -> Result<Self> {
+        if weight.len() != self.cols
+            || rows.len != self.rows
+            || rows.maximum >= m.rows
+            || !m.cols.is_multiple_of(self.cols)
+            || shift >= m.cols / self.cols
+            || scale >= m.cols / self.cols
+        {
+            return Err(Error::new("invalid modulation shapes".into()));
+        }
+
+        let out = Self::empty(self.device(), self.rows, self.cols)?;
+        self.device().run(
+            "normalize_modulate",
+            &[
+                &self.buffer,
+                &weight.buffer,
+                &m.buffer,
+                &rows.buffer,
+                &out.buffer,
+            ],
+            &[
+                self.cols as u32,
+                epsilon.to_bits(),
+                m.cols as u32,
+                shift as u32,
+                scale as u32,
+            ],
+            self.rows,
+            true,
         )?;
         Ok(out)
     }
@@ -990,6 +1203,65 @@ fn product_band(rows: usize, outputs: usize, inputs: usize) -> u32 {
     } else {
         2
     }
+}
+
+/// Rows rotated and packed for a ConvRot layer's product, INT8 or FP16 as its precision takes them,
+/// with one scale a row, which `add_norm_pack` makes.
+pub(crate) struct PackedRows {
+    buffer: Buffer,
+    scales: Array,
+    rows: usize,
+    cols: usize,
+    precision: LinearPrecision,
+}
+
+impl PackedRows {
+    /// Whether rows of `width` values at `precision` can be packed by `add_norm_pack`.
+    pub(crate) fn fit(width: usize, precision: LinearPrecision) -> bool {
+        precision != LinearPrecision::Fp32
+            && width.is_multiple_of(256)
+            && width <= ADD_NORM_PACK_WIDTH
+    }
+
+    /// The product of these rows with a ConvRot layer's INT8 `weight` of `outputs` rows.
+    pub(crate) fn product(&self, weight: &Buffer, outputs: usize, finish: Finish) -> Result<Array> {
+        if outputs.checked_mul(self.cols) != Some(weight.0.bytes)
+            || [
+                self.rows * self.cols,
+                outputs * self.cols,
+                self.rows * outputs,
+            ]
+            .iter()
+            .any(|&n| n > i32::MAX as usize)
+        {
+            return Err(Error::new("packed matrix shape mismatch".into()));
+        }
+        Array::product_of_packed(
+            self.scales.device(),
+            &self.buffer,
+            &self.scales,
+            weight,
+            self.rows,
+            self.cols,
+            outputs,
+            self.precision,
+            finish,
+        )
+    }
+}
+
+/// The widest rows `add_norm_pack` keeps in registers: three 256-value blocks for each of eight SIMD
+/// groups, `PACK_BLOCKS` in ops.metal.
+const ADD_NORM_PACK_WIDTH: usize = 3 * 8 * 256;
+
+/// What a packed product does to its rows as it packs them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Packing {
+    Plain,
+    /// ConvRot's Hadamard rotation.
+    Rotate,
+    /// SwiGLU of the rows' two halves, then the rotation.
+    GatedRotate,
 }
 
 /// Whether attention at `precision` over heads of `dim` runs on the matrix units, which read FP16
@@ -1187,6 +1459,17 @@ mod tests {
             };
             let (q, k) = (step(0, &q_norm), step(inner, &k_norm));
             let v = qkv.slice(0, rows, 2 * inner, inner).unwrap();
+            let per_head: Vec<f32> = {
+                let values = qkv.to_f32().unwrap();
+                (0..rows * 3 * inner)
+                    .map(|i| {
+                        let (row, rest) = (i / (3 * inner), i % (3 * inner));
+                        let (head, tensor, d) = (rest / (3 * dim), rest / dim % 3, rest % dim);
+                        values[row * 3 * inner + tensor * inner + head * dim + d]
+                    })
+                    .collect()
+            };
+            let per_head = Array::from_f32(&device, rows, 3 * inner, &per_head).unwrap();
             for half in [false, true]
                 .into_iter()
                 .take(1 + device.supports_tensor_ops() as usize)
@@ -1201,23 +1484,25 @@ mod tests {
                     .unwrap()
                     .to_f32()
                     .unwrap();
-                let got = qkv
-                    .attention_inputs(heads, (&q_norm, &k_norm), 1e-5, angles, half)
-                    .unwrap()
-                    .attend()
-                    .unwrap()
-                    .to_f32()
-                    .unwrap();
-                let worst = got
-                    .iter()
-                    .zip(&expected)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0, f32::max);
-                assert!(
-                    worst < 1e-4,
-                    "FP16 {half}, angles {}: {worst}",
-                    angles.is_some()
-                );
+                for (layout, input) in [(false, &qkv), (true, &per_head)] {
+                    let got = input
+                        .attention_inputs(heads, (&q_norm, &k_norm), 1e-5, angles, half, layout)
+                        .unwrap()
+                        .attend()
+                        .unwrap()
+                        .to_f32()
+                        .unwrap();
+                    let worst = got
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0, f32::max);
+                    assert!(
+                        worst < 1e-4,
+                        "FP16 {half}, angles {}, per head {layout}: {worst}",
+                        angles.is_some()
+                    );
+                }
             }
         }
     }
@@ -1412,6 +1697,180 @@ mod tests {
                 .any(|(&found, &want)| (found - want).abs() > largest * 1e-3),
             "rotating one side changed nothing, so this test proves nothing"
         );
+    }
+
+    /// Taking SwiGLU as the rows are packed is the same arithmetic as the swiglu kernel first.
+    #[test]
+    fn gating_while_packing_matches_gating_first() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let (rows, cols, outputs) = (37usize, 1280usize, 96usize);
+        let x = Array::from_f32(
+            &device,
+            rows,
+            2 * cols,
+            &(0..rows * 2 * cols)
+                .map(|i| ((i * 31) % 251) as f32 / 25.0 - 5.0)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let bytes: Vec<u8> = (0..outputs * cols).map(|i| (i * 37 % 251) as u8).collect();
+        let weight = device.alloc(bytes.len(), Some(&bytes)).unwrap();
+        for precision in [LinearPrecision::Int8, LinearPrecision::Fp16] {
+            let first = x
+                .swiglu()
+                .unwrap()
+                .rotate_linear_int8(&weight, outputs, precision, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            let fused = x
+                .swiglu_rotate_linear_int8(&weight, outputs, precision, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            assert_eq!(first, fused, "{precision:?}");
+        }
+    }
+
+    /// Adding, normalizing and packing in one pass gives what add_gated, norm_modulate and the
+    /// packing product give in three. The residual is the same to the bit; the norm sums in
+    /// another order, so a packed value can land on the other side of a rounding edge.
+    #[test]
+    fn adding_normalizing_and_packing_match_the_three_passes() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let (rows, width, outputs, chunks) = (37usize, 1280usize, 96usize, 6usize);
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
+                .collect()
+        };
+        let x = Array::from_f32(&device, rows, width, &fill(rows * width, 31)).unwrap();
+        let delta = Array::from_f32(&device, rows, width, &fill(rows * width, 23)).unwrap();
+        let weight = Array::from_f32(&device, 1, width, &fill(width, 17)).unwrap();
+        let m = Array::from_f32(&device, 3, chunks * width, &fill(3 * chunks * width, 13)).unwrap();
+        let gates =
+            Array::from_f32(&device, 3, chunks * width, &fill(3 * chunks * width, 11)).unwrap();
+        let map = RowMap::new(&device, &(0..rows).map(|row| row % 3).collect::<Vec<_>>()).unwrap();
+        let bytes: Vec<u8> = (0..outputs * width).map(|i| (i * 37 % 251) as u8).collect();
+        let layer = device.alloc(bytes.len(), Some(&bytes)).unwrap();
+        for precision in [LinearPrecision::Int8, LinearPrecision::Fp16] {
+            let hidden = x.add_gated(&delta, &gates, &map, 5).unwrap();
+            let normed = hidden.norm_modulate(&weight, 1e-5, &m, &map, 0, 1).unwrap();
+            let expected = normed
+                .rotate_linear_int8(&layer, outputs, precision, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            let (fused_hidden, fused_normed, packed) = x
+                .add_norm_pack(
+                    Some((&delta, &gates, 5)),
+                    &weight,
+                    1e-5,
+                    (&m, &map, 0, 1),
+                    precision,
+                    true,
+                )
+                .unwrap();
+            assert_eq!(
+                fused_hidden.unwrap().to_f32().unwrap(),
+                hidden.to_f32().unwrap()
+            );
+            let close = |a: &[f32], b: &[f32], tolerance: f32| {
+                let largest = b.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+                let worst = a
+                    .iter()
+                    .zip(b)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    worst <= largest * tolerance,
+                    "{precision:?}: {worst} of {largest}"
+                );
+            };
+            close(
+                &fused_normed.unwrap().to_f32().unwrap(),
+                &normed.to_f32().unwrap(),
+                1e-5,
+            );
+            let got = packed
+                .product(&layer, outputs, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            close(&got, &expected, 1e-2);
+        }
+    }
+
+    /// Normalizing and modulating in one pass is the same arithmetic as the two passes.
+    #[test]
+    fn normalizing_while_modulating_matches_the_two_passes() {
+        let device = Device::new().unwrap();
+        let (rows, width, chunks) = (9usize, 640usize, 6usize);
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
+                .collect()
+        };
+        let x = Array::from_f32(&device, rows, width, &fill(rows * width, 31)).unwrap();
+        let weight = Array::from_f32(&device, 1, width, &fill(width, 17)).unwrap();
+        let m = Array::from_f32(&device, 3, chunks * width, &fill(3 * chunks * width, 13)).unwrap();
+        let map = RowMap::new(&device, &(0..rows).map(|row| row % 3).collect::<Vec<_>>()).unwrap();
+        let two = x
+            .norm(&weight, 1e-5, false)
+            .unwrap()
+            .modulate(&m, &map, 3, 4)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        let one = x
+            .norm_modulate(&weight, 1e-5, &m, &map, 3, 4)
+            .unwrap()
+            .to_f32()
+            .unwrap();
+        assert_eq!(one, two);
+    }
+
+    /// Rotating as the rows are packed is the same arithmetic as rotating first: the Hadamard
+    /// stages add the same values in the same order, so the products agree to the bit.
+    #[test]
+    fn rotating_while_packing_matches_rotating_first() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let (rows, cols, outputs) = (37usize, 1280usize, 96usize);
+        let x = Array::from_f32(
+            &device,
+            rows,
+            cols,
+            &(0..rows * cols)
+                .map(|i| ((i * 31) % 251) as f32 / 25.0 - 5.0)
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        let bytes: Vec<u8> = (0..outputs * cols).map(|i| (i * 37 % 251) as u8).collect();
+        let weight = device.alloc(bytes.len(), Some(&bytes)).unwrap();
+        for precision in [LinearPrecision::Int8, LinearPrecision::Fp16] {
+            let first = x
+                .rotate()
+                .unwrap()
+                .linear_int8(&weight, outputs, precision, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            let fused = x
+                .rotate_linear_int8(&weight, outputs, precision, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            assert_eq!(first, fused, "{precision:?}");
+        }
     }
 
     /// A LoRA's down projection runs on the rows the exchange delivers, which arrive rotated, so

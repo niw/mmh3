@@ -3,7 +3,7 @@
 use crate::{
     Device, Error, Result,
     model::Weights,
-    ops::{Array, RowMap, attends_in_half},
+    ops::{Array, PackedRows, RowMap, attends_in_half},
     shard::ShardContext,
     sparse::SparsePass,
     streaming::{Pass, Stream, fits},
@@ -251,16 +251,18 @@ impl MetalDit {
         Ok(added)
     }
 
-    /// A block's attention, block-sparse with `sparse`.
+    /// A block's attention, block-sparse with `sparse`. `project` is a layer of the block's own
+    /// applied to the block's input, which is either rows as they are or rows already packed for
+    /// its products.
     fn attention(
         &self,
-        x: &Array,
+        project: &dyn Fn(&str) -> Result<Array>,
         prefix: &str,
         angles: Option<&Array>,
         sparse: Option<&SparsePass>,
     ) -> Result<Array> {
         let c = &self.config;
-        let qkv = self.weights.linear(x, &format!("{prefix}.attn.qkv_proj"))?;
+        let qkv = project(&format!("{prefix}.attn.qkv_proj"))?;
         let norm = |name: &str| -> Result<Array> {
             let name = format!("{prefix}.attn.{name}_norm");
             if self.weights.contains(&format!("{name}.bias")) {
@@ -275,12 +277,13 @@ impl MetalDit {
             c.norm_eps,
             angles,
             half,
+            false,
         )?;
         let attended = match sparse {
             Some(sparse) => {
                 let gate = format!("{prefix}.attn.to_gate_compress");
                 let gate = (sparse.is_vsa() && self.weights.contains(&format!("{gate}.weight")))
-                    .then(|| self.weights.linear(x, &gate))
+                    .then(|| project(&gate))
                     .transpose()?;
                 sparse.attend(&inputs, gate.as_ref())?
             }
@@ -587,11 +590,8 @@ impl MetalDit {
     }
 
     fn mlp(&self, x: &Array, prefix: &str) -> Result<Array> {
-        self.weights.linear(
-            &self
-                .weights
-                .linear(x, &format!("{prefix}.mlp.fc1"))?
-                .swiglu()?,
+        self.weights.linear_gated(
+            &self.weights.linear(x, &format!("{prefix}.mlp.fc1"))?,
             &format!("{prefix}.mlp.fc2"),
         )
     }
@@ -615,12 +615,8 @@ impl MetalDit {
             if let Some(pass) = &mut pass {
                 pass.enter(layer)?;
             }
-            text = text.add(&self.attention(
-                &w.norm(&text, &format!("{p}.norm1"), c.norm_eps)?,
-                &p,
-                None,
-                None,
-            )?)?;
+            let normed = w.norm(&text, &format!("{p}.norm1"), c.norm_eps)?;
+            text = text.add(&self.attention(&|name| w.linear(&normed, name), &p, None, None)?)?;
             text = text.add(&self.mlp(&w.norm(&text, &format!("{p}.norm2"), c.norm_eps)?, &p)?)?;
             if let Some(pass) = &mut pass {
                 pass.leave(layer);
@@ -874,29 +870,96 @@ impl MetalDit {
             .map(|stream| stream.pass(w, (0..c.layers).map(|layer| refiner + layer)))
             .transpose()?;
         let mut blocks = Vec::new();
+        // One pass takes the residual's update, the norm and the packing of the next product's
+        // input, for INT8 projections after RMS norms of rows that fit in registers.
+        let fused = shard.is_none()
+            && PackedRows::fit(width, w.linear_precision)
+            && (0..c.layers).all(|layer| {
+                let p = format!("blocks.{layer}");
+                w.is_int8(&format!("{p}.attn.qkv_proj"))
+                    && w.is_int8(&format!("{p}.mlp.fc1"))
+                    && !w.contains(&format!("{p}.norm1.bias"))
+                    && !w.contains(&format!("{p}.norm2.bias"))
+            });
+        let mut pending: Option<(Array, Array)> = None;
         for layer in 0..c.layers {
             let p = format!("blocks.{layer}");
             if let Some(pass) = &mut pass {
                 pass.enter(refiner + layer)?;
             }
             let m = modulation(&format!("{p}.adaln_proj.linear"), 6)?;
-            let norm = w
-                .norm(&hidden, &format!("{p}.norm1"), c.norm_eps)?
-                .modulate(&m, &rows, 0, 1)?;
-            let attended = match &mut shard {
-                Some(context) => self.sharded_attention(&norm, &p, Some(&angles), context)?,
-                None => self.attention(&norm, &p, Some(&angles), sparse.as_ref())?,
-            };
-            hidden = hidden.add_gated(&attended, &m, &rows, 2)?;
-            let norm = w
-                .norm(&hidden, &format!("{p}.norm2"), c.norm_eps)?
-                .modulate(&m, &rows, 3, 4)?;
-            hidden = hidden.add_gated(&self.mlp(&norm, &p)?, &m, &rows, 5)?;
+            if fused {
+                let keep = |parts: &[&str]| {
+                    parts
+                        .iter()
+                        .any(|part| w.has_adapter(&format!("{p}.{part}")))
+                };
+                let (updated, normed, packed) = hidden.add_norm_pack(
+                    pending.as_ref().map(|(delta, gates)| (delta, gates, 5)),
+                    &w.vector(&format!("{p}.norm1.weight"))?,
+                    c.norm_eps,
+                    (&m, &rows, 0, 1),
+                    w.linear_precision,
+                    keep(&["attn.qkv_proj", "attn.to_gate_compress"]),
+                )?;
+                if let Some(updated) = updated {
+                    hidden = updated;
+                }
+                let attended = self.attention(
+                    &|name| w.linear_prepacked(&packed, normed.as_ref(), name),
+                    &p,
+                    Some(&angles),
+                    sparse.as_ref(),
+                )?;
+                let (updated, normed, packed) = hidden.add_norm_pack(
+                    Some((&attended, &m, 2)),
+                    &w.vector(&format!("{p}.norm2.weight"))?,
+                    c.norm_eps,
+                    (&m, &rows, 3, 4),
+                    w.linear_precision,
+                    keep(&["mlp.fc1"]),
+                )?;
+                hidden = updated.expect("a pass given a delta updates the residual");
+                let expanded =
+                    w.linear_prepacked(&packed, normed.as_ref(), &format!("{p}.mlp.fc1"))?;
+                pending = Some((w.linear_gated(&expanded, &format!("{p}.mlp.fc2"))?, m));
+            } else {
+                let norm = w.norm_modulate(
+                    &hidden,
+                    &format!("{p}.norm1"),
+                    c.norm_eps,
+                    (&m, &rows),
+                    0,
+                    1,
+                )?;
+                let attended = match &mut shard {
+                    Some(context) => self.sharded_attention(&norm, &p, Some(&angles), context)?,
+                    None => self.attention(
+                        &|name| w.linear(&norm, name),
+                        &p,
+                        Some(&angles),
+                        sparse.as_ref(),
+                    )?,
+                };
+                hidden = hidden.add_gated(&attended, &m, &rows, 2)?;
+                let norm = w.norm_modulate(
+                    &hidden,
+                    &format!("{p}.norm2"),
+                    c.norm_eps,
+                    (&m, &rows),
+                    3,
+                    4,
+                )?;
+                hidden = hidden.add_gated(&self.mlp(&norm, &p)?, &m, &rows, 5)?;
+            }
             if let Some(pass) = &mut pass {
                 pass.leave(refiner + layer);
             }
 
             if capture.contains(&layer) {
+                if let Some((delta, gates)) = pending.take() {
+                    hidden = hidden.add_gated(&delta, &gates, &rows, 5)?;
+                }
                 let mut states = hidden.to_f32()?;
                 if let Some(plan) = &plan {
                     let video = video_rows.start * width..video_rows.end * width;
@@ -905,6 +968,10 @@ impl MetalDit {
                 }
                 blocks.push((layer, states));
             }
+        }
+
+        if let Some((delta, gates)) = pending.take() {
+            hidden = hidden.add_gated(&delta, &gates, &rows, 5)?;
         }
 
         let m = modulation("final_layer.adaln_proj.linear", 2)?;
@@ -1525,7 +1592,7 @@ mod tests {
         let x = Array::from_f32(&device, tokens, c.hidden, &values).unwrap();
 
         let whole = dit
-            .attention(&x, "blocks.0", None, None)
+            .attention(&|name| dit.weights.linear(&x, name), "blocks.0", None, None)
             .unwrap()
             .to_f32()
             .unwrap();

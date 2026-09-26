@@ -386,7 +386,6 @@ impl Weights {
         };
 
         if w.dtype == DType::I8 {
-            let rotated = x.rotate()?;
             let scales = self.vector(&format!("{name}.weight_scale"))?;
             let finish = Finish {
                 scales: Some(&scales),
@@ -395,9 +394,9 @@ impl Weights {
                 lora,
             };
             return if self.linear_precision == LinearPrecision::Fp32 {
-                finish.apply(rotated.linear_packed(&w.buffer, w.shape[0], w.dtype)?)
+                finish.apply(x.rotate()?.linear_packed(&w.buffer, w.shape[0], w.dtype)?)
             } else {
-                rotated.linear_int8(&w.buffer, w.shape[0], self.linear_precision, finish)
+                x.rotate_linear_int8(&w.buffer, w.shape[0], self.linear_precision, finish)
             };
         }
 
@@ -413,6 +412,99 @@ impl Weights {
             lora,
         }
         .apply(result)
+    }
+
+    /// Whether a layer carries an adapter, whose down projection reads the layer's input as it is.
+    pub fn has_adapter(&self, name: &str) -> bool {
+        self.adapters.contains_key(name)
+    }
+
+    /// `linear` of rows `add_norm_pack` packed for a ConvRot layer. An adapter's down projection
+    /// reads `normed`, the same rows before their rotation.
+    pub(crate) fn linear_prepacked(
+        &self,
+        packed: &crate::ops::PackedRows,
+        normed: Option<&Array>,
+        name: &str,
+    ) -> Result<Array> {
+        let w = self.weight(&format!("{name}.weight"))?;
+        if w.dtype != DType::I8 {
+            return Err(Error::new(format!(
+                "{name}: packed rows reach INT8 layers only"
+            )));
+        }
+        let bias = format!("{name}.bias");
+        let bias = if self.contains(&bias) {
+            Some(self.vector(&bias)?)
+        } else {
+            None
+        };
+        let adapter = self.adapters.get(name);
+        let normed = match (adapter, normed) {
+            (Some(_), None) => {
+                return Err(Error::new(format!(
+                    "{name}: an adapter needs the rows before their rotation"
+                )));
+            }
+            (_, normed) => normed,
+        };
+        let (addend, lora) = match (adapter, normed) {
+            (Some(Adapter::Fp16 { down, up, rank, .. }), Some(x)) => (
+                None,
+                Some(Lora {
+                    mid: x.linear_half(down, *rank)?,
+                    up,
+                }),
+            ),
+            (Some(adapter), Some(x)) => (Some(adapter.apply(x)?), None),
+            _ => (None, None),
+        };
+        let scales = self.vector(&format!("{name}.weight_scale"))?;
+        packed.product(
+            &w.buffer,
+            w.shape[0],
+            Finish {
+                scales: Some(&scales),
+                bias: bias.as_ref(),
+                addend,
+                lora,
+            },
+        )
+    }
+
+    /// `linear` of SwiGLU of `x`, an MLP's gate and up halves side by side. A ConvRot layer
+    /// without an adapter takes SwiGLU as it packs its input, so the gated rows are never written
+    /// out; an adapter needs them, and takes the separate passes.
+    pub fn linear_gated(&self, x: &Array, name: &str) -> Result<Array> {
+        let w = self.weight(&format!("{name}.weight"))?;
+        if w.dtype != DType::I8
+            || self.adapters.contains_key(name)
+            || self.linear_precision == LinearPrecision::Fp32
+        {
+            return self.linear(&x.swiglu()?, name);
+        }
+        if w.shape.len() < 2 || 2 * w.shape[1..].iter().product::<usize>() != x.cols {
+            return Err(Error::new(format!("{name}: linear input shape mismatch")));
+        }
+
+        let bias = format!("{name}.bias");
+        let bias = if self.contains(&bias) {
+            Some(self.vector(&bias)?)
+        } else {
+            None
+        };
+        let scales = self.vector(&format!("{name}.weight_scale"))?;
+        x.swiglu_rotate_linear_int8(
+            &w.buffer,
+            w.shape[0],
+            self.linear_precision,
+            Finish {
+                scales: Some(&scales),
+                bias: bias.as_ref(),
+                addend: None,
+                lora: None,
+            },
+        )
     }
 
     /// `linear` for an input another rank has already rotated and quantized, which is how a
@@ -608,6 +700,29 @@ impl Weights {
 
     /// Adds the LoRA layers of `file` as adapters and returns how many there are. The file's other
     /// tensors are the model's business, which a patch replaces.
+    /// `norm` followed by `modulate`, in one pass for an RMS norm.
+    pub(crate) fn norm_modulate(
+        &self,
+        x: &Array,
+        name: &str,
+        epsilon: f32,
+        (m, rows): (&Array, &crate::ops::RowMap),
+        shift: usize,
+        scale: usize,
+    ) -> Result<Array> {
+        if self.contains(&format!("{name}.bias")) {
+            return self.norm(x, name, epsilon)?.modulate(m, rows, shift, scale);
+        }
+        x.norm_modulate(
+            &self.vector(&format!("{name}.weight"))?,
+            epsilon,
+            m,
+            rows,
+            shift,
+            scale,
+        )
+    }
+
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize> {
         if !strength.is_finite() {
             return Err(Error::new("LoRA strength must be finite".into()));
