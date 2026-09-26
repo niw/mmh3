@@ -30,6 +30,7 @@ use mmh3_core::dit::timestep::{MODALITY_COUNT, StepTimesteps};
 use mmh3_core::dit::vsa::VsaPlan;
 use mmh3_core::numeric::f32_to_bf16;
 use mmh3_core::safetensors::{DType, SafeTensors, TensorInfo};
+use mmh3_core::shard::Stretch;
 use mmh3_core::streaming::{Arrangement, Files, Unit, give_up_order};
 use mmh3_core::tensor::Tensor;
 use std::cell::{Ref, RefCell};
@@ -248,6 +249,15 @@ struct ForwardBuffers {
     sparse: Option<(AttentionPrecision, SparseWorkspace)>,
     vsa: Option<(AttentionPrecision, VsaPlan, VsaWorkspace)>,
     text: Option<TextStates>,
+}
+
+/// Ends a stretch of a shared block, waiting for the device first, when the step is profiled.
+fn end_stretch(context: &mut ShardContext<'_>, stretch: Stretch) -> Result<(), Error> {
+    if mmh3_core::shard::profile() != mmh3_core::shard::Profile::Off {
+        crate::synchronize()?;
+        context.timing.end(stretch);
+    }
+    Ok(())
 }
 
 /// Refined text states `[text tokens, hidden]` in FP32 and the context they came from. The refiner
@@ -1177,7 +1187,9 @@ impl CudaDit {
         sparse: Option<&SparsePass>,
     ) -> Result<(), Error> {
         let config = &self.config;
+        end_stretch(context, Stretch::Before)?;
         let (normalized, scales) = self.publish_inputs(workspace, context, tokens)?;
+        end_stretch(context, Stretch::Publish)?;
 
         let started = Instant::now();
         let shard = context.shard.clone();
@@ -1212,8 +1224,10 @@ impl CudaDit {
             gate,
         )?;
         context.timing.attend += started.elapsed();
+        end_stretch(context, Stretch::OwnProjections)?;
         self.send_inputs(context)?;
         self.fetch_inputs(context)?;
+        end_stretch(context, Stretch::InputExchange)?;
         let started = Instant::now();
         for peer in 0..shard.ranks() {
             if peer == shard.rank {
@@ -1230,6 +1244,7 @@ impl CudaDit {
                 gate,
             )?;
         }
+        end_stretch(context, Stretch::PeerProjections)?;
 
         let query_norm = self.pointer(&format!("{prefix}.attn.q_norm.weight"))?;
         let key_norm = self.pointer(&format!("{prefix}.attn.k_norm.weight"))?;
@@ -1341,7 +1356,9 @@ impl CudaDit {
         // The attention is on the stream too, and the peers are about to read what it wrote.
         crate::synchronize()?;
         context.timing.attend += started.elapsed();
-        self.exchange_outputs(workspace, context, tokens)
+        end_stretch(context, Stretch::Attention)?;
+        self.exchange_outputs(workspace, context, tokens)?;
+        end_stretch(context, Stretch::OutputExchange)
     }
 
     /// Puts this rank's rows of the block input where the peers can read them, and says so. The

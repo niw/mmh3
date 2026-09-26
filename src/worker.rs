@@ -3094,6 +3094,9 @@ impl Exchanger<'_> {
             )));
         }
         let source = self.computed.memory(from, held.as_mut_slice());
+        if shard::profile() == shard::Profile::WithoutCopies {
+            return Ok(());
+        }
         // The kernels that wrote the source are done: a block synchronizes the card before it
         // writes to a peer, after the rows are in the region and again after attention.
         let copies = self.copies.as_ref().ok_or_else(|| {
@@ -4205,14 +4208,18 @@ pub fn describe_timing(
     whole: std::time::Duration,
 ) -> String {
     let seconds = |span: std::time::Duration| span.as_secs_f64();
-    format!(
+    let totals = format!(
         "gather {:.1} s, barrier {:.1} s, read {:.1} s, attend {:.1} s, everything else {:.1} s",
         seconds(timing.gather),
         seconds(timing.barrier),
         seconds(timing.read),
         seconds(timing.attend),
         seconds(whole).max(seconds(timing.total())) - seconds(timing.total()),
-    )
+    );
+    match mmh3_core::shard::profile() {
+        mmh3_core::shard::Profile::Off => totals,
+        _ => format!("{totals}; {}", timing.describe_stretches()),
+    }
 }
 
 #[cfg(test)]

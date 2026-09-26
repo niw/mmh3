@@ -18,7 +18,7 @@ use crate::dit::sparse::{SparseAttention, SparseMethod};
 use crate::dit::vsa::VsaPlan;
 use std::fmt;
 use std::ops::Range;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Values in one attention head, which every backend lays out the same way.
 pub const HEAD_DIM: usize = 128;
@@ -408,8 +408,8 @@ pub trait Exchange {
 
 /// Where a shared-out step went, which is what decides whether sharing one is worth it at all.
 ///
-/// The four are exclusive and cover a block's share between them, so a backend charges every span
-/// to exactly one. `attend` is the only one that would still be there if the step ran alone.
+/// The four totals are exclusive and cover a block's share between them, so a backend charges every
+/// span to exactly one. `attend` is the only one that would still be there if the step ran alone.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ShardTiming {
     /// Gathering a block's inputs and scattering its output, and the wait for the device that
@@ -421,12 +421,86 @@ pub struct ShardTiming {
     pub read: Duration,
     /// Attention itself, over the whole sequence for this rank's heads.
     pub attend: Duration,
+    /// Each stretch of a block by `Stretch`, when the step is profiled, see `profile`.
+    pub stretches: [Duration; STRETCHES],
+    /// When the last stretch ended, with the device done with it.
+    pub mark: Option<Instant>,
 }
 
 impl ShardTiming {
     pub fn total(&self) -> Duration {
         self.gather + self.barrier + self.read + self.attend
     }
+
+    /// Ends `stretch` now, where the caller has waited for the device. The first stretch of a step
+    /// starts the clock rather than being charged, since it has no end before it.
+    pub fn end(&mut self, stretch: Stretch) {
+        let now = Instant::now();
+        if let Some(mark) = self.mark {
+            self.stretches[stretch as usize] += now - mark;
+        }
+        self.mark = Some(now);
+    }
+
+    /// The stretches, named, for a profiled step.
+    pub fn describe_stretches(&self) -> String {
+        STRETCH_NAMES
+            .iter()
+            .zip(self.stretches)
+            .map(|(name, spent)| format!("{name} {:.2} s", spent.as_secs_f64()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+/// The stretches of a shared block, in the order it runs them. A profiled step waits for the
+/// device at the end of each, which gives up the overlap between them and says where the time went.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stretch {
+    /// Everything since the previous block's output exchange, its MLP among it.
+    Before,
+    /// Putting this rank's rows where the peers read them.
+    Publish,
+    /// The projections of this rank's own rows.
+    OwnProjections,
+    /// Sending this rank's rows and taking the peers'.
+    InputExchange,
+    /// The projections of the peers' rows.
+    PeerProjections,
+    Attention,
+    /// Sending the attention output back and taking this rank's rows of it.
+    OutputExchange,
+}
+
+pub const STRETCHES: usize = 7;
+
+const STRETCH_NAMES: [&str; STRETCHES] = [
+    "before",
+    "publish",
+    "own projections",
+    "input exchange",
+    "peer projections",
+    "attention",
+    "output exchange",
+];
+
+/// How a shared step is timed, from `MMH3_SHARD_PROFILE`: unset for not at all beyond the four
+/// totals, `sync` to wait for the device at the end of every stretch, and `no-copies` to do that
+/// and leave out the copies between the ranks of one process, whose results are then wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Profile {
+    Off,
+    Synchronized,
+    WithoutCopies,
+}
+
+pub fn profile() -> Profile {
+    static PROFILE: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
+    *PROFILE.get_or_init(|| match std::env::var("MMH3_SHARD_PROFILE").as_deref() {
+        Ok("sync") => Profile::Synchronized,
+        Ok("no-copies") => Profile::WithoutCopies,
+        _ => Profile::Off,
+    })
 }
 
 /// One rank's share of a step and the transport its blocks exchange over. `M` is what the
