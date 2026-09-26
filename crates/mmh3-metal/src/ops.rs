@@ -589,9 +589,17 @@ impl Array {
                 cols as u32,
                 flags,
                 rank as u32,
-                product_band(rows, outputs, cols),
+                if precision == LinearPrecision::Int8 {
+                    INT8_PRODUCT_BAND
+                } else {
+                    product_band(rows, outputs, cols)
+                },
             ],
-            rows.div_ceil(PRODUCT_TILE.0) * outputs.div_ceil(PRODUCT_TILE.1),
+            if precision == LinearPrecision::Int8 {
+                rows.div_ceil(INT8_PRODUCT_TILE) * outputs.div_ceil(INT8_PRODUCT_TILE)
+            } else {
+                rows.div_ceil(PRODUCT_TILE.0) * outputs.div_ceil(PRODUCT_TILE.1)
+            },
             true,
         )?;
         Ok(out)
@@ -1209,11 +1217,18 @@ impl Array {
         Ok(out)
     }
 }
-/// How many row tiles the threadgroups of a packed product go down before taking the next column
-/// tile, which decides what the ones running together share in the cache. Tuned at MiniMax H3's
-/// shapes: at a DiT block's rows, bands of 16 suit the wide qkv projection and fc1 and bands of 2
-/// the deep out projection and fc2, where bands of 24 or 4 are slower than taking a row tile's
-/// columns in turn; a video VAE tile's few rows take bands of 4.
+/// Outputs a side of one threadgroup of the INT8 product, `PRODUCT_TILE` in matmul.metal.
+const INT8_PRODUCT_TILE: usize = 128;
+/// The row tiles the threadgroups of the INT8 product go down before taking the next column tile.
+/// Bands of 4 were the fastest for every product of a MiniMax H3 block.
+const INT8_PRODUCT_BAND: u32 = 4;
+
+/// How many row tiles the threadgroups of `packed_product`, which runs the FP16 products, go down
+/// before taking the next column tile, which decides what the ones running together share in the
+/// cache. Tuned at MiniMax H3's shapes while it also ran the INT8 ones: at a DiT block's rows,
+/// bands of 16 suit the wide qkv projection and fc1 and bands of 2 the deep out projection and fc2,
+/// where bands of 24 or 4 are slower than taking a row tile's columns in turn; a video VAE tile's
+/// few rows take bands of 4.
 fn product_band(rows: usize, outputs: usize, inputs: usize) -> u32 {
     if rows <= 4096 {
         4
@@ -2234,6 +2249,118 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The INT8 product's finish, which runs on its registers: the outputs' scales, a bias, an
+    /// addend and a LoRA of a rank that does not fill a fragment, over tiles its edges cut.
+    #[test]
+    fn the_int8_product_finishes_as_the_host_would() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let (rows, outputs, cols, rank) = (150usize, 200usize, 272usize, 20usize);
+        let fill = |n: usize, seed: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)
+                .collect()
+        };
+        let x = Array::from_f32(&device, rows, cols, &fill(rows * cols, 31)).unwrap();
+        let bytes: Vec<u8> = (0..outputs * cols).map(|i| (i * 37 % 251) as u8).collect();
+        let weight = device.alloc(bytes.len(), Some(&bytes)).unwrap();
+        let plain = x
+            .linear_int8(&weight, outputs, LinearPrecision::Int8, Finish::default())
+            .unwrap()
+            .to_f32()
+            .unwrap();
+
+        let (output_scales, bias) = (fill(outputs, 13), fill(outputs, 11));
+        let (addend, mid, up) = (
+            fill(rows * outputs, 17),
+            fill(rows * rank, 19),
+            fill(outputs * rank, 23),
+        );
+        let upload =
+            |values: &[f32], r: usize, c: usize| Array::from_f32(&device, r, c, values).unwrap();
+        let up_bytes: Vec<u8> = up
+            .iter()
+            .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+            .collect();
+        let up_buffer = device.alloc(up_bytes.len(), Some(&up_bytes)).unwrap();
+        let (scales_array, bias_array) = (
+            upload(&output_scales, 1, outputs),
+            upload(&bias, 1, outputs),
+        );
+        let finished = x
+            .linear_int8(
+                &weight,
+                outputs,
+                LinearPrecision::Int8,
+                Finish {
+                    scales: Some(&scales_array),
+                    bias: Some(&bias_array),
+                    addend: Some(upload(&addend, rows, outputs)),
+                    lora: Some(Lora {
+                        mid: upload(&mid, rows, rank),
+                        up: &up_buffer,
+                    }),
+                },
+            )
+            .unwrap()
+            .to_f32()
+            .unwrap();
+
+        let half = |v: f32| mmh3_core::numeric::f16_to_f32(f32_to_f16(v));
+        let mut worst = 0.0f32;
+        for r in 0..rows {
+            for n in 0..outputs {
+                let lora: f32 = (0..rank)
+                    .map(|k| half(mid[r * rank + k]) * half(up[n * rank + k]))
+                    .sum();
+                let expected = plain[r * outputs + n] * output_scales[n]
+                    + bias[n]
+                    + lora
+                    + addend[r * outputs + n];
+                worst = worst
+                    .max((finished[r * outputs + n] - expected).abs() / expected.abs().max(1.0));
+            }
+        }
+        assert!(worst < 1e-3, "{worst}");
+    }
+
+    /// The INT8 product's tiles are 128 rows of eight SIMD groups, so rows past the first 64 of
+    /// a tile are another group's. A product that ran on too few groups left them unwritten, and
+    /// every smaller test here fits in one group's rows.
+    #[test]
+    fn the_int8_product_covers_whole_tiles() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let (rows, outputs, cols) = (300usize, 384usize, 512usize);
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 7919 % 2001) as f32) / 1000.0 - 1.0)
+            .collect();
+        let x = Array::from_f32(&device, rows, cols, &values).unwrap();
+        let bytes: Vec<u8> = (0..outputs * cols).map(|i| (i * 131 % 251) as u8).collect();
+        let weight = device.alloc(bytes.len(), Some(&bytes)).unwrap();
+        let product = |precision| {
+            x.linear_int8(&weight, outputs, precision, Finish::default())
+                .unwrap()
+                .to_f32()
+                .unwrap()
+        };
+        let (int8, fp16) = (
+            product(LinearPrecision::Int8),
+            product(LinearPrecision::Fp16),
+        );
+        let largest = fp16.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        let worst = int8
+            .iter()
+            .zip(&fp16)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst <= largest * 0.02, "{worst} of {largest}");
     }
 
     #[test]

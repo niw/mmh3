@@ -363,8 +363,7 @@ impl Device {
 
         // The tensor kernels run on the number of SIMD groups their products share.
         let group_size = match name {
-            "mpp_int8"
-            | "mpp_lora"
+            "mpp_lora"
             | "mpp_attention_64"
             | "mpp_attention_128"
             | "mpp_attention_int8_128"

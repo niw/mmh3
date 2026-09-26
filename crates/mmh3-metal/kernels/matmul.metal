@@ -100,7 +100,6 @@ void packed_product(device Input *a, device int8_t *b, device float *c, device c
                                                    lora);                                          \
     }
 PACKED_PRODUCT(mpp_fp16, half, float, 8)
-PACKED_PRODUCT(mpp_int8, int8_t, int32_t, 4)
 #undef PACKED_PRODUCT
 
 // C = A · Bᵀ for FP32 activations and FP16 weights, the two products of a LoRA. A 64×64 tile a
@@ -166,26 +165,33 @@ short2 fragment_coord(ushort lane) {
 constexpr short fragment_column(short j) { return FRAGMENT_PAIRS ? (j & 1) + (j >> 1) * 8 : j; }
 
 // A fragment of `src`, rows `stride` apart, or with RIGHT the right operand of a product with b
-// transposed that `src` holds, b's columns as its rows. With CHECK, only its first `rows` rows are
-// read and the rest are zero; a whole block skips the checks, which slow the attention down
-// markedly. A lane's columns are offsets from one address, so that the consecutive ones are read
-// together.
-template <bool CHECK, bool RIGHT = false, typename T = half>
-vec<T, 8> load_fragment(device const T *src, int stride, int rows, short2 at) {
-    vec<T, 8> out;
+// transposed that `src` holds, b's columns as its rows. With CHECK, only its first `rows` rows and
+// `depth` columns are read and the rest are zero; a whole block skips the checks, which slow the
+// attention down markedly. A lane's columns are offsets from one address, so that the consecutive
+// ones are read together.
+template <bool CHECK, bool RIGHT, typename U, typename T>
+vec<U, 8> load_block(device const T *src, int stride, int rows, int depth, short2 at) {
+    vec<U, 8> out;
     _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
         const int r = at.y + i * 8;
         _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
             const short column = fragment_column(j);
             if constexpr (RIGHT && FRAGMENT_PAIRS) {
-                out[i * 4 + j] =
-                    !CHECK || at.x + column < rows ? src[(at.x + column) * stride + r] : T(0);
+                const bool inside = !CHECK || (at.x + column < rows && r < depth);
+                out[i * 4 + j] = inside ? U(src[(at.x + column) * stride + r]) : U(0);
             } else {
-                out[i * 4 + j] = !CHECK || r < rows ? src[r * stride + at.x + column] : T(0);
+                const bool inside = !CHECK || (r < rows && at.x + column < depth);
+                out[i * 4 + j] = inside ? U(src[r * stride + at.x + column]) : U(0);
             }
         }
     }
     return out;
+}
+
+// load_block of all of a fragment's columns.
+template <bool CHECK, bool RIGHT = false, typename T = half>
+vec<T, 8> load_fragment(device const T *src, int stride, int rows, short2 at) {
+    return load_block<CHECK, RIGHT, T>(src, stride, rows, FRAGMENT, at);
 }
 
 // Which fragment of a 16 × 32 tensor, and which of its elements, is the tensor's element i.
@@ -547,4 +553,143 @@ void sparse_attention(device half *q, device half *k, device half *v, device flo
     uint lane [[thread_index_in_simdgroup]]) {
     sparse_attention<true>(q, k, v, o, starts, lengths, routes, counts, tails, key_mean, gate, q8,
                            k8, scales, p, g, simd, lane);
+}
+
+// The INT8 product of packed rows and a ConvRot layer's INT8 weights, C = A · Bᵀ, finished as
+// packed_product finishes its own, after MLX's GEMM for the Neural Accelerators. A threadgroup
+// takes 128 × 128 outputs, and each of its eight SIMD groups 64 × 32 of them, kept in its registers
+// as INT32 fragments of the matrix units' cooperative tensors. A group reads its rows and weights
+// straight from memory, and the groups take each 256 of the depth together, so that what one reads
+// is in the cache for the others. Threadgroups go down bands of p[5] row tiles, as packed_product's
+// do.
+//
+// Against packed_product, which shares one product among four SIMD groups, this is faster at both a
+// DiT block's and a video VAE tile's shapes, and the product alone reaches most of the rate the
+// matrix units run INT8 products at.
+constant constexpr int PRODUCT_TILE = 128, PRODUCT_DEPTH = 256;
+constant constexpr int PRODUCT_GROUP_ROWS = 64, PRODUCT_GROUP_COLS = 32;
+constant constexpr int PRODUCT_FRAGMENT_ROWS = PRODUCT_GROUP_ROWS / FRAGMENT;
+constant constexpr int PRODUCT_FRAGMENT_COLS = PRODUCT_GROUP_COLS / FRAGMENT;
+
+// The depth [begin, end) of a SIMD group's product: `a` and `b` at its first row and weight row,
+// `rows` and `cols` of them real.
+template <bool CHECK>
+void product_depth(thread vec<int, 8> (&acc)[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS],
+                   device const int8_t *a, device const int8_t *b, int K, int rows, int cols,
+                   int begin, int end, short2 at) {
+    for (int k = begin; k < end; k += FRAGMENT) {
+        vec<int8_t, 8> left[PRODUCT_FRAGMENT_ROWS], right[PRODUCT_FRAGMENT_COLS];
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+            left[m] = load_block<CHECK, false, int8_t>(a + m * FRAGMENT * K + k, K,
+                                                       rows - m * FRAGMENT, K - k, at);
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
+            right[n] = load_block<CHECK, true, int8_t>(b + n * FRAGMENT * K + k, K,
+                                                       cols - n * FRAGMENT, K - k, at);
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+            _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; n += 2)
+                multiply_fragments<true, int8_t, int8_t, int>(acc[m][n], acc[m][n + 1], left[m],
+                                                              right[n], right[n + 1]);
+    }
+}
+
+// A LoRA's up projection of its down projection's result `mid`, FP16 products added to a SIMD
+// group's outputs.
+template <bool CHECK>
+void lora_up(thread fragment_float (&result)[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS],
+             device const float *mid, device const half *up, int rank, int row, int col, int rows,
+             int cols, short2 at) {
+    for (int k = 0; k < rank; k += FRAGMENT) {
+        fragment_half down[PRODUCT_FRAGMENT_ROWS], ups[PRODUCT_FRAGMENT_COLS];
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+            down[m] = load_block<CHECK, false, half>(mid + (max(row, 0) + m * FRAGMENT) * rank + k,
+                                                     rank, rows - m * FRAGMENT, rank - k, at);
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
+            ups[n] = load_block<CHECK, true, half>(up + (max(col, 0) + n * FRAGMENT) * rank + k,
+                                                   rank, cols - n * FRAGMENT, rank - k, at);
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+            _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; n += 2)
+                multiply_fragments<true>(result[m][n], result[m][n + 1], down[m], ups[n],
+                                         ups[n + 1]);
+    }
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+mpp_int8(device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],
+         device float *c [[buffer(2)]], device const float *scales [[buffer(3)]],
+         device const float *outputs [[buffer(4)]], device const float *bias [[buffer(5)]],
+         device float *mid [[buffer(6)]], device half *up [[buffer(7)]],
+         constant uint *p [[buffer(8)]], uint g [[threadgroup_position_in_grid]],
+         uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int GROUP_COLUMNS = PRODUCT_TILE / PRODUCT_GROUP_COLS;
+    const int M = p[0], N = p[1], K = p[2], rank = p[4];
+    const uint flags = p[3];
+    const int tiles = (N + PRODUCT_TILE - 1) / PRODUCT_TILE;
+    const int row_tiles = (M + PRODUCT_TILE - 1) / PRODUCT_TILE, BAND = max(int(p[5]), 1);
+    const int band = g / (BAND * tiles), in_band = g % (BAND * tiles);
+    const int band_rows = min(BAND, row_tiles - band * BAND);
+    const int row = (band * BAND + in_band % band_rows) * PRODUCT_TILE +
+                    int(simd / GROUP_COLUMNS) * PRODUCT_GROUP_ROWS;
+    const int col =
+        (in_band / band_rows) * PRODUCT_TILE + int(simd % GROUP_COLUMNS) * PRODUCT_GROUP_COLS;
+    // A group past the last rows or columns still takes every depth, since the eight take it
+    // together; its checked loads read nothing.
+    const int rows = M - row, cols = N - col;
+    const short2 at = fragment_coord(lane);
+
+    vec<int, 8> acc[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS];
+    _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
+            acc[m][n] = 0;
+    const bool whole =
+        rows >= PRODUCT_GROUP_ROWS && cols >= PRODUCT_GROUP_COLS && K % FRAGMENT == 0;
+    device const int8_t *left = a + max(row, 0) * K, *right = b + max(col, 0) * K;
+    for (int depth = 0; depth < K; depth += PRODUCT_DEPTH) {
+        threadgroup_barrier(mem_flags::mem_none);
+        const int end = min(depth + PRODUCT_DEPTH, K);
+        if (whole)
+            product_depth<false>(acc, left, right, K, rows, cols, depth, end, at);
+        else
+            product_depth<true>(acc, left, right, K, rows, cols, depth, end, at);
+    }
+
+    fragment_float result[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS];
+    _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n) {
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                const int r = row + m * FRAGMENT + at.y + i * 8;
+                const float row_scale = r < M ? scales[r] : 0.0f;
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const int column = col + n * FRAGMENT + at.x + fragment_column(j);
+                    float value = float(acc[m][n][i * 4 + j]) * row_scale;
+                    if (column < N) {
+                        if (flags & SCALE_OUTPUTS)
+                            value *= outputs[column];
+                        if (flags & ADD_BIAS)
+                            value += bias[column];
+                    }
+                    result[m][n][i * 4 + j] = value;
+                }
+            }
+        }
+    }
+    if (flags & ADD_LORA) {
+        if (whole && rank % FRAGMENT == 0)
+            lora_up<false>(result, mid, up, rank, row, col, rows, cols, at);
+        else
+            lora_up<true>(result, mid, up, rank, row, col, rows, cols, at);
+    }
+    _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n) {
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                const int r = row + m * FRAGMENT + at.y + i * 8;
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const int column = col + n * FRAGMENT + at.x + fragment_column(j);
+                    if (r < M && column < N) {
+                        const float value = result[m][n][i * 4 + j];
+                        c[r * N + column] = flags & ACCUMULATE ? c[r * N + column] + value : value;
+                    }
+                }
+            }
+        }
+    }
 }
