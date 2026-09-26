@@ -4,19 +4,37 @@
 //! A choice comes from timing the heuristic's candidates on the shape's own operands, which costs
 //! about a second on the first step of a run. A file taken over at startup spares it: a run that
 //! has met its shapes before times none of them.
+//!
+//! A choice belongs to the GPU it was timed on, so every device keeps a table of its own and a
+//! file keeps a section for every kind of GPU that wrote to it. Two kinds of card in one machine
+//! then each find theirs, rather than each saving over the other's and timing everything again.
 
-use crate::{CudaError, check};
+use crate::{CudaError, MAX_DEVICES, check, device_count};
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_char, c_int};
 use std::path::Path;
 use std::{fs, io, ptr};
 
 unsafe extern "C" {
-    fn mmh3_cublaslt_matmul_algorithms(algorithms: *mut Algorithm, capacity: c_int) -> c_int;
-    fn mmh3_cublaslt_matmul_adopt(algorithms: *const Algorithm, count: c_int);
-    fn mmh3_cublaslt_matmul_algorithm_key(key: *mut c_char, capacity: c_int) -> c_int;
-    fn mmh3_cublaslt_nvfp4_algorithms(algorithms: *mut Nvfp4Algorithm, capacity: c_int) -> c_int;
-    fn mmh3_cublaslt_nvfp4_adopt(algorithms: *const Nvfp4Algorithm, count: c_int);
-    fn mmh3_cublaslt_nvfp4_algorithm_key(key: *mut c_char, capacity: c_int) -> c_int;
+    fn mmh3_cublaslt_matmul_algorithms(
+        device: c_int,
+        algorithms: *mut Algorithm,
+        capacity: c_int,
+    ) -> c_int;
+    fn mmh3_cublaslt_matmul_adopt(device: c_int, algorithms: *const Algorithm, count: c_int);
+    fn mmh3_cublaslt_matmul_algorithm_key(
+        device: c_int,
+        key: *mut c_char,
+        capacity: c_int,
+    ) -> c_int;
+    fn mmh3_cublaslt_nvfp4_algorithms(
+        device: c_int,
+        algorithms: *mut Nvfp4Algorithm,
+        capacity: c_int,
+    ) -> c_int;
+    fn mmh3_cublaslt_nvfp4_adopt(device: c_int, algorithms: *const Nvfp4Algorithm, count: c_int);
+    fn mmh3_cublaslt_nvfp4_algorithm_key(device: c_int, key: *mut c_char, capacity: c_int)
+    -> c_int;
     fn mmh3_cublaslt_consistent_by_default(consistent: c_int);
     fn mmh3_cublaslt_consistent_on_this_thread(consistent: c_int);
 }
@@ -61,10 +79,15 @@ struct Nvfp4Algorithm {
     data: [u64; 8],
 }
 
-/// First line of a file of chosen algorithms, followed by the line its key writes and a line per
-/// shape: the fields that name the shape and the eight words of the algorithm in hexadecimal.
+/// First line of a file of chosen algorithms, followed by a section for every key: the line the key
+/// writes, which starts with [`KEY_PREFIX`], and a line per shape, the fields that name the shape
+/// and the eight words of the algorithm in hexadecimal. A file of one section is what a build
+/// before the sections wrote.
 const MATMUL_HEADER: &str = "mmh3 cuBLASLt matmul algorithms";
 const NVFP4_HEADER: &str = "mmh3 cuBLASLt NVFP4 algorithms";
+
+/// How every key line starts, which no line of numbers does.
+const KEY_PREFIX: &str = "cuBLASLt ";
 
 fn parse(line: &str, fields: usize) -> Option<(Vec<i64>, [u64; 8])> {
     let columns: Vec<&str> = line.split_whitespace().collect();
@@ -104,26 +127,63 @@ fn key_of(of: impl FnOnce(*mut c_char, c_int) -> c_int) -> Result<String, CudaEr
         .unwrap_or_default())
 }
 
-/// The entry lines of `path`, and none from a missing or damaged file or from one written with
-/// another cuBLASLt version, GPU, descriptors or rule.
-fn read(path: &Path, header: &str, key: &str) -> io::Result<Vec<String>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
+/// The sections of `text` by key, and none from a damaged file or from one written under another
+/// header.
+fn sections(text: &str, header: &str) -> BTreeMap<String, Vec<String>> {
+    let mut sections = BTreeMap::new();
     let mut lines = text.lines();
-    if lines.next() != Some(header) || lines.next() != Some(key) {
-        return Ok(Vec::new());
+    if lines.next() != Some(header) {
+        return sections;
     }
-    Ok(lines.map(str::to_owned).collect())
+    let mut current: Option<&mut Vec<String>> = None;
+    for line in lines {
+        if line.starts_with(KEY_PREFIX) {
+            current = Some(sections.entry(line.to_owned()).or_default());
+        } else if let Some(entries) = current.as_mut()
+            && !line.trim().is_empty()
+        {
+            entries.push(line.to_owned());
+        }
+    }
+    sections
 }
 
-/// Writes the entries to `path` and returns whether it wrote. It writes nothing when the file
-/// already holds them.
-fn write(path: &Path, header: &str, key: &str, entries: &str) -> io::Result<bool> {
-    let text = format!("{header}\n{key}\n{entries}");
-    if fs::read_to_string(path).is_ok_and(|existing| existing == text) {
+/// The sections `path` keeps, and none from a missing file.
+fn read(path: &Path, header: &str) -> io::Result<BTreeMap<String, Vec<String>>> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(sections(&text, header)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(BTreeMap::new()),
+        Err(error) => Err(error),
+    }
+}
+
+/// `text` with the sections of `saved` in place of its own of the same keys, and every other one
+/// kept, so that a GPU this process does not have loses nothing by its saving.
+fn merged(text: &str, header: &str, saved: BTreeMap<String, Vec<String>>) -> String {
+    let mut all = sections(text, header);
+    all.extend(saved);
+    let mut written = format!("{header}\n");
+    for (key, entries) in all {
+        written.push_str(&key);
+        written.push('\n');
+        for entry in entries {
+            written.push_str(&entry);
+            written.push('\n');
+        }
+    }
+    written
+}
+
+/// Writes `saved` into `path` beside the sections of other keys it holds, and returns whether it
+/// wrote. It writes nothing when the file already holds them.
+fn write(path: &Path, header: &str, saved: BTreeMap<String, Vec<String>>) -> io::Result<bool> {
+    let existing = match fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    let text = merged(existing.as_deref().unwrap_or(""), header, saved);
+    if existing.is_some_and(|existing| existing == text) {
         return Ok(false);
     }
     if let Some(directory) = path.parent() {
@@ -137,6 +197,83 @@ fn write(path: &Path, header: &str, key: &str, entries: &str) -> io::Result<bool
     Ok(true)
 }
 
+/// The devices this process may have chosen algorithms on.
+fn devices() -> std::ops::Range<usize> {
+    0..device_count().unwrap_or(0).min(MAX_DEVICES)
+}
+
+/// Takes the section of every device's key out of `path` and hands its entries to `adopt`, and
+/// returns how many entries it took, counting a section two devices share once.
+fn load<T>(
+    path: &Path,
+    header: &str,
+    key: impl Fn(usize) -> Result<String, CudaError>,
+    parse: impl Fn(&str) -> Option<T>,
+    adopt: impl Fn(usize, &[T]),
+) -> io::Result<usize> {
+    let sections = read(path, header)?;
+    let mut taken = 0;
+    let mut counted = Vec::new();
+    for device in devices() {
+        let key = key(device).map_err(io::Error::other)?;
+        let Some(entries) = sections.get(&key) else {
+            continue;
+        };
+        let Some(algorithms) = entries
+            .iter()
+            .map(|entry| parse(entry))
+            .collect::<Option<Vec<T>>>()
+        else {
+            continue;
+        };
+        adopt(device, &algorithms);
+        if !counted.contains(&key) {
+            taken += algorithms.len();
+            counted.push(key);
+        }
+    }
+    Ok(taken)
+}
+
+/// Writes what every device chose to `path`, a section per key, and returns whether it wrote. The
+/// devices of one key share a section, since what one of them timed is as good for the other.
+fn save<T>(
+    path: &Path,
+    header: &str,
+    key: impl Fn(usize) -> Result<String, CudaError>,
+    chosen: impl Fn(usize) -> Vec<T>,
+    line_of: impl Fn(&T) -> String,
+) -> io::Result<bool> {
+    let mut saved: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for device in devices() {
+        let algorithms = chosen(device);
+        if algorithms.is_empty() {
+            continue;
+        }
+        let key = key(device).map_err(io::Error::other)?;
+        let entries = saved.entry(key).or_default();
+        for algorithm in &algorithms {
+            let line = line_of(algorithm);
+            let line = line.trim_end();
+            // Two devices of one kind may both have chosen for a shape, and the first choice is
+            // the one kept, as adopting it would.
+            let shape = |entry: &str| entry.rsplitn(9, ' ').nth(8).map(str::to_owned);
+            if !entries.iter().any(|entry| shape(entry) == shape(line)) {
+                entries.push(line.to_owned());
+            }
+        }
+    }
+    if saved.is_empty() {
+        return Ok(false);
+    }
+    // In the order of the shapes rather than of the devices that chose them, so that the same
+    // choices write the same file whichever device met a shape first.
+    for entries in saved.values_mut() {
+        entries.sort();
+    }
+    write(path, header, saved)
+}
+
 fn chosen<T: Copy + Default>(of: impl Fn(*mut T, c_int) -> c_int) -> Vec<T> {
     // SAFETY of both calls: a capacity of 0 writes nothing, and the vector holds `count` entries.
     let count = of(ptr::null_mut(), 0) as usize;
@@ -146,24 +283,28 @@ fn chosen<T: Copy + Default>(of: impl Fn(*mut T, c_int) -> c_int) -> Vec<T> {
     algorithms
 }
 
-/// What the algorithms chosen here depend on: a file is taken over only when it names the same
-/// thing, which one written on another GPU or with another cuBLASLt does not.
-fn key() -> Result<String, CudaError> {
-    key_of(|key, capacity| unsafe { mmh3_cublaslt_matmul_algorithm_key(key, capacity) })
+/// What the algorithms chosen on `device` depend on: a section is taken over only by a device whose
+/// key it names, which one written on another GPU or with another cuBLASLt does not.
+fn matmul_key(device: usize) -> Result<String, CudaError> {
+    key_of(|key, capacity| unsafe {
+        mmh3_cublaslt_matmul_algorithm_key(device as c_int, key, capacity)
+    })
 }
 
-/// The algorithms this process has chosen for ordinary GEMM shapes.
-fn chosen_matmul() -> Vec<Algorithm> {
-    chosen(|algorithms, capacity| unsafe { mmh3_cublaslt_matmul_algorithms(algorithms, capacity) })
+fn nvfp4_key(device: usize) -> Result<String, CudaError> {
+    key_of(|key, capacity| unsafe {
+        mmh3_cublaslt_nvfp4_algorithm_key(device as c_int, key, capacity)
+    })
 }
 
-/// Takes over the algorithms that `save_matmul` left in `path` for ordinary GEMM shapes and
-/// returns how many it took. A shape that has one chosen here already keeps it.
+/// Takes over the algorithms that `save_matmul` left in `path` for ordinary GEMM shapes, each device
+/// those of its own key, and returns how many it took. A shape that has one chosen already keeps it.
 pub fn load_matmul(path: &Path) -> io::Result<usize> {
-    let key = key().map_err(io::Error::other)?;
-    let Some(algorithms) = read(path, MATMUL_HEADER, &key)?
-        .iter()
-        .map(|entry| {
+    load(
+        path,
+        MATMUL_HEADER,
+        matmul_key,
+        |entry| {
             let (named, data) = parse(entry, 5)?;
             Some(Algorithm {
                 kind: named[0],
@@ -173,48 +314,53 @@ pub fn load_matmul(path: &Path) -> io::Result<usize> {
                 k: named[4],
                 data,
             })
-        })
-        .collect::<Option<Vec<Algorithm>>>()
-    else {
-        return Ok(0);
-    };
-    // SAFETY: the slice holds `algorithms.len()` algorithms.
-    unsafe { mmh3_cublaslt_matmul_adopt(algorithms.as_ptr(), algorithms.len() as c_int) };
-    Ok(algorithms.len())
+        },
+        // SAFETY: the slice holds `algorithms.len()` algorithms.
+        |device, algorithms| unsafe {
+            mmh3_cublaslt_matmul_adopt(
+                device as c_int,
+                algorithms.as_ptr(),
+                algorithms.len() as c_int,
+            )
+        },
+    )
 }
 
 /// Writes the algorithms this process chose for ordinary GEMM shapes to `path` for `load_matmul`,
 /// and returns whether it wrote.
 pub fn save_matmul(path: &Path) -> io::Result<bool> {
-    let algorithms = chosen_matmul();
-    if algorithms.is_empty() {
-        return Ok(false);
-    }
-    let key = key().map_err(io::Error::other)?;
-    let mut entries = String::new();
-    for algorithm in &algorithms {
-        entries.push_str(&line(
-            &[
-                algorithm.kind,
-                algorithm.bias,
-                algorithm.m,
-                algorithm.n,
-                algorithm.k,
-            ],
-            &algorithm.data,
-        ));
-    }
-    write(path, MATMUL_HEADER, &key, &entries)
+    save(
+        path,
+        MATMUL_HEADER,
+        matmul_key,
+        |device| {
+            chosen(|algorithms, capacity| unsafe {
+                mmh3_cublaslt_matmul_algorithms(device as c_int, algorithms, capacity)
+            })
+        },
+        |algorithm: &Algorithm| {
+            line(
+                &[
+                    algorithm.kind,
+                    algorithm.bias,
+                    algorithm.m,
+                    algorithm.n,
+                    algorithm.k,
+                ],
+                &algorithm.data,
+            )
+        },
+    )
 }
 
-/// Takes over the algorithms that `save_nvfp4` left in `path` for NVFP4 GEMM shapes and returns
-/// how many it took.
+/// Takes over the algorithms that `save_nvfp4` left in `path` for NVFP4 GEMM shapes, each device
+/// those of its own key, and returns how many it took.
 pub fn load_nvfp4(path: &Path) -> io::Result<usize> {
-    let key = key_of(|key, capacity| unsafe { mmh3_cublaslt_nvfp4_algorithm_key(key, capacity) })
-        .map_err(io::Error::other)?;
-    let Some(algorithms) = read(path, NVFP4_HEADER, &key)?
-        .iter()
-        .map(|entry| {
+    load(
+        path,
+        NVFP4_HEADER,
+        nvfp4_key,
+        |entry| {
             let (named, data) = parse(entry, 3)?;
             Some(Nvfp4Algorithm {
                 m: named[0],
@@ -222,33 +368,86 @@ pub fn load_nvfp4(path: &Path) -> io::Result<usize> {
                 k: named[2],
                 data,
             })
-        })
-        .collect::<Option<Vec<Nvfp4Algorithm>>>()
-    else {
-        return Ok(0);
-    };
-    // SAFETY: the slice holds `algorithms.len()` algorithms.
-    unsafe { mmh3_cublaslt_nvfp4_adopt(algorithms.as_ptr(), algorithms.len() as c_int) };
-    Ok(algorithms.len())
+        },
+        // SAFETY: the slice holds `algorithms.len()` algorithms.
+        |device, algorithms| unsafe {
+            mmh3_cublaslt_nvfp4_adopt(
+                device as c_int,
+                algorithms.as_ptr(),
+                algorithms.len() as c_int,
+            )
+        },
+    )
 }
 
 /// Writes the algorithms this process chose for NVFP4 GEMM shapes to `path` for `load_nvfp4`, and
 /// returns whether it wrote.
 pub fn save_nvfp4(path: &Path) -> io::Result<bool> {
-    let algorithms = chosen(|algorithms, capacity| unsafe {
-        mmh3_cublaslt_nvfp4_algorithms(algorithms, capacity)
-    });
-    if algorithms.is_empty() {
-        return Ok(false);
+    save(
+        path,
+        NVFP4_HEADER,
+        nvfp4_key,
+        |device| {
+            chosen(|algorithms, capacity| unsafe {
+                mmh3_cublaslt_nvfp4_algorithms(device as c_int, algorithms, capacity)
+            })
+        },
+        |algorithm: &Nvfp4Algorithm| {
+            line(&[algorithm.m, algorithm.n, algorithm.k], &algorithm.data)
+        },
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BTreeMap, merged, sections};
+
+    const HEADER: &str = "mmh3 cuBLASLt matmul algorithms";
+
+    fn section(key: &str, entries: &[&str]) -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([(
+            key.to_owned(),
+            entries.iter().map(|entry| (*entry).to_owned()).collect(),
+        )])
     }
-    let key = key_of(|key, capacity| unsafe { mmh3_cublaslt_nvfp4_algorithm_key(key, capacity) })
-        .map_err(io::Error::other)?;
-    let mut entries = String::new();
-    for algorithm in &algorithms {
-        entries.push_str(&line(
-            &[algorithm.m, algorithm.n, algorithm.k],
-            &algorithm.data,
-        ));
+
+    /// Saving the choices of one kind of GPU keeps what another kind saved before, so that a
+    /// machine with both finds each on the next run.
+    #[test]
+    fn a_save_keeps_the_sections_of_other_gpus() {
+        let first = merged(
+            "",
+            HEADER,
+            section("cuBLASLt 1, Some GPU", &["0 0 1 2 3 a"]),
+        );
+        let both = merged(
+            &first,
+            HEADER,
+            section("cuBLASLt 1, Another GPU", &["0 0 4 5 6 b"]),
+        );
+        let read = sections(&both, HEADER);
+        assert_eq!(read["cuBLASLt 1, Some GPU"], ["0 0 1 2 3 a"]);
+        assert_eq!(read["cuBLASLt 1, Another GPU"], ["0 0 4 5 6 b"]);
+
+        let again = merged(
+            &both,
+            HEADER,
+            section("cuBLASLt 1, Some GPU", &["0 0 7 8 9 c"]),
+        );
+        let read = sections(&again, HEADER);
+        assert_eq!(read["cuBLASLt 1, Some GPU"], ["0 0 7 8 9 c"]);
+        assert_eq!(read["cuBLASLt 1, Another GPU"], ["0 0 4 5 6 b"]);
     }
-    write(path, NVFP4_HEADER, &key, &entries)
+
+    /// A file of one section, which is all a file held before there were sections, reads as that
+    /// section, and one under another header reads as nothing.
+    #[test]
+    fn reads_a_file_of_one_section() {
+        let text = format!("{HEADER}\ncuBLASLt 1, Some GPU\n0 0 1 2 3 a\n");
+        assert_eq!(
+            sections(&text, HEADER)["cuBLASLt 1, Some GPU"],
+            ["0 0 1 2 3 a"]
+        );
+        assert!(sections(&text, "mmh3 cuBLASLt NVFP4 algorithms").is_empty());
+    }
 }
