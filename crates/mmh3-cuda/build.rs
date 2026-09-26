@@ -1,7 +1,10 @@
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::thread;
 
 fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("linux") {
@@ -38,23 +41,65 @@ fn main() {
         .filter(|path| path.extension().is_some_and(|extension| extension == "cu"))
         .collect();
 
+    // NOTE: each source compiles on its own, without relocatable device code. `-rdc` would make
+    // ptxas compile for a later device link, which changes register allocation and SASS.
+    let nvcc = PathBuf::from(&cuda_home).join("bin/nvcc");
+    let mut flags: Vec<String> = [
+        "-c",
+        "-O3",
+        "-std=c++17",
+        "-lineinfo",
+        "-Xcompiler",
+        "-fPIC",
+    ]
+    .map(str::to_owned)
+    .to_vec();
+    flags.push(format!("-arch={architecture}"));
+
+    // A source compiles again when its object is older than the source or a header it includes,
+    // as nvcc listed them last time, or when the compiler or its flags change.
+    let flags_path = output_directory.join("kernels.flags");
+    let flags_record = format!("{}\n{}\n", nvcc.display(), flags.join("\n"));
+    let flags_changed = fs::read_to_string(&flags_path).ok().as_deref() != Some(&flags_record);
+    let objects: Vec<PathBuf> = compiled_sources
+        .iter()
+        .map(|source| {
+            output_directory
+                .join(source.file_stem().unwrap())
+                .with_extension("o")
+        })
+        .collect();
+    let stale: Vec<usize> = (0..compiled_sources.len())
+        .filter(|&index| flags_changed || !is_up_to_date(&objects[index]))
+        .collect();
+
+    let job_count = env::var("NUM_JOBS")
+        .ok()
+        .and_then(|jobs| jobs.parse::<usize>().ok())
+        .unwrap_or(1)
+        .clamp(1, stale.len().max(1));
+    let next_stale = AtomicUsize::new(0);
+    thread::scope(|scope| {
+        for _ in 0..job_count {
+            scope.spawn(|| {
+                while let Some(&index) = stale.get(next_stale.fetch_add(1, Ordering::Relaxed)) {
+                    compile(&nvcc, &flags, compiled_sources[index], &objects[index]);
+                }
+            });
+        }
+    });
+    fs::write(&flags_path, flags_record).unwrap();
+
     let library = output_directory.join("libmmh3_cuda_kernels.a");
-    let status = Command::new(PathBuf::from(&cuda_home).join("bin/nvcc"))
-        .args([
-            "--lib",
-            "-O3",
-            "-std=c++17",
-            "-lineinfo",
-            "-Xcompiler",
-            "-fPIC",
-        ])
-        .arg(format!("-arch={architecture}"))
-        .arg("-o")
+    // ar adds to an existing archive, so a removed source would otherwise stay in it.
+    let _ = fs::remove_file(&library);
+    let status = Command::new("ar")
+        .arg("crs")
         .arg(&library)
-        .args(&compiled_sources)
+        .args(&objects)
         .status()
-        .expect("failed to run nvcc");
-    assert!(status.success(), "nvcc failed");
+        .expect("failed to run ar");
+    assert!(status.success(), "ar failed");
 
     println!(
         "cargo:rustc-link-search=native={}",
@@ -67,4 +112,50 @@ fn main() {
     for library in ["stdc++", "dl", "rt", "pthread"] {
         println!("cargo:rustc-link-lib=dylib={library}");
     }
+}
+
+/// Compiles one kernel source into an object file, with the headers it includes listed next to it.
+fn compile(nvcc: &Path, flags: &[String], source: &Path, object: &Path) {
+    // A failed compilation must not leave an object that looks newer than its source.
+    let _ = fs::remove_file(object);
+    let output = Command::new(nvcc)
+        .args(flags)
+        .arg("-MD")
+        .arg("-MF")
+        .arg(object.with_extension("d"))
+        .arg("-o")
+        .arg(object)
+        .arg(source)
+        .output()
+        .expect("failed to run nvcc");
+    // One write per source keeps the messages of concurrent compilations apart.
+    let mut messages = output.stdout;
+    messages.extend_from_slice(&output.stderr);
+    io::stderr().write_all(&messages).unwrap();
+    if !output.status.success() {
+        let _ = fs::remove_file(object);
+        panic!("nvcc failed on {}", source.display());
+    }
+}
+
+/// Whether an object is newer than every file its dependency list names.
+fn is_up_to_date(object: &Path) -> bool {
+    let Ok(object_time) = fs::metadata(object).and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    let Ok(dependencies) = fs::read_to_string(object.with_extension("d")) else {
+        return false;
+    };
+    // The list is a make rule, `object: source header ...`, with lines continued by backslashes.
+    let Some((_, prerequisites)) = dependencies.split_once(": ") else {
+        return false;
+    };
+    prerequisites
+        .split_whitespace()
+        .filter(|prerequisite| *prerequisite != "\\")
+        .all(|prerequisite| {
+            fs::metadata(prerequisite)
+                .and_then(|metadata| metadata.modified())
+                .is_ok_and(|time| time < object_time)
+        })
 }
