@@ -1160,13 +1160,27 @@ impl RemoteAudio {
 }
 
 impl RemoteCanvases {
-    /// Hands the chunks out over the workers that serve decodes, keeping the first share for the
-    /// leader, and starts them at once. `role` is the video VAE both sides must agree on.
+    /// Hands the chunks out over the workers that serve decodes, and starts them at once. `role`
+    /// is the video VAE both sides must agree on.
     pub fn start(
         workers: Vec<Worker>,
         role: &str,
         latent: &Tensor,
         chunks: usize,
+        tile_size: usize,
+        tile_overlap: usize,
+    ) -> Self {
+        let chunks = (0..chunks).collect();
+        Self::start_for(workers, role, latent, chunks, tile_size, tile_overlap)
+    }
+
+    /// `start` for the chunks named rather than every chunk, which a decode asks for again when it
+    /// took their canvases and then had to start over.
+    pub fn start_for(
+        workers: Vec<Worker>,
+        role: &str,
+        latent: &Tensor,
+        chunks: Vec<usize>,
         tile_size: usize,
         tile_overlap: usize,
     ) -> Self {
@@ -1194,8 +1208,8 @@ impl RemoteCanvases {
         let latent = Arc::new(latent.clone());
         let mut first = 0;
         for (index, mut worker) in workers.into_iter().enumerate() {
-            let share = (chunks - first).div_ceil(count - index);
-            let mine: Vec<usize> = (first..first + share).collect();
+            let share = (chunks.len() - first).div_ceil(count - index);
+            let mine: Vec<usize> = chunks[first..first + share].to_vec();
             first += share;
             if mine.is_empty() {
                 continue;

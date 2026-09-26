@@ -106,19 +106,32 @@ pub fn run(arguments: &[String], usage: &'static str) -> Result<(), Box<dyn Erro
     #[cfg(feature = "cuda")]
     {
         // The card this machine lends a worker of its own holds its models, and the decode makes
-        // room beside them. It tries again only while it has taken no canvas, since one taken is
-        // one the workers do not send twice.
+        // room beside them. A canvas it took is one the workers do not send twice, so trying again
+        // asks them for those chunks once more.
+        let mut again: Option<crate::worker::RemoteCanvases> = None;
+        let mut taken = Vec::new();
         let decoded = crate::resident::with_room(|| {
-            let mut taken = false;
-            match decoder.decode_device_with(&video, &mut |chunk| {
-                let canvas = remote.take(chunk)?;
-                taken |= canvas.is_some();
+            let decoded = decoder.decode_device_with(&video, &mut |chunk| {
+                let canvas = match again.as_mut() {
+                    Some(again) if again.chunks().contains(&chunk) => again.take(chunk)?,
+                    _ => remote.take(chunk)?,
+                };
+                if canvas.is_some() && !taken.contains(&chunk) {
+                    taken.push(chunk);
+                }
                 Ok(canvas)
-            }) {
-                Ok(decoded) => Ok(decoded),
-                Err(error) if taken => Err(format!("decoding the video: {error}").into()),
-                Err(error) => Err(error.into()),
+            });
+            if matches!(&decoded, Err(error) if error.is_out_of_memory()) && !taken.is_empty() {
+                again = Some(crate::worker::RemoteCanvases::start_for(
+                    crate::worker::connect_all(&chunks_out, &settings.token),
+                    crate::worker::VIDEO_VAE_ROLE,
+                    &video,
+                    taken.clone(),
+                    DEFAULT_TILE_SIZE,
+                    DEFAULT_TILE_OVERLAP_MIN,
+                ));
             }
+            Ok(decoded?)
         })?;
         drop(decoder);
         output.write_cuda_video(&decoded)?;
