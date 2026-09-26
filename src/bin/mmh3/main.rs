@@ -2,8 +2,9 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--devices CARD,CARD...] [--worker HOST[:PORT]]...
-              [--local-worker] [--consistent] [--vram-budget GB] [--idle-unload SECONDS]
+  mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--models DIR] [--devices CARD,CARD...]
+              [--worker HOST[:PORT]]... [--local-worker] [--consistent] [--vram-budget GB] [--idle-unload SECONDS]
+              [--ffmpeg ARGS...]
   mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--devices CARD,CARD...] [--vram-budget GB]
               [--idle-unload SECONDS]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]

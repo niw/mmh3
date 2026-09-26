@@ -8,7 +8,7 @@
 //! There is no authentication here. That is somebody else's to add in front, which is why this
 //! listens on loopback unless it is told otherwise.
 
-use crate::cli::parse_options;
+use crate::cli::{parse_options, split_ffmpeg_arguments};
 use axum::extract::{Multipart, Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -37,9 +37,32 @@ const FILE_BYTES: u64 = 4 << 30;
 /// nothing between them.
 const WATCH: Duration = Duration::from_millis(250);
 
-const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--models DIR] [--worker HOST[:PORT]]... \
-                     [--local-worker] [--devices CARD,CARD...] [--consistent] [--token FILE] \
-                     [--vram-budget GB] [--idle-unload SECONDS]";
+const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--models DIR] \
+                     [--worker HOST[:PORT]]... [--local-worker] [--devices CARD,CARD...] [--consistent] \
+                     [--token FILE] [--vram-budget GB] [--idle-unload SECONDS] [--ffmpeg ARGS...]";
+
+/// The container every generation of a server is written in.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Container {
+    Mp4,
+    Webm,
+}
+
+impl Container {
+    fn extension(self) -> &'static str {
+        match self {
+            Container::Mp4 => "mp4",
+            Container::Webm => "webm",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            Container::Mp4 => "video/mp4",
+            Container::Webm => "video/webm",
+        }
+    }
+}
 
 /// What a generation the server was asked for is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -103,14 +126,20 @@ struct Server {
     /// What every generation is told before what its own request said, so that a machine's models
     /// directory and its workers are the server's business rather than each request's.
     defaults: Vec<String>,
+    /// What every generation hands ffmpeg to write its video, after everything else it is told, or
+    /// none for the native output.
+    ffmpeg: Option<Vec<String>>,
+    container: Container,
     directory: PathBuf,
 }
 
 /// `mmh3 server [--listen ADDR] [--jobs DIR] ...`, which serves until it is stopped.
 pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
+    let (arguments, ffmpeg) = split_ffmpeg_arguments(arguments);
     let allowed = [
         "listen",
         "jobs",
+        "format",
         "models",
         "worker",
         "worker-units",
@@ -131,9 +160,31 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     };
     std::fs::create_dir_all(&directory)?;
+    let container = match options.get("format").copied().unwrap_or("mp4") {
+        "mp4" => Container::Mp4,
+        "webm" => Container::Webm,
+        other => return Err(format!("--format must be mp4 or webm, not {other}").into()),
+    };
+    // Checked here rather than by the first generation, which would fail only after its steps.
+    if container == Container::Webm {
+        match ffmpeg {
+            None if !cfg!(feature = "webm") => {
+                return Err("--format webm needs a build with webm, or --ffmpeg".into());
+            }
+            // ffmpeg's recipe without arguments is H.264 and AAC, which WebM cannot hold.
+            Some([]) => {
+                return Err(
+                    "--format webm with --ffmpeg needs ffmpeg's arguments for WebM, \
+                            such as -c:v libvpx-vp9 -c:a libopus"
+                        .into(),
+                );
+            }
+            _ => {}
+        }
+    }
 
-    // Everything but --listen, --jobs and --idle-unload is the generation's, and every generation
-    // is told it.
+    // Everything but --listen, --jobs, --format and --idle-unload is the generation's, and every
+    // generation is told it.
     let mut defaults = Vec::new();
     let mut remaining = arguments.iter();
     while let Some(name) = remaining.next() {
@@ -143,7 +194,10 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             continue;
         }
         let Some(value) = remaining.next() else { break };
-        if !matches!(name.as_str(), "--listen" | "--jobs" | "--idle-unload") {
+        if !matches!(
+            name.as_str(),
+            "--listen" | "--jobs" | "--format" | "--idle-unload"
+        ) {
             defaults.push(name.clone());
             defaults.push(value.clone());
         }
@@ -172,6 +226,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         jobs: Mutex::new(HashMap::new()),
         queue,
         defaults,
+        ffmpeg: ffmpeg.map(<[String]>::to_vec),
+        container,
         directory: directory.clone(),
     });
 
@@ -247,7 +303,7 @@ async fn create(
     let id = next_id();
     let directory = server.directory.join(&id);
     tokio::fs::create_dir_all(&directory).await?;
-    let video = directory.join("video.mp4");
+    let video = directory.join(format!("video.{}", server.container.extension()));
     let mut arguments = server.defaults.clone();
     arguments.push("--out".to_owned());
     arguments.push(video.to_string_lossy().into_owned());
@@ -257,6 +313,11 @@ async fn create(
         // that was refused.
         let _ = tokio::fs::remove_dir_all(&directory).await;
         return Err(failure);
+    }
+    // Last, since generate takes everything after --ffmpeg as ffmpeg's.
+    if let Some(ffmpeg) = &server.ffmpeg {
+        arguments.push("--ffmpeg".to_owned());
+        arguments.extend(ffmpeg.iter().cloned());
     }
 
     let job = Job {
@@ -508,7 +569,7 @@ async fn video(
     };
     match state {
         Stage::Done => Ok((
-            [(header::CONTENT_TYPE, "video/mp4")],
+            [(header::CONTENT_TYPE, server.container.content_type())],
             tokio::fs::read(&path).await?,
         )
             .into_response()),

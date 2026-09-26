@@ -12,6 +12,15 @@ target/release/mmh3 server
 It waits on `127.0.0.1:8833` and writes each generation into a directory of its own under
 `$XDG_CACHE_HOME/mmh3/jobs`. `--listen ADDR` and `--jobs DIR` change either.
 
+Each video is MP4, written the way `mmh3 generate --out FILE.mp4` writes it, which on CUDA takes
+NVENC. `--format webm` writes WebM instead, from a build with the `webm` feature. A GPU without
+NVENC hands every video to ffmpeg with `--ffmpeg`, which comes last and takes the rest of the line
+as ffmpeg's arguments, as it does for a generation. See [Output](output.md).
+
+```sh
+target/release/mmh3 server --ffmpeg
+```
+
 There is no authentication. A machine that should answer anybody but itself wants something in
 front of this that decides who may ask, which is why the default is loopback.
 
@@ -79,7 +88,8 @@ Asking again works as well, at `GET /v1/generations/{id}`, and says the same thi
 curl http://localhost:8833/v1/generations/6ab1cf3b0000/video -o out.mp4
 ```
 
-Until the generation is done this answers 409 rather than a video.
+The video is `video/webm` rather than `video/mp4` from a server started with `--format webm`. Until
+the generation is done this answers 409 rather than a video.
 
 ## What a server holds
 
