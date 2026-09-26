@@ -294,13 +294,18 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         shift_audio: dit_file.metadata("shift_audio")?.parse()?,
     };
 
-    let dit = load_dit(&options, "weights", dit_file_for(&inputs.references))?;
-    let started = Instant::now();
-    let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     // `--shard 1` runs the path a shared-out step takes, with one rank and nothing to carry
     // anywhere, and `--shard N` splits the step N ways across threads of this process, a DiT each.
     // Either has to give what a whole step gives, which `--consistent` holds for every N.
     let ranks: usize = option_number(&options, "shard", 0)?;
+    // The split runs before the whole DiT is read, and its ranks let go of theirs before it is, so
+    // that a card holds one rank's DiT or the whole one but never both.
+    let mut split = (ranks > 1)
+        .then(|| split_step(&options, &inputs, ranks))
+        .transpose()?;
+    let dit = load_dit(&options, "weights", dit_file_for(&inputs.references))?;
+    let started = Instant::now();
+    let sparse = sparse_attention(&options, dit.has_vsa_gates())?;
     let outputs = if ranks > 0 {
         use mmh3_cuda::shard::{Shard, ShardContext, WholeExchange};
         let parts = if ranks == 1 {
@@ -314,7 +319,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             let part = dit.forward_shard(&inputs, sparse.as_ref(), &mut context, &mut || false)?;
             vec![part.part.ok_or("no part")?]
         } else {
-            split_step(&options, &inputs, ranks)?
+            split.take().ok_or("no split step")?
         };
         let shared = dit.assemble_velocity(&inputs, sparse.as_ref(), &parts)?;
         // The same step without the shard, in the same process, so that the two can be compared
@@ -561,6 +566,10 @@ fn split_step(
             .map(|rank| {
                 let hub = &hub;
                 scope.spawn(move || -> Result<VelocityRows, String> {
+                    // The ranks take the cards in turn, so that a machine with several splits the
+                    // step across them and one with a single card holds every rank on it.
+                    mmh3::resident::bind_device(rank % mmh3::resident::device_count())
+                        .map_err(|error| error.to_string())?;
                     let dit = load_dit(options, "weights", dit_file_for(&inputs.references))
                         .map_err(|error| error.to_string())?;
                     let sparse = sparse_attention(options, dit.has_vsa_gates())
