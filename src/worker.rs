@@ -200,37 +200,25 @@ fn rdma_device() -> Option<&'static mmh3_rdma::Device> {
 /// a shared-out step follow. Measured once, since it is a property of the machine and not of a run,
 /// and answered with nothing by a backend that cannot measure itself.
 pub fn measure_speed() -> Option<worker::Speed> {
-    // A machine does not change between runs, so the first one measures and the rest read. The
-    // file names the device it was measured on, and another one measures again.
+    // A machine does not change between runs, so the first one measures and the rest read. Every
+    // line names the device it was measured on, so that the cards of a machine that has two kinds
+    // keep a line each rather than taking turns to measure again.
     let cache = crate::models::cache_file("speed.txt");
     let (name, road) = (device_name(), road());
     let kept = cache
         .as_ref()
         .and_then(|path| std::fs::read_to_string(path).ok())
-        .filter(|text| {
-            let mut lines = text.lines();
-            lines.next() == Some(SPEED_HEADER) && lines.next() == Some(name.as_str())
-        })
         .unwrap_or_default();
-    if let Some(speed) = kept.lines().skip(2).find_map(|line| parse_road(line, road)) {
+    if let Some(speed) = kept_speed(&kept, &name, road) {
         return Some(speed);
     }
 
     let speed = measure_now()?;
     if let Some(path) = cache {
-        // The roads already measured are kept: a run on one of them should not pay to measure
-        // again because a run on another came between.
-        let mut text = format!("{SPEED_HEADER}\n{name}\n");
-        for line in kept.lines().skip(2) {
-            if parse_road(line, road).is_none() && !line.trim().is_empty() {
-                text.push_str(line);
-                text.push('\n');
-            }
-        }
-        text.push_str(&format!(
-            "{road} {} {} {}\n",
-            speed.gemm_tops, speed.bandwidth_gbytes, speed.attention_tops
-        ));
+        // Read again rather than taken from above, since another card of this process may have
+        // added its line while this one was measuring.
+        let kept = std::fs::read_to_string(&path).unwrap_or_default();
+        let text = with_speed(&kept, &name, road, speed);
         if let Some(directory) = path.parent() {
             let _ = std::fs::create_dir_all(directory);
         }
@@ -246,20 +234,49 @@ pub fn measure_speed() -> Option<worker::Speed> {
     Some(speed)
 }
 
-/// One kept line, when it is the road asked for.
-fn parse_road(line: &str, road: &str) -> Option<worker::Speed> {
-    let mut fields = line.split_whitespace();
+/// What `text`, a file `measure_speed` kept, says `name` does on `road`, if it says anything.
+fn kept_speed(text: &str, name: &str, road: &str) -> Option<worker::Speed> {
+    let mut lines = text.lines();
+    if lines.next() != Some(SPEED_HEADER) {
+        return None;
+    }
+    lines.find_map(|line| parse_speed(line, name, road))
+}
+
+/// `text` with the line for `name` on `road` replaced by `speed`, and the lines of every other
+/// device and road kept: a run on one of them should not pay to measure again because a run on
+/// another came between.
+fn with_speed(text: &str, name: &str, road: &str, speed: worker::Speed) -> String {
+    let mut written = format!("{SPEED_HEADER}\n");
+    let mut lines = text.lines();
+    if lines.next() == Some(SPEED_HEADER) {
+        for line in lines {
+            if parse_speed(line, name, road).is_none() && !line.trim().is_empty() {
+                written.push_str(line);
+                written.push('\n');
+            }
+        }
+    }
+    written.push_str(&format!(
+        "{road} {} {} {} {name}\n",
+        speed.gemm_tops, speed.bandwidth_gbytes, speed.attention_tops
+    ));
+    written
+}
+
+/// One kept line, when it is `name` on `road`: the road, the three numbers and then the device,
+/// which is last because its name has spaces in it.
+fn parse_speed(line: &str, name: &str, road: &str) -> Option<worker::Speed> {
+    let mut fields = line.splitn(5, ' ');
     if fields.next()? != road {
         return None;
     }
-
-    Some(worker::Speed {
+    let speed = worker::Speed {
         gemm_tops: fields.next()?.parse().ok()?,
         bandwidth_gbytes: fields.next()?.parse().ok()?,
-        // A file kept before a machine measured its attention says nothing about it, and the cut
-        // then prices both kinds of work by the product, as it used to.
-        attention_tops: fields.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
-    })
+        attention_tops: fields.next()?.parse().ok()?,
+    };
+    (fields.next()? == name).then_some(speed)
 }
 
 /// The precision a block's products run in here, which is what the measurement is of. The same
@@ -285,10 +302,10 @@ fn road() -> &'static str {
     }
 }
 
-/// First line of the file `measure_speed` keeps, followed by the device and then a line for every
-/// road measured on it. It goes up when what is measured changes, so an old file is not taken for
-/// a new one.
-const SPEED_HEADER: &str = "mmh3 machine speed 3";
+/// First line of the file `measure_speed` keeps, followed by a line for every device and road
+/// measured. It goes up when what is measured or how it is written changes, so an old file is not
+/// taken for a new one.
+const SPEED_HEADER: &str = "mmh3 machine speed 4";
 
 #[cfg(feature = "cuda")]
 fn measure_now() -> Option<worker::Speed> {
@@ -3823,4 +3840,49 @@ pub fn describe_timing(
         seconds(timing.attend),
         seconds(whole).max(seconds(timing.total())) - seconds(timing.total()),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SPEED_HEADER, kept_speed, with_speed};
+    use mmh3_core::worker::Speed;
+
+    fn speed(gemm_tops: f32) -> Speed {
+        Speed {
+            gemm_tops,
+            bandwidth_gbytes: 700.0,
+            attention_tops: 100.0,
+        }
+    }
+
+    /// Two kinds of card on one machine keep a line each, so that neither measures again because
+    /// the other was measured after it.
+    #[test]
+    fn two_kinds_of_card_keep_a_speed_each() {
+        let first = with_speed("", "Some GPU", "bf16", speed(166.0));
+        let both = with_speed(&first, "Another GPU", "bf16", speed(400.0));
+        assert_eq!(kept_speed(&both, "Some GPU", "bf16"), Some(speed(166.0)));
+        assert_eq!(kept_speed(&both, "Another GPU", "bf16"), Some(speed(400.0)));
+        assert_eq!(kept_speed(&both, "A third GPU", "bf16"), None);
+        assert_eq!(kept_speed(&both, "Some GPU", "int8"), None);
+    }
+
+    /// Measuring a card again replaces its line rather than adding a second one.
+    #[test]
+    fn a_card_measured_again_keeps_one_line() {
+        let once = with_speed("", "A third GPU", "bf16", speed(90.0));
+        let twice = with_speed(&once, "A third GPU", "bf16", speed(95.0));
+        assert_eq!(twice.lines().count(), 2);
+        assert_eq!(kept_speed(&twice, "A third GPU", "bf16"), Some(speed(95.0)));
+    }
+
+    /// A file written under another header says nothing, and writing over it keeps nothing of it.
+    #[test]
+    fn an_old_file_is_measured_again() {
+        let old = "mmh3 machine speed 3\nA third GPU\nbf16 90 250 60\n";
+        assert_eq!(kept_speed(old, "A third GPU", "bf16"), None);
+        let new = with_speed(old, "A third GPU", "bf16", speed(90.0));
+        assert!(new.starts_with(&format!("{SPEED_HEADER}\n")));
+        assert_eq!(new.lines().count(), 2);
+    }
 }
