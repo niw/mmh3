@@ -3,6 +3,8 @@
 #include <cstring>
 #include <cuda_runtime.h>
 
+#include "device.cuh"
+
 struct Mmh3DeviceInfo {
     char name[256];
     int32_t compute_major;
@@ -73,6 +75,8 @@ extern "C" int mmh3_cuda_enable_peer_access(int peer) {
 extern "C" int mmh3_cuda_copy_across(void *destination, const void *source, size_t bytes) {
     return static_cast<int>(cudaMemcpyAsync(destination, source, bytes, cudaMemcpyDefault));
 }
+
+extern "C" void mmh3_cuda_tma_on_this_thread(int enabled) { mmh3_tma_turned_off = enabled == 0; }
 
 extern "C" const char *mmh3_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));

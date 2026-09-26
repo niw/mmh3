@@ -48,7 +48,8 @@ fn u16_bytes(values: &[u16]) -> Vec<u8> {
 }
 
 /// Runs every config on random operands, with a random adapter of `rank` when it is not zero, and
-/// compares the output with an f64 reference within BF16 rounding. The adapter's down rows lie
+/// compares the output with an f64 reference within BF16 rounding. Each config runs with TMA and
+/// with the cp.async copies of a device without it, which must agree in every bit. The adapter's down rows lie
 /// `down_stride` values apart, with values the kernel must skip in between. `f16_with_bias`
 /// switches to FP16 output with a random bias.
 fn check_every_config(
@@ -127,27 +128,37 @@ fn check_every_config(
         .collect();
 
     for config in 0..gemm::int8_config_count() {
-        let mut output = DeviceBuffer::new(m * n * 2).unwrap();
-        gemm::int8(
-            config,
-            &activation_buffer,
-            &weight_buffer,
-            &activation_scale_buffer,
-            &weight_scale_buffer,
-            Output {
-                buffer: &mut output,
-                f16: f16_with_bias,
-                bias: f16_with_bias.then_some(&bias_buffer),
-                swiglu: false,
-            },
-            m,
-            n,
-            k,
-            (rank > 0).then_some(&adapter),
-        )
-        .unwrap();
-        let mut output_bytes = vec![0; m * n * 2];
-        output.copy_to_host(&mut output_bytes).unwrap();
+        let run = |tma: bool| {
+            mmh3_cuda::use_tma_on_this_thread(tma);
+            let mut output = DeviceBuffer::new(m * n * 2).unwrap();
+            gemm::int8(
+                config,
+                &activation_buffer,
+                &weight_buffer,
+                &activation_scale_buffer,
+                &weight_scale_buffer,
+                Output {
+                    buffer: &mut output,
+                    f16: f16_with_bias,
+                    bias: f16_with_bias.then_some(&bias_buffer),
+                    swiglu: false,
+                },
+                m,
+                n,
+                k,
+                (rank > 0).then_some(&adapter),
+            )
+            .unwrap();
+            mmh3_cuda::use_tma_on_this_thread(true);
+            let mut output_bytes = vec![0; m * n * 2];
+            output.copy_to_host(&mut output_bytes).unwrap();
+            output_bytes
+        };
+        let output_bytes = run(true);
+        assert!(
+            output_bytes == run(false),
+            "{m} × {n} × {k}, rank {rank}, config {config}: the cp.async copies disagree with TMA"
+        );
 
         for (index, &expected) in expected.iter().enumerate() {
             let bits = u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]]);
@@ -247,27 +258,37 @@ fn writes_swiglu_of_interleaved_rows() {
             scale: adapter_scale,
         };
 
-        let mut output = DeviceBuffer::new(m * features * 2).unwrap();
-        gemm::int8(
-            0,
-            &activation_buffer,
-            &weight_buffer,
-            &activation_scale_buffer,
-            &weight_scale_buffer,
-            Output {
-                buffer: &mut output,
-                f16,
-                bias: Some(&bias_buffer),
-                swiglu: true,
-            },
-            m,
-            n,
-            k,
-            Some(&adapter),
-        )
-        .unwrap();
-        let mut output_bytes = vec![0; m * features * 2];
-        output.copy_to_host(&mut output_bytes).unwrap();
+        let run = |tma: bool| {
+            mmh3_cuda::use_tma_on_this_thread(tma);
+            let mut output = DeviceBuffer::new(m * features * 2).unwrap();
+            gemm::int8(
+                0,
+                &activation_buffer,
+                &weight_buffer,
+                &activation_scale_buffer,
+                &weight_scale_buffer,
+                Output {
+                    buffer: &mut output,
+                    f16,
+                    bias: Some(&bias_buffer),
+                    swiglu: true,
+                },
+                m,
+                n,
+                k,
+                Some(&adapter),
+            )
+            .unwrap();
+            mmh3_cuda::use_tma_on_this_thread(true);
+            let mut output_bytes = vec![0; m * features * 2];
+            output.copy_to_host(&mut output_bytes).unwrap();
+            output_bytes
+        };
+        let output_bytes = run(true);
+        assert!(
+            output_bytes == run(false),
+            "f16 {f16}: the cp.async copies disagree with TMA"
+        );
 
         let product = |row: usize, column: usize| -> f32 {
             let dot: i32 = (0..k)

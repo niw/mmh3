@@ -15,8 +15,9 @@
 // [q | k | v] with fewer key and value heads alike.
 //
 // NOTE: the tiles arrive through TMA, which describes each of them as a box of a tensor map and
-// leaves the addresses, the bounds and the swizzle to the copy engine. Layouts TMA cannot describe,
-// such as strides that are not multiples of 16 bytes, fall back to per-thread cp.async copies.
+// leaves the addresses, the bounds and the swizzle to the copy engine. Devices without TMA (sm_89)
+// and layouts TMA cannot describe, such as strides that are not multiples of 16 bytes, fall back to
+// per-thread cp.async copies.
 
 namespace {
 
@@ -184,7 +185,7 @@ __global__ void __launch_bounds__(THREADS, HEAD_DIM == 64 ? 2 : 1)
             barrier_init(barriers, 1);
             barrier_init(barriers + 8, 1);
             barrier_init(barriers + 16, 1);
-            asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+            barrier_init_fence();
             barrier_expect_bytes(barriers + 16, BLOCK_M * HEAD_DIM * sizeof(Element));
             #pragma unroll
             for (int slab = 0; slab < SLABS; slab++) {
@@ -459,6 +460,7 @@ int launch(const void *query, const void *key, const void *value, void *output, 
     AttentionMaps maps = {};
     const CUtensorMapDataType type = map_type<Element>();
     const bool mapped =
+        mmh3_tma_available() &&
         encode_attention_map(&maps.query, query_base, type, sizeof(Element), HEAD_DIM, tokens,
                              heads, batch, BLOCK_M, normalized.token_stride[QUERY],
                              normalized.head_stride[QUERY], normalized.batch_stride[QUERY]) &&

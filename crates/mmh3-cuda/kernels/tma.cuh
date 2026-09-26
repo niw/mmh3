@@ -15,6 +15,11 @@ __device__ __forceinline__ void barrier_init(uint32_t barrier, uint32_t count) {
     asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(barrier), "r"(count));
 }
 
+// Makes the initialized barriers visible to the copy engine.
+__device__ __forceinline__ void barrier_init_fence() {
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
+}
+
 __device__ __forceinline__ void barrier_expect_bytes(uint32_t barrier, uint32_t bytes) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(barrier),
                  "r"(bytes)

@@ -89,6 +89,30 @@ fn matches_cpu_reference() {
     }
 }
 
+/// The cp.async copies a device without TMA (sm_89) takes must agree with TMA in every bit.
+#[test]
+fn copies_without_tma_agree_with_tma() {
+    let (tokens, heads) = (200, 3);
+    let inner = heads * HEAD_DIM;
+    let mut random = Random(5);
+    let qkv: Vec<u8> = (0..tokens * 3 * inner)
+        .flat_map(|_| to_bf16(random.uniform(-2.0, 2.0)).to_le_bytes())
+        .collect();
+    let mut qkv_buffer = DeviceBuffer::new(qkv.len()).unwrap();
+    qkv_buffer.copy_from_host(&qkv).unwrap();
+    let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+    let run = |tma: bool| {
+        mmh3_cuda::use_tma_on_this_thread(tma);
+        let mut output_buffer = DeviceBuffer::new(tokens * inner * 2).unwrap();
+        attention::dense_bf16(&qkv_buffer, &mut output_buffer, tokens, heads, scale).unwrap();
+        mmh3_cuda::use_tma_on_this_thread(true);
+        let mut output_bytes = vec![0; tokens * inner * 2];
+        output_buffer.copy_to_host(&mut output_bytes).unwrap();
+        output_bytes
+    };
+    assert!(run(true) == run(false));
+}
+
 fn to_f16(value: f32) -> u16 {
     // Round to nearest even through f64, adequate for test data in [-2, 2].
     let bits = value.to_bits();

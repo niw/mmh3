@@ -52,6 +52,7 @@ unsafe extern "C" {
     fn mmh3_cuda_set_device(device: c_int) -> c_int;
     fn mmh3_cuda_can_access_peer(device: c_int, peer: c_int, can: *mut c_int) -> c_int;
     fn mmh3_cuda_enable_peer_access(peer: c_int) -> c_int;
+    fn mmh3_cuda_tma_on_this_thread(enabled: c_int);
     fn mmh3_cuda_copy_across(
         destination: *mut c_void,
         source: *const c_void,
@@ -221,6 +222,14 @@ pub fn can_access_peer(device: usize, peer: usize) -> Result<bool, CudaError> {
 pub fn enable_peer_access(peer: usize) -> Result<(), CudaError> {
     // SAFETY: no pointers.
     check(unsafe { mmh3_cuda_enable_peer_access(peer as c_int) })
+}
+
+/// Lets the kernels launched from this thread copy through TMA where the device has it (the
+/// default), or makes them take the cp.async copies an Ada card (sm_89) takes, so that a card with
+/// TMA can check them.
+pub fn use_tma_on_this_thread(enabled: bool) {
+    // SAFETY: no pointers.
+    unsafe { mmh3_cuda_tma_on_this_thread(c_int::from(enabled)) }
 }
 
 /// Copies `bytes` bytes between two addresses this process holds, on one card, between two cards
