@@ -8,6 +8,8 @@
 #include <mutex>
 #include <tuple>
 
+#include "device.cuh"
+
 // y[m, n] = x[m, k] · w[n, k]ᵀ + bias[n] through cuBLASLt, for the linear layers that stay in BF16
 // or FP32.
 
@@ -100,21 +102,38 @@ constexpr int MATMUL_ALGORITHM_FORMAT = 2;
 
 using Shape = std::tuple<int64_t, int64_t, int64_t>;
 
-// NOTE: the tables of chosen algorithms below and their locks are made once and never destroyed. A
-// worker's session thread saves them when its session ends, which can be while the process is
-// already exiting, and a table the exit handlers destroyed under it would crash the process after
-// its work is done.
-
-// The algorithm chosen for each NVFP4 GEMM shape (m, n, k), shared by the threads of the process.
-std::mutex &nvfp4_algorithms_mutex = *new std::mutex;
-std::map<Shape, cublasLtMatmulAlgo_t> &nvfp4_algorithms =
-    *new std::map<Shape, cublasLtMatmulAlgo_t>;
-
-// The same for the plain GEMMs, keyed by kind, shape and whether a bias is added.
+// The plain GEMMs are keyed by kind, shape and whether a bias is added.
 using MatmulKey = std::tuple<int, int64_t, int64_t, int64_t, bool>;
-std::mutex &matmul_algorithms_mutex = *new std::mutex;
-std::map<MatmulKey, cublasLtMatmulAlgo_t> &matmul_algorithms =
-    *new std::map<MatmulKey, cublasLtMatmulAlgo_t>;
+
+// The algorithm consistency runs for each kind, n, k and bias of the plain GEMMs, and for each n
+// and k of the NVFP4 ones. It is derived rather than measured, so it is not kept between runs.
+using ConsistentKey = std::tuple<int, int64_t, int64_t, bool>;
+
+// The algorithms chosen on one device, shared by the threads that compute on it. An algorithm is
+// chosen for the GPU it was timed on, so two cards of different kinds in one process keep a table
+// each, and the threads of two cards do not wait on each other's lock either.
+struct Tables {
+    // The algorithm chosen for each NVFP4 GEMM shape (m, n, k).
+    std::mutex nvfp4_mutex;
+    std::map<Shape, cublasLtMatmulAlgo_t> nvfp4;
+    // The same for the plain GEMMs.
+    std::mutex matmul_mutex;
+    std::map<MatmulKey, cublasLtMatmulAlgo_t> matmul;
+    // What consistency runs, which the heuristic answers for this GPU.
+    std::mutex consistent_mutex;
+    std::map<ConsistentKey, cublasLtMatmulAlgo_t> consistent_matmul;
+    std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t> consistent_nvfp4;
+};
+
+// NOTE: the tables are made once and never destroyed. A worker's session thread saves them when its
+// session ends, which can be while the process is already exiting, and a table the exit handlers
+// destroyed under it would crash the process after its work is done.
+Tables *const tables = new Tables[MMH3_MAX_DEVICES];
+
+// The tables of `device`, or none for a device past the ones this build indexes.
+Tables *tables_of(int device) {
+    return device >= 0 && device < MMH3_MAX_DEVICES ? &tables[device] : nullptr;
+}
 
 // How many heuristic candidates a new shape times against each other. cuBLASLt offers only a few
 // for the convolution shapes of the VAE encoder, so the list is as long as it will fill.
@@ -138,15 +157,6 @@ bool consistent() {
     return consistent_here >= 0 ? consistent_here != 0
                                 : consistent_by_default.load(std::memory_order_relaxed);
 }
-
-// The algorithm consistency runs for each kind, n, k and bias of the plain GEMMs, and for each n
-// and k of the NVFP4 ones. It is derived rather than measured, so it is not kept between runs.
-using ConsistentKey = std::tuple<int, int64_t, int64_t, bool>;
-std::mutex &consistent_mutex = *new std::mutex;
-std::map<ConsistentKey, cublasLtMatmulAlgo_t> &consistent_matmul =
-    *new std::map<ConsistentKey, cublasLtMatmulAlgo_t>;
-std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t> &consistent_nvfp4 =
-    *new std::map<std::tuple<int64_t, int64_t>, cublasLtMatmulAlgo_t>;
 
 // Asks the heuristic for the algorithm of `operation` over `weight` at CONSISTENT_ROWS rows.
 cublasStatus_t consistent_algorithm(cublasLtHandle_t handle, cublasLtMatmulDesc_t operation,
@@ -185,17 +195,17 @@ cublasStatus_t consistent_algorithm(cublasLtHandle_t handle, cublasLtMatmulDesc_
 // A call whose own shape that algorithm cannot run takes the heuristic's first answer for its own
 // shape, which still does not move from run to run.
 template <typename Key, typename Choose, typename Run>
-cublasStatus_t run_consistently(std::map<Key, cublasLtMatmulAlgo_t> &table, const Key &key,
-                                cublasLtHandle_t handle, cublasLtMatmulDesc_t operation,
-                                cublasLtMatrixLayout_t weight, cublasLtMatrixLayout_t input,
-                                cublasLtMatrixLayout_t output,
+cublasStatus_t run_consistently(std::mutex &mutex, std::map<Key, cublasLtMatmulAlgo_t> &table,
+                                const Key &key, cublasLtHandle_t handle,
+                                cublasLtMatmulDesc_t operation, cublasLtMatrixLayout_t weight,
+                                cublasLtMatrixLayout_t input, cublasLtMatrixLayout_t output,
                                 cublasLtMatmulPreference_t preference, Choose choose, Run run) {
     const uint32_t reduction = CUBLASLT_REDUCTION_SCHEME_NONE;
     cublasLtMatmulPreferenceSetAttribute(preference, CUBLASLT_MATMUL_PREF_REDUCTION_SCHEME_MASK,
                                          &reduction, sizeof(reduction));
     cublasLtMatmulAlgo_t algorithm;
     {
-        const std::lock_guard<std::mutex> lock(consistent_mutex);
+        const std::lock_guard<std::mutex> lock(mutex);
         const auto found = table.find(key);
         if (found != table.end()) {
             algorithm = found->second;
@@ -253,7 +263,15 @@ extern "C" const char *mmh3_cublaslt_status_string(int code) {
 extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *weight,
                                     const void *bias, void *output, int64_t m, int64_t n, int64_t k,
                                     float alpha, float beta, cudaStream_t stream) {
-    thread_local ThreadState state;
+    // A handle and workspace per device, since the workspace lives on the device it was made on
+    // and a thread may compute on another one later.
+    thread_local ThreadState states[MMH3_MAX_DEVICES];
+    const int device = mmh3_current_device();
+    Tables *const table = tables_of(device);
+    if (table == nullptr) {
+        return static_cast<int>(cudaErrorInvalidDevice);
+    }
+    ThreadState &state = states[device];
     if (const int prepared = state.prepare(); prepared != 0) {
         return prepared;
     }
@@ -301,9 +319,9 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     };
     if (consistent()) {
         return status_code(run_consistently(
-            consistent_matmul, std::make_tuple(kind, n, k, bias != nullptr), state.handle,
-            descriptors.operation, descriptors.weight, descriptors.input, descriptors.output,
-            descriptors.preference,
+            table->consistent_mutex, table->consistent_matmul,
+            std::make_tuple(kind, n, k, bias != nullptr), state.handle, descriptors.operation,
+            descriptors.weight, descriptors.input, descriptors.output, descriptors.preference,
             [&](cublasLtMatmulAlgo_t *algorithm) {
                 return consistent_algorithm(state.handle, descriptors.operation, descriptors.weight,
                                             data_type, data_type, n, k, descriptors.preference,
@@ -316,14 +334,14 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     // operands and keeps the fastest. A call that accumulates cannot be repeated, so it takes the
     // algorithm of the same shape without one, or the heuristic's first result.
     const MatmulKey key = std::make_tuple(kind, m, n, k, bias != nullptr);
-    const std::lock_guard<std::mutex> lock(matmul_algorithms_mutex);
-    const auto found = matmul_algorithms.find(key);
-    if (found != matmul_algorithms.end()) {
+    const std::lock_guard<std::mutex> lock(table->matmul_mutex);
+    const auto found = table->matmul.find(key);
+    if (found != table->matmul.end()) {
         status = run(&found->second);
         if (status == CUBLAS_STATUS_SUCCESS) {
             return 0;
         }
-        matmul_algorithms.erase(found);
+        table->matmul.erase(found);
     }
     cublasLtMatmulHeuristicResult_t results[MATMUL_CANDIDATES];
     int returned = 0;
@@ -365,7 +383,7 @@ extern "C" int mmh3_cublaslt_matmul(int kind, const void *input, const void *wei
     if (chosen < 0) {
         return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
     }
-    matmul_algorithms[key] = results[chosen].algo;
+    table->matmul[key] = results[chosen].algo;
     return status_code(run(&results[chosen].algo));
 }
 
@@ -381,7 +399,15 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
                                    const void *activations, const void *activation_scales,
                                    const float *alpha_beta, void *output, int64_t m, int64_t n,
                                    int64_t k, cudaStream_t stream) {
-    thread_local ThreadState state;
+    // A handle and workspace per device, since the workspace lives on the device it was made on
+    // and a thread may compute on another one later.
+    thread_local ThreadState states[MMH3_MAX_DEVICES];
+    const int device = mmh3_current_device();
+    Tables *const table = tables_of(device);
+    if (table == nullptr) {
+        return static_cast<int>(cudaErrorInvalidDevice);
+    }
+    ThreadState &state = states[device];
     if (const int prepared = state.prepare(); prepared != 0) {
         return prepared;
     }
@@ -437,8 +463,9 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
     };
     if (consistent()) {
         return status_code(run_consistently(
-            consistent_nvfp4, std::make_tuple(n, k), state.handle, descriptors.operation,
-            descriptors.weight, descriptors.input, descriptors.output, descriptors.preference,
+            table->consistent_mutex, table->consistent_nvfp4, std::make_tuple(n, k), state.handle,
+            descriptors.operation, descriptors.weight, descriptors.input, descriptors.output,
+            descriptors.preference,
             [&](cublasLtMatmulAlgo_t *algorithm) {
                 return consistent_algorithm(state.handle, descriptors.operation, descriptors.weight,
                                             CUDA_R_4F_E2M1, CUDA_R_16BF, n, k,
@@ -446,15 +473,15 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
             },
             run));
     }
-    const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
-    const auto found = nvfp4_algorithms.find(key);
-    if (found != nvfp4_algorithms.end()) {
+    const std::lock_guard<std::mutex> lock(table->nvfp4_mutex);
+    const auto found = table->nvfp4.find(key);
+    if (found != table->nvfp4.end()) {
         status = run(&found->second);
         if (status == CUBLAS_STATUS_SUCCESS) {
             return 0;
         }
         // An algorithm taken over from an earlier process may not run here.
-        nvfp4_algorithms.erase(found);
+        table->nvfp4.erase(found);
     }
     cublasLtMatmulHeuristicResult_t results[NVFP4_CANDIDATES];
     int returned = 0;
@@ -489,16 +516,21 @@ extern "C" int mmh3_cublaslt_nvfp4(const void *weights, const void *weight_scale
     if (best_index < 0) {
         return status_code(CUBLAS_STATUS_NOT_SUPPORTED);
     }
-    nvfp4_algorithms[key] = results[best_index].algo;
+    table->nvfp4[key] = results[best_index].algo;
     return status_code(run(&results[best_index].algo));
 }
 
-// Copies up to `capacity` of the algorithms chosen for NVFP4 GEMM shapes to `algorithms` and
-// returns how many there are.
-extern "C" int mmh3_cublaslt_nvfp4_algorithms(Mmh3Nvfp4Algorithm *algorithms, int capacity) {
-    const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
+// Copies up to `capacity` of the algorithms chosen for NVFP4 GEMM shapes on `device` to
+// `algorithms` and returns how many there are.
+extern "C" int mmh3_cublaslt_nvfp4_algorithms(int device, Mmh3Nvfp4Algorithm *algorithms,
+                                              int capacity) {
+    Tables *const table = tables_of(device);
+    if (table == nullptr) {
+        return 0;
+    }
+    const std::lock_guard<std::mutex> lock(table->nvfp4_mutex);
     int index = 0;
-    for (const auto &[shape, algorithm] : nvfp4_algorithms) {
+    for (const auto &[shape, algorithm] : table->nvfp4) {
         if (index < capacity) {
             algorithms[index].m = std::get<0>(shape);
             algorithms[index].n = std::get<1>(shape);
@@ -512,30 +544,31 @@ extern "C" int mmh3_cublaslt_nvfp4_algorithms(Mmh3Nvfp4Algorithm *algorithms, in
     return index;
 }
 
-// Takes over algorithms for NVFP4 GEMM shapes that have none chosen yet.
-extern "C" void mmh3_cublaslt_nvfp4_adopt(const Mmh3Nvfp4Algorithm *algorithms, int count) {
-    const std::lock_guard<std::mutex> lock(nvfp4_algorithms_mutex);
+// Takes over algorithms for NVFP4 GEMM shapes on `device` that have none chosen yet.
+extern "C" void mmh3_cublaslt_nvfp4_adopt(int device, const Mmh3Nvfp4Algorithm *algorithms,
+                                          int count) {
+    Tables *const table = tables_of(device);
+    if (table == nullptr) {
+        return;
+    }
+    const std::lock_guard<std::mutex> lock(table->nvfp4_mutex);
     for (int index = 0; index < count; index++) {
         cublasLtMatmulAlgo_t algorithm;
         for (int word = 0; word < 8; word++) {
             algorithm.data[word] = algorithms[index].data[word];
         }
-        nvfp4_algorithms.emplace(
+        table->nvfp4.emplace(
             std::make_tuple(algorithms[index].m, algorithms[index].n, algorithms[index].k),
             algorithm);
     }
 }
 
-// Writes a line naming what a table of chosen algorithms depends on, the cuBLASLt version, the
-// GPU, the descriptors and the rule that picked between the candidates, to `key`, which holds
-// `capacity` bytes.
-static int algorithm_key(char *key, int capacity, const char *table, int format) {
-    int device = 0;
+// Writes a line naming what a table of chosen algorithms on `device` depends on, the cuBLASLt
+// version, the GPU, the descriptors and the rule that picked between the candidates, to `key`,
+// which holds `capacity` bytes.
+static int algorithm_key(int device, char *key, int capacity, const char *table, int format) {
     cudaDeviceProp properties;
-    cudaError_t status = cudaGetDevice(&device);
-    if (status == cudaSuccess) {
-        status = cudaGetDeviceProperties(&properties, device);
-    }
+    const cudaError_t status = cudaGetDeviceProperties(&properties, device);
     if (status != cudaSuccess) {
         return static_cast<int>(status);
     }
@@ -546,20 +579,25 @@ static int algorithm_key(char *key, int capacity, const char *table, int format)
     return written < 0 || written >= capacity ? static_cast<int>(cudaErrorInvalidValue) : 0;
 }
 
-extern "C" int mmh3_cublaslt_nvfp4_algorithm_key(char *key, int capacity) {
-    return algorithm_key(key, capacity, "NVFP4", NVFP4_ALGORITHM_FORMAT);
+extern "C" int mmh3_cublaslt_nvfp4_algorithm_key(int device, char *key, int capacity) {
+    return algorithm_key(device, key, capacity, "NVFP4", NVFP4_ALGORITHM_FORMAT);
 }
 
-extern "C" int mmh3_cublaslt_matmul_algorithm_key(char *key, int capacity) {
-    return algorithm_key(key, capacity, "matmul", MATMUL_ALGORITHM_FORMAT);
+extern "C" int mmh3_cublaslt_matmul_algorithm_key(int device, char *key, int capacity) {
+    return algorithm_key(device, key, capacity, "matmul", MATMUL_ALGORITHM_FORMAT);
 }
 
-// Copies up to `capacity` of the algorithms chosen for ordinary GEMM shapes to `algorithms` and
-// returns how many there are.
-extern "C" int mmh3_cublaslt_matmul_algorithms(Mmh3MatmulAlgorithm *algorithms, int capacity) {
-    const std::lock_guard<std::mutex> lock(matmul_algorithms_mutex);
+// Copies up to `capacity` of the algorithms chosen for ordinary GEMM shapes on `device` to
+// `algorithms` and returns how many there are.
+extern "C" int mmh3_cublaslt_matmul_algorithms(int device, Mmh3MatmulAlgorithm *algorithms,
+                                               int capacity) {
+    Tables *const table = tables_of(device);
+    if (table == nullptr) {
+        return 0;
+    }
+    const std::lock_guard<std::mutex> lock(table->matmul_mutex);
     int index = 0;
-    for (const auto &[key, algorithm] : matmul_algorithms) {
+    for (const auto &[key, algorithm] : table->matmul) {
         if (index < capacity) {
             algorithms[index].kind = std::get<0>(key);
             algorithms[index].bias = std::get<4>(key) ? 1 : 0;
@@ -586,17 +624,22 @@ extern "C" void mmh3_cublaslt_consistent_on_this_thread(int consistent) {
     consistent_here = consistent < 0 ? -1 : (consistent != 0 ? 1 : 0);
 }
 
-// Takes over algorithms for ordinary GEMM shapes that have none chosen yet.
-extern "C" void mmh3_cublaslt_matmul_adopt(const Mmh3MatmulAlgorithm *algorithms, int count) {
-    const std::lock_guard<std::mutex> lock(matmul_algorithms_mutex);
+// Takes over algorithms for ordinary GEMM shapes on `device` that have none chosen yet.
+extern "C" void mmh3_cublaslt_matmul_adopt(int device, const Mmh3MatmulAlgorithm *algorithms,
+                                           int count) {
+    Tables *const table = tables_of(device);
+    if (table == nullptr) {
+        return;
+    }
+    const std::lock_guard<std::mutex> lock(table->matmul_mutex);
     for (int index = 0; index < count; index++) {
         cublasLtMatmulAlgo_t algorithm;
         for (int word = 0; word < 8; word++) {
             algorithm.data[word] = algorithms[index].data[word];
         }
-        matmul_algorithms.emplace(std::make_tuple(static_cast<int>(algorithms[index].kind),
-                                                  algorithms[index].m, algorithms[index].n,
-                                                  algorithms[index].k, algorithms[index].bias != 0),
-                                  algorithm);
+        table->matmul.emplace(std::make_tuple(static_cast<int>(algorithms[index].kind),
+                                              algorithms[index].m, algorithms[index].n,
+                                              algorithms[index].k, algorithms[index].bias != 0),
+                              algorithm);
     }
 }
