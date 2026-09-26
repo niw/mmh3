@@ -129,152 +129,228 @@ kernel void mpp_lora(device float *a [[buffer(0)]], device half *b [[buffer(1)]]
     }
 }
 
-// Flash attention on the matrix units for heads of D, 64 or 128. A threadgroup of eight SIMD
-// groups owns 128 queries of one head and walks the keys 64 at a time. Q·Kᵀ and P·V are tensor
-// products in FP16 with FP32 accumulation, which the eight groups run together: that is the shape
-// that keeps the matrix units busy, where a group running its own rows leaves them mostly idle.
-//
-// The online softmax runs between the products, two threads a query row. The scores go to
-// threadgroup memory as FP32, and the FP16 probabilities are written back over them, so the
-// 32 KB a threadgroup has holds both. A row's probabilities fill the first half of its 256 bytes,
-// and its correction sits in the last four.
-//
-// Rescaling the output for a new maximum costs as much as the softmax, so a row moves its
-// reference only when a score passes it by more than RAISE. Probabilities then reach e^RAISE,
-// which FP16 holds, and a tile where no row moved skips the rescale. Whether any row of a SIMD
-// group moved goes in the float before the correction of the group's first row.
-constant constexpr int ATTENTION_QUERIES = 128, ATTENTION_KEYS = 64;
-constant constexpr float RAISE = 8;
+// Flash attention on the matrix units, after MLX's attention for the Neural Accelerators: each SIMD
+// group owns 16 query rows and keeps their scores, softmax and output in its registers, as 16 × 16
+// fragments of the matrix units' cooperative tensors, so no threadgroup memory or barrier is
+// needed. A fragment's lane holds rows r and r + 8 and four of the columns from c, the same in
+// both. Products take FP16 queries, keys and values with FP32 accumulation, and the scores stay
+// FP32 into the product with the values. The scores are in log2 units.
+constant constexpr int FRAGMENT = 16, ATTENTION_QUERIES = 64, ATTENTION_KEYS = 32;
 
-template <int D>
-void flash_attention(device half *q, device half *k, device half *v, device float *o,
-                     constant uint *p, uint g, uint tid, uint simd, uint lane,
-                     threadgroup float *scores) {
-    constexpr int QUERIES = ATTENTION_QUERIES, KEYS = ATTENTION_KEYS;
-    constexpr int SPAN = KEYS / 2, LAST = KEYS - 1;
-    const int count = p[0], heads = p[1], kv_heads = p[2], causal = p[4], rows = p[5];
-    const int head = g % heads, first = (g / heads) * QUERIES;
-    const int kv_head = head / (heads / kv_heads);
-    const int limit = causal ? min(count, first + QUERIES) : count;
-    const float scale = rsqrt(float(D));
-    threadgroup half *probabilities = (threadgroup half *)scores;
+using fragment_half = vec<half, 8>;
+using fragment_float = vec<float, 8>;
 
-    using Tile = tensor<device half, dextents<int, 2>, tensor_inline>;
-    using Shared = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
-    Tile queries(q + (first * heads + head) * D, dextents<int, 2>(D, min(QUERIES, rows - first)),
-                 array<int, 2>{1, heads * D});
+// Where the cooperative tensors put their elements depends on the GPU, so the runtime sets
+// FRAGMENT_PAIRS for one without the Neural Accelerators. There a lane holds columns c, c + 1,
+// c + 8 and c + 9 of a fragment rather than c to c + 3, a 16 × 32 tensor goes through its two
+// fragments' first rows before their second, and the right operand of a product with b transposed
+// holds its columns of b by the lane's rows. Either way, the lanes that hold a row differ in bits 0
+// and 3.
+#ifndef FRAGMENT_PAIRS
+#define FRAGMENT_PAIRS 0
+#endif
 
-    constexpr auto score_desc =
-        matmul2d_descriptor(QUERIES, KEYS, dynamic_length_v<int>, false, true, false);
-    matmul2d<score_desc, execution_simdgroups<8>> score_op;
-    constexpr auto value_desc =
-        matmul2d_descriptor(QUERIES, D, dynamic_length_v<int>, false, false, false,
-                            matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<value_desc, execution_simdgroups<8>> value_op;
+// The column c and first row r of a lane's elements in a fragment.
+short2 fragment_coord(ushort lane) {
+    const short row = (lane & 16) >> 2 | ((lane >> 1) & 3);
+    return FRAGMENT_PAIRS ? short2{short((lane & 1) * 2 + ((lane >> 3) & 1) * 4), row}
+                          : short2{short((lane & 1) * 4 + ((lane >> 3) & 1) * 8), row};
+}
 
-    auto out = value_op.template get_destination_cooperative_tensor<Shared, Tile, float>();
-#pragma unroll
-    for (uint i = 0; i < out.get_capacity(); ++i)
-        if (out.is_valid_element(i))
-            out[i] = 0;
+// How far the j-th of a lane's four columns in a fragment is from its first, c.
+constexpr short fragment_column(short j) { return FRAGMENT_PAIRS ? (j & 1) + (j >> 1) * 8 : j; }
 
-    const int row = tid / 2, column = (tid % 2) * SPAN;
-    const bool live = first + row < rows;
-    // The reference is -∞ until the row has seen a key.
-    float reference = -INFINITY, total = 0;
-    for (int base = 0; base < limit; base += KEYS) {
-        const int length = min(KEYS, count - base);
-        Tile keys(k + (base * kv_heads + kv_head) * D, dextents<int, 2>(D, length),
-                  array<int, 2>{1, kv_heads * D});
-        auto s = score_op.template get_destination_cooperative_tensor<Tile, Tile, float>();
-        score_op.run(queries, keys, s);
-#pragma unroll
-        for (uint i = 0; i < s.get_capacity(); ++i) {
-            if (s.is_valid_element(i)) {
-                auto xy = s.get_multidimensional_index(i);
-                scores[xy[1] * KEYS + xy[0]] = s[i];
+// A fragment of `src`, rows `stride` apart, or with RIGHT the right operand of a product with b
+// transposed that `src` holds, b's columns as its rows. With CHECK, only its first `rows` rows are
+// read and the rest are zero; a whole block skips the checks, which slow the attention down
+// markedly. A lane's columns are offsets from one address, so that the consecutive ones are read
+// together.
+template <bool CHECK, bool RIGHT = false>
+fragment_half load_fragment(device const half *src, int stride, int rows, short2 at) {
+    fragment_half out;
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+        const int r = at.y + i * 8;
+        _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+            const short column = fragment_column(j);
+            if constexpr (RIGHT && FRAGMENT_PAIRS) {
+                out[i * 4 + j] =
+                    !CHECK || at.x + column < rows ? src[(at.x + column) * stride + r] : half(0);
+            } else {
+                out[i * 4 + j] = !CHECK || r < rows ? src[r * stride + at.x + column] : half(0);
             }
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    return out;
+}
 
-        float x[SPAN], local = -INFINITY;
-#pragma unroll
-        for (int c = 0; c < SPAN; ++c) {
-            const int key = base + column + c;
-            const bool seen = live && key < count && !(causal && key > first + row);
-            x[c] = seen ? scores[row * KEYS + column + c] * scale : -INFINITY;
-            local = max(local, x[c]);
-        }
-        local = max(local, simd_shuffle_xor(local, 1));
-        float correction = 1;
-        if (reference == -INFINITY) {
-            reference = local;
-        } else if (local > reference + RAISE) {
-            correction = exp(reference - local);
-            reference = local;
-        }
-        // A row with no key seen yet takes nothing from this tile.
-        const float offset = reference == -INFINITY ? 0.0f : reference;
-        float sum = 0;
-#pragma unroll
-        for (int c = 0; c < SPAN; ++c) {
-            x[c] = exp(x[c] - offset);
-            sum += x[c];
-        }
-        sum += simd_shuffle_xor(sum, 1);
-        total = total * correction + sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+// Which fragment of a 16 × 32 tensor, and which of its elements, is the tensor's element i.
+constexpr short fragment_of(short i) { return FRAGMENT_PAIRS ? (i >> 2) & 1 : i >> 3; }
+constexpr short element_of(short i) { return FRAGMENT_PAIRS ? (i >> 3) << 2 | (i & 3) : i & 7; }
 
-#pragma unroll
-        for (int c = 0; c < SPAN; ++c)
-            probabilities[row * 2 * KEYS + column + c] = half(x[c]);
-        if (column == 0)
-            scores[row * KEYS + LAST] = correction;
-        const bool moved = simd_any(correction != 1);
-        if (lane == 0)
-            scores[simd * KEYS + LAST - 1] = moved;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+// c (16 × 32, two fragments) += a (16 × 16) · b (16 × 32, two fragments), with b transposed when
+// TRANSPOSE: then its fragments are its rows 0 to 15 and 16 to 31 as stored, loaded with RIGHT.
+template <bool TRANSPOSE, typename A>
+void multiply_fragments(thread fragment_float &c0, thread fragment_float &c1,
+                        thread const vec<A, 8> &a, thread const fragment_half &b0,
+                        thread const fragment_half &b1) {
+    constexpr auto desc = matmul2d_descriptor(FRAGMENT, 2 * FRAGMENT, FRAGMENT, false, TRANSPOSE,
+                                              true, matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto left = op.template get_left_input_cooperative_tensor<A, half, float>();
+    auto right = op.template get_right_input_cooperative_tensor<A, half, float>();
+    auto out = op.template get_destination_cooperative_tensor<
+        remove_addrspace_t<decltype(left)>, remove_addrspace_t<decltype(right)>, float>();
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 8; ++i) left[i] = a[i];
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 16; ++i) {
+        const short e = element_of(i);
+        right[i] = fragment_of(i) ? b1[e] : b0[e];
+        out[i] = fragment_of(i) ? c1[e] : c0[e];
+    }
+    op.run(left, right, out);
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 16; ++i) {
+        if (fragment_of(i))
+            c1[element_of(i)] = out[i];
+        else
+            c0[element_of(i)] = out[i];
+    }
+}
 
-        bool rescale = false;
-        for (int group = 0; group < 8; ++group)
-            rescale |= scores[group * KEYS + LAST - 1] != 0;
+// The running softmax of a SIMD group's 16 query rows over the keys seen so far: its output before
+// the division, and each of the lane's two rows' reference and total.
+template <int D> struct AttentionState {
+    fragment_float out[D / FRAGMENT];
+    float reference[2] = {-INFINITY, -INFINITY}, total[2] = {0, 0};
 
-        if (rescale) {
-#pragma unroll
-            for (uint i = 0; i < out.get_capacity(); ++i)
-                if (out.is_valid_element(i))
-                    out[i] *= scores[out.get_multidimensional_index(i)[1] * KEYS + LAST];
-        }
-        Shared weights(probabilities, dextents<int, 2>(length, QUERIES),
-                       array<int, 2>{1, 2 * KEYS});
-        Tile values(v + (base * kv_heads + kv_head) * D, dextents<int, 2>(D, length),
-                    array<int, 2>{1, kv_heads * D});
-        value_op.run(weights, values, out);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    AttentionState() {
+        _Pragma("clang loop unroll(full)") for (short f = 0; f < D / FRAGMENT; ++f) out[f] = 0;
     }
 
-    if (column == 0)
-        scores[row * KEYS + LAST] = total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-#pragma unroll
-    for (uint i = 0; i < out.get_capacity(); ++i) {
-        if (out.is_valid_element(i)) {
-            auto xy = out.get_multidimensional_index(i);
-            const int r = first + xy[1];
-            if (r < rows && xy[0] < D)
-                o[(r * heads + head) * D + xy[0]] = out[i] / scores[xy[1] * KEYS + LAST];
+    // Takes in up to 32 keys: `keys` and `values` point at the first, rows `kv_stride` apart, and
+    // `length` of them are real. `queries` are the group's rows, `rows` of them real. `seen` says
+    // whether a (row, key) pair takes part, and `offset` is taken off each of the lane's rows.
+    template <bool CHECK, typename Seen>
+    void attend(device const half *queries, int q_stride, int rows, device const half *keys,
+                device const half *values, int kv_stride, int length, float scale_log2,
+                thread const float *offset, Seen seen, short2 at) {
+        constexpr int PARTS = D / FRAGMENT;
+        // The SIMD groups take each block together, so that its keys and values are read into
+        // the cache once for all four.
+        threadgroup_barrier(mem_flags::mem_none);
+        fragment_float s[2] = {0, 0};
+        _Pragma("clang loop unroll(full)") for (short part = 0; part < PARTS; ++part) {
+            const fragment_half a =
+                load_fragment<CHECK>(queries + part * FRAGMENT, q_stride, rows, at);
+            const fragment_half b0 =
+                load_fragment<CHECK, true>(keys + part * FRAGMENT, kv_stride, length, at);
+            const fragment_half b1 = load_fragment<CHECK, true>(
+                keys + FRAGMENT * kv_stride + part * FRAGMENT, kv_stride, length - FRAGMENT, at);
+            multiply_fragments<true>(s[0], s[1], a, b0, b1);
         }
+
+        float maximum[2];
+        _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+            maximum[i] = reference[i];
+            _Pragma("clang loop unroll(full)") for (short f = 0; f < 2; ++f) {
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const int key = f * FRAGMENT + at.x + fragment_column(j);
+                    const float x = key < length && seen(at.y + i * 8, key)
+                                        ? s[f][i * 4 + j] * scale_log2 - offset[i]
+                                        : -INFINITY;
+                    s[f][i * 4 + j] = x;
+                    maximum[i] = max(maximum[i], x);
+                }
+            }
+            maximum[i] = max(maximum[i], simd_shuffle_xor(maximum[i], 1));
+            maximum[i] = max(maximum[i], simd_shuffle_xor(maximum[i], 8));
+        }
+        _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+            // A row with no key seen yet takes nothing from this block.
+            const float shift = maximum[i] == -INFINITY ? 0.0f : maximum[i];
+            const float correction = reference[i] == -INFINITY ? 0.0f : exp2(reference[i] - shift);
+            float sum = 0;
+            _Pragma("clang loop unroll(full)") for (short f = 0; f < 2; ++f) {
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const float x = exp2(s[f][i * 4 + j] - shift);
+                    s[f][i * 4 + j] = x;
+                    sum += x;
+                }
+            }
+            sum += simd_shuffle_xor(sum, 1);
+            sum += simd_shuffle_xor(sum, 8);
+            total[i] = total[i] * correction + sum;
+            reference[i] = maximum[i];
+            _Pragma("clang loop unroll(full)") for (short f = 0; f < PARTS; ++f)
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j)
+                    out[f][i * 4 + j] *= correction;
+        }
+
+        _Pragma("clang loop unroll(full)")
+
+            for (short part = 0; part < PARTS; part += 2) {
+            _Pragma("clang loop unroll(full)") for (short half_block = 0; half_block < 2;
+                                                    ++half_block) {
+                device const half *rows_of = values + half_block * FRAGMENT * kv_stride;
+                const int left = length - half_block * FRAGMENT;
+                const fragment_half b0 =
+                    load_fragment<CHECK>(rows_of + part * FRAGMENT, kv_stride, left, at);
+                const fragment_half b1 =
+                    load_fragment<CHECK>(rows_of + (part + 1) * FRAGMENT, kv_stride, left, at);
+                multiply_fragments<false>(out[part], out[part + 1], s[half_block], b0, b1);
+            }
+        }
+    }
+};
+
+// Dense attention for heads of D, grouped heads and a causal mask included: a threadgroup of four
+// SIMD groups takes 64 queries of one head.
+template <int D>
+void flash_attention(device half *q, device half *k, device half *v, device float *o,
+                     constant uint *p, uint g, uint simd, uint lane) {
+    const int count = p[0], heads = p[1], kv_heads = p[2], causal = p[4], rows = p[5];
+    // Threadgroups take a head's query blocks one after another, so the ones running together
+    // read the same keys and values, which then stay in the cache. Taking the heads of one block
+    // together instead is far slower.
+    const int blocks = (rows + ATTENTION_QUERIES - 1) / ATTENTION_QUERIES;
+    const int head = g / blocks, kv_head = head / (heads / kv_heads), block = g % blocks;
+    const int first = block * ATTENTION_QUERIES + simd * FRAGMENT;
+    // A group past the last query still takes every block, since the four take them together.
+    const int mine = rows - first;
+    const short2 at = fragment_coord(lane);
+    const float scale_log2 = rsqrt(float(D)) * M_LOG2E_F, offset[2] = {0, 0};
+    const int q_stride = heads * D, kv_stride = kv_heads * D;
+    device const half *queries = q + (first * heads + head) * D;
+    const int limit = causal ? min(count, (block + 1) * ATTENTION_QUERIES) : count;
+    AttentionState<D> state;
+    for (int base = 0; base < limit; base += ATTENTION_KEYS) {
+        device const half *keys = k + (base * kv_heads + kv_head) * D;
+        device const half *values = v + (base * kv_heads + kv_head) * D;
+        const int length = min(ATTENTION_KEYS, count - base);
+        auto seen = [&](int row, int key) { return !causal || base + key <= first + row; };
+        if (length == ATTENTION_KEYS && mine >= FRAGMENT)
+            state.template attend<false>(queries, q_stride, mine, keys, values, kv_stride, length,
+                                         scale_log2, offset, seen, at);
+        else
+            state.template attend<true>(queries, q_stride, mine, keys, values, kv_stride, length,
+                                        scale_log2, offset, seen, at);
+    }
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+        const int r = at.y + i * 8;
+        if (r >= mine)
+            continue;
+        _Pragma("clang loop unroll(full)") for (short f = 0; f < D / FRAGMENT; ++f)
+            _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j)
+                o[((first + r) * heads + head) * D + f * FRAGMENT + at.x + fragment_column(j)] =
+                    state.out[f][i * 4 + j] / state.total[i];
     }
 }
 
 #define ATTENTION(D)                                                                               \
-    kernel void mpp_attention_##D(                                                                 \
+    [[kernel, max_total_threads_per_threadgroup(128)]] void mpp_attention_##D(                     \
         device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],  \
         device float *o [[buffer(3)]], constant uint *p [[buffer(4)]],                             \
-        uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],         \
-        uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {   \
-        threadgroup float scores[ATTENTION_QUERIES * ATTENTION_KEYS];                              \
-        flash_attention<D>(q, k, v, o, p, g, tid, simd, lane, scores);                             \
+        uint g [[threadgroup_position_in_grid]], uint simd [[simdgroup_index_in_threadgroup]],     \
+        uint lane [[thread_index_in_simdgroup]]) {                                                 \
+        flash_attention<D>(q, k, v, o, p, g, simd, lane);                                          \
     }
 ATTENTION(64)
 ATTENTION(128)
@@ -282,155 +358,86 @@ ATTENTION(128)
 
 // Block-sparse attention on the matrix units over heads of 128, the last step of Sol-Attn and VSA
 // (see ops.metal): flash_attention over the tiles one query tile attends token by token, a
-// threadgroup of four SIMD groups a query tile of at most 64 tokens, with the scores in log2
-// units. Sol-Attn centers the keys by their mean, which a row takes off its scores, and merges the
-// pooled tail at the end. Gated VSA adds the gate times the coarse output.
+// threadgroup of four SIMD groups a query tile of at most 64 tokens. Sol-Attn centers the keys by
+// their mean, which a row takes off its scores, and merges the pooled tail at the end. Gated VSA
+// adds the gate times the coarse output.
 //
 // Parameters: tiles, heads, the method (0 for Sol-Attn, 1 for VSA), whether VSA is gated, and the
 // scale in log2 units.
-kernel void mpp_sparse_attention_128(
+[[kernel, max_total_threads_per_threadgroup(128)]] void mpp_sparse_attention_128(
     device half *q [[buffer(0)]], device half *k [[buffer(1)]], device half *v [[buffer(2)]],
     device float *o [[buffer(3)]], device const uint *starts [[buffer(4)]],
     device const uint *lengths [[buffer(5)]], device const ushort *routes [[buffer(6)]],
     device const uint *counts [[buffer(7)]], device const float *tails [[buffer(8)]],
     device const float *key_mean [[buffer(9)]], device const float *gate [[buffer(10)]],
     constant uint *p [[buffer(11)]], uint g [[threadgroup_position_in_grid]],
-    uint tid [[thread_index_in_threadgroup]], uint simd [[simdgroup_index_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]]) {
-    constexpr int D = 128, QUERIES = 64, KEYS = 64, GROUPS = 4;
-    constexpr int SPAN = KEYS / 2, LAST = KEYS - 1, TAIL = D + 2;
-    threadgroup float scores[QUERIES * KEYS];
-    threadgroup half *probabilities = (threadgroup half *)scores;
+    uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int D = 128, TAIL = D + 2;
     const int tiles = p[0], heads = p[1], gated = p[3];
     const bool sol = p[2] == 0;
     const float scale_log2 = as_type<float>(p[4]);
     const int tile = g % tiles, head = g / tiles, index = g;
-    const int first = starts[tile], rows = lengths[tile];
+    const int first = starts[tile] + simd * FRAGMENT;
+    const int mine = int(lengths[tile]) - int(simd) * FRAGMENT;
+    const short2 at = fragment_coord(lane);
+    const int stride = heads * D;
+    device const half *queries = q + (first * heads + head) * D;
 
-    using Tile = tensor<device half, dextents<int, 2>, tensor_inline>;
-    using Shared = tensor<threadgroup half, dextents<int, 2>, tensor_inline>;
-    Tile queries(q + (first * heads + head) * D, dextents<int, 2>(D, rows),
-                 array<int, 2>{1, heads * D});
-    constexpr auto score_desc =
-        matmul2d_descriptor(QUERIES, KEYS, dynamic_length_v<int>, false, true, false);
-    matmul2d<score_desc, execution_simdgroups<GROUPS>> score_op;
-    constexpr auto value_desc =
-        matmul2d_descriptor(QUERIES, D, dynamic_length_v<int>, false, false, false,
-                            matmul2d_descriptor::mode::multiply_accumulate);
-    matmul2d<value_desc, execution_simdgroups<GROUPS>> value_op;
-
-    auto out = value_op.template get_destination_cooperative_tensor<Shared, Tile, float>();
-#pragma unroll
-    for (uint i = 0; i < out.get_capacity(); ++i)
-        if (out.is_valid_element(i))
-            out[i] = 0;
-
-    const int row = tid / 2, column = (tid % 2) * SPAN;
-    const bool live = row < rows;
-    // Sol-Attn scores the keys centered by their mean. Each of a row's two threads takes half of
-    // the dimensions.
-    float offset = 0;
-    if (sol && live) {
-        device const half *query = q + ((first + row) * heads + head) * D + (tid % 2) * (D / 2);
-        device const float *mean = key_mean + head * D + (tid % 2) * (D / 2);
-        for (int c = 0; c < D / 2; ++c)
-            offset += float(query[c]) * mean[c];
+    float offset[2] = {0, 0};
+    for (short i = 0; i < 2 && sol; ++i) {
+        const int r = at.y + i * 8;
+        if (r >= mine)
+            continue;
+        for (int d = 0; d < D; ++d)
+            offset[i] += float(queries[r * stride + d]) * key_mean[head * D + d];
+        offset[i] *= scale_log2;
     }
-    offset = (offset + simd_shuffle_xor(offset, 1)) * scale_log2;
 
-    float reference = -INFINITY, total = 0;
+    AttentionState<D> state;
     device const ushort *route = routes + index * tiles;
-    const int count = counts[index];
-    for (int entry = 0; entry < count; ++entry) {
+    for (int entry = 0; entry < int(counts[index]); ++entry) {
         const int base = starts[route[entry]], length = lengths[route[entry]];
-        Tile keys(k + (base * heads + head) * D, dextents<int, 2>(D, length),
-                  array<int, 2>{1, heads * D});
-        auto s = score_op.template get_destination_cooperative_tensor<Tile, Tile, float>();
-        score_op.run(queries, keys, s);
-#pragma unroll
-        for (uint i = 0; i < s.get_capacity(); ++i) {
-            if (s.is_valid_element(i)) {
-                auto xy = s.get_multidimensional_index(i);
-                scores[xy[1] * KEYS + xy[0]] = s[i];
-            }
+        for (int block = 0; block < length; block += ATTENTION_KEYS) {
+            const int at_key = ((base + block) * heads + head) * D;
+            const int keys = min(ATTENTION_KEYS, length - block);
+            auto seen = [](int, int) { return true; };
+            if (keys == ATTENTION_KEYS && mine >= FRAGMENT)
+                state.template attend<false>(queries, stride, mine, k + at_key, v + at_key, stride,
+                                             keys, scale_log2, offset, seen, at);
+            else
+                state.template attend<true>(queries, stride, mine, k + at_key, v + at_key, stride,
+                                            keys, scale_log2, offset, seen, at);
         }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float x[SPAN], local = -INFINITY;
-#pragma unroll
-        for (int c = 0; c < SPAN; ++c) {
-            const bool seen = live && column + c < length;
-            x[c] = seen ? scores[row * KEYS + column + c] * scale_log2 - offset : -INFINITY;
-            local = max(local, x[c]);
-        }
-        local = max(local, simd_shuffle_xor(local, 1));
-        float correction = 1;
-        if (reference == -INFINITY) {
-            reference = local;
-        } else if (local > reference + RAISE) {
-            correction = exp2(reference - local);
-            reference = local;
-        }
-        const float offset_row = reference == -INFINITY ? 0.0f : reference;
-        float sum = 0;
-#pragma unroll
-        for (int c = 0; c < SPAN; ++c) {
-            x[c] = exp2(x[c] - offset_row);
-            sum += x[c];
-        }
-        sum += simd_shuffle_xor(sum, 1);
-        total = total * correction + sum;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-#pragma unroll
-        for (int c = 0; c < SPAN; ++c)
-            probabilities[row * 2 * KEYS + column + c] = half(x[c]);
-        if (column == 0)
-            scores[row * KEYS + LAST] = correction;
-        const bool moved = simd_any(correction != 1);
-        if (lane == 0)
-            scores[simd * KEYS + LAST - 1] = moved;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        bool rescale = false;
-        for (int group = 0; group < GROUPS; ++group)
-            rescale |= scores[group * KEYS + LAST - 1] != 0;
-        if (rescale) {
-#pragma unroll
-            for (uint i = 0; i < out.get_capacity(); ++i)
-                if (out.is_valid_element(i))
-                    out[i] *= scores[out.get_multidimensional_index(i)[1] * KEYS + LAST];
-        }
-        Shared weights(probabilities, dextents<int, 2>(length, QUERIES),
-                       array<int, 2>{1, 2 * KEYS});
-        Tile values(v + (base * heads + head) * D, dextents<int, 2>(D, length),
-                    array<int, 2>{1, heads * D});
-        value_op.run(weights, values, out);
-        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (column == 0) {
-        scores[row * KEYS + LAST - 1] = reference;
-        scores[row * KEYS + LAST] = total;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Each row's weights for the routed keys and the pooled tail, worked out once. The loops
+    // are unrolled so the output fragments stay in registers: indexing them at run time here puts
+    // them in memory for the whole kernel, which made it far slower.
     device const float *tail = tails + index * TAIL;
-#pragma unroll
-    for (uint i = 0; i < out.get_capacity(); ++i) {
-        if (!out.is_valid_element(i))
-            continue;
-        auto xy = out.get_multidimensional_index(i);
-        const int r = xy[1], d = xy[0];
-        if (r >= rows || d >= D)
-            continue;
-        const float maximum = scores[r * KEYS + LAST - 1], sum = scores[r * KEYS + LAST];
-        const int at = ((first + r) * heads + head) * D + d;
+    float routed[2], pooled[2];
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
         if (sol) {
-            const float merged = max(maximum, tail[D]);
-            const float routed = exp2(maximum - merged), pooled = exp2(tail[D] - merged);
-            o[at] = (out[i] * routed + tail[d] * pooled) / (sum * routed + tail[D + 1] * pooled);
+            const float merged = max(state.reference[i], tail[D]);
+            const float inverse = 1.0f / (state.total[i] * exp2(state.reference[i] - merged) +
+                                          tail[D + 1] * exp2(tail[D] - merged));
+            routed[i] = exp2(state.reference[i] - merged) * inverse;
+            pooled[i] = exp2(tail[D] - merged) * inverse;
         } else {
-            o[at] = out[i] / sum + (gated ? gate[at] * tail[d] : 0.0f);
+            routed[i] = 1.0f / state.total[i];
+            pooled[i] = gated ? 1.0f : 0.0f;
+        }
+    }
+    _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+        const int r = at.y + i * 8;
+        if (r >= mine)
+            continue;
+        _Pragma("clang loop unroll(full)") for (short f = 0; f < D / FRAGMENT; ++f) {
+            _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                const int d = f * FRAGMENT + at.x + fragment_column(j),
+                          out = ((first + r) * heads + head) * D + d;
+                const float extra = sol ? tail[d] : gated ? gate[out] * tail[d] : 0.0f;
+                o[out] = state.out[f][i * 4 + j] * routed[i] + extra * pooled[i];
+            }
         }
     }
 }

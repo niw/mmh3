@@ -13,6 +13,7 @@ private final class Context {
     let library: MTLLibrary
     let tensorSource: String
     var tensorLibrary: MTLLibrary?
+    lazy var fragmentLayout = probeFragments()
     var pipelines: [String: MTLComputePipelineState] = [:]
     var pending: MTLCommandBuffer?
     var operations = 0
@@ -40,6 +41,53 @@ private final class Context {
         options.mathMode = .safe
         library = try device.makeLibrary(source: source, options: options)
         name = strdup(device.name)!
+    }
+
+    /// Where this GPU's cooperative tensors put a lane's elements, found by running `fragmentProbe`
+    /// once. The kernels in matmul.metal keep their fragments in registers in one of two layouts,
+    /// and a GPU that uses neither runs none of them.
+    func probeFragments() -> FragmentLayout {
+        guard #available(macOS 26.0, *), device.supportsFamily(.apple7) else {
+            return .unknown
+        }
+
+        do {
+            let options = MTLCompileOptions()
+            options.languageVersion = .version4_0
+            let library = try device.makeLibrary(source: fragmentProbe, options: options)
+            guard let function = library.makeFunction(name: "fragment_probe"),
+                  let output = device.makeBuffer(
+                      length: fragmentProbeValues * MemoryLayout<Int32>.stride,
+                      options: .storageModeShared
+                  ),
+                  let commands = queue.makeCommandBuffer(),
+                  let encoder = commands.makeComputeCommandEncoder()
+            else {
+                return .unknown
+            }
+
+            let pipeline = try device.makeComputePipelineState(function: function)
+            encoder.setComputePipelineState(pipeline)
+            encoder.setBuffer(output, offset: 0, index: 0)
+            encoder.dispatchThreadgroups(
+                MTLSize(width: 1, height: 1, depth: 1),
+                threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+            )
+            encoder.endEncoding()
+            commands.commit()
+            commands.waitUntilCompleted()
+            guard commands.status == .completed else {
+                return .unknown
+            }
+
+            let values = UnsafeBufferPointer(
+                start: output.contents().bindMemory(to: Int32.self, capacity: fragmentProbeValues),
+                count: fragmentProbeValues
+            )
+            return [FragmentLayout.consecutive, .pairs].first { $0.matches(values) } ?? .unknown
+        } catch {
+            return .unknown
+        }
     }
 
     func command() throws -> MTLCommandBuffer {
@@ -111,6 +159,112 @@ private final class Context {
         // Complete outstanding work even when unwinding an earlier Rust error.
         try? synchronize()
         free(name)
+    }
+}
+
+/// Writes where the cooperative tensors of the 16 × 32 × 16 products in matmul.metal put each lane's
+/// elements: for the left operand, the right one and the destination, with b transposed and not, in
+/// FP16 and INT8, a lane's capacity and then each element's two indices.
+private let fragmentProbe = """
+#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+#include <metal_stdlib>
+using namespace metal;
+using namespace mpp::tensor_ops;
+
+template <typename T> void put(device int *out, ushort lane, thread T &tensor) {
+    device int *o = out + lane * 33;
+    o[0] = int(tensor.get_capacity());
+    for (ushort i = 0; i < 16 && i < tensor.get_capacity(); ++i) {
+        auto index = tensor.get_multidimensional_index(i);
+        o[1 + i * 2] = int(index[0]);
+        o[2 + i * 2] = int(index[1]);
+    }
+}
+
+template <bool TRANSPOSE, typename A, typename B, typename C>
+void probe(device int *out, ushort lane) {
+    constexpr auto desc = matmul2d_descriptor(16, 32, 16, false, TRANSPOSE, true,
+                                              matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto left = op.template get_left_input_cooperative_tensor<A, B, C>();
+    auto right = op.template get_right_input_cooperative_tensor<A, B, C>();
+    auto destination = op.template get_destination_cooperative_tensor<
+        remove_addrspace_t<decltype(left)>, remove_addrspace_t<decltype(right)>, C>();
+    put(out, lane, left);
+    put(out + 32 * 33, lane, right);
+    put(out + 64 * 33, lane, destination);
+}
+
+kernel void fragment_probe(device int *out [[buffer(0)]],
+                           ushort lane [[thread_index_in_simdgroup]]) {
+    probe<true, half, half, float>(out, lane);
+    probe<false, half, half, float>(out + 96 * 33, lane);
+    probe<true, int8_t, int8_t, int>(out + 192 * 33, lane);
+    probe<false, int8_t, int8_t, int>(out + 288 * 33, lane);
+}
+"""
+
+/// Four products of three tensors of 32 lanes, each a capacity and 16 pairs of indices.
+private let fragmentProbeValues = 4 * 3 * 32 * 33
+
+/// Where the kernels in matmul.metal expect the cooperative tensors to put a lane's elements, as
+/// FRAGMENT_PAIRS there says.
+enum FragmentLayout {
+    /// Columns c to c + 3 of a lane's rows r and r + 8, as on GPUs with the Neural Accelerators.
+    case consecutive
+    /// Columns c, c + 1, c + 8 and c + 9, as on the GPUs before them.
+    case pairs
+    case unknown
+
+    /// Whether `values`, which `fragmentProbe` wrote, put every element where this layout does.
+    func matches(_ values: UnsafeBufferPointer<Int32>) -> Bool {
+        for product in 0 ..< 4 {
+            let transposed = product % 2 == 0
+            for role in 0 ..< 3 {
+                for lane in 0 ..< 32 {
+                    let at = ((product * 3 + role) * 32 + lane) * 33
+                    let capacity = role == 0 ? 8 : 16
+                    guard values[at] == capacity else {
+                        return false
+                    }
+
+                    for i in 0 ..< capacity {
+                        let (x, y) = index(role: role, transposed: transposed, lane: lane, element: i)
+                        guard values[at + 1 + i * 2] == x, values[at + 2 + i * 2] == y else {
+                            return false
+                        }
+                    }
+                }
+            }
+        }
+
+        return true
+    }
+
+    /// The two indices get_multidimensional_index gives the element i of a lane in the left
+    /// operand (role 0), the right one (1) or the destination (2), as matmul.metal's
+    /// fragment_coord, fragment_column, fragment_of and element_of place it.
+    private func index(role: Int, transposed: Bool, lane: Int, element i: Int) -> (Int32, Int32) {
+        let pairs = self == .pairs
+        let row = (lane & 16) >> 2 | (lane >> 1) & 3
+        let column = pairs ? (lane & 1) * 2 + (lane >> 3 & 1) * 4 : (lane & 1) * 4 + (lane >> 3 & 1) * 8
+        func place(_ e: Int) -> (x: Int, y: Int) {
+            let j = e & 3
+            return (column + (pairs ? (j & 1) + (j >> 1) * 8 : j), row + (e >> 2) * 8)
+        }
+
+        if role == 0 {
+            let at = place(i)
+            return (Int32(at.x), Int32(at.y))
+        }
+
+        let f = pairs ? (i >> 2) & 1 : i >> 3
+        let at = place(pairs ? (i >> 3) << 2 | (i & 3) : i & 7)
+        if role == 1, transposed {
+            return pairs ? (Int32(at.y), Int32(at.x + 16 * f)) : (Int32(at.x), Int32(at.y + 16 * f))
+        }
+
+        return (Int32(at.x + 16 * f), Int32(at.y))
     }
 }
 
@@ -325,10 +479,19 @@ func metalDispatch(
                             throw BridgeError.message("MPP TensorOps requires macOS 26 and an Apple silicon GPU")
                         }
 
+                        guard ctx.fragmentLayout != .unknown else {
+                            throw BridgeError.message(
+                                "MPP TensorOps lay out their fragments where the kernels do not expect"
+                            )
+                        }
+
                         if ctx.tensorLibrary == nil {
                             let options = MTLCompileOptions()
                             options.languageVersion = .version4_0
                             options.mathMode = .safe
+                            options.preprocessorMacros = [
+                                "FRAGMENT_PAIRS": NSNumber(value: ctx.fragmentLayout == .pairs ? 1 : 0),
+                            ]
                             ctx.tensorLibrary = try ctx.device.makeLibrary(
                                 source: ctx.tensorSource, options: options
                             )
@@ -440,9 +603,5 @@ func metalMatmul(
 
 @_cdecl("mmh3_metal_supports_tensor_ops")
 func metalSupportsTensorOps(_ pointer: UnsafeMutableRawPointer) -> Bool {
-    if #available(macOS 26.0, *) {
-        return context(pointer).device.supportsFamily(.apple7)
-    }
-
-    return false
+    locked(pointer) { $0.fragmentLayout != .unknown }
 }

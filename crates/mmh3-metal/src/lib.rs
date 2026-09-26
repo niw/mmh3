@@ -352,7 +352,11 @@ impl Device {
 
         // The tensor kernels run on the number of SIMD groups their products share.
         let group_size = match name {
-            "mpp_int8" | "mpp_lora" | "mpp_sparse_attention_128" => 128,
+            "mpp_int8"
+            | "mpp_lora"
+            | "mpp_attention_64"
+            | "mpp_attention_128"
+            | "mpp_sparse_attention_128" => 128,
             _ => 256,
         };
         let name = CString::new(name).unwrap();

@@ -48,7 +48,7 @@ fn size(rows: usize, cols: usize) -> Result<usize> {
 }
 
 /// Queries one threadgroup of `flash_attention` answers.
-const TENSOR_ATTENTION_QUERIES: usize = 128;
+const TENSOR_ATTENTION_QUERIES: usize = 64;
 
 /// Output rows and columns one threadgroup of `mpp_int8` or `mpp_fp16` answers.
 const PRODUCT_TILE: (usize, usize) = (128, 64);
