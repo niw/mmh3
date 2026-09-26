@@ -316,7 +316,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 exchange: &mut exchange,
                 timing: Default::default(),
             };
-            let part = dit.forward_shard(&inputs, sparse.as_ref(), &mut context)?;
+            let part = dit.forward_shard(&inputs, sparse.as_ref(), &mut context, &mut || false)?;
             vec![part.part.ok_or("no part")?]
         } else {
             split.take().ok_or("no split step")?
@@ -680,7 +680,7 @@ fn split_step(
                         timing: Default::default(),
                     };
                     let part = dit
-                        .forward_shard(inputs, sparse.as_ref(), &mut context)
+                        .forward_shard(inputs, sparse.as_ref(), &mut context, &mut || false)
                         .map_err(|error| error.to_string())?;
                     // A peer may still read what this rank holds until every rank is done.
                     hub.barrier.wait()?;

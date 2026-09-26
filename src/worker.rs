@@ -1646,6 +1646,8 @@ fn session(
                     }
                 };
                 let served = lent.and_then(|(key, dit)| {
+                    // What else this card holds goes first when a step runs short of memory, since
+                    // the DiT is lent and a step that has reached its peers cannot run again.
                     let served = serve_shard(
                         &mut reader,
                         &mut writer,
@@ -1653,6 +1655,7 @@ fn session(
                         &open,
                         &body[payload..],
                         token,
+                        &mut || table.let_go_of_one(),
                     );
                     table.borrow().return_dit(key, dit);
                     served
@@ -2455,6 +2458,7 @@ impl<'a> Exchanger<'a> {
         leader_writer: &'a mut BufWriter<TcpStream>,
         token: &str,
         run: (u64, &[u64]),
+        room: &mut dyn FnMut() -> bool,
     ) -> Result<Self, Box<dyn Error>> {
         let (rank, ranks) = (shard.rank, shard.ranks());
         #[cfg(not(feature = "cuda"))]
@@ -2490,7 +2494,7 @@ impl<'a> Exchanger<'a> {
             exchanger.copies = Some(mmh3_cuda::CopyStream::new()?);
         }
         exchanger.link_peers()?;
-        exchanger.register(shard, tokens, hidden, gated)?;
+        exchanger.register(shard, tokens, hidden, gated, room)?;
         #[cfg(feature = "cuda")]
         exchanger.meet_locally(run.0)?;
         exchanger.dial_peers()?;
@@ -2609,7 +2613,10 @@ impl<'a> Exchanger<'a> {
         tokens: usize,
         hidden: usize,
         gated: bool,
+        room: &mut dyn FnMut() -> bool,
     ) -> Result<(), Box<dyn Error>> {
+        #[cfg(not(feature = "cuda"))]
+        let _ = room;
         // A machine with a port registers its memory, so a peer writes into it from its own
         // machine. One without gets plain buffers and its peers write down the socket: the table
         // carries no address for them, which is how a peer knows which way to send.
@@ -2644,8 +2651,15 @@ impl<'a> Exchanger<'a> {
             #[cfg(feature = "cuda")]
             let written_here = matches!(region, shard::Region::Received(peer)
                 if self.local.peers.contains(&peer));
+            // The peers learn of no region before the table below, so a region that finds no
+            // room is made again once the caller has let go of something.
             #[cfg(feature = "cuda")]
-            self.computed.make(region, bytes, written_here)?;
+            loop {
+                match self.computed.make(region, bytes, written_here) {
+                    Err(error) if crate::resident::out_of_memory(&*error) && room() => {}
+                    result => break result?,
+                }
+            }
             #[cfg(not(feature = "cuda"))]
             self.computed.make(region, bytes)?;
         }
@@ -3502,13 +3516,14 @@ pub fn share_a_step(
     shard: &Shard,
     exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
     elapsed: impl Fn() -> Duration,
+    room: &mut dyn FnMut() -> bool,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
     let mut context = mmh3_cuda::shard::ShardContext {
         shard: shard.clone(),
         exchange,
         timing: Default::default(),
     };
-    let outputs = dit.forward_shard(inputs, sparse, &mut context)?;
+    let outputs = dit.forward_shard(inputs, sparse, &mut context, room)?;
     let part = outputs.part.ok_or("a shared step returned no rows")?;
     let timing = describe_timing(&context.timing, elapsed());
     Ok((part, timing))
@@ -3522,6 +3537,8 @@ pub fn share_a_step(
     shard: &Shard,
     exchange: &mut dyn shard::Exchange<Memory = BlockMemory>,
     elapsed: impl Fn() -> Duration,
+    // A Metal share that runs out of memory is not run again, so it has no room to ask for.
+    _room: &mut dyn FnMut() -> bool,
 ) -> Result<(shard::VelocityRows, String), Box<dyn Error>> {
     let mut context = mmh3_metal::shard::ShardContext {
         shard: shard.clone(),
@@ -3669,6 +3686,7 @@ fn serve_shard(
     open: &OpenSession,
     payload: &[u8],
     token: &str,
+    room: &mut dyn FnMut() -> bool,
 ) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::layout::PackedLayout;
     use mmh3_core::dit::timestep::Modality;
@@ -3765,6 +3783,16 @@ fn serve_shard(
         writer,
         token,
         (open.run, &open.processes),
+        // What this card holds besides the DiT goes first, and then the DiT reads more of its
+        // blocks on the way.
+        &mut || {
+            room() || {
+                #[cfg(feature = "cuda")]
+                return dit.make_room().unwrap_or(false);
+                #[cfg(not(feature = "cuda"))]
+                false
+            }
+        },
     )?;
     println!(
         "rank {} of {} takes tokens {:?} and heads {:?}",
@@ -3808,6 +3836,7 @@ fn serve_shard(
             &shard,
             &mut exchanger,
             || started.elapsed(),
+            room,
         )?;
         println!(
             "step {} of rank {} in {:.1} s{}{timing}",
