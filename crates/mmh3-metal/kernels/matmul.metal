@@ -26,8 +26,13 @@ void packed_product(device Input *a, device int8_t *b, device float *c, device c
     constexpr int TM = 128, TN = 64;
     const int M = p[0], N = p[1], K = p[2], rank = p[4];
     const uint flags = p[3];
-    const uint tiles = (uint(N) + TN - 1) / TN;
-    const int col = (g % tiles) * TN, row = (g / tiles) * TM;
+    // Threadgroups go down bands of p[5] row tiles, so the ones running together share weights in
+    // the cache.
+    const uint tiles = (uint(N) + TN - 1) / TN, row_tiles = (uint(M) + TM - 1) / TM;
+    const uint BAND = max(p[5], 1u);
+    const uint band = g / (BAND * tiles), in_band = g % (BAND * tiles);
+    const uint band_rows = min(BAND, row_tiles - band * BAND);
+    const int col = (in_band / band_rows) * TN, row = (band * BAND + in_band % band_rows) * TM;
     constexpr auto desc = matmul2d_descriptor(TM, TN, dynamic_length_v<int>, false, true, false);
 
     if (flags & ADD_LORA) {

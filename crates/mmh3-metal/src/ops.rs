@@ -522,7 +522,14 @@ impl Array {
                 mid,
                 up,
             ],
-            &[rows as u32, outputs as u32, cols as u32, flags, rank as u32],
+            &[
+                rows as u32,
+                outputs as u32,
+                cols as u32,
+                flags,
+                rank as u32,
+                product_band(rows, outputs, cols),
+            ],
             rows.div_ceil(PRODUCT_TILE.0) * outputs.div_ceil(PRODUCT_TILE.1),
             true,
         )?;
@@ -970,6 +977,21 @@ impl Array {
         Ok(out)
     }
 }
+/// How many row tiles the threadgroups of a packed product go down before taking the next column
+/// tile, which decides what the ones running together share in the cache. Tuned at MiniMax H3's
+/// shapes: at a DiT block's rows, bands of 16 suit the wide qkv projection and fc1 and bands of 2
+/// the deep out projection and fc2, where bands of 24 or 4 are slower than taking a row tile's
+/// columns in turn; a video VAE tile's few rows take bands of 4.
+fn product_band(rows: usize, outputs: usize, inputs: usize) -> u32 {
+    if rows <= 4096 {
+        4
+    } else if outputs >= 2 * inputs {
+        16
+    } else {
+        2
+    }
+}
+
 /// Whether attention at `precision` over heads of `dim` runs on the matrix units, which read FP16
 /// inputs.
 pub(crate) fn attends_in_half(device: &Device, precision: AttentionPrecision, dim: usize) -> bool {
