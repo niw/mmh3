@@ -630,6 +630,29 @@ impl Weights {
     }
 }
 
+/// `keep`, ranges of `source`'s rows of `row_bytes` each, copied out end to end. The rows of one
+/// range are contiguous, so this is one copy per range rather than one per row.
+fn gather_rows(
+    device: &crate::Device,
+    source: &crate::Buffer,
+    row_bytes: usize,
+    keep: &[std::ops::Range<usize>],
+) -> Result<crate::Buffer> {
+    let kept: usize = keep.iter().map(|range| range.len()).sum();
+    let out = device.alloc(kept * row_bytes, None)?;
+    let mut written = 0;
+    for range in keep {
+        out.copy_range(
+            source,
+            range.start * row_bytes,
+            written * row_bytes,
+            range.len() * row_bytes,
+        )?;
+        written += range.len();
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -935,27 +958,4 @@ mod tests {
             assert!((a - b).abs() < 1e-5, "{a} came back as {b}");
         }
     }
-}
-
-/// `keep`, ranges of `source`'s rows of `row_bytes` each, copied out end to end. The rows of one
-/// range are contiguous, so this is one copy per range rather than one per row.
-fn gather_rows(
-    device: &crate::Device,
-    source: &crate::Buffer,
-    row_bytes: usize,
-    keep: &[std::ops::Range<usize>],
-) -> Result<crate::Buffer> {
-    let kept: usize = keep.iter().map(|range| range.len()).sum();
-    let out = device.alloc(kept * row_bytes, None)?;
-    let mut written = 0;
-    for range in keep {
-        out.copy_range(
-            source,
-            range.start * row_bytes,
-            written * row_bytes,
-            range.len() * row_bytes,
-        )?;
-        written += range.len();
-    }
-    Ok(out)
 }

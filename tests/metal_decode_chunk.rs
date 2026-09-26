@@ -109,8 +109,10 @@ fn the_first_chunks_canvas_carries_the_frames_a_whole_decode_writes() {
 
     let bytes = decoder.decode_chunk(&latent, 0).unwrap();
     let canvas: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|value| f32::from_le_bytes(value.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|value| f32::from_le_bytes(*value))
         .collect();
     let pixels = decoder.decode(&latent, false).unwrap().pixels;
     let (frames, height, width) = (pixels.shape[1], pixels.shape[2], pixels.shape[3]);

@@ -466,9 +466,7 @@ async fn events(
             };
             // The generation was taken away while somebody watched it, so there is nothing more
             // to say about it.
-            let Some((state, described)) = described else {
-                return None;
-            };
+            let (state, described) = described?;
             if watch.said.as_ref() != Some(&described) {
                 watch.ended = matches!(state, Stage::Done | Stage::Failed);
                 watch.said = Some(described.clone());

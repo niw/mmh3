@@ -259,7 +259,8 @@ impl Models {
             (self.dit.kept.is_some(), Kind::Dit),
         ]
         .into_iter()
-        .filter_map(|(kept, kind)| kept.then(|| kind.key()))
+        .filter(|(kept, _)| *kept)
+        .map(|(_, kind)| kind.key())
         .collect()
     }
 

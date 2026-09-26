@@ -804,6 +804,7 @@ impl CudaVideoEncoder {
     /// reflect-pads one pixel on each side at stride 1, and one pixel after the input at stride 2,
     /// while the temporal taps read zeros before the clip. With `accumulate`, the result adds onto
     /// that activation.
+    #[allow(clippy::too_many_arguments)]
     fn convolve<'a>(
         &self,
         convolution: &Convolution,

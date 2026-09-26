@@ -568,8 +568,10 @@ impl Worker {
         Ok(Tensor {
             shape: vec![states.tokens, states.hidden],
             data: values
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
         })
     }
@@ -612,8 +614,10 @@ impl Worker {
         Ok(Tensor::new(
             shape,
             values
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect(),
         ))
     }
@@ -1648,8 +1652,10 @@ fn latent_of(shape: &[u32], values: &[u8]) -> Result<Tensor, Box<dyn Error>> {
     Ok(Tensor::new(
         shape,
         values
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect(),
     ))
 }
@@ -2868,8 +2874,10 @@ fn session_conditions_of(
         Ok(Some(Tensor::new(
             shape,
             taken
-                .chunks_exact(4)
-                .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|four| f32::from_le_bytes(*four))
                 .collect(),
         )))
     };
@@ -3168,8 +3176,10 @@ fn serve_shard(
     let context = Tensor::new(
         vec![context_tokens, context_width],
         payload[..context_bytes]
-            .chunks_exact(4)
-            .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|four| f32::from_le_bytes(*four))
             .collect(),
     );
     let modalities: Vec<Modality> = payload[context_bytes..context_bytes + context_tokens]
@@ -3267,8 +3277,10 @@ fn serve_shard(
             return Err(format!("a step carried {} bytes of latent", values.len()).into());
         }
         let floats: Vec<f32> = values
-            .chunks_exact(4)
-            .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|four| f32::from_le_bytes(*four))
             .collect();
         inputs.video = Tensor::new(video_shape.clone(), floats[..video_values].to_vec());
         inputs.audio = Tensor::new(audio_shape.clone(), floats[video_values..].to_vec());
@@ -3278,7 +3290,7 @@ fn serve_shard(
         let step_sparse =
             sparse.filter(|sparse| sparse.applies_to_step(step.step as usize, open.steps as usize));
         let (part, timing) = share_a_step(
-            &dit,
+            dit,
             &inputs,
             step_sparse.as_ref(),
             &shard,
@@ -3650,8 +3662,10 @@ pub fn step_shard(
             return Err(format!("a rank sent {} bytes of velocity", values.len()).into());
         }
         let floats: Vec<f32> = values
-            .chunks_exact(4)
-            .map(|four| f32::from_le_bytes(four.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|four| f32::from_le_bytes(*four))
             .collect();
         let split = part.video_values as usize;
         parts.push(shard::VelocityRows {

@@ -204,8 +204,10 @@ pub fn check_layout(tokens: usize, heads: usize, dim: usize) -> Result<(), CudaE
         let mut raw = vec![0u8; buffer.bytes()];
         buffer.copy_to_host(&mut raw)?;
         Ok(raw
-            .chunks_exact(2)
-            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| u16::from_le_bytes(*pair))
             .collect())
     };
     let mismatch = |what: String, found: u16, wanted: u16| CudaError {

@@ -367,8 +367,10 @@ mod tests {
         );
         let read: Vec<f32> = file
             .data(video)
-            .chunks_exact(4)
-            .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| f32::from_le_bytes(*bytes))
             .collect();
         assert_eq!(read, values);
         assert_eq!(file.data(file.get("audio").unwrap()), 7.0f32.to_le_bytes());
