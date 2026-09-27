@@ -6,7 +6,8 @@ The `cuda` backend runs every part of a generation on an NVIDIA GPU, with the ke
 ## Requirements
 
 - Linux or Windows (WSL) with an NVIDIA Blackwell GPU (developed on a GB10, aarch64) or an Ada
-  GPU (`sm_89`, tested on an RTX 4090). Ada cards copy tiles without TMA, and NVFP4 needs
+  GPU (`sm_89`, tested on an RTX 4090). The build also holds code for Hopper (`sm_90a`, such as
+  H100), which has not run on such a card yet. Ada cards copy tiles without TMA, and NVFP4 needs
   Blackwell.
 - The CUDA toolkit with `nvcc` and cuBLASLt, including its headers, which Ubuntu packages as
   `libcublas-dev-13-0` (developed with CUDA 13.0).
