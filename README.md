@@ -75,9 +75,9 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps.
 - Videos from a first frame, a last frame or both ([FL2VA](docs/fl2va.md)) work too.
 - Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
-- NVIDIA Blackwell GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for
-  `sm_120f`, so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been
-  tested yet. The build also targets Ada (`sm_89`), untested so far.
+- NVIDIA GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for `sm_120f`,
+  so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been tested yet. The
+  build also targets Ada (`sm_89`), which runs on an RTX 4090.
 - Apple silicon with Metal on macOS 15 or later, tested on an M4 Max and an M6. Text to video with
   audio works with LoRAs, patches such as FastH3's, and Sol-Attn and VSA sparse attention, and a
   Mac with 24 GB runs it by reading the layers that do not fit from the disk. Videos from frames or

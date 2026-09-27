@@ -1,13 +1,12 @@
 # CUDA on Linux
 
-The `cuda` backend runs every part of a generation on an NVIDIA Blackwell GPU, with the kernels in
+The `cuda` backend runs every part of a generation on an NVIDIA GPU, with the kernels in
 `crates/mmh3-cuda`. MP4 output uses NVENC for H.264 video and a built-in AAC encoder.
 
 ## Requirements
 
-- Linux with an NVIDIA Blackwell GPU (developed on aarch64). The build also holds code for Ada
-  (`sm_89`, such as RTX 4090) GPUs, which has not run on those cards yet. Ada cards copy tiles
-  without TMA, and NVFP4 needs Blackwell.
+- Linux with an NVIDIA Blackwell GPU (developed on a GB10, aarch64) or an Ada GPU (`sm_89`, tested
+  on an RTX 4090). Ada cards copy tiles without TMA, and NVFP4 needs Blackwell.
 - The CUDA toolkit with `nvcc` and cuBLASLt, including its headers, which Ubuntu packages as
   `libcublas-dev-13-0` (developed with CUDA 13.0).
 - Rust with edition 2024 support (developed with 1.98).
@@ -38,6 +37,10 @@ FastH3 clip of `make generate` with the DiT's steps as fast as without the limit
 hide behind the layers kept between them. How well they hide elsewhere depends on the disk and on
 how long the layers take to run. The reads bypass the page cache, so they want a fast NVMe drive
 rather than host memory.
+
+An RTX 4090 (24 GB) keeps 34 of the DiT's 52 blocks for that clip, and its reads hide behind the
+layers too, apart from the first block of each step. Longer clips keep fewer: at 1344×768 a
+15-second clip keeps none and is at the edge of what 24 GB holds.
 
 `--lora-mode merge` and `--linear-precision nvfp4` change the DiT's weights on the GPU, so a DiT
 with either cannot read its blocks again and needs the memory for all of them.
