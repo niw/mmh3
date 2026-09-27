@@ -37,9 +37,28 @@ const FILE_BYTES: u64 = 4 << 30;
 /// nothing between them.
 const WATCH: Duration = Duration::from_millis(250);
 
-const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--models DIR] \
-                     [--worker HOST[:PORT]]... [--local-worker] [--devices CARD,CARD...] [--consistent] \
-                     [--token FILE] [--vram-budget GB] [--idle-unload SECONDS] [--ffmpeg ARGS...]";
+const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] \
+                     [--idle-unload SECONDS] [--models DIR] [--dit FILE] [--text-encoder FILE] \
+                     [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...] \
+                     [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]] \
+                     [--token FILE] [--vram-budget GB] [--consistent] [--ffmpeg ARGS...]";
+/// The options that are the server's own rather than a generation's.
+const SERVER_OPTIONS: &[&str] = &["listen", "jobs", "format", "idle-unload"];
+/// The options of a generation that say what this machine has and which machines compute, which
+/// the server is given and a request may not give. `--local-worker` and `--consistent`, which a
+/// form cannot give either, are the others.
+const MACHINE_OPTIONS: &[&str] = &[
+    "models",
+    "dit",
+    "text-encoder",
+    "video-vae",
+    "audio-vae",
+    "devices",
+    "vram-budget",
+    "worker",
+    "worker-units",
+    "token",
+];
 
 /// The container every generation of a server is written in.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -123,8 +142,8 @@ struct Server {
     jobs: Mutex<HashMap<String, Job>>,
     /// Ids in the order they were asked for, which is the order they run in.
     queue: Sender<String>,
-    /// What every generation is told before what its own request said, so that a machine's models
-    /// directory and its workers are the server's business rather than each request's.
+    /// What every generation is told before what its own request said: the machine options the
+    /// server was given.
     defaults: Vec<String>,
     /// What every generation hands ffmpeg to write its video, after everything else it is told, or
     /// none for the native output.
@@ -136,19 +155,22 @@ struct Server {
 /// `mmh3 server [--listen ADDR] [--jobs DIR] ...`, which serves until it is stopped.
 pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let (arguments, ffmpeg) = split_ffmpeg_arguments(arguments);
-    let allowed = [
-        "listen",
-        "jobs",
-        "format",
-        "models",
-        "worker",
-        "worker-units",
-        "devices",
-        "token",
-        "vram-budget",
-        "idle-unload",
-    ];
-    let options = parse_options(arguments, &allowed, crate::generation::FLAGS, USAGE)?;
+    if arguments.iter().any(|argument| argument == "--out") {
+        return Err("the server names every job's video itself, so leave out --out".into());
+    }
+    if let Some(name) = arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--"))
+        .find(|name| crate::generation::OPTIONS.contains(name) && !MACHINE_OPTIONS.contains(name))
+    {
+        return Err(format!("--{name} is for each request to give, not the server").into());
+    }
+    let options = parse_options(
+        arguments,
+        &[SERVER_OPTIONS, MACHINE_OPTIONS].concat(),
+        crate::generation::FLAGS,
+        USAGE,
+    )?;
     let listen = options
         .get("listen")
         .map_or(DEFAULT_LISTEN, |listen| *listen)
@@ -183,7 +205,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Everything but --listen, --jobs, --format and --idle-unload is the generation's, and every
+    // Everything but --listen, --jobs, --format and --idle-unload is about this machine, and every
     // generation is told it.
     let mut defaults = Vec::new();
     let mut remaining = arguments.iter();
@@ -202,6 +224,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             defaults.push(value.clone());
         }
     }
+    crate::generation::Settings::check_machines(&options, &defaults)?;
     let idle_unload = crate::cli::option_number(&options, "idle-unload", 0)?;
     #[cfg(any(feature = "cuda", feature = "metal"))]
     if idle_unload > 0 {
@@ -294,8 +317,8 @@ fn generate(server: &Server, id: &str) {
 }
 
 /// Takes a generation, and answers with the job rather than with the video, which is not there
-/// yet. The form's fields are the options of `mmh3 generate`, and a field with a file name is
-/// written beside the job and stands for the path it was written to.
+/// yet. The form's fields are the options of `mmh3 generate` but the machine's, and a field with a
+/// file name is written beside the job and stands for the path it was written to.
 async fn create(
     State(server): State<Arc<Server>>,
     mut form: Multipart,
@@ -357,11 +380,7 @@ async fn read_fields(
         let Some(name) = field.name().map(str::to_owned) else {
             return Err(Failure::asked("a form field with no name"));
         };
-        if !crate::generation::OPTIONS.contains(&name.as_str()) {
-            return Err(Failure::asked(&format!(
-                "{name} is not an option of a generation"
-            )));
-        }
+        refused_field(&name).map_err(|message| Failure::asked(&message))?;
         let value = match field.file_name().map(str::to_owned) {
             // A file stands for the path it is written to, which is this job's own directory.
             Some(filename) => {
@@ -578,6 +597,17 @@ async fn video(
     }
 }
 
+/// Why a request may not give the field `name`, if it may not.
+fn refused_field(name: &str) -> Result<(), String> {
+    if !crate::generation::OPTIONS.contains(&name) {
+        return Err(format!("{name} is not an option of a generation"));
+    }
+    if MACHINE_OPTIONS.contains(&name) {
+        return Err(format!("{name} is the server's to set, not a request's"));
+    }
+    Ok(())
+}
+
 /// The file name a client gave, taken down to a name. A name with a directory in it is a name
 /// meant to land somewhere other than where it was sent.
 fn named(filename: &str) -> Result<String, Failure> {
@@ -645,5 +675,23 @@ impl From<std::io::Error> for Failure {
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_request_gives_what_to_generate_and_not_the_machine() {
+        for name in ["steps", "reference", "lora", "attention-precision"] {
+            assert!(refused_field(name).is_ok(), "{name}");
+        }
+        for name in MACHINE_OPTIONS
+            .iter()
+            .chain(&["out", "local-worker", "listen"])
+        {
+            assert!(refused_field(name).is_err(), "{name}");
+        }
     }
 }

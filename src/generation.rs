@@ -320,6 +320,23 @@ impl Settings {
         Err("this build runs nothing of its own".into())
     }
 
+    /// Checks the options that say which machines compute and how much of this one they may use,
+    /// without starting a worker or reading a model, so that a server refuses them when it starts
+    /// rather than when the first request reaches them.
+    pub fn check_machines(
+        options: &HashMap<&str, &str>,
+        arguments: &[String],
+    ) -> Result<(), Box<dyn Error>> {
+        Self::machines(options, arguments)?;
+        if option_float(options, "vram-budget", 0.0)? < 0.0 {
+            return Err("--vram-budget must not be negative".into());
+        }
+        if let Some(path) = options.get("token") {
+            std::fs::read_to_string(path).map_err(|error| format!("--token {path}: {error}"))?;
+        }
+        Ok(())
+    }
+
     /// The canvas, step schedule, seed and schedule shifts of the options, with their defaults.
     /// `arguments` gives the repeated `--reference` and `--worker` options.
     pub fn parse(

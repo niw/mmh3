@@ -21,14 +21,20 @@ as ffmpeg's arguments, as it does for a generation. See [Output](output.md).
 target/release/mmh3 server --ffmpeg
 ```
 
+The rest of the server's line is what `mmh3 generate` takes about the machine: `--models`,
+`--dit`, `--text-encoder`, `--video-vae`, `--audio-vae`, `--devices`, `--worker`,
+`--worker-units`, `--local-worker`, `--token`, `--vram-budget` and `--consistent`. Every
+generation is told them, and a request may not give them. What to generate is a request's, and the
+server refuses it on its own line.
+
 There is no authentication. A machine that should answer anybody but itself wants something in
 front of this that decides who may ask, which is why the default is loopback.
 
 ## Asking for a generation
 
 A form field is the option of the same name, so what `mmh3 generate` takes on the command line
-this takes as a field. A field that carries a file is written beside the generation and stands for
-the path it was written to.
+about what to generate this takes as a field. A field that carries a file is written beside the
+generation and stands for the path it was written to.
 
 ```sh
 curl -X POST http://localhost:8833/v1/generations \
@@ -63,8 +69,8 @@ curl -X POST http://localhost:8833/v1/generations \
   -F reference=@cat.png -F reference=@street.jpg
 ```
 
-A field that is not an option of a generation is refused by name, and so is a file longer than the
-server takes. See [Usage](usage.md) for what the options mean.
+A field that is not an option of a generation or that is the machine's is refused by name, and so
+is a file longer than the server takes. See [Usage](usage.md) for what the options mean.
 
 ## Watching one
 

@@ -2,9 +2,10 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
-  mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--models DIR] [--devices CARD,CARD...]
-              [--worker HOST[:PORT]]... [--local-worker] [--consistent] [--vram-budget GB] [--idle-unload SECONDS]
-              [--ffmpeg ARGS...]
+  mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--idle-unload SECONDS] [--models DIR]
+              [--dit FILE] [--text-encoder FILE] [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...]
+              [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
+              [--token FILE] [--vram-budget GB] [--consistent] [--ffmpeg ARGS...]
   mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--devices CARD,CARD...] [--vram-budget GB]
               [--idle-unload SECONDS]
   mmh3 generate (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <video.mp4|video.webm> [--models DIR]
@@ -61,6 +62,8 @@ that the video does not depend on how the run is split, on which machine compute
 would. A worker lets go of the model it has used least whenever an allocation finds no memory left.
 --idle-unload SECONDS lets a worker go of every model it holds after that long with nothing to do, so that a
 machine nobody is generating on is a machine with its memory back. Without it a worker holds what it loaded.
+server takes the options of generate about this machine and its workers, and each request the ones about what to
+generate as form fields.
 A machine that cannot be reached, or that holds no checkpoint for what it was asked, is passed over. One that
 answered and then failed ends the run.";
 
