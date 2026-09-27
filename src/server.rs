@@ -132,7 +132,8 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     std::fs::create_dir_all(&directory)?;
 
-    // Everything but --listen and --jobs is the generation's, and every generation is told it.
+    // Everything but --listen, --jobs and --idle-unload is the generation's, and every generation
+    // is told it.
     let mut defaults = Vec::new();
     let mut remaining = arguments.iter();
     while let Some(name) = remaining.next() {
@@ -142,10 +143,21 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             continue;
         }
         let Some(value) = remaining.next() else { break };
-        if !matches!(name.as_str(), "--listen" | "--jobs") {
+        if !matches!(name.as_str(), "--listen" | "--jobs" | "--idle-unload") {
             defaults.push(name.clone());
             defaults.push(value.clone());
         }
+    }
+    let idle_unload = crate::cli::option_number(&options, "idle-unload", 0)?;
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    if idle_unload > 0 {
+        crate::resident::release_when_idle(Duration::from_secs(idle_unload as u64));
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    if idle_unload > 0 {
+        return Err(
+            "this build holds no models, so it has none for --idle-unload to let go of".into(),
+        );
     }
     // NOTE: a run that has nothing to hand its work to reads every model itself and lets go of
     // them when it ends, which is right for a command and wrong for a server. A worker is what
