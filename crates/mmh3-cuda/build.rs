@@ -13,7 +13,10 @@ fn main() {
     }
 
     let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_owned());
-    let architecture = env::var("MMH3_CUDA_ARCH").unwrap_or_else(|_| "sm_120f".to_owned());
+    // NOTE: the Blackwell family of GB10 and the RTX 50 series, and Ada (RTX 4090, L40S). Each gets
+    // machine code only. A PTX for sm_89 would let a newer card compile it, but that card has TMA,
+    // so it would launch the TMA paths, which sm_89 code only traps in.
+    let architectures = env::var("MMH3_CUDA_ARCH").unwrap_or_else(|_| "sm_120f,sm_89".to_owned());
     let manifest_directory = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let output_directory = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernel_directory = manifest_directory.join("kernels");
@@ -54,7 +57,14 @@ fn main() {
     ]
     .map(str::to_owned)
     .to_vec();
-    flags.push(format!("-arch={architecture}"));
+    flags.extend(architectures.split(',').map(|architecture| {
+        let architecture = architecture.trim();
+        let virtual_architecture = architecture.replacen("sm_", "compute_", 1);
+        format!("-gencode=arch={virtual_architecture},code={architecture}")
+    }));
+    // The architectures of one source compile in parallel too, since the longest source sets how
+    // long the build takes.
+    flags.extend(["--threads".to_owned(), "0".to_owned()]);
 
     // A source compiles again when its object is older than the source or a header it includes,
     // as nvcc listed them last time, or when the compiler or its flags change.

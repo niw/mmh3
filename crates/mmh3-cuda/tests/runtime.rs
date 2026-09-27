@@ -22,7 +22,8 @@ fn reports_a_device() {
     assert!(mmh3_cuda::device_count().unwrap() > 0);
     let info = mmh3_cuda::device_info(0).unwrap();
     assert!(!info.name.is_empty());
-    assert!(info.compute_capability.0 >= 12);
+    // The architectures the kernels are built for: Ada and the sm_12x Blackwell family.
+    assert!(matches!(info.compute_capability, (8, 9) | (12, _)));
 }
 
 #[test]
