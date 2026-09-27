@@ -34,7 +34,9 @@ front of this that decides who may ask, which is why the default is loopback.
 
 A form field is the option of the same name, so what `mmh3 generate` takes on the command line
 about what to generate this takes as a field. A field that carries a file is written beside the
-generation and stands for the path it was written to.
+generation and stands for the path it was written to. `first-frame`, `last-frame`, the
+references, `prompt-file` and `context` take only such a file. `lora` and `patch` take the name of
+a file in the models directory, looked for where `mmh3 generate` looks for it.
 
 ```sh
 curl -X POST http://localhost:8833/v1/generations \

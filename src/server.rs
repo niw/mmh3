@@ -59,6 +59,20 @@ const MACHINE_OPTIONS: &[&str] = &[
     "worker-units",
     "token",
 ];
+/// The options of a generation whose value is a file, which a request uploads.
+const FILE_OPTIONS: &[&str] = &[
+    "prompt-file",
+    "context",
+    "first-frame",
+    "last-frame",
+    "reference",
+    "reference-audio",
+    "reference-video",
+];
+/// The options of a generation whose value names a file in the server's models directory, with
+/// the directories it is looked for in, in order.
+const MODEL_FILE_OPTIONS: &[(&str, &[&str])] =
+    &[("patch", &["patches", "loras"]), ("lora", &["loras"])];
 
 /// The container every generation of a server is written in.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -145,6 +159,8 @@ struct Server {
     /// What every generation is told before what its own request said: the machine options the
     /// server was given.
     defaults: Vec<String>,
+    /// Where a request's `lora` and `patch` are looked for.
+    models: Option<PathBuf>,
     /// What every generation hands ffmpeg to write its video, after everything else it is told, or
     /// none for the native output.
     ffmpeg: Option<Vec<String>>,
@@ -249,6 +265,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         jobs: Mutex::new(HashMap::new()),
         queue,
         defaults,
+        models: crate::models::models_directory(&options),
         ffmpeg: ffmpeg.map(<[String]>::to_vec),
         container,
         directory: directory.clone(),
@@ -317,8 +334,9 @@ fn generate(server: &Server, id: &str) {
 }
 
 /// Takes a generation, and answers with the job rather than with the video, which is not there
-/// yet. The form's fields are the options of `mmh3 generate` but the machine's, and a field with a
-/// file name is written beside the job and stands for the path it was written to.
+/// yet. The form's fields are the options of `mmh3 generate` but the machine's. A file is written
+/// beside the job and stands for the path it was written to, and a `lora` or `patch` names a file
+/// in the server's models directory.
 async fn create(
     State(server): State<Arc<Server>>,
     mut form: Multipart,
@@ -331,7 +349,7 @@ async fn create(
     arguments.push("--out".to_owned());
     arguments.push(video.to_string_lossy().into_owned());
 
-    if let Err(failure) = read_fields(&mut form, &directory, &mut arguments).await {
+    if let Err(failure) = read_fields(&server, &mut form, &directory, &mut arguments).await {
         // A refused request leaves nothing behind, not even the files it sent before the field
         // that was refused.
         let _ = tokio::fs::remove_dir_all(&directory).await;
@@ -372,6 +390,7 @@ async fn create(
 
 /// Adds the fields of a request's form to `arguments`, writing its files into `directory`.
 async fn read_fields(
+    server: &Server,
     form: &mut Multipart,
     directory: &std::path::Path,
     arguments: &mut Vec<String>,
@@ -380,10 +399,10 @@ async fn read_fields(
         let Some(name) = field.name().map(str::to_owned) else {
             return Err(Failure::asked("a form field with no name"));
         };
-        refused_field(&name).map_err(|message| Failure::asked(&message))?;
-        let value = match field.file_name().map(str::to_owned) {
+        let kind = field_kind(&name).map_err(|message| Failure::asked(&message))?;
+        let value = match (kind, field.file_name().map(str::to_owned)) {
             // A file stands for the path it is written to, which is this job's own directory.
-            Some(filename) => {
+            (FieldKind::File, Some(filename)) => {
                 let path = directory.join(named(&filename)?);
                 let mut file = tokio::fs::File::create(&path).await?;
                 let mut written = 0;
@@ -397,13 +416,26 @@ async fn read_fields(
                 file.flush().await?;
                 path.to_string_lossy().into_owned()
             }
-            None => {
+            (FieldKind::File, None) => {
+                return Err(Failure::asked(&format!("{name} takes an uploaded file")));
+            }
+            (_, Some(_)) => {
+                return Err(Failure::asked(&format!("{name} takes text, not a file")));
+            }
+            (kind, None) => {
                 let bytes = field.bytes().await.map_err(Failure::form)?;
                 if bytes.len() as u64 > FIELD_BYTES {
                     return Err(Failure::asked("a field longer than this takes"));
                 }
-                String::from_utf8(bytes.to_vec())
-                    .map_err(|_| Failure::asked("a form field that is not text"))?
+                let text = String::from_utf8(bytes.to_vec())
+                    .map_err(|_| Failure::asked("a form field that is not text"))?;
+                match kind {
+                    FieldKind::ModelFile(directories) => {
+                        model_named(server.models.as_deref(), &name, &text, directories)
+                            .map_err(|message| Failure::asked(&message))?
+                    }
+                    _ => text,
+                }
             }
         };
         arguments.push(format!("--{name}"));
@@ -597,15 +629,61 @@ async fn video(
     }
 }
 
-/// Why a request may not give the field `name`, if it may not.
-fn refused_field(name: &str) -> Result<(), String> {
+/// What the value of a request's field is.
+#[derive(Clone, Copy)]
+enum FieldKind {
+    Text,
+    /// A file the request uploads.
+    File,
+    /// The name of a file in one of these directories of the models directory.
+    ModelFile(&'static [&'static str]),
+}
+
+/// What kind of value the field `name` of a request takes, or why a request may not give it.
+fn field_kind(name: &str) -> Result<FieldKind, String> {
     if !crate::generation::OPTIONS.contains(&name) {
         return Err(format!("{name} is not an option of a generation"));
     }
     if MACHINE_OPTIONS.contains(&name) {
         return Err(format!("{name} is the server's to set, not a request's"));
     }
-    Ok(())
+    if FILE_OPTIONS.contains(&name) {
+        return Ok(FieldKind::File);
+    }
+    Ok(MODEL_FILE_OPTIONS
+        .iter()
+        .find(|(option, _)| *option == name)
+        .map_or(FieldKind::Text, |(_, directories)| {
+            FieldKind::ModelFile(directories)
+        }))
+}
+
+/// The path of the file a request's `option` names, the first of `directories` in the models
+/// directory that has it. A name is only a name, so one with a directory in it is refused rather
+/// than followed out of the models directory.
+fn model_named(
+    models: Option<&std::path::Path>,
+    option: &str,
+    name: &str,
+    directories: &[&str],
+) -> Result<String, String> {
+    let is_name = std::path::Path::new(name).file_name() == Some(name.as_ref());
+    if !is_name || name.starts_with('.') {
+        return Err(format!("{option} takes the name of a file, not {name}"));
+    }
+    let models =
+        models.ok_or_else(|| format!("this server has no models directory for {option}"))?;
+    directories
+        .iter()
+        .map(|directory| models.join(directory).join(name))
+        .find(|path| path.is_file())
+        .map(|path| path.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            format!(
+                "{option} {name}: none in the models directory's {}",
+                directories.join(" or ")
+            )
+        })
 }
 
 /// The file name a client gave, taken down to a name. A name with a directory in it is a name
@@ -684,14 +762,46 @@ mod tests {
 
     #[test]
     fn a_request_gives_what_to_generate_and_not_the_machine() {
-        for name in ["steps", "reference", "lora", "attention-precision"] {
-            assert!(refused_field(name).is_ok(), "{name}");
-        }
+        assert!(matches!(field_kind("steps"), Ok(FieldKind::Text)));
+        assert!(matches!(field_kind("reference"), Ok(FieldKind::File)));
+        assert!(matches!(
+            field_kind("lora"),
+            Ok(FieldKind::ModelFile(["loras"]))
+        ));
         for name in MACHINE_OPTIONS
             .iter()
             .chain(&["out", "local-worker", "listen"])
         {
-            assert!(refused_field(name).is_err(), "{name}");
+            assert!(field_kind(name).is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_model_file_is_a_name_in_the_models_directory() {
+        let models = std::env::temp_dir().join(format!("mmh3-server-{}", std::process::id()));
+        for directory in ["patches", "loras"] {
+            std::fs::create_dir_all(models.join(directory)).unwrap();
+        }
+        std::fs::write(models.join("loras/both.safetensors"), b"").unwrap();
+        std::fs::write(models.join("patches/both.safetensors"), b"").unwrap();
+        let found = |name: &str, directories: &[&str]| {
+            model_named(Some(&models), "lora", name, directories)
+        };
+        assert_eq!(
+            found("both.safetensors", &["patches", "loras"]).unwrap(),
+            models.join("patches/both.safetensors").to_string_lossy()
+        );
+        for name in [
+            "missing.safetensors",
+            "../loras/both.safetensors",
+            "loras/both.safetensors",
+            "/etc/hostname",
+            ".hidden",
+            "",
+        ] {
+            assert!(found(name, &["loras"]).is_err(), "{name}");
+        }
+        assert!(model_named(None, "lora", "both.safetensors", &["loras"]).is_err());
+        std::fs::remove_dir_all(&models).unwrap();
     }
 }
