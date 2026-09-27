@@ -385,11 +385,15 @@ impl Stream {
     }
 
     /// Makes room on a device that ran out of memory, and says whether there was any to make: a
-    /// model holding its units as it loaded them starts reading them on the way, and one that
-    /// already does lets go of the units it kept back, to keep back fewer before its next call.
+    /// model holding units as it loaded them reads the next of those on the way, and one that
+    /// reads every unit it does not keep back lets go of those it kept, to keep back fewer before
+    /// its next call.
+    ///
+    /// NOTE: the units a whole load left go one at a time rather than all at once, since the call
+    /// that ran short is usually short of a few of them, and every unit let go of is read again.
     pub(crate) fn make_room(&mut self, tensors: &mut DeviceTensors) -> Result<bool, Error> {
-        if !self.reads() {
-            self.start_reading(tensors)?;
+        if self.kept.iter().any(|kept| matches!(kept, Kept::Tensors)) {
+            self.read_one_more(tensors)?;
             return Ok(true);
         }
         let kept = self
@@ -409,11 +413,40 @@ impl Stream {
     /// model on the device, and says whether there was any. Unlike `make_room` this does not lower
     /// how many units the next call keeps back: that call finds whatever the other model left.
     pub(crate) fn give_up(&mut self, tensors: &mut DeviceTensors) -> Result<bool, Error> {
-        if self.reads() && !self.kept.iter().any(|kept| matches!(kept, Kept::Buffer(_))) {
+        if self.reads() && self.kept.iter().all(|kept| matches!(kept, Kept::Read(_))) {
             return Ok(false);
         }
         self.let_go(tensors)?;
         Ok(true)
+    }
+
+    /// Reads on the way the next unit, in the order they are given up, of those a whole load left,
+    /// and as many more as it takes to find room for the regions they are read into.
+    fn read_one_more(&mut self, tensors: &mut DeviceTensors) -> Result<(), Error> {
+        loop {
+            let Some(index) = self
+                .give_up
+                .iter()
+                .copied()
+                .find(|&index| matches!(self.kept[index], Kept::Tensors))
+            else {
+                // Every unit is read on the way and there is still no room for the regions.
+                return self.size_regions().map(|()| self.assign(tensors));
+            };
+            for tensor in self.units[index].tensors() {
+                tensors.remove(&tensor.name);
+            }
+            self.kept[index] = Kept::Read(Region::Both);
+            self.settled = false;
+            match self.size_regions() {
+                Ok(()) => {
+                    self.assign(tensors);
+                    return Ok(());
+                }
+                Err(Error::Cuda(error)) if error.is_out_of_memory() => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     /// Lets go of every unit kept back, sizes the regions for the units as they are now and points
@@ -427,6 +460,15 @@ impl Stream {
             }
             *kept = Kept::Read(Region::Both);
         }
+        self.size_regions()?;
+        self.assign(tensors);
+        self.settled = false;
+        Ok(())
+    }
+
+    /// Makes the regions the units read on the way go through, unless those there are the size
+    /// the units need now.
+    fn size_regions(&mut self) -> Result<(), Error> {
         let largest = self.units.iter().map(Unit::bytes).max().unwrap_or(0);
         let bytes = self.units[self.sized.clone()]
             .iter()
@@ -452,8 +494,6 @@ impl Stream {
                 holds: [None; 2],
             });
         }
-        self.assign(tensors);
-        self.settled = false;
         Ok(())
     }
 
@@ -498,7 +538,14 @@ impl Stream {
         }
         let mut kept = Vec::new();
         let mut free = free_bytes()?;
-        for &index in self.give_up.iter().rev().take(self.most) {
+        // Only units read on the way are kept back: those a whole load left are here already.
+        for &index in self
+            .give_up
+            .iter()
+            .rev()
+            .filter(|&&index| matches!(self.kept[index], Kept::Read(_)))
+            .take(self.most)
+        {
             let bytes = self.units[index].bytes();
             if free < bytes + HEADROOM {
                 break;
@@ -534,9 +581,14 @@ impl Stream {
         }
         // SAFETY: the stream belongs to the loader.
         check(unsafe { mmh3_cuda_stream_synchronize(regions.loader.handles.stream) })?;
+        let whole = self
+            .kept
+            .iter()
+            .filter(|kept| matches!(kept, Kept::Tensors))
+            .count();
         println!(
             "keeping {} of {} {} on the device and reading the rest as they run",
-            kept.len(),
+            whole + kept.len(),
             self.units.len(),
             self.what
         );
