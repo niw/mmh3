@@ -55,6 +55,7 @@ unsafe extern "C" {
     fn mmh3_cuda_can_access_peer(device: c_int, peer: c_int, can: *mut c_int) -> c_int;
     fn mmh3_cuda_enable_peer_access(peer: c_int) -> c_int;
     fn mmh3_cuda_tma_on_this_thread(enabled: c_int);
+    fn mmh3_cuda_wgmma_on_this_thread(enabled: c_int);
     fn mmh3_cuda_copy_across(
         destination: *mut c_void,
         source: *const c_void,
@@ -241,6 +242,14 @@ pub fn enable_peer_access(peer: usize) -> Result<(), CudaError> {
 pub fn use_tma_on_this_thread(enabled: bool) {
     // SAFETY: no pointers.
     unsafe { mmh3_cuda_tma_on_this_thread(c_int::from(enabled)) }
+}
+
+/// Lets the kernels launched from this thread take Hopper's warpgroup MMAs (wgmma) on an sm_90 card
+/// (the default), or makes them run the mma.sync kernels every other card runs, so that an H100 can
+/// check the one against the other.
+pub fn use_wgmma_on_this_thread(enabled: bool) {
+    // SAFETY: no pointers.
+    unsafe { mmh3_cuda_wgmma_on_this_thread(c_int::from(enabled)) }
 }
 
 /// Copies `bytes` bytes between two addresses this process holds, on one card, between two cards

@@ -131,6 +131,10 @@ extern "C" int mmh3_cuda_copy_across_on(void *destination, const void *source, s
 
 extern "C" void mmh3_cuda_tma_on_this_thread(int enabled) { mmh3_tma_turned_off = enabled == 0; }
 
+extern "C" void mmh3_cuda_wgmma_on_this_thread(int enabled) {
+    mmh3_wgmma_turned_off = enabled == 0;
+}
+
 extern "C" const char *mmh3_cuda_error_string(int code) {
     return cudaGetErrorString(static_cast<cudaError_t>(code));
 }

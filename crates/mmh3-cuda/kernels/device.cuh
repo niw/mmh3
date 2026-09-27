@@ -104,6 +104,33 @@ inline bool mmh3_tma_available() {
     return major >= 9;
 }
 
+// Whether this thread's launches leave Hopper's warpgroup MMAs out, so that an H100 can check its
+// wgmma kernels against the mma.sync ones every other card runs.
+inline thread_local bool mmh3_wgmma_turned_off = false;
+
+// Whether a launch on this thread's device may take the kernels built on wgmma, which only compute
+// capability 9.0 has, in the sm_90a machine code the build holds for it.
+inline bool mmh3_wgmma_available() {
+    static std::atomic<int> answers[MMH3_MAX_DEVICES];
+    const int device = mmh3_current_device();
+    if (mmh3_wgmma_turned_off || device < 0 || device >= MMH3_MAX_DEVICES) {
+        return false;
+    }
+    // One plus whether the device is an sm_90, so that zero means unasked.
+    if (const int kept = answers[device].load(std::memory_order_relaxed); kept != 0) {
+        return kept == 2;
+    }
+    int major = 0;
+    int minor = 0;
+    if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+        cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess) {
+        return false;
+    }
+    const bool hopper = major == 9 && minor == 0;
+    answers[device].store(hopper ? 2 : 1, std::memory_order_relaxed);
+    return hopper;
+}
+
 // Multiprocessors on the device this thread computes on, or zero where it cannot be asked.
 inline int mmh3_multiprocessor_count() {
     static std::atomic<int> counts[MMH3_MAX_DEVICES];
