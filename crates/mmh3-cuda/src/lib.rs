@@ -107,6 +107,9 @@ pub const OUT_OF_MEMORY: i32 = 2;
 /// `cudaErrorInvalidDevice`, which is also what this build answers for a device it cannot index.
 pub const INVALID_DEVICE: i32 = 101;
 
+/// `cudaErrorNotSupported`, which a kernel of one architecture answers on a device of another.
+pub const NOT_SUPPORTED: i32 = 801;
+
 /// The most devices this process computes on. It matches `MMH3_MAX_DEVICES` in `device.cuh`, which
 /// caches the same kind of per-device answer on the other side of the ABI.
 pub const MAX_DEVICES: usize = 16;
@@ -114,6 +117,10 @@ pub const MAX_DEVICES: usize = 16;
 impl CudaError {
     pub fn is_out_of_memory(&self) -> bool {
         self.code == OUT_OF_MEMORY
+    }
+
+    pub fn is_not_supported(&self) -> bool {
+        self.code == NOT_SUPPORTED
     }
 }
 

@@ -34,8 +34,6 @@ unsafe extern "C" {
     ) -> c_int;
 }
 
-/// cudaErrorNotSupported.
-const NOT_SUPPORTED: c_int = 801;
 const A_ROWS: usize = 64;
 const ROW_BYTES: usize = 128;
 
@@ -107,7 +105,7 @@ fn only_hopper_runs_it() {
     let operand = vec![0; (A_ROWS + 256) * ROW_BYTES];
     assert_eq!(
         run(false, 256, &operand, &operand),
-        Err(NOT_SUPPORTED),
+        Err(mmh3_cuda::NOT_SUPPORTED),
         "a card without wgmma must refuse it"
     );
 }

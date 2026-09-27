@@ -117,11 +117,17 @@ fn bench_mma(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(arguments, &["iterations"], &[], USAGE)?;
     let iterations = option_number(&options, "iterations", 4096)?;
     println!(
-        "register-only mma.sync throughput, {iterations} iterations of 8 independent chains per warp"
+        "register-only mma.sync throughput, {iterations} iterations of 8 independent chains per warp, \
+         and wgmma from shared memory where the card has it"
     );
     for kind in MmaKind::ALL {
-        let throughput = mma_peak(kind, iterations)?;
-        println!("  {:<22} {throughput:>7.1} T/s", kind.instruction());
+        match mma_peak(kind, iterations) {
+            Ok(throughput) => println!("  {:<28} {throughput:>7.1} T/s", kind.instruction()),
+            Err(error) if error.is_not_supported() => {
+                println!("  {:<28}  not on this card", kind.instruction())
+            }
+            Err(error) => return Err(error.into()),
+        }
     }
     Ok(())
 }

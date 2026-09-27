@@ -103,15 +103,20 @@ pub enum MmaKind {
     Int8AccumulateS32,
     Fp8AccumulateF32,
     Fp8AccumulateF16,
+    /// Hopper's wgmma, which other cards refuse (`CudaError::is_not_supported`).
+    WgmmaInt8AccumulateS32,
+    WgmmaBf16AccumulateF32,
 }
 
 impl MmaKind {
-    pub const ALL: [MmaKind; 5] = [
+    pub const ALL: [MmaKind; 7] = [
         MmaKind::Bf16AccumulateF32,
         MmaKind::F16AccumulateF16,
         MmaKind::Int8AccumulateS32,
         MmaKind::Fp8AccumulateF32,
         MmaKind::Fp8AccumulateF16,
+        MmaKind::WgmmaInt8AccumulateS32,
+        MmaKind::WgmmaBf16AccumulateF32,
     ];
 
     pub fn instruction(self) -> &'static str {
@@ -121,6 +126,8 @@ impl MmaKind {
             MmaKind::Int8AccumulateS32 => "m16n8k32 s8 → s32",
             MmaKind::Fp8AccumulateF32 => "m16n8k32 e4m3 → f32",
             MmaKind::Fp8AccumulateF16 => "m16n8k32 e4m3 → f16",
+            MmaKind::WgmmaInt8AccumulateS32 => "wgmma m64n256k32 s8 → s32",
+            MmaKind::WgmmaBf16AccumulateF32 => "wgmma m64n256k16 bf16 → f32",
         }
     }
 
