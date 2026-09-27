@@ -16,7 +16,7 @@ use std::process::ExitCode;
 const USAGE: &str = "usage:
   mmh3-tools inspect <file.safetensors> [--all]
   mmh3-tools device
-  mmh3-tools bench gemm [--tokens N] [--iterations N] [--kinds bf16,fp8,int8,nvfp4,int8-mmh3] [--no-tma]
+  mmh3-tools bench gemm [--tokens N] [--iterations N] [--kinds bf16,fp8,int8,nvfp4,int8-mmh3] [--no-tma] [--no-wgmma]
   mmh3-tools bench memory [--megabytes N] [--iterations N]
   mmh3-tools bench mma [--iterations N]
   mmh3-tools bench attention [--tokens N] [--heads N] [--iterations N] [--no-tma]

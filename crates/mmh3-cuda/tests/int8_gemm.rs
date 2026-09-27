@@ -61,18 +61,62 @@ fn every_tiling(n: usize) -> Vec<Option<Int8Tiling>> {
     tilings
 }
 
-/// Every tiling of `every_tiling`, first with TMA and then with the cp.async copies of a device
-/// without it (sm_89), and whether TMA is on.
-fn every_tiling_and_copy(n: usize) -> Vec<(Option<Int8Tiling>, bool)> {
-    [true, false]
+/// How a run copies its tiles and multiplies them.
+#[derive(Clone, Copy, Debug)]
+struct Path {
+    tma: bool,
+    wgmma: bool,
+}
+
+impl Path {
+    /// Runs `run` on this path, and leaves the thread on the default one after it.
+    fn run<T>(self, run: impl FnOnce() -> T) -> T {
+        mmh3_cuda::use_tma_on_this_thread(self.tma);
+        mmh3_cuda::use_wgmma_on_this_thread(self.wgmma);
+        let result = run();
+        mmh3_cuda::use_tma_on_this_thread(true);
+        mmh3_cuda::use_wgmma_on_this_thread(true);
+        result
+    }
+}
+
+fn is_hopper() -> bool {
+    let device = mmh3_cuda::current_device().unwrap();
+    mmh3_cuda::device_info(device).unwrap().compute_capability == (9, 0)
+}
+
+/// Every tiling of `every_tiling` on every path this card can take: on an sm_90 card wgmma first,
+/// then mma.sync with TMA copies, and the cp.async copies of a card without TMA (sm_89).
+fn every_tiling_and_path(n: usize) -> Vec<(Option<Int8Tiling>, Path)> {
+    let mut paths = Vec::new();
+    if is_hopper() {
+        paths.push(Path {
+            tma: true,
+            wgmma: true,
+        });
+    }
+    paths.push(Path {
+        tma: true,
+        wgmma: false,
+    });
+    paths.push(Path {
+        tma: false,
+        wgmma: false,
+    });
+    paths
         .into_iter()
-        .flat_map(|tma| every_tiling(n).into_iter().map(move |tiling| (tiling, tma)))
+        .flat_map(|path| {
+            every_tiling(n)
+                .into_iter()
+                .map(move |tiling| (tiling, path))
+        })
         .collect()
 }
 
-/// Runs every tiling, with TMA and with cp.async copies, on random operands, with a random adapter
-/// of `rank` when it is not zero, compares the output with an f64 reference within BF16 rounding,
-/// and checks that every run gives the same bits. The adapter's down rows lie
+/// Runs every tiling on every path on random operands, with a random adapter of `rank` when it is
+/// not zero, compares the output with an f64 reference within BF16 rounding, and checks that every
+/// run gives the same bits. The wgmma and mma.sync runs add an adapter's BF16 products in their own
+/// orders, so with an adapter each only has to agree with itself. The adapter's down rows lie
 /// `down_stride` values apart, with values the kernel must skip in between. `f16_with_bias`
 /// switches to FP16 output with a random bias.
 fn check_every_config(
@@ -157,34 +201,35 @@ fn check_every_config(
     } else {
         (n - first_column) / 128
     };
-    let mut first_output: Option<Vec<u8>> = None;
-    for (tiling, tma) in every_tiling_and_copy(n) {
+    // The first output of the wgmma runs and of the mma.sync ones.
+    let mut first_outputs: [Option<Vec<u8>>; 2] = [None, None];
+    for (tiling, path) in every_tiling_and_path(n) {
         let mut output = DeviceBuffer::new(m * n * 2).unwrap();
         let maxima = DeviceBuffer::zeroed(groups.max(1) * 4).unwrap();
-        mmh3_cuda::use_tma_on_this_thread(tma);
-        let result = gemm::int8(
-            tiling,
-            &activation_buffer,
-            &weight_buffer,
-            &activation_scale_buffer,
-            &weight_scale_buffer,
-            Output {
-                buffer: &mut output,
-                f16: f16_with_bias,
-                bias: f16_with_bias.then_some(&bias_buffer),
-                swiglu: false,
-                column_maxima: (!f16_with_bias).then_some(ColumnMaxima {
-                    values: &maxima,
-                    first_column,
-                }),
-            },
-            m,
-            n,
-            k,
-            (rank > 0).then_some(&adapter),
-        );
-        mmh3_cuda::use_tma_on_this_thread(true);
-        result.unwrap();
+        path.run(|| {
+            gemm::int8(
+                tiling,
+                &activation_buffer,
+                &weight_buffer,
+                &activation_scale_buffer,
+                &weight_scale_buffer,
+                Output {
+                    buffer: &mut output,
+                    f16: f16_with_bias,
+                    bias: f16_with_bias.then_some(&bias_buffer),
+                    swiglu: false,
+                    column_maxima: (!f16_with_bias).then_some(ColumnMaxima {
+                        values: &maxima,
+                        first_column,
+                    }),
+                },
+                m,
+                n,
+                k,
+                (rank > 0).then_some(&adapter),
+            )
+        })
+        .unwrap();
         let mut output_bytes = vec![0; m * n * 2];
         output.copy_to_host(&mut output_bytes).unwrap();
         let mut expected_maxima = vec![0.0f32; groups];
@@ -199,7 +244,7 @@ fn check_every_config(
         assert_eq!(
             maxima.to_f32().unwrap()[..groups],
             expected_maxima,
-            "{m} × {n} × {k}, rank {rank}, {tiling:?}, TMA {tma}: column maxima"
+            "{m} × {n} × {k}, rank {rank}, {tiling:?}, {path:?}: column maxima"
         );
 
         for (index, &expected) in expected.iter().enumerate() {
@@ -212,17 +257,27 @@ fn check_every_config(
             let tolerance = expected.abs() / 256.0 + 1e-4;
             assert!(
                 (actual - expected).abs() <= tolerance,
-                "{m} × {n} × {k}, rank {rank}, {tiling:?}, TMA {tma}, row {}, column {}: expected {expected}, got {actual}",
+                "{m} × {n} × {k}, rank {rank}, {tiling:?}, {path:?}, row {}, column {}: expected {expected}, got {actual}",
                 index / n,
                 index % n
             );
         }
-        match &first_output {
-            Some(first) => assert!(
+        // Without an adapter every product is an integer and the FP32 steps are the same, so the
+        // two families agree too.
+        let family = usize::from(!path.wgmma);
+        let compared = if rank == 0 {
+            first_outputs.iter().flatten().next()
+        } else {
+            first_outputs[family].as_ref()
+        };
+        if let Some(first) = compared {
+            assert!(
                 *first == output_bytes,
-                "{m} × {n} × {k}, rank {rank}: {tiling:?} with TMA {tma} differs from the first run"
-            ),
-            None => first_output = Some(output_bytes),
+                "{m} × {n} × {k}, rank {rank}: {tiling:?} on {path:?} differs from the first run"
+            );
+        }
+        if first_outputs[family].is_none() {
+            first_outputs[family] = Some(output_bytes);
         }
     }
 }
@@ -307,40 +362,42 @@ fn writes_swiglu_of_interleaved_rows() {
             scale: adapter_scale,
         };
 
-        let mut outputs = Vec::new();
-        for (tiling, tma) in every_tiling_and_copy(n) {
+        // The runs of each family, wgmma and mma.sync, which add the adapter in their own orders.
+        let mut families: [Vec<_>; 2] = [Vec::new(), Vec::new()];
+        for (tiling, path) in every_tiling_and_path(n) {
             let mut output = DeviceBuffer::new(m * features * 2).unwrap();
-            mmh3_cuda::use_tma_on_this_thread(tma);
-            let result = gemm::int8(
-                tiling,
-                &activation_buffer,
-                &weight_buffer,
-                &activation_scale_buffer,
-                &weight_scale_buffer,
-                Output {
-                    buffer: &mut output,
-                    f16,
-                    bias: Some(&bias_buffer),
-                    swiglu: true,
-                    column_maxima: None,
-                },
-                m,
-                n,
-                k,
-                Some(&adapter),
-            );
-            mmh3_cuda::use_tma_on_this_thread(true);
-            result.unwrap();
+            path.run(|| {
+                gemm::int8(
+                    tiling,
+                    &activation_buffer,
+                    &weight_buffer,
+                    &activation_scale_buffer,
+                    &weight_scale_buffer,
+                    Output {
+                        buffer: &mut output,
+                        f16,
+                        bias: Some(&bias_buffer),
+                        swiglu: true,
+                        column_maxima: None,
+                    },
+                    m,
+                    n,
+                    k,
+                    Some(&adapter),
+                )
+            })
+            .unwrap();
             let mut output_bytes = vec![0; m * features * 2];
             output.copy_to_host(&mut output_bytes).unwrap();
-            outputs.push((tiling, tma, output_bytes));
+            families[usize::from(!path.wgmma)].push((tiling, path, output_bytes));
         }
-        let output_bytes = &outputs[0].2;
-        for (tiling, tma, other) in &outputs[1..] {
-            assert!(
-                other == output_bytes,
-                "f16 {f16}: {tiling:?} with TMA {tma} differs from the first run"
-            );
+        for runs in &families {
+            for (tiling, path, other) in runs.iter().skip(1) {
+                assert!(
+                    *other == runs[0].2,
+                    "f16 {f16}: {tiling:?} on {path:?} differs from the first run"
+                );
+            }
         }
 
         let product = |row: usize, column: usize| -> f32 {
@@ -360,22 +417,25 @@ fn writes_swiglu_of_interleaved_rows() {
                 + bias[column] as f64;
             round_output(value, f16)
         };
-        for row in 0..m {
-            for feature in 0..features {
-                let (gate, up) = (product(row, feature), product(row, features + feature));
-                let expected = round_output((gate / (1.0 + (-gate).exp()) * up) as f64, f16) as f64;
-                let index = row * features + feature;
-                let bits =
-                    u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]]);
-                let actual = if f16 {
-                    f16_to_f32(bits)
-                } else {
-                    bf16_to_f32(bits)
-                } as f64;
-                assert!(
-                    (actual - expected).abs() <= expected.abs() / 64.0 + 1e-3,
-                    "f16 {f16}, row {row}, feature {feature}: expected {expected}, got {actual}"
-                );
+        for (_, path, output_bytes) in families.iter().filter_map(|runs| runs.first()) {
+            for row in 0..m {
+                for feature in 0..features {
+                    let (gate, up) = (product(row, feature), product(row, features + feature));
+                    let expected =
+                        round_output((gate / (1.0 + (-gate).exp()) * up) as f64, f16) as f64;
+                    let index = row * features + feature;
+                    let bits =
+                        u16::from_le_bytes([output_bytes[index * 2], output_bytes[index * 2 + 1]]);
+                    let actual = if f16 {
+                        f16_to_f32(bits)
+                    } else {
+                        bf16_to_f32(bits)
+                    } as f64;
+                    assert!(
+                        (actual - expected).abs() <= expected.abs() / 64.0 + 1e-3,
+                        "f16 {f16}, {path:?}, row {row}, feature {feature}: expected {expected}, got {actual}"
+                    );
+                }
             }
         }
     }

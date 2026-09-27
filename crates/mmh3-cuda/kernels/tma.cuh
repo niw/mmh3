@@ -42,6 +42,15 @@ __device__ __forceinline__ void barrier_expect_bytes(uint32_t barrier, uint32_t 
 #endif
 }
 
+// Counts this thread in the barrier's current phase.
+__device__ __forceinline__ void barrier_arrive(uint32_t barrier) {
+#ifdef MMH3_TMA_TRAP
+    __trap();
+#else
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" ::"r"(barrier) : "memory");
+#endif
+}
+
 __device__ __forceinline__ bool barrier_try_wait(uint32_t barrier, uint32_t parity) {
 #ifdef MMH3_TMA_TRAP
     __trap();

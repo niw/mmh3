@@ -9,11 +9,13 @@
 #include <map>
 #include <mutex>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "device.cuh"
 #include "tensor_core.cuh"
 #include "tma.cuh"
+#include "wgmma.cuh"
 
 // Scaled INT8 GEMM for the DiT, text encoder and video VAE linear layers:
 //   output[m, n] = round(sum_k activations[m, k] * weights[n, k] * activation_scales[m] *
@@ -31,6 +33,9 @@
 // to 168 registers. Instead, the warp that releases a stage last issues the copies that refill it.
 // An adapter adds stages of 64 ranks of its BF16 operands after the K blocks of each tile,
 // multiplied with BF16 MMAs into the scaled FP32 result before the single rounding.
+//
+// On Hopper (sm_90) three warpgroups share the same tiles and stages instead: one copies with TMA
+// and two multiply with wgmma, over four stages the larger shared memory holds.
 //
 // Devices without TMA (sm_89) fill the same swizzled stages with cp.async instead: every thread
 // copies its share of the next stage while the warps multiply the current one, and the whole CTA
@@ -585,6 +590,276 @@ __global__ void __launch_bounds__(WARPS * 32, 1)
     }
 }
 
+// The Hopper kernel: warpgroup 0 fills the stages with TMA, and warpgroups 1 and 2 each multiply
+// half of the tile's rows with wgmma, 64 rows at a time over all of its columns.
+constexpr int HOPPER_STAGES = 4;
+constexpr int HOPPER_THREADS = 384;
+constexpr int HOPPER_CONSUMER_THREADS = 256;
+// Registers after the warpgroups trade them: the copying one needs few, and the multiplying ones
+// hold 128 accumulators each.
+constexpr int HOPPER_PRODUCER_REGISTERS = 40;
+constexpr int HOPPER_CONSUMER_REGISTERS = 232;
+
+template <typename Config> struct HopperLayout {
+    // Rows each multiplying warpgroup owns, in wgmma of 64 rows over every column of the tile.
+    static constexpr int rows = Config::block_m / 2;
+    static constexpr int m_steps = rows / 64;
+    static constexpr int columns = Config::block_n;
+    static constexpr int registers = columns / 2;
+    // The stages, alignment slack, and a full and an empty barrier per stage.
+    static constexpr int shared_bytes =
+        HOPPER_STAGES * Config::stage_bytes + 1024 + HOPPER_STAGES * 16;
+    static_assert(rows % 64 == 0 && (columns == 128 || columns == 256), "wgmma tiles");
+    static_assert(m_steps * registers == 128, "128 accumulators per thread");
+};
+
+// D (+)= A · Bᵀ over 32 bytes of K for one wgmma of `COLUMNS` columns.
+template <int COLUMNS, bool BF16>
+__device__ __forceinline__ void hopper_mma(uint32_t (&d)[COLUMNS / 2], uint64_t a, uint64_t b,
+                                           int accumulate) {
+    if constexpr (COLUMNS == 256 && BF16) {
+        wgmma_bf16_m64n256k16(d, a, b, accumulate);
+    } else if constexpr (COLUMNS == 256) {
+        wgmma_s8_m64n256k32(d, a, b, accumulate);
+    } else if constexpr (BF16) {
+        wgmma_bf16_m64n128k16(d, a, b, accumulate);
+    } else {
+        wgmma_s8_m64n128k32(d, a, b, accumulate);
+    }
+}
+
+template <typename Config, typename Output, bool SWIGLU>
+__global__ void __launch_bounds__(HOPPER_THREADS, 1)
+    int8_gemm_hopper_kernel(const __grid_constant__ TensorMaps maps,
+                            const float *__restrict__ activation_scales,
+                            const float *__restrict__ weight_scales, const float *__restrict__ bias,
+                            Output *__restrict__ output, int m, int n, int k, int output_stride,
+                            int adapter_blocks, float adapter_scale, ColumnMaxima maxima,
+                            int group_m) {
+    using L = HopperLayout<Config>;
+    extern __shared__ __align__(1024) uint8_t shared_memory[];
+    const uint32_t shared_base = (shared_address(shared_memory) + 1023) & ~1023u;
+    const uint32_t full_barriers = shared_base + HOPPER_STAGES * Config::stage_bytes;
+    const uint32_t empty_barriers = full_barriers + HOPPER_STAGES * 8;
+
+    TileGrid grid;
+    grid.tiles_m = (m + Config::block_m - 1) / Config::block_m;
+    grid.tiles_n = n / Config::block_n;
+    grid.tiles = grid.tiles_m * grid.tiles_n;
+    grid.k_blocks = k / BLOCK_K;
+    grid.blocks_per_tile = grid.k_blocks + adapter_blocks;
+    grid.group_m = group_m;
+
+    if (threadIdx.x == 0) {
+        for (int stage = 0; stage < HOPPER_STAGES; stage++) {
+            barrier_init(full_barriers + stage * 8, 1);
+            barrier_init(empty_barriers + stage * 8, HOPPER_CONSUMER_THREADS);
+        }
+        barrier_init_fence();
+    }
+    __syncthreads();
+
+    const int warpgroup = threadIdx.x / 128;
+    Ring ring;
+    if (warpgroup == 0) {
+        registers_decrease<HOPPER_PRODUCER_REGISTERS>();
+        if (threadIdx.x == 0) {
+            for (;; ring.advance()) {
+                const int tile = blockIdx.x + ring.sequence / grid.blocks_per_tile * gridDim.x;
+                if (tile >= grid.tiles) {
+                    break;
+                }
+                // A stage's first fill waits for nothing, and every later one for both
+                // multiplying warpgroups to have let go of it.
+                if (ring.sequence >= HOPPER_STAGES) {
+                    barrier_wait(empty_barriers + ring.stage * 8, ring.phase ^ 1);
+                }
+                fill_stage<Config>(grid, ring.sequence,
+                                   shared_base + ring.stage * Config::stage_bytes,
+                                   full_barriers + ring.stage * 8, maps);
+            }
+        }
+        return;
+    }
+
+    registers_increase<HOPPER_CONSUMER_REGISTERS>();
+    const int consumer = warpgroup - 1;
+    const int thread = threadIdx.x % 128;
+    const int warp = thread / 32;
+    const int lane = thread % 32;
+    // The stage whose wgmma may still read it, released once they are done.
+    int pending_stage = -1;
+    auto release_pending = [&]() {
+        if (pending_stage >= 0) {
+            barrier_arrive(empty_barriers + pending_stage * 8);
+            pending_stage = -1;
+        }
+    };
+    uint32_t accumulators[L::m_steps][L::registers];
+    // Multiplies the ring's current stage into the accumulators, INT8 or the adapter's BF16, and
+    // lets go of the stage before it, whose wgmma are done by the time this returns.
+    auto consume = [&](auto bf16, bool overwrite) {
+        barrier_wait(full_barriers + ring.stage * 8, ring.phase);
+        const uint32_t stage_a =
+            shared_base + ring.stage * Config::stage_bytes + consumer * L::rows * BLOCK_K;
+        const uint32_t stage_b = shared_base + ring.stage * Config::stage_bytes + Config::a_bytes;
+        wgmma_fence();
+        #pragma unroll
+        for (int k_step = 0; k_step < BLOCK_K / 32; k_step++) {
+            // A descriptor counts 16-byte units, and each step reads 32 bytes of K.
+            const uint64_t b = wgmma_descriptor(stage_b) + k_step * 2;
+            #pragma unroll
+            for (int m_step = 0; m_step < L::m_steps; m_step++) {
+                const uint64_t a = wgmma_descriptor(stage_a + m_step * 64 * BLOCK_K) + k_step * 2;
+                hopper_mma<L::columns, decltype(bf16)::value>(accumulators[m_step], a, b,
+                                                              !(overwrite && k_step == 0));
+            }
+        }
+        wgmma_commit();
+        wgmma_wait<1>();
+        release_pending();
+        pending_stage = ring.stage;
+        ring.advance();
+    };
+    auto finish = [&]() {
+        wgmma_wait<0>();
+        release_pending();
+    };
+
+    for (int tile = blockIdx.x; tile < grid.tiles; tile += gridDim.x) {
+        int tile_m, tile_n;
+        grid.coordinates(tile, tile_m, tile_n);
+        for (int k_block = 0; k_block < grid.k_blocks; k_block++) {
+            consume(std::false_type{}, k_block == 0);
+        }
+        finish();
+
+        const int first_row = tile_m * Config::block_m + consumer * L::rows + warp * 16 + lane / 4;
+        const int first_column = tile_n * Config::block_n + 2 * (lane % 4);
+        // Register i of an m step holds row first_row + 64 m + 8 ((i / 2) % 2) and column
+        // first_column + 8 (i / 4) + i % 2. Scale the INT8 products in place, in the order the
+        // mma.sync kernel does.
+        float row_scales[L::m_steps][2];
+        #pragma unroll
+        for (int m_step = 0; m_step < L::m_steps; m_step++) {
+            #pragma unroll
+            for (int half = 0; half < 2; half++) {
+                const int row = first_row + m_step * 64 + half * 8;
+                row_scales[m_step][half] = row < m ? activation_scales[row] : 0.0f;
+            }
+        }
+        #pragma unroll
+        for (int n_tile = 0; n_tile < L::columns / 8; n_tile++) {
+            const float2 column_scale =
+                *reinterpret_cast<const float2 *>(weight_scales + first_column + n_tile * 8);
+            #pragma unroll
+            for (int m_step = 0; m_step < L::m_steps; m_step++) {
+                #pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    uint32_t *pair = accumulators[m_step] + n_tile * 4 + half * 2;
+                    pair[0] = __float_as_uint(static_cast<float>(static_cast<int32_t>(pair[0])) *
+                                              row_scales[m_step][half] * column_scale.x);
+                    pair[1] = __float_as_uint(static_cast<float>(static_cast<int32_t>(pair[1])) *
+                                              row_scales[m_step][half] * column_scale.y);
+                }
+            }
+        }
+
+        // Add adapter_scale · down · upᵀ in FP32, accumulating the products at the scale of the
+        // adapter.
+        if (adapter_blocks > 0) {
+            const float inverse_scale = 1.0f / adapter_scale;
+            #pragma unroll
+            for (int m_step = 0; m_step < L::m_steps; m_step++) {
+                #pragma unroll
+                for (int index = 0; index < L::registers; index++) {
+                    accumulators[m_step][index] = __float_as_uint(
+                        __uint_as_float(accumulators[m_step][index]) * inverse_scale);
+                }
+            }
+            for (int block = 0; block < adapter_blocks; block++) {
+                consume(std::true_type{}, false);
+            }
+            finish();
+            #pragma unroll
+            for (int m_step = 0; m_step < L::m_steps; m_step++) {
+                #pragma unroll
+                for (int index = 0; index < L::registers; index++) {
+                    accumulators[m_step][index] = __float_as_uint(
+                        __uint_as_float(accumulators[m_step][index]) * adapter_scale);
+                }
+            }
+        }
+
+        if (bias != nullptr) {
+            #pragma unroll
+            for (int n_tile = 0; n_tile < L::columns / 8; n_tile++) {
+                const float2 column_bias =
+                    *reinterpret_cast<const float2 *>(bias + first_column + n_tile * 8);
+                #pragma unroll
+                for (int m_step = 0; m_step < L::m_steps; m_step++) {
+                    #pragma unroll
+                    for (int half = 0; half < 2; half++) {
+                        uint32_t *pair = accumulators[m_step] + n_tile * 4 + half * 2;
+                        pair[0] = __float_as_uint(__uint_as_float(pair[0]) + column_bias.x);
+                        pair[1] = __float_as_uint(__uint_as_float(pair[1]) + column_bias.y);
+                    }
+                }
+            }
+        }
+
+        // Groups of 128 columns the tile spans, for the maxima.
+        constexpr int GROUPS = L::columns / 128;
+        const int tile_first_column = tile_n * Config::block_n;
+        uint32_t magnitudes[GROUPS] = {};
+        #pragma unroll
+        for (int n_tile = 0; n_tile < L::columns / 8; n_tile++) {
+            const int column = first_column + n_tile * 8;
+            #pragma unroll
+            for (int m_step = 0; m_step < L::m_steps; m_step++) {
+                #pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    const uint32_t *pair = accumulators[m_step] + n_tile * 4 + half * 2;
+                    const uint32_t word =
+                        pack(output, __uint_as_float(pair[0]), __uint_as_float(pair[1]));
+                    const int row = first_row + m_step * 64 + half * 8;
+                    if constexpr (SWIGLU) {
+                        // Lanes 0 and 1 of a quad hold the gates of features column / 8 * 4 +
+                        // 2 (lane % 4) and the one after, and lanes 2 and 3 their up projections.
+                        const uint32_t up = __shfl_xor_sync(0xffffffff, word, 2);
+                        if (lane % 4 < 2 && row < m) {
+                            *reinterpret_cast<uint32_t *>(
+                                output + static_cast<size_t>(row) * output_stride + column / 8 * 4 +
+                                2 * (lane % 4)) = swiglu_pair(output, word, up);
+                        }
+                    } else if (row < m) {
+                        *reinterpret_cast<uint32_t *>(
+                            output + static_cast<size_t>(row) * output_stride + column) = word;
+                        // Magnitudes of non-negative BF16 values order like integers.
+                        uint32_t &magnitude = magnitudes[n_tile * 8 / 128];
+                        magnitude = max(magnitude, max(word & 0x7fffu, (word >> 16) & 0x7fffu));
+                    }
+                }
+            }
+        }
+        if (!SWIGLU && maxima.values != nullptr) {
+            #pragma unroll
+            for (int group = 0; group < GROUPS; group++) {
+                const int group_first_column = tile_first_column + group * 128;
+                uint32_t magnitude = magnitudes[group];
+                #pragma unroll
+                for (int offset = 16; offset > 0; offset /= 2) {
+                    magnitude = max(magnitude, __shfl_xor_sync(0xffffffff, magnitude, offset));
+                }
+                if (lane == 0 && group_first_column >= maxima.first_column) {
+                    atomicMax(maxima.values + (group_first_column - maxima.first_column) / 128,
+                              magnitude << 16);
+                }
+            }
+        }
+    }
+}
+
 using TallTile = Int8GemmConfig<256, 128, 4>;
 using WideTile = Int8GemmConfig<128, 256, 4>;
 
@@ -672,6 +947,26 @@ int launch(int group_m, const int8_t *activations, const int8_t *weights,
         // cp.async copies 16 bytes from 16-byte aligned addresses, as TMA needs its bases.
         return static_cast<int>(cudaErrorInvalidValue);
     }
+    const int tiles = (m + Config::block_m - 1) / Config::block_m * (n / Config::block_n);
+    const int processors = mmh3_multiprocessor_count();
+    if (processors == 0) {
+        return static_cast<int>(cudaErrorInvalidDevice);
+    }
+    const int blocks = tiles < processors ? tiles : processors;
+    if (tma && mmh3_wgmma_available()) {
+        auto kernel = int8_gemm_hopper_kernel<Config, Output, SWIGLU>;
+        constexpr int shared_bytes = HopperLayout<Config>::shared_bytes;
+        static Mmh3SharedMemory shared_memory;
+        const cudaError_t configured =
+            mmh3_configure_shared_memory(shared_memory, kernel, shared_bytes);
+        if (configured != cudaSuccess) {
+            return static_cast<int>(configured);
+        }
+        kernel<<<blocks, HOPPER_THREADS, shared_bytes, stream>>>(
+            maps, activation_scales, weight_scales, bias, output, m, n, k, output_stride,
+            adapter_blocks, adapter.scale, maxima, group_m);
+        return static_cast<int>(cudaGetLastError());
+    }
     auto kernel = tma ? int8_gemm_kernel<Config, Output, SWIGLU, true>
                       : int8_gemm_kernel<Config, Output, SWIGLU, false>;
     static Mmh3SharedMemory shared_memory[2];
@@ -680,12 +975,6 @@ int launch(int group_m, const int8_t *activations, const int8_t *weights,
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }
-    const int tiles = (m + Config::block_m - 1) / Config::block_m * (n / Config::block_n);
-    const int processors = mmh3_multiprocessor_count();
-    if (processors == 0) {
-        return static_cast<int>(cudaErrorInvalidDevice);
-    }
-    const int blocks = tiles < processors ? tiles : processors;
     kernel<<<blocks, WARPS * 32, Config::shared_bytes, stream>>>(
         maps, operands, activation_scales, weight_scales, bias, output, m, n, k, output_stride,
         adapter_blocks, adapter.scale, maxima, group_m);

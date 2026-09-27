@@ -32,12 +32,13 @@ fn bench_gemm(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(
         arguments,
         &["tokens", "iterations", "kinds"],
-        &["no-tma"],
+        &["no-tma", "no-wgmma"],
         USAGE,
     )?;
     let tokens = option_number(&options, "tokens", 38_710)?;
     let iterations = option_number(&options, "iterations", 10)?;
     mmh3_cuda::use_tma_on_this_thread(!options.contains_key("no-tma"));
+    mmh3_cuda::use_wgmma_on_this_thread(!options.contains_key("no-wgmma"));
     let kinds = match options.get("kinds") {
         Some(list) => list
             .split(',')
