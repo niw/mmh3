@@ -309,7 +309,7 @@ impl Drop for CopyStream {
 }
 
 /// Checks that the current device has at least the shared memory and registers per SM the kernels
-/// were tuned for, which every sm_12x, Hopper and Ada device has.
+/// were tuned for, which every sm_12x, sm_10x, Hopper and Ada device has.
 pub fn check_device() -> Result<(), CudaError> {
     let mut message = [0u8; 256];
     // SAFETY: the message buffer holds `message.len()` bytes.

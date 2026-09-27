@@ -43,8 +43,8 @@ extern "C" int mmh3_cuda_device_info(int device, Mmh3DeviceInfo *info) {
 }
 
 // The shared memory and registers of an sm_12x SM, which the kernels' tile sizes, pipeline stages
-// and blocks per SM are chosen for. An Ada SM (sm_89) has the same, and a Hopper SM (sm_90) more
-// shared memory, which the kernels leave unused.
+// and blocks per SM are chosen for. An Ada SM (sm_89) has the same, and a Hopper (sm_90) or data
+// center Blackwell (sm_100) SM more shared memory, which the kernels leave unused.
 constexpr int EXPECTED_SHARED_MEMORY_PER_MULTIPROCESSOR = 100 * 1024;
 constexpr int EXPECTED_SHARED_MEMORY_PER_BLOCK = 99 * 1024;
 constexpr int EXPECTED_REGISTERS_PER_MULTIPROCESSOR = 64 * 1024;

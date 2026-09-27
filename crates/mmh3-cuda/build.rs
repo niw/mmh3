@@ -13,11 +13,12 @@ fn main() {
     }
 
     let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".to_owned());
-    // NOTE: the Blackwell family of GB10 and the RTX 50 series, Hopper (H20, H100, H200) and Ada
-    // (RTX 4090, L40S). Each gets machine code only. A PTX for sm_89 would let a newer card compile
-    // it, but that card has TMA, so it would launch the TMA paths, which sm_89 code only traps in.
+    // NOTE: the Blackwell family of GB10 and the RTX 50 series, the data center Blackwell family (B200,
+    // B300), Hopper (H20, H100, H200) and Ada (RTX 4090, L40S). Each gets machine code only. A PTX
+    // for sm_89 would let a newer card compile it, but that card has TMA, so it would launch the TMA
+    // paths, which sm_89 code only traps in.
     let architectures =
-        env::var("MMH3_CUDA_ARCH").unwrap_or_else(|_| "sm_120f,sm_90a,sm_89".to_owned());
+        env::var("MMH3_CUDA_ARCH").unwrap_or_else(|_| "sm_120f,sm_100f,sm_90a,sm_89".to_owned());
     let manifest_directory = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let output_directory = PathBuf::from(env::var("OUT_DIR").unwrap());
     let kernel_directory = manifest_directory.join("kernels");
