@@ -10,8 +10,8 @@ The `cuda` backend runs every part of a generation on an NVIDIA GPU, with the ke
 - The CUDA toolkit with `nvcc` and cuBLASLt, including its headers, which Ubuntu packages as
   `libcublas-dev-13-0` (developed with CUDA 13.0).
 - Rust with edition 2024 support (developed with 1.98).
-- The Hugging Face CLI (`hf`) to download the models, for example installed with
-  `uv tool install huggingface_hub`.
+- curl to download the models, or the Hugging Face CLI (`hf`), which the download uses when it is
+  installed, for example with `uv tool install huggingface_hub`.
 - A C/C++ toolchain for the CUDA kernels and NVENC adapter.
 - Optionally, the libibverbs headers (`libibverbs-dev`) for RDMA between machines. Without them
   mmh3 builds without RDMA and sends everything over the socket. After installing them, run

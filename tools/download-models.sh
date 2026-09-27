@@ -8,9 +8,10 @@ usage() {
 usage: $0 [--video-vae int8|fp16] [--ref2va | --no-ref2va] [--fasth3 | --no-fasth3]
        [--lightx2v-turbo | --no-lightx2v-turbo] [--taomate | --no-taomate] [--models DIR]
 
-Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf). By default
-it downloads the ones make generate uses: the INT8 ConvRot DiT, text encoder and video VAE, the FP32
-audio VAE and the FastH3 VSA-DataFree patch.
+Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf), or with curl
+when hf is not installed. curl sends HF_TOKEN when it is set. By default it downloads the ones make
+generate uses: the INT8 ConvRot DiT, text encoder and video VAE, the FP32 audio VAE and the FastH3
+VSA-DataFree patch.
 
   --video-vae int8     The INT8 ConvRot video VAE from yniw/MiniMax-H3-mmh3 (default).
   --video-vae fp16     The FP16 video VAE from Comfy-Org/MiniMax-H3 instead. The DiT and the text
@@ -75,16 +76,36 @@ case $video_vae in
   *) fail "--video-vae must be int8 or fp16, not $video_vae" ;;
 esac
 
-if ! command -v hf >/dev/null; then
-  cat >&2 <<EOF
-error: the Hugging Face CLI (hf) is not installed. Install it, for example with uv:
+# NOTE: Without hf, curl resumes each file from DEST/FILE.incomplete and renames it when the
+# download completes, so a file that already exists is complete and is skipped.
+download() {
+  local repo=$1 dest=$2
+  shift 2
+  if command -v hf >/dev/null; then
+    hf download "$repo" "$@" --local-dir "$dest"
+    return
+  fi
+  local curl_options=(--location --fail --continue-at - --retry 5)
+  if [[ -n ${HF_TOKEN:-} ]]; then
+    curl_options+=(--header "Authorization: Bearer $HF_TOKEN")
+  fi
+  local file path
+  for file in "$@"; do
+    path=$dest/$file
+    if [[ -f $path ]]; then
+      echo "$path exists, skipping"
+      continue
+    fi
+    mkdir -p "$(dirname "$path")"
+    echo "Downloading $repo/$file"
+    curl "${curl_options[@]}" --output "$path.incomplete" \
+      "https://huggingface.co/$repo/resolve/main/$file"
+    mv "$path.incomplete" "$path"
+  done
+}
 
-  uv tool install huggingface_hub
-
-and run this script again. To install uv, see https://docs.astral.sh/uv/getting-started/installation/.
-Other ways to install hf are in https://huggingface.co/docs/huggingface_hub/guides/cli.
-EOF
-  exit 1
+if ! command -v hf >/dev/null && ! command -v curl >/dev/null; then
+  fail "neither the Hugging Face CLI (hf) nor curl is installed"
 fi
 
 files=(
@@ -98,7 +119,7 @@ fi
 if [[ $ref2va == 1 ]]; then
   files+=(diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors)
 fi
-hf download Comfy-Org/MiniMax-H3 "${files[@]}" --local-dir "$models"
+download Comfy-Org/MiniMax-H3 "$models" "${files[@]}"
 mmh3_files=()
 if [[ $video_vae == int8 ]]; then
   mmh3_files+=(vae/minimax_h3_video_vae_int8_convrot.safetensors)
@@ -110,7 +131,7 @@ if [[ $taomate == 1 ]]; then
   mmh3_files+=(loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors)
 fi
 if [[ ${#mmh3_files[@]} -gt 0 ]]; then
-  hf download yniw/MiniMax-H3-mmh3 "${mmh3_files[@]}" --local-dir "$models"
+  download yniw/MiniMax-H3-mmh3 "$models" "${mmh3_files[@]}"
 fi
 turbo_files=()
 if [[ $turbo == 1 ]]; then
@@ -120,5 +141,5 @@ if [[ $ref2va == 1 ]]; then
   turbo_files+=(minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors)
 fi
 if [[ ${#turbo_files[@]} -gt 0 ]]; then
-  hf download lightx2v/Minimax-h3-Turbo "${turbo_files[@]}" --local-dir "$models/loras"
+  download lightx2v/Minimax-h3-Turbo "$models/loras" "${turbo_files[@]}"
 fi

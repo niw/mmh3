@@ -5,7 +5,8 @@ mmh3 finds each checkpoint under its ComfyUI name in a models directory laid out
 directory with `--models DIR` or `MMH3_MODELS`, and single files with `--dit`, `--text-encoder`,
 `--video-vae` and `--audio-vae`.
 
-`make download-models` runs `tools/download-models.sh`, which downloads these files into `models`:
+`make download-models` runs `tools/download-models.sh`, which downloads these files into `models`
+with the Hugging Face CLI (`hf`), or with curl when hf is not installed:
 
 | File | From |
 | --- | --- |
