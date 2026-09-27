@@ -405,6 +405,17 @@ impl Stream {
         Ok(true)
     }
 
+    /// Lets go of every unit kept back, or of every unit held as a whole load left it, for another
+    /// model on the device, and says whether there was any. Unlike `make_room` this does not lower
+    /// how many units the next call keeps back: that call finds whatever the other model left.
+    pub(crate) fn give_up(&mut self, tensors: &mut DeviceTensors) -> Result<bool, Error> {
+        if self.reads() && !self.kept.iter().any(|kept| matches!(kept, Kept::Buffer(_))) {
+            return Ok(false);
+        }
+        self.let_go(tensors)?;
+        Ok(true)
+    }
+
     /// Lets go of every unit kept back, sizes the regions for the units as they are now and points
     /// the tensors of every unit at them. The next call keeps back what fits again.
     fn let_go(&mut self, tensors: &mut DeviceTensors) -> Result<(), Error> {

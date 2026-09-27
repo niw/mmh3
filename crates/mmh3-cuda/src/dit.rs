@@ -575,6 +575,17 @@ impl CudaDit {
             .make_room(&mut self.tensors.borrow_mut())
     }
 
+    /// Gives the device the blocks this DiT holds, reading them on the way from its next call, for
+    /// another model that ran out of memory beside it. Says whether there were any.
+    pub fn give_up_blocks(&self) -> Result<bool, Error> {
+        if self.merged || !self.nvfp4.is_empty() {
+            return Ok(false);
+        }
+        self.stream
+            .borrow_mut()
+            .give_up(&mut self.tensors.borrow_mut())
+    }
+
     /// Refined text states `[text tokens, hidden]` of the last call's context, or `None` before the
     /// first call or after `add_lora`.
     pub fn text_states(&self) -> Result<Option<Vec<f32>>, Error> {

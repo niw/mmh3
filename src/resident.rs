@@ -85,6 +85,9 @@ enum Kind {
     VideoDecoder,
     AudioDecoder,
     Dit,
+    /// The blocks a DiT kept on the device, which it reads on the way until it keeps some again.
+    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
+    DitBlocks,
 }
 
 impl Kind {
@@ -95,6 +98,7 @@ impl Kind {
             Kind::VideoDecoder => "the video VAE",
             Kind::AudioDecoder => "the audio VAE",
             Kind::Dit => "the DiT",
+            Kind::DitBlocks => "the DiT's blocks",
         }
     }
 
@@ -104,7 +108,7 @@ impl Kind {
             Kind::TextEncoder => "text_encoder",
             Kind::VideoDecoder => "video_vae",
             Kind::AudioDecoder => "audio_vae",
-            Kind::Dit => "dit",
+            Kind::Dit | Kind::DitBlocks => "dit",
         }
     }
 }
@@ -213,11 +217,20 @@ impl Models {
     /// had the room for or keep models it did not.
     pub fn read<T, E: Into<Box<dyn Error>>>(
         &mut self,
+        read: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, Box<dyn Error>> {
+        self.read_keeping(read, &[])
+    }
+
+    /// `read`, letting go of none of `kept`.
+    fn read_keeping<T, E: Into<Box<dyn Error>>>(
+        &mut self,
         mut read: impl FnMut() -> Result<T, E>,
+        kept: &[Kind],
     ) -> Result<T, Box<dyn Error>> {
         loop {
             match read().map_err(Into::into) {
-                Err(error) if out_of_memory(&*error) => match self.release_oldest() {
+                Err(error) if out_of_memory(&*error) => match self.release_oldest_except(kept) {
                     Some(released) => println!(
                         "device {} had no memory left, so let go of {} and tried again",
                         self.device,
@@ -233,13 +246,14 @@ impl Models {
     /// `read`, and when there is nothing left to let go of and the whole model still does not fit,
     /// `fitting`, which reads a model that keeps what fits of its weights and reads the rest from
     /// the disk as it runs. The other models go first, since a model that reads on the way is a
-    /// slower one.
+    /// slower one, except for a DiT, which gives up its blocks but stays: reading it again and
+    /// patching it costs more than a text encoder that reads a few layers on the way.
     pub fn read_fitting<T, E: Into<Box<dyn Error>>, F: Into<Box<dyn Error>>>(
         &mut self,
         whole: impl FnMut() -> Result<T, E>,
         fitting: impl FnOnce() -> Result<T, F>,
     ) -> Result<T, Box<dyn Error>> {
-        match self.read(whole) {
+        match self.read_keeping(whole, &[Kind::Dit]) {
             Err(error) if out_of_memory(&*error) => fitting().map_err(Into::into),
             result => result,
         }
@@ -319,19 +333,34 @@ impl Models {
     }
 
     /// Lets go of the model used least recently that is none of `kept`, and says which it was.
+    ///
+    /// A DiT gives up its blocks before it goes as a whole, so that the next run finds it here and
+    /// only reads on the way what the other model left no room for. A DiT in `kept` still gives up
+    /// its blocks unless `kept` holds those too.
     fn release_oldest_except(&mut self, kept: &[Kind]) -> Option<Kind> {
-        let oldest = [
+        let mut models = [
             (self.text_encoder.releasable(), Kind::TextEncoder),
             (self.video_decoder.releasable(), Kind::VideoDecoder),
             (self.audio_decoder.releasable(), Kind::AudioDecoder),
             (self.dit.releasable(), Kind::Dit),
         ]
         .into_iter()
-        .filter(|(_, kind)| !kept.contains(kind))
         .filter_map(|(used, kind)| Some((used?, kind)))
-        .min_by_key(|(used, _)| *used);
-        let (_, kind) = oldest?;
+        .collect::<Vec<_>>();
+        models.sort_by_key(|(used, _)| *used);
+        let kind = models.into_iter().find_map(|(_, kind)| {
+            #[cfg(feature = "cuda")]
+            if kind == Kind::Dit
+                && !kept.contains(&Kind::DitBlocks)
+                && let Some((_, dit)) = &self.dit.kept
+                && dit.give_up_blocks().unwrap_or(false)
+            {
+                return Some(Kind::DitBlocks);
+            }
+            (!kept.contains(&kind)).then_some(kind)
+        })?;
         match kind {
+            Kind::DitBlocks => {}
             Kind::TextEncoder => self.text_encoder.kept = None,
             Kind::VideoDecoder => self.video_decoder.kept = None,
             Kind::AudioDecoder => self.audio_decoder.kept = None,
