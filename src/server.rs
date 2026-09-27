@@ -252,6 +252,46 @@ async fn create(
     arguments.push("--out".to_owned());
     arguments.push(video.to_string_lossy().into_owned());
 
+    if let Err(failure) = read_fields(&mut form, &directory, &mut arguments).await {
+        // A refused request leaves nothing behind, not even the files it sent before the field
+        // that was refused.
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+        return Err(failure);
+    }
+
+    let job = Job {
+        state: Stage::Queued,
+        arguments,
+        directory,
+        video,
+        failure: None,
+        queued: SystemTime::now(),
+        started: None,
+        seconds: None,
+    };
+    let described = job.describe(&id);
+    server
+        .jobs
+        .lock()
+        .expect("the jobs")
+        .insert(id.clone(), job);
+    if server.queue.send(id.clone()).is_err() {
+        return Err(Failure::gone("nothing is generating any more"));
+    }
+    Ok((
+        StatusCode::ACCEPTED,
+        [(header::LOCATION, format!("/v1/generations/{id}"))],
+        Json(described),
+    )
+        .into_response())
+}
+
+/// Adds the fields of a request's form to `arguments`, writing its files into `directory`.
+async fn read_fields(
+    form: &mut Multipart,
+    directory: &std::path::Path,
+    arguments: &mut Vec<String>,
+) -> Result<(), Failure> {
     while let Some(mut field) = form.next_field().await.map_err(Failure::form)? {
         let Some(name) = field.name().map(str::to_owned) else {
             return Err(Failure::asked("a form field with no name"));
@@ -289,32 +329,7 @@ async fn create(
         arguments.push(format!("--{name}"));
         arguments.push(value);
     }
-
-    let job = Job {
-        state: Stage::Queued,
-        arguments,
-        directory,
-        video,
-        failure: None,
-        queued: SystemTime::now(),
-        started: None,
-        seconds: None,
-    };
-    let described = job.describe(&id);
-    server
-        .jobs
-        .lock()
-        .expect("the jobs")
-        .insert(id.clone(), job);
-    if server.queue.send(id.clone()).is_err() {
-        return Err(Failure::gone("nothing is generating any more"));
-    }
-    Ok((
-        StatusCode::ACCEPTED,
-        [(header::LOCATION, format!("/v1/generations/{id}"))],
-        Json(described),
-    )
-        .into_response())
+    Ok(())
 }
 
 /// Takes a generation away, with whatever it wrote. A generation that is running is left alone:
