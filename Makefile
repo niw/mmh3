@@ -2,6 +2,8 @@ MODELS = models
 # Native output: out.mp4 (NVENC H.264 + AAC) needs the mp4 feature, and out.webm (VP9 + Opus) needs webm.
 # Metal MP4 output uses VideoToolbox.
 OUT = out.mp4
+# Options that come last, after GENERATE_OPTIONS, such as --ffmpeg, which takes the rest of the line.
+OUTPUT_OPTIONS =
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
 FEATURES = metal,server
@@ -35,7 +37,8 @@ generate: build
 		--out "$(OUT)" \
 		--prompt "$$PROMPT" \
 		--seed $(SEED) \
-		$(GENERATE_OPTIONS)
+		$(GENERATE_OPTIONS) \
+		$(OUTPUT_OPTIONS)
 
 .PHONY: download-models
 download-models:

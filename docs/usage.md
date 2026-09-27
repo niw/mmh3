@@ -25,6 +25,9 @@ make generate \
   SEED=2 OUT=panda.mp4
 ```
 
+`OUTPUT_OPTIONS` goes last on the line, so `make generate OUTPUT_OPTIONS=--ffmpeg` writes the MP4
+through ffmpeg on a GPU or in a container without NVENC.
+
 ## Options
 
 - `--out FILE` (required, `make generate` uses `out.mp4`): `.mp4` uses native NVENC H.264 + AAC in
