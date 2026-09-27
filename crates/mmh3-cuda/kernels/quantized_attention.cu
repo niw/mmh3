@@ -9,11 +9,14 @@
 #include "attention_workspace.cuh"
 #include "device.cuh"
 #include "tensor_core.cuh"
+#include "tma.cuh"
+#include "wgmma.cuh"
 
 // Quantized DiT attention: Q/K use symmetric INT8 scales per head and 64-token block, or per VSA
 // tile. V uses FP8 E4M3 with one scale per head, and is transposed for the PV MMA. Probabilities
 // are scaled by 448 before FP8 conversion. Softmax, the pooled sparse tail, and accumulation
-// stay in FP32. Every path reads BF16 inputs and writes BF16 output.
+// stay in FP32. Every path reads BF16 inputs and writes BF16 output. On Hopper (sm_90) one
+// warpgroup multiplies the same tiles with wgmma instead, see attention_hopper_kernel.
 
 namespace {
 
@@ -548,21 +551,338 @@ __global__ void __launch_bounds__(THREADS, 3)
     }
 }
 
+// The Hopper kernel: the warpgroup's thread 0 copies the query tile and the key and value tiles
+// into a ring of stages with TMA, and the warpgroup multiplies Q · Kᵀ in INT8 and P · V in FP8 with
+// wgmma. V's transposed rows of 64 bytes arrive in the 64B swizzle, the layout the mma.sync kernel
+// gives them by hand. The scores, the softmax and the output are the mma.sync kernel's, since the
+// accumulators lie in the same layout.
+constexpr int HOPPER_STAGES = 4;
+constexpr int HOPPER_QUERY_BYTES = BLOCK_M * HEAD_DIM;
+// The query tile, the stages, alignment slack, and the query barrier and a barrier per stage.
+constexpr int HOPPER_SHARED_BYTES = HOPPER_QUERY_BYTES +
+                                    HOPPER_STAGES * QuantizedTiles::stage_bytes + 1024 +
+                                    (1 + HOPPER_STAGES) * 8;
+
+// The INT8 query and key tensors as [128 bytes, heads, tokens], and the transposed FP8 value tensor
+// as [padded tokens, 128 dimensions, heads].
+struct QuantizedMaps {
+    CUtensorMap query;
+    CUtensorMap key;
+    CUtensorMap value;
+};
+
+template <Pattern PATTERN>
+__global__ void __launch_bounds__(THREADS, 3)
+    attention_hopper_kernel(Element *__restrict__ output, int tokens, Mmh3AttentionLayout layout,
+                            float scale_log2, const float *q_scales, const float *k_scales,
+                            const float *value_scale, Mmh3SparseWorkspace workspace,
+                            Mmh3VsaWorkspace vsa, const __nv_bfloat16 *__restrict__ gate,
+                            int64_t gate_stride, const __grid_constant__ QuantizedMaps maps) {
+    constexpr bool SPARSE = PATTERN == Pattern::SOL;
+    constexpr bool VSA = PATTERN == Pattern::VSA;
+    using T = QuantizedTiles;
+    using N = Numeric<Element>;
+    extern __shared__ __align__(128) uint8_t shared_memory[];
+    const uint32_t shared_base = (shared_address(shared_memory) + 1023) & ~1023u;
+    const uint32_t query_tile = shared_base;
+    const uint32_t stages = shared_base + HOPPER_QUERY_BYTES;
+    const uint32_t query_barrier = stages + HOPPER_STAGES * T::stage_bytes;
+    const uint32_t full_barriers = query_barrier + 8;
+    const int head = blockIdx.y;
+    const int first_query = VSA ? vsa.tile_starts[blockIdx.x] : blockIdx.x * BLOCK_M;
+    const int query_rows = VSA ? vsa.tile_lengths[blockIdx.x] : min(BLOCK_M, tokens - first_query);
+    const int lane = threadIdx.x % 32;
+    const int warp = threadIdx.x / 32;
+    const int route_blocks = gridDim.x;
+    const size_t route_row = static_cast<size_t>(head) * route_blocks + blockIdx.x;
+    const uint16_t *routes = VSA ? vsa.routes : workspace.routes;
+    const int blocks = SPARSE ? workspace.route_counts[route_row]
+                       : VSA  ? vsa.route_counts[route_row]
+                              : route_blocks;
+    const uint16_t *route = SPARSE || VSA ? routes + route_row * route_blocks : nullptr;
+
+    // Copies the key and value tiles of the `entry`-th block this query block attends to.
+    auto issue = [&](int entry) {
+        const int stage = entry % HOPPER_STAGES;
+        const int block = SPARSE || VSA ? route[entry] : entry;
+        const int first_key = VSA ? vsa.tile_starts[block] : block * BLOCK_N;
+        const uint32_t barrier = full_barriers + stage * 8;
+        const uint32_t key_tile = stages + stage * T::stage_bytes;
+        barrier_expect_bytes(barrier, T::stage_bytes);
+        copy_tile(key_tile, &maps.key, barrier, 0, head, first_key);
+        copy_tile(key_tile + T::tile_bytes, &maps.value, barrier, block * BLOCK_N, 0, head);
+    };
+    if (threadIdx.x == 0) {
+        barrier_init(query_barrier, 1);
+        for (int stage = 0; stage < HOPPER_STAGES; stage++) {
+            barrier_init(full_barriers + stage * 8, 1);
+        }
+        barrier_init_fence();
+        barrier_expect_bytes(query_barrier, HOPPER_QUERY_BYTES);
+        copy_tile(query_tile, &maps.query, query_barrier, 0, head, first_query);
+        for (int entry = 0; entry < min(blocks, HOPPER_STAGES); entry++) {
+            issue(entry);
+        }
+    }
+    __syncthreads();
+    barrier_wait(query_barrier, 0);
+
+    uint32_t output_words[HEAD_DIM / 2];
+    #pragma unroll
+    for (int index = 0; index < HEAD_DIM / 2; index++) {
+        output_words[index] = 0;
+    }
+    float row_max[2] = {-FLT_MAX, -FLT_MAX};
+    float row_sum[2] = {0.0f, 0.0f};
+    float offsets[2];
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int token = first_query + warp * 16 + half * 8 + lane / 4;
+        offsets[half] = SPARSE && token < tokens
+                            ? workspace.row_offsets[static_cast<size_t>(head) * tokens + token]
+                            : 0.0f;
+    }
+
+    for (int block = 0; block < blocks; block++) {
+        const int stage = block % HOPPER_STAGES;
+        barrier_wait(full_barriers + stage * 8, (block / HOPPER_STAGES) & 1);
+        const uint32_t key_tile = stages + stage * T::stage_bytes;
+        const uint32_t value_tile = key_tile + T::tile_bytes;
+
+        uint32_t score_words[BLOCK_N / 2];
+        wgmma_fence();
+        #pragma unroll
+        for (int k_step = 0; k_step < HEAD_DIM / 32; k_step++) {
+            // A descriptor counts 16-byte units, and each step reads 32 bytes of the head.
+            wgmma_s8_m64n64k32(score_words, wgmma_descriptor(query_tile) + k_step * 2,
+                               wgmma_descriptor(key_tile) + k_step * 2, k_step);
+        }
+        wgmma_commit();
+        wgmma_wait<0>();
+
+        const int key_block = SPARSE || VSA ? route[block] : block;
+        // Keys past the block's tokens are masked.
+        const int key_count = VSA ? vsa.tile_lengths[key_block] : tokens - key_block * BLOCK_N;
+        const bool masked_block = key_count < BLOCK_N;
+        float scores[BLOCK_N / 8][4];
+        float block_max[2] = {-FLT_MAX, -FLT_MAX};
+        #pragma unroll
+        for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
+            #pragma unroll
+            for (int element = 0; element < 4; element++) {
+                float score = static_cast<float>(
+                                  static_cast<int32_t>(score_words[key_tile_index * 4 + element])) *
+                                  (scale_log2 * q_scales[head * route_blocks + blockIdx.x] *
+                                   k_scales[head * route_blocks + key_block]) -
+                              offsets[element / 2];
+                if (masked_block) {
+                    const int key_row = key_tile_index * 8 + (lane % 4) * 2 + (element % 2);
+                    if (key_row >= key_count) {
+                        score = -FLT_MAX;
+                    }
+                }
+                scores[key_tile_index][element] = score;
+                block_max[element / 2] = fmaxf(block_max[element / 2], score);
+            }
+        }
+        float correction[2];
+        #pragma unroll
+        for (int half = 0; half < 2; half++) {
+            block_max[half] =
+                fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 1));
+            block_max[half] =
+                fmaxf(block_max[half], __shfl_xor_sync(0xffffffff, block_max[half], 2));
+            float new_max = fmaxf(row_max[half], block_max[half]);
+            correction[half] = exp2_flushed(row_max[half] - new_max);
+            row_max[half] = new_max;
+            row_sum[half] *= correction[half];
+        }
+        #pragma unroll
+        for (int key_tile_index = 0; key_tile_index < BLOCK_N / 8; key_tile_index++) {
+            #pragma unroll
+            for (int element = 0; element < 4; element++) {
+                float probability =
+                    exp2_flushed(scores[key_tile_index][element] - row_max[element / 2]);
+                scores[key_tile_index][element] = probability;
+                row_sum[element / 2] += probability;
+            }
+        }
+        #pragma unroll
+        for (int index = 0; index < HEAD_DIM / 2; index++) {
+            output_words[index] =
+                __float_as_uint(__uint_as_float(output_words[index]) * correction[(index / 2) % 2]);
+        }
+
+        wgmma_fence();
+        // Repack two adjacent FP8 pairs with word shuffles into the four A registers.
+        #pragma unroll
+        for (int key_step = 0; key_step < BLOCK_N / 32; key_step++) {
+            uint32_t probability_fragment[4];
+            #pragma unroll
+            for (int key_half = 0; key_half < 2; key_half++) {
+                const int tile_base = key_step * 4 + key_half * 2;
+                const int source_lane = (lane & ~3) + 2 * (lane % 2);
+                #pragma unroll
+                for (int half = 0; half < 2; half++) {
+                    uint32_t pairs = static_cast<uint32_t>(__nv_cvt_float2_to_fp8x2(
+                        make_float2(scores[tile_base][half * 2] * 448.0f,
+                                    scores[tile_base][half * 2 + 1] * 448.0f),
+                        __NV_SATFINITE, __NV_E4M3));
+                    pairs |= static_cast<uint32_t>(__nv_cvt_float2_to_fp8x2(
+                                 make_float2(scores[tile_base + 1][half * 2] * 448.0f,
+                                             scores[tile_base + 1][half * 2 + 1] * 448.0f),
+                                 __NV_SATFINITE, __NV_E4M3))
+                             << 16;
+                    const uint32_t first =
+                        __shfl_sync(0xffffffff, pairs, source_lane) >> ((lane & 2) * 8);
+                    const uint32_t second =
+                        __shfl_sync(0xffffffff, pairs, source_lane + 1) >> ((lane & 2) * 8);
+                    probability_fragment[key_half * 2 + half] = (first & 0xffffu) | (second << 16);
+                }
+            }
+            wgmma_e4m3_m64n128k32_registers(output_words, probability_fragment,
+                                            wgmma_descriptor_64b(value_tile) + key_step * 2, 1);
+        }
+        wgmma_commit();
+        wgmma_wait<0>();
+        // Every warp is done with the stage before thread 0 refills it.
+        __syncthreads();
+        if (threadIdx.x == 0 && block + HOPPER_STAGES < blocks) {
+            issue(block + HOPPER_STAGES);
+        }
+    }
+
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 1);
+        row_sum[half] += __shfl_xor_sync(0xffffffff, row_sum[half], 2);
+    }
+
+    auto accumulator = [&](int dimension_tile, int index) {
+        return __uint_as_float(output_words[dimension_tile * 4 + index]);
+    };
+    const int group_id = lane / 4;
+    Element *output_head = output + head * layout.head_stride[OUTPUT];
+    #pragma unroll
+    for (int half = 0; half < 2; half++) {
+        const int query_row = warp * 16 + half * 8 + group_id;
+        if (query_row >= query_rows) {
+            continue;
+        }
+        const int token = first_query + query_row;
+        Element *output_row =
+            output_head + static_cast<int64_t>(token) * layout.token_stride[OUTPUT];
+        const float value_factor = value_scale[head] / 448.0f;
+        if constexpr (SPARSE) {
+            const float tail_max = workspace.tail_max[route_row];
+            const float tail_sum = workspace.tail_sum[route_row];
+            const float *tail_values = workspace.tail_values + route_row * HEAD_DIM;
+            const float merged_max = fmaxf(row_max[half], tail_max);
+            const float routed_weight = exp2f(row_max[half] - merged_max);
+            const float tail_weight = exp2f(tail_max - merged_max);
+            const float inverse_sum =
+                1.0f / (row_sum[half] * routed_weight + tail_sum * tail_weight);
+            #pragma unroll
+            for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
+                const int dimension = dimension_tile * 8 + (lane % 4) * 2;
+                const float first =
+                    (accumulator(dimension_tile, half * 2) * value_factor * routed_weight +
+                     tail_values[dimension] * tail_weight) *
+                    inverse_sum;
+                const float second =
+                    (accumulator(dimension_tile, half * 2 + 1) * value_factor * routed_weight +
+                     tail_values[dimension + 1] * tail_weight) *
+                    inverse_sum;
+                *reinterpret_cast<uint32_t *>(output_row + dimension) = N::pack(first, second);
+            }
+        } else if (VSA && gate != nullptr) {
+            const float inverse_sum = value_factor / row_sum[half];
+            const float *coarse = vsa.coarse + route_row * HEAD_DIM;
+            const __nv_bfloat16 *gate_row = gate + token * gate_stride + head * HEAD_DIM;
+            #pragma unroll
+            for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
+                const int dimension = dimension_tile * 8 + (lane % 4) * 2;
+                const __nv_bfloat162 gates =
+                    *reinterpret_cast<const __nv_bfloat162 *>(gate_row + dimension);
+                const float first = fmaf(__low2float(gates), coarse[dimension],
+                                         accumulator(dimension_tile, half * 2) * inverse_sum);
+                const float second = fmaf(__high2float(gates), coarse[dimension + 1],
+                                          accumulator(dimension_tile, half * 2 + 1) * inverse_sum);
+                *reinterpret_cast<uint32_t *>(output_row + dimension) = N::pack(first, second);
+            }
+        } else {
+            const float inverse_sum = value_factor / row_sum[half];
+            #pragma unroll
+            for (int dimension_tile = 0; dimension_tile < HEAD_DIM / 8; dimension_tile++) {
+                const int dimension = dimension_tile * 8 + (lane % 4) * 2;
+                *reinterpret_cast<uint32_t *>(output_row + dimension) =
+                    N::pack(accumulator(dimension_tile, half * 2) * inverse_sum,
+                            accumulator(dimension_tile, half * 2 + 1) * inverse_sum);
+            }
+        }
+    }
+}
+
+// Describes a 3D byte tensor to TMA in boxes of `box` with `swizzle`.
+bool encode_bytes_map(CUtensorMap *map, const void *base, const cuuint64_t (&dimensions)[3],
+                      const cuuint64_t (&strides)[2], const cuuint32_t (&box)[3],
+                      CUtensorMapSwizzle swizzle) {
+    PFN_cuTensorMapEncodeTiled_v12000 encoder = tensor_map_encoder();
+    if (encoder == nullptr) {
+        return false;
+    }
+    const cuuint32_t element_strides[3] = {1, 1, 1};
+    return encoder(map, CU_TENSOR_MAP_DATA_TYPE_UINT8, 3, const_cast<void *>(base), dimensions,
+                   strides, box, element_strides, CU_TENSOR_MAP_INTERLEAVE_NONE, swizzle,
+                   CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                   CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE) == CUDA_SUCCESS;
+}
+
 // The launch path makes no allocations or host downloads. All scratch belongs to the caller.
 template <Pattern PATTERN>
 int launch_attention(const Mmh3QuantizedWorkspace &workspace, __nv_bfloat16 *output, int tokens,
                      int heads, Mmh3AttentionLayout layout, float scale, Mmh3SparseWorkspace sparse,
                      int blocks, Mmh3VsaWorkspace vsa, const __nv_bfloat16 *gate,
                      int64_t gate_stride, cudaStream_t stream) {
+    layout.token_stride[0] = layout.token_stride[1] = static_cast<int64_t>(heads) * HEAD_DIM;
+    layout.head_stride[0] = layout.head_stride[1] = HEAD_DIM;
+    layout.heads_per_key_value = 1;
+    if (mmh3_wgmma_available()) {
+        const cuuint64_t padded = static_cast<cuuint64_t>(blocks) * BLOCK_N;
+        const cuuint64_t rows[3] = {HEAD_DIM, static_cast<cuuint64_t>(heads),
+                                    static_cast<cuuint64_t>(tokens)};
+        const cuuint64_t row_strides[2] = {HEAD_DIM, static_cast<cuuint64_t>(heads) * HEAD_DIM};
+        const cuuint32_t row_box[3] = {HEAD_DIM, 1, BLOCK_M};
+        const cuuint64_t columns[3] = {padded, HEAD_DIM, static_cast<cuuint64_t>(heads)};
+        const cuuint64_t column_strides[2] = {padded, padded * HEAD_DIM};
+        const cuuint32_t column_box[3] = {BLOCK_N, HEAD_DIM, 1};
+        QuantizedMaps maps;
+        if (!encode_bytes_map(&maps.query, workspace.query, rows, row_strides, row_box,
+                              CU_TENSOR_MAP_SWIZZLE_128B) ||
+            !encode_bytes_map(&maps.key, workspace.key, rows, row_strides, row_box,
+                              CU_TENSOR_MAP_SWIZZLE_128B) ||
+            !encode_bytes_map(&maps.value, workspace.value, columns, column_strides, column_box,
+                              CU_TENSOR_MAP_SWIZZLE_64B)) {
+            return static_cast<int>(cudaErrorInvalidValue);
+        }
+        static Mmh3SharedMemory shared_memory;
+        const cudaError_t configured = mmh3_configure_shared_memory(
+            shared_memory, attention_hopper_kernel<PATTERN>, HOPPER_SHARED_BYTES);
+        if (configured != cudaSuccess) {
+            return static_cast<int>(configured);
+        }
+        attention_hopper_kernel<PATTERN>
+            <<<dim3(blocks, heads), THREADS, HOPPER_SHARED_BYTES, stream>>>(
+                output, tokens, layout, scale * 1.4426950408889634f, workspace.query_scales,
+                workspace.key_scales, workspace.value_scales, sparse, vsa, gate, gate_stride, maps);
+        return static_cast<int>(cudaGetLastError());
+    }
     static Mmh3SharedMemory shared_memory;
     const cudaError_t configured =
         mmh3_configure_shared_memory(shared_memory, attention_kernel<PATTERN>, SHARED_BYTES);
     if (configured != cudaSuccess) {
         return static_cast<int>(configured);
     }
-    layout.token_stride[0] = layout.token_stride[1] = static_cast<int64_t>(heads) * HEAD_DIM;
-    layout.head_stride[0] = layout.head_stride[1] = HEAD_DIM;
-    layout.heads_per_key_value = 1;
     attention_kernel<PATTERN><<<dim3(blocks, heads), THREADS, SHARED_BYTES, stream>>>(
         workspace.query, workspace.key, workspace.value, output, tokens, layout,
         scale * 1.4426950408889634f, workspace.query_scales, workspace.key_scales,

@@ -98,6 +98,19 @@ __device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMa
 }
 
 __device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMap *map,
+                                          uint32_t barrier, int column, int row, int plane) {
+#ifdef MMH3_TMA_TRAP
+    __trap();
+#else
+    asm volatile("cp.async.bulk.tensor.3d.shared::cta.global.mbarrier::complete_tx::bytes "
+                 "[%0], [%1, {%2, %3, %4}], [%5];\n" ::"r"(destination),
+                 "l"(reinterpret_cast<uint64_t>(map)), "r"(column), "r"(row), "r"(plane),
+                 "r"(barrier)
+                 : "memory");
+#endif
+}
+
+__device__ __forceinline__ void copy_tile(uint32_t destination, const CUtensorMap *map,
                                           uint32_t barrier, int column, int row, int head,
                                           int batch) {
 #ifdef MMH3_TMA_TRAP
