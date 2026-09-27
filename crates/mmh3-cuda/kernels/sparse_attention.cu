@@ -6,6 +6,7 @@
 
 #include "attention_workspace.cuh"
 #include "device.cuh"
+#include "routed_attention.cuh"
 #include "tensor_core.cuh"
 
 // Sol-Attn block-sparse attention for BF16 heads of 128 (see mmh3-core's dit/sparse.rs for the
@@ -20,7 +21,7 @@
 // 4. row_offsets: per token and head, q · key mean, which centers the keys of the token-level
 // scores.
 // 5. sparse_attention: FlashAttention over the routed key blocks of each query block, merged with
-// its tail.
+// its tail, or on Hopper routed_attention_hopper_kernel.
 
 namespace {
 
@@ -578,6 +579,20 @@ extern "C" int mmh3_sparse_attention(const void *query, const void *key, const v
     if (quantized != nullptr) {
         return mmh3_attention_quantized(query, key, value, output, tokens, heads, layout, scale,
                                         workspace, quantized, inputs_ready, stream);
+    }
+    RoutedAttention routed_blocks = {};
+    routed_blocks.routes = workspace->routes;
+    routed_blocks.route_counts = workspace->route_counts;
+    routed_blocks.blocks = blocks;
+    routed_blocks.row_offsets = workspace->row_offsets;
+    routed_blocks.tail_max = workspace->tail_max;
+    routed_blocks.tail_sum = workspace->tail_sum;
+    routed_blocks.tail_values = workspace->tail_values;
+    const int hopper =
+        launch_routed_attention_hopper<false>(q, k, v, static_cast<__nv_bfloat16 *>(output), tokens,
+                                              heads, *layout, routed_blocks, log2_scale, stream);
+    if (hopper >= 0) {
+        return hopper;
     }
     sparse_attention_kernel<<<dim3(blocks, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
         q, k, v, static_cast<__nv_bfloat16 *>(output), tokens, *layout, blocks, *workspace,

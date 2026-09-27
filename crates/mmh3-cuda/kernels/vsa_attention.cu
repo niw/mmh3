@@ -6,6 +6,7 @@
 
 #include "attention_workspace.cuh"
 #include "device.cuh"
+#include "routed_attention.cuh"
 #include "tensor_core.cuh"
 
 // VSA over BF16 heads of 128 (see mmh3-core's dit/vsa.rs for the algorithm). The sequence is
@@ -527,6 +528,21 @@ extern "C" int mmh3_vsa_attention(const void *query, const void *key, const void
         return mmh3_vsa_attention_quantized(value, gate, gate_stride, output, tokens, heads, layout,
                                             scale, tiles, workspace, quantized, inputs_ready,
                                             stream);
+    }
+    RoutedAttention routed = {};
+    routed.tile_starts = workspace->tile_starts;
+    routed.tile_lengths = workspace->tile_lengths;
+    routed.routes = workspace->routes;
+    routed.route_counts = workspace->route_counts;
+    routed.blocks = tiles;
+    routed.coarse = workspace->coarse;
+    routed.gate = static_cast<const __nv_bfloat16 *>(gate);
+    routed.gate_stride = gate_stride;
+    const int hopper = launch_routed_attention_hopper<true>(
+        q, k, v, static_cast<__nv_bfloat16 *>(output), tokens, heads, *layout, routed,
+        scale * 1.4426950408889634f, stream);
+    if (hopper >= 0) {
+        return hopper;
     }
     attention_kernel<<<dim3(tiles, heads), THREADS, ATTENTION_SHARED_BYTES, stream>>>(
         q, k, v, static_cast<const __nv_bfloat16 *>(gate), gate_stride,
