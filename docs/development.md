@@ -43,6 +43,8 @@
   bridge and Metal RGB-to-NV12 conversion into shared pixel buffers.
 - `tests/fixtures`: small random models with outputs computed by ComfyUI's implementation.
 - `tools/download-models.sh`: the model downloader that `make download-models` runs.
+- `tools/check-gpu.sh`: one run of the tests, benchmarks, golden checks, generations and a profile
+  on a GPU mmh3 has not run on before, packed into one archive.
 - `tools/golden`: development tools that write golden data with a ComfyUI checkout.
 - `tools/models`: development tools that build model files, such as the FastH3 patch.
 - `tools/unicode`: the generator of the tokenizer's Unicode tables.
