@@ -137,13 +137,14 @@ fn bench_attention(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let options = parse_options(
         arguments,
         &["tokens", "heads", "iterations"],
-        &["no-tma"],
+        &["no-tma", "no-wgmma"],
         USAGE,
     )?;
     let tokens = option_number(&options, "tokens", 38_710)?;
     let heads = option_number(&options, "heads", 56)?;
     let iterations = option_number(&options, "iterations", 3)?;
     mmh3_cuda::use_tma_on_this_thread(!options.contains_key("no-tma"));
+    mmh3_cuda::use_wgmma_on_this_thread(!options.contains_key("no-wgmma"));
     let milliseconds = mmh3_cuda::bench::attention(tokens, heads, iterations)?;
     let operations = 4.0 * (tokens as f64).powi(2) * 128.0 * heads as f64;
     let teraflops = operations / (milliseconds as f64 * 1e-3) / 1e12;

@@ -89,7 +89,9 @@ fn matches_cpu_reference() {
     }
 }
 
-/// The cp.async copies a device without TMA (sm_89) takes must agree with TMA in every bit.
+/// The cp.async copies a device without TMA (sm_89) takes must agree with TMA in every bit. Both
+/// runs multiply with mma.sync, since on Hopper the TMA path otherwise takes wgmma, which adds in
+/// its own order and meets the references the other tests check instead.
 #[test]
 fn copies_without_tma_agree_with_tma() {
     let (tokens, heads) = (200, 3);
@@ -103,9 +105,11 @@ fn copies_without_tma_agree_with_tma() {
     let scale = 1.0 / (HEAD_DIM as f32).sqrt();
     let run = |tma: bool| {
         mmh3_cuda::use_tma_on_this_thread(tma);
+        mmh3_cuda::use_wgmma_on_this_thread(false);
         let mut output_buffer = DeviceBuffer::new(tokens * inner * 2).unwrap();
         attention::dense_bf16(&qkv_buffer, &mut output_buffer, tokens, heads, scale).unwrap();
         mmh3_cuda::use_tma_on_this_thread(true);
+        mmh3_cuda::use_wgmma_on_this_thread(true);
         let mut output_bytes = vec![0; tokens * inner * 2];
         output_buffer.copy_to_host(&mut output_bytes).unwrap();
         output_bytes
