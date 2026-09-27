@@ -14,9 +14,9 @@ installed ffmpeg instead.
 
 ## make generate
 
-`make generate` runs the [FastH3](fasth3.md) settings on CUDA and a short
-[Turbo LoRA](lightx2v-turbo.md) clip with dense attention on Metal. `PROMPT`, `SEED`, `OUT` and
-`MODELS` change the prompt, the seed, the output file and the models directory. This writes
+`make generate` runs the [FastH3](fasth3.md) settings on both backends, on Metal in a 672×384,
+73-frame clip with FP16 attention. `PROMPT`, `SEED`, `OUT` and `MODELS` change the prompt, the
+seed, the output file and the models directory. This writes
 `panda.mp4`:
 
 ```sh

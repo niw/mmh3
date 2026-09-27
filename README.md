@@ -4,17 +4,15 @@ mmh3 is an inference engine dedicated to
 [MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), written in Rust with CUDA and Metal
 kernels and running without PyTorch or ComfyUI. The tokenizer, the Qwen3-VL text encoder, the
 diffusion transformer, the sampler and both VAE decoders are written in this repository and tuned
-for MiniMax H3's shapes. It reads the ComfyUI checkpoints from
-[Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3), and writes MP4 with NVENC or
-VideoToolbox H.264 and AAC, or WebM with VP9 and Opus, without an ffmpeg installation.
+for MiniMax H3's shapes.
 
 It runs on one machine or [distributed across several](docs/distributed.md) running `mmh3 worker`,
 splitting every diffusion step between them over RDMA where there is a path for it and ordinary
 sockets where there is not. The machine that hands the work out runs none of it, so it needs no GPU
 of its own.
 
-The backends are [CUDA](docs/cuda.md) on Linux and [Metal](docs/metal.md) on macOS, the second
-through a Swift bridge and MPS beside its own kernels. Each page says what that backend needs.
+The backends are [CUDA](docs/cuda.md) on Linux and [Metal](docs/metal.md) on macOS, each with its
+own kernels. Each page says what that backend needs.
 
 ## Getting started
 
@@ -28,35 +26,62 @@ make generate
 ```
 
 `make` builds mmh3 with Metal on macOS and CUDA on Linux. `make download-models` downloads the
-models into `models`, and `make generate` writes a video with audio to `out.mp4` from a sample
-prompt. On CUDA it generates a 5.2-second 1344×768 video with NVENC H.264 and AAC. On Metal it
-generates a 1.625-second 448×256 video with the four-step Turbo LoRA and VideoToolbox output.
+models into `models`, and `make generate` writes a video with audio from a sample prompt to
+`out.mp4`. See [Usage](docs/usage.md) for the other settings.
 
-On CUDA, `make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT,
-with its video sparse attention, INT8/FP8 attention and the INT8 video VAE. Compared with mmh3's
-defaults, they can change image details and the composition. mmh3 also runs two other few-step
-models with the settings on their pages. On a DGX Spark, a complete generation, including model
-loading and encoding, took:
+## Performance
 
-| Model | Steps | Time |
-| --- | ---: | ---: |
-| [FastH3](docs/fasth3.md) | 4 | 87 s |
-| [lightx2v Turbo LoRA](docs/lightx2v-turbo.md) | 4 | 86 s |
-| [TaoMate-H3](docs/taomate.md) | 3 | 70 s |
+These are the times of `make generate`, including model loading and encoding, with warm model
+files. [Performance and accuracy](docs/performance.md) has the times of each stage.
 
-See [Usage](docs/usage.md) for the other settings.
+### CUDA on Linux
+
+`make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT, with
+its video sparse attention, INT8/FP8 attention and the INT8 video VAE, and writes MP4 with NVENC
+H.264 and AAC. Compared with mmh3's defaults, these can change image details and the composition.
+mmh3 also runs two other few-step models with the settings on their pages.
+
+On a DGX Spark, a complete generation took:
+
+| Model | Steps | Time per step | Time |
+| --- | ---: | ---: | ---: |
+| [FastH3](docs/fasth3.md) | 4 | 14 s | 80 s |
+| [lightx2v Turbo LoRA](docs/lightx2v-turbo.md) | 4 | 14 s | 81 s |
+| [TaoMate-H3](docs/taomate.md) | 3 | 14 s | 66 s |
+
+Each generated a 1344×768, 124-frame video, 5.2 seconds at 24 fps.
+
+### Metal on macOS
+
+`make generate` uses the same 4-step [FastH3](docs/fasth3.md) patch with its video sparse
+attention, in a smaller and shorter clip, and writes MP4 with VideoToolbox H.264 and AAC. The DiT,
+the text encoder and the video VAE's transformer run on the GPU's matrix units with INT8 products
+and FP16 attention, on the Neural Accelerators of an M5 or later. A Mac whose GPU cannot hold a
+whole model keeps as many layers as fit and reads the others from the disk as they run.
+
+A complete generation took:
+
+| Mac | Memory | Time per step | Time |
+| --- | ---: | ---: | ---: |
+| M4 Max | 128 GB | 27 s | 153 s |
+| M6 | 24 GB | 12 s | 67 s |
+
+Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps.
 
 ## Status
 
 - Text to video with audio (T2VA) works end to end, one video at a time. Native MP4 and WebM
   generation and complete video/audio decoding have been verified on GB10.
 - Videos from a first frame, a last frame or both ([FL2VA](docs/fl2va.md)) work too.
+- Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
+  DiT, reading reference clips from MP4 files.
 - NVIDIA Blackwell GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for
   `sm_120f`, so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been
   tested yet.
-- Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
-  DiT, reading reference clips from MP4 files.
-- Metal text-to-video support on macOS. See [Metal](docs/metal.md) for its current limits.
+- Apple silicon with Metal on macOS 15 or later, tested on an M4 Max and an M6. Text to video with
+  audio works with LoRAs, patches such as FastH3's, and Sol-Attn and VSA sparse attention, and a
+  Mac with 24 GB runs it by reading the layers that do not fit from the disk. Videos from frames or
+  references are not supported on Metal yet. See [Metal](docs/metal.md) for its current limits.
 - [Distributed generation](docs/distributed.md) works on both backends and between them, and from a
   machine with neither. Shares follow what each machine measures itself to do. Between two DGX
   Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark rather
@@ -64,7 +89,6 @@ See [Usage](docs/usage.md) for the other settings.
 - An [HTTP server](docs/server.md) takes a generation as a form and keeps its models loaded
   between the generations it runs, so the second one against a warm server starts at its first
   step. It has no authentication of its own and waits on loopback.
-- Not yet: stopping a generation that is already running.
 
 ## Documentation
 

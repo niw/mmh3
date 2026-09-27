@@ -26,7 +26,7 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 of the models directory. mmh3 selects VSA for DiTs with VSA gates, which the patch adds.
 `--vsa-sparsity X` (default 0.9) is the fraction of the video tiles that VSA leaves out for each
 query tile, and `--attention-precision int8-fp8` runs the attention with INT8 QK and FP8 PV. With
-these settings, a complete MP4 generation at 1344×768 on a DGX Spark takes about 87 seconds,
+these settings, a complete MP4 generation at 1344×768 on a DGX Spark takes about 80 seconds,
 including model loading and encoding.
 
 INT8/FP8 attention changes image details compared with `--attention-precision bf16`.

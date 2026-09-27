@@ -126,6 +126,11 @@ mmh3 was checked against ComfyUI's MiniMax H3 implementation and contains none
 of its code. The development tools in `tools/golden` import a ComfyUI checkout
 at run time to write golden data.
 
+MLX by Apple (MIT License).
+The flash attention and INT8 product kernels in `crates/mmh3-metal/kernels/matmul.metal`
+follow the design of MLX's attention and GEMM kernels for the Neural Accelerators,
+and contain none of its code.
+
 Other references consulted: the MiniMax H3 repository and the MiniMax H3
 pipeline of Hugging Face diffusers (Apache License, Version 2.0), and BigVGAN by
 NVIDIA and the alias-free activations of junjun3518/alias-free-torch for the

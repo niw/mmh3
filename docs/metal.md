@@ -38,8 +38,8 @@ make download-models
 make generate
 ```
 
-This downloads the base models and Turbo LoRA, then generates a 448×256, 39-frame clip using
-four steps. Change the prompt and output path with:
+This downloads the base models and the [FastH3](fasth3.md) patch, then generates a 672×384,
+73-frame clip in four steps with FastH3's video sparse attention. Change the prompt and output path with:
 
 ```sh
 make generate PROMPT="A rainy street." OUT=rain.mp4
@@ -53,9 +53,8 @@ target/release/mmh3-tools device
 
 target/release/mmh3 generate \
   --models models --prompt "A rainy street." \
-  --width 448 --height 256 --frames 39 --steps 4 \
-  --shift-video 6 --shift-audio 3 \
-  --lora minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors \
+  --width 672 --height 384 --frames 73 --steps 4 \
+  --patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors \
   --out rain.mp4
 ```
 
@@ -118,7 +117,9 @@ so a small difference in the scores keeps a different tenth.
 
 ## Approximate speed
 
-On an Apple M4 Max, the 448×256, 39-frame, four-step Turbo example takes roughly a minute with
-warm model files, including loading, generation and MP4 output. Denoising takes about 11 seconds
-per step. Loading uncached models takes longer, and larger clips require more time and memory.
+`make generate`, a 672×384, 73-frame FastH3 clip in four steps, takes about 153 seconds on an Apple
+M4 Max with 128 GB, at about 27 seconds a step, and about 67 seconds on an M6 with 24 GB, at about
+12 seconds a step, even though the M6 keeps only 24 of the DiT's 52 blocks on the device. Both are
+with warm model files and include loading, generation and MP4 output. Loading uncached models takes
+longer, and larger clips require more time and memory.
 These figures are a starting point for this configuration, not a comparison across GPUs.

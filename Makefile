@@ -13,17 +13,14 @@ export PROMPT = A woman in a yellow raincoat opens a clear umbrella on a neon-li
 
 comma := ,
 ifneq ($(filter metal,$(subst $(comma), ,$(FEATURES))),)
-# Start with a short clip using dense attention and the four-step Turbo LoRA on Metal.
-GENERATE_OPTIONS = --width 448 --height 256 --frames 39 --steps 4 \
-	--shift-video 6 --shift-audio 3 --attention dense \
-	--lora minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
-DOWNLOAD_OPTIONS = --no-fasth3 --lightx2v-turbo
+# A smaller and shorter clip on Metal.
+BACKEND_OPTIONS = --width 672 --height 384 --frames 73
 else
-# FastVideo's FastH3 in four steps, as a patch on the base DiT, with VSA and INT8/FP8 attention.
-GENERATE_OPTIONS = --steps 4 --attention-precision int8-fp8 \
-	--patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
-DOWNLOAD_OPTIONS =
+BACKEND_OPTIONS = --attention-precision int8-fp8
 endif
+# FastVideo's FastH3 in four steps, as a patch on the base DiT, with VSA.
+GENERATE_OPTIONS = --steps 4 $(BACKEND_OPTIONS) \
+	--patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
 
 .PHONY: build
 build:
@@ -42,7 +39,7 @@ generate: build
 
 .PHONY: download-models
 download-models:
-	tools/download-models.sh --models "$(MODELS)" $(DOWNLOAD_OPTIONS)
+	tools/download-models.sh --models "$(MODELS)"
 
 # Formats the Rust code with rustfmt, the Python tools with ruff, the Swift code with swiftformat
 # and the C++, CUDA and Metal code with clang-format. uvx runs pinned formatter versions, so the
