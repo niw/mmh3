@@ -677,6 +677,11 @@ impl Array {
         Ok(out)
     }
 
+    /// GELU, with the tanh approximation or the exact error function.
+    pub fn gelu(&self, tanh_approximation: bool) -> Result<Self> {
+        self.unary(if tanh_approximation { 3 } else { 4 }, 1.0)
+    }
+
     pub fn slice(&self, row: usize, rows: usize, col: usize, cols: usize) -> Result<Self> {
         if row.checked_add(rows).is_none_or(|end| end > self.rows)
             || col.checked_add(cols).is_none_or(|end| end > self.cols)
@@ -760,6 +765,31 @@ impl Array {
             &[self.cols as u32, epsilon.to_bits(), center as u32],
             self.rows,
             true,
+        )?;
+        Ok(out)
+    }
+
+    /// softmax(scale · row) of each row.
+    pub fn softmax(&self, scale: f32) -> Result<Self> {
+        let out = Self::empty(self.device(), self.rows, self.cols)?;
+        self.device().run(
+            "softmax_rows",
+            &[&self.buffer, &out.buffer],
+            &[self.cols as u32, scale.to_bits()],
+            self.rows,
+            true,
+        )?;
+        Ok(out)
+    }
+
+    pub fn transpose(&self) -> Result<Self> {
+        let out = Self::empty(self.device(), self.cols, self.rows)?;
+        self.device().run(
+            "transpose",
+            &[&self.buffer, &out.buffer],
+            &[self.len() as u32, self.rows as u32, self.cols as u32],
+            self.len(),
+            false,
         )?;
         Ok(out)
     }

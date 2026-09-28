@@ -48,12 +48,49 @@ kernel void add_scaled(device const float *x [[buffer(0)]], device const float *
         y[i] = x[i] + delta[i] * scale[i % p[1]];
 }
 
+// erfc(x) for x ≥ 0 by the Chebyshev fit of Numerical Recipes, within 1.2e-7 of it relatively.
+// Metal has no error function, and GELU needs one close to FP32's own.
+float erfc_positive(float x) {
+    const float t = 1 / (1 + 0.5f * x);
+    const float series =
+        -1.26551223f +
+        t * (1.00002368f +
+             t * (0.37409196f +
+                  t * (0.09678418f +
+                       t * (-0.18628806f +
+                            t * (0.27886807f + t * (-1.13520398f +
+                                                    t * (1.48851587f + t * (-0.82215223f +
+                                                                            t * 0.17087277f))))))));
+    return t * exp(-x * x + series);
+}
+
+// GELU with the exact error function: x · Φ(x). Each side takes the complement of the tail, so
+// neither loses precision where Φ(x) is near 0 or 1.
+float gelu_erf(float v) {
+    const float tail = 0.5f * erfc_positive(abs(v) * 0.70710678118654752f);
+    return v < 0 ? v * tail : v - v * tail;
+}
+
+// GELU with the tanh approximation. Metal's tanh is NaN for large arguments, so they are clamped
+// where it is ±1 in FP32 already.
+float gelu_tanh(float v) {
+    const float inner = 0.79788456080286536f * (v + 0.044715f * v * v * v);
+    return 0.5f * v * (1 + tanh(clamp(inner, -10.0f, 10.0f)));
+}
+
+// p[1] picks the operation: 0 scales by p[2], 1 is SiLU, 2 clamps to ±p[2], 3 is GELU with the
+// tanh approximation and 4 GELU with the error function.
 kernel void unary_op(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
                      constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p[0])
         return;
     float v = x[i], s = as_type<float>(p[2]);
-    y[i] = p[1] == 0 ? v * s : p[1] == 1 ? v / (1 + exp(-v)) : p[1] == 2 ? clamp(v, -s, s) : v;
+    y[i] = p[1] == 0   ? v * s
+           : p[1] == 1 ? v / (1 + exp(-v))
+           : p[1] == 2 ? clamp(v, -s, s)
+           : p[1] == 3 ? gelu_tanh(v)
+           : p[1] == 4 ? gelu_erf(v)
+                       : v;
 }
 
 kernel void slice_rows(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
@@ -163,6 +200,48 @@ kernel void normalize_modulate(device const float *x [[buffer(0)]],
     const uint width = p[0];
     normalize_row<true>(x + row * width, w, y + row * width, width, as_type<float>(p[1]), false,
                         m + rows[row] * p[2], p[3], p[4], lane, scratch);
+}
+
+// The maximum over a threadgroup of 256 threads, which every thread gets.
+float row_max(float v, threadgroup float *scratch, uint tid) {
+    v = simd_max(v);
+    if (tid % 32 == 0)
+        scratch[tid / 32] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float maximum = scratch[0];
+    for (uint i = 1; i < 8; ++i)
+        maximum = max(maximum, scratch[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return maximum;
+}
+
+// softmax(p[1] · row) of rows of p[0] values, a threadgroup a row: the scores of an attention
+// whose products run as matrix products.
+kernel void softmax_rows(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                         constant uint *p [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+                         uint lane [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    const uint width = p[0];
+    const float scale = as_type<float>(p[1]);
+    device const float *source = x + size_t(row) * width;
+    device float *destination = y + size_t(row) * width;
+    float maximum = -INFINITY;
+    for (uint c = lane; c < width; c += 256)
+        maximum = max(maximum, source[c] * scale);
+    maximum = row_max(maximum, scratch, lane);
+    float sum = 0;
+    for (uint c = lane; c < width; c += 256)
+        sum += exp(source[c] * scale - maximum);
+    const float inverse = 1 / row_sum(sum, scratch, lane);
+    for (uint c = lane; c < width; c += 256)
+        destination[c] = exp(source[c] * scale - maximum) * inverse;
+}
+
+// [p[1] rows, p[2] columns] to [columns, rows].
+kernel void transpose(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                      constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p[0])
+        y[i] = x[(i % p[1]) * p[2] + i / p[1]];
 }
 
 kernel void rotary(device const float *x [[buffer(0)]], device const float *angles [[buffer(1)]],

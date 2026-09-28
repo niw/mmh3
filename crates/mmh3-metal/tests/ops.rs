@@ -120,6 +120,79 @@ fn products_and_norms_cover_unaligned_dimensions_and_invalid_shapes() {
     assert!(a.norm(&b, 1e-5, false).is_err());
 }
 
+/// Φ(x) in f64 by Simpson's rule over the normal density from 0, far finer than FP32.
+fn normal_cdf(x: f64) -> f64 {
+    // Past 10 it is 0 or 1 to far below f64's precision near them.
+    if x.abs() > 10.0 {
+        return (x > 0.0) as u8 as f64;
+    }
+    let steps = 20_000;
+    let h = x / steps as f64;
+    let density = |t: f64| (-t * t / 2.0).exp();
+    let inner: f64 = (1..steps)
+        .map(|i| density(i as f64 * h) * if i % 2 == 1 { 4.0 } else { 2.0 })
+        .sum();
+    0.5 + (density(0.0) + inner + density(x)) * h / 3.0 / (2.0 * std::f64::consts::PI).sqrt()
+}
+
+#[test]
+fn softmax_and_transpose_cover_rows_wider_than_a_threadgroup() {
+    let device = Device::new().unwrap();
+    let (rows, cols) = (3, 601);
+    let x = values(rows * cols, 7);
+    let a = Array::from_f32(&device, rows, cols, &x).unwrap();
+    let softmax = a.softmax(2.5).unwrap().to_f32().unwrap();
+    for (row, actual) in x.chunks(cols).zip(softmax.chunks(cols)) {
+        let exponentials: Vec<f64> = row.iter().map(|&v| (2.5 * v as f64).exp()).collect();
+        let sum: f64 = exponentials.iter().sum();
+        for (&value, exponential) in actual.iter().zip(&exponentials) {
+            assert!((value as f64 - exponential / sum).abs() < 1e-8);
+        }
+    }
+
+    let transposed = a.transpose().unwrap();
+    assert_eq!(transposed.shape(), [cols, rows]);
+    let transposed = transposed.to_f32().unwrap();
+    for row in 0..rows {
+        for col in 0..cols {
+            assert_eq!(transposed[col * rows + row], x[row * cols + col]);
+        }
+    }
+}
+
+#[test]
+fn gelu_matches_f64_reference_on_both_tails() {
+    let device = Device::new().unwrap();
+    // Fine steps over ±10, and the far tails, where tanh and the error function saturate.
+    let x: Vec<f32> = (0..801)
+        .map(|i| (i as f32 - 400.0) / 40.0)
+        .chain([-1e5, -1e3, -50.0, 50.0, 1e3, 1e5])
+        .collect();
+    let a = Array::from_f32(&device, 1, x.len(), &x).unwrap();
+    let exact = a.gelu(false).unwrap().to_f32().unwrap();
+    let approximate = a.gelu(true).unwrap().to_f32().unwrap();
+    for (i, &v) in x.iter().enumerate() {
+        let v = v as f64;
+        let expected = v * normal_cdf(v);
+        // Relative to the value, with an absolute floor where GELU nears 0 in the negative tail.
+        let tolerance = 1e-6 * expected.abs().max(1e-3);
+        assert!(
+            (exact[i] as f64 - expected).abs() <= tolerance,
+            "GELU({v}) = {} != {expected}",
+            exact[i]
+        );
+        let tanh = 0.5
+            * v
+            * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v.powi(3))).tanh());
+        // The approximation cancels in FP32 where tanh nears −1, as it does on CUDA.
+        assert!(
+            (approximate[i] as f64 - tanh).abs() <= 1e-6 * tanh.abs().max(0.3),
+            "tanh GELU({v}) = {} != {tanh}",
+            approximate[i]
+        );
+    }
+}
+
 #[test]
 fn batches_retain_dropped_inputs_and_recycle_only_completed_buffers() {
     let device = Device::new().unwrap();
