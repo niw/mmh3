@@ -13,6 +13,7 @@ pub mod sparse;
 mod streaming;
 pub mod text_encoder;
 pub mod vae;
+pub mod vision;
 
 use std::{
     ffi::{CStr, CString, c_char, c_void},
