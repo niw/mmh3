@@ -771,7 +771,7 @@ pub fn release_when_idle(idle: Duration) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Table, cards, device_count, kept, shared};
+    use super::{DEVICES, Table, cards, device_count, kept, shared};
     use std::collections::HashMap;
 
     /// Two devices take their turns apart, which is the whole point of a table apiece: one holding
@@ -779,6 +779,10 @@ mod tests {
     /// while any of them is, since that is the answer a caller can act on.
     #[test]
     fn a_device_holding_its_models_leaves_another_free() {
+        // A build with one device, such as Metal's, has no other to leave free.
+        if DEVICES < 2 {
+            return;
+        }
         let mut first = Table::new(0);
         let held = first.borrow();
         assert!(shared(1).try_lock().is_ok());
