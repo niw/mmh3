@@ -7,8 +7,10 @@ using namespace mpp::tensor_ops;
 
 // What a product does to its result besides the rows' scales, as bits of its flags: scale each
 // output by the weight's own scale, add a bias, add what the output already holds, and add a
-// LoRA's up projection of the down projection's result, `mid`.
-constant constexpr uint SCALE_OUTPUTS = 1, ADD_BIAS = 2, ACCUMULATE = 4, ADD_LORA = 8;
+// LoRA's up projection of the down projection's result, `mid`. With SWIGLU, only the INT8 product
+// takes it, the weights' rows alternate 16 gate rows and their 16 up rows, and the product writes
+// silu(gate) · up, half as many outputs, as the swiglu kernel would from its whole result.
+constant constexpr uint SCALE_OUTPUTS = 1, ADD_BIAS = 2, ACCUMULATE = 4, ADD_LORA = 8, SWIGLU = 16;
 
 // A threadgroup computes a 128×64 output tile. Checkpoint weights stay INT8; row scales restore
 // the activation range after FP16 conversion / INT8 quantization. INT8 runs on four SIMD groups
@@ -704,6 +706,24 @@ void int8_product(device int8_t *a, device int8_t *b, device float *c, device co
             lora_up<false>(result, mid, up, rank, row, col, rows, cols, at);
         else
             lora_up<true>(result, mid, up, rank, row, col, rows, cols, at);
+    }
+    if (flags & SWIGLU) {
+        // A group's two fragments of columns are 16 gate outputs and their 16 up outputs.
+        static_assert(PRODUCT_FRAGMENT_COLS == 2, "a group holds one gate and one up fragment");
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                const int r = row + m * FRAGMENT + at.y + i * 8;
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const int column = col + at.x + fragment_column(j);
+                    if (r >= own_row && r < M && column >= own_col && column < N) {
+                        const float gate = result[m][0][i * 4 + j], up = result[m][1][i * 4 + j];
+                        c[r * (N / 2) + col / 2 + at.x + fragment_column(j)] =
+                            gate / (1 + exp(-gate)) * up;
+                    }
+                }
+            }
+        }
+        return;
     }
     _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
         _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n) {

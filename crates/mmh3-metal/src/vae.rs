@@ -222,6 +222,13 @@ impl MetalVideoDecoder {
             name.starts_with("decoder.") || name.starts_with("post_quant_conv.")
         })?;
         weights.set_precision(self.precision)?;
+        // An INT8 MLP's gate and up rows alternate, so that its product writes SwiGLU itself.
+        for layer in 0..self.layers {
+            let w1 = format!("decoder.transformer_blocks.{layer}.ff.w1");
+            if weights.is_int8(&w1) {
+                weights.interleave_swiglu(&w1)?;
+            }
+        }
         Ok(self.weights.get_or_init(|| weights))
     }
 
@@ -325,10 +332,10 @@ impl MetalVideoDecoder {
                     w.adapter_reads_rows(&format!("{p}.ff.w1")),
                 )?;
                 x = updated.expect("a pass given a delta updates the residual");
-                let expanded =
-                    w.linear_prepacked(&packed, normed.as_ref(), &format!("{p}.ff.w1"))?;
+                let gated =
+                    w.linear_swiglu_prepacked(&packed, normed.as_ref(), &format!("{p}.ff.w1"))?;
                 pending = Some((
-                    w.linear_gated(&expanded, &format!("{p}.ff.w2"))?,
+                    w.linear(&gated, &format!("{p}.ff.w2"))?,
                     w.vector(&format!("{p}.scale2"))?,
                 ));
             }
@@ -344,11 +351,13 @@ impl MetalVideoDecoder {
                 )?;
                 let attended = attend(&qkv, &p)?;
                 x = x.add_scaled(&attended, &w.vector(&format!("{p}.scale1"))?)?;
-                let expanded = w.linear(
-                    &w.norm(&x, &format!("{p}.norm2"), 1e-5)?,
-                    &format!("{p}.ff.w1"),
-                )?;
-                let delta = w.linear_gated(&expanded, &format!("{p}.ff.w2"))?;
+                let normed = w.norm(&x, &format!("{p}.norm2"), 1e-5)?;
+                let w1 = format!("{p}.ff.w1");
+                let delta = if w.is_int8(&w1) {
+                    w.linear(&w.linear_swiglu(&normed, &w1)?, &format!("{p}.ff.w2"))?
+                } else {
+                    w.linear_gated(&w.linear(&normed, &w1)?, &format!("{p}.ff.w2"))?
+                };
                 x = x.add_scaled(&delta, &w.vector(&format!("{p}.scale2"))?)?;
             }
         }

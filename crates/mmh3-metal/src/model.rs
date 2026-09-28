@@ -443,6 +443,7 @@ impl Weights {
                 bias: bias.as_ref(),
                 addend,
                 lora,
+                swiglu: false,
             };
             return if self.linear_precision == LinearPrecision::Fp32 {
                 finish.apply(x.rotate()?.linear_packed(&w.buffer, w.shape[0], w.dtype)?)
@@ -461,6 +462,7 @@ impl Weights {
             bias: bias.as_ref(),
             addend,
             lora,
+            swiglu: false,
         }
         .apply(result)
     }
@@ -541,6 +543,81 @@ impl Weights {
                 bias: bias.as_ref(),
                 addend,
                 lora,
+                swiglu: false,
+            },
+        )
+    }
+
+    /// Reorders the rows of SwiGLU layer `name`, its weights, their scales and its bias, to
+    /// alternate 16 gate rows and their 16 up rows, in place. The INT8 product then writes SwiGLU
+    /// of its result itself, and `linear_swiglu` and `linear_swiglu_prepacked` are what apply the
+    /// layer from then on: `linear` would answer with its outputs in that order.
+    pub(crate) fn interleave_swiglu(&mut self, name: &str) -> Result<()> {
+        // An adapter's outputs would stay in the layer's own order.
+        if self.adapters.contains_key(name) {
+            return Err(Error::new(format!(
+                "{name}: an adapter's outputs cannot follow reordered rows"
+            )));
+        }
+        for suffix in ["weight", "weight_scale", "bias"] {
+            let Some(weight) = self.tensors.get(&format!("{name}.{suffix}")) else {
+                if suffix == "bias" {
+                    continue;
+                }
+                return Err(Error::new(format!("missing tensor {name}.{suffix}")));
+            };
+            let (rows, bytes) = (weight.shape[0], weight.buffer.0.bytes);
+            if !rows.is_multiple_of(32) || !bytes.is_multiple_of(rows) {
+                return Err(Error::new(format!(
+                    "{name}.{suffix}: {rows} rows do not split into groups of 32"
+                )));
+            }
+            let reordered = self.device.alloc(bytes, None)?;
+            self.device.run(
+                "interleave_swiglu_rows",
+                &[&weight.buffer, &reordered],
+                &[rows as u32, (bytes / rows) as u32],
+                bytes,
+                false,
+            )?;
+            weight.buffer.copy_range(&reordered, 0, 0, bytes)?;
+        }
+        Ok(())
+    }
+
+    /// SwiGLU of layer `name` applied to `x`, once `interleave_swiglu` has reordered its rows.
+    pub(crate) fn linear_swiglu(&self, x: &Array, name: &str) -> Result<Array> {
+        self.linear(x, name)?.swiglu_interleaved()
+    }
+
+    /// `linear_swiglu` of rows packed for the layer, which the INT8 product finishes itself.
+    pub(crate) fn linear_swiglu_prepacked(
+        &self,
+        packed: &crate::ops::PackedRows,
+        normed: Option<&Array>,
+        name: &str,
+    ) -> Result<Array> {
+        let w = self.weight(&format!("{name}.weight"))?;
+        if w.dtype != DType::I8 || self.linear_precision != LinearPrecision::Int8 {
+            return self
+                .linear_prepacked(packed, normed, name)?
+                .swiglu_interleaved();
+        }
+        let bias = format!("{name}.bias");
+        let bias = if self.contains(&bias) {
+            Some(self.vector(&bias)?)
+        } else {
+            None
+        };
+        let scales = self.vector(&format!("{name}.weight_scale"))?;
+        packed.product(
+            &w.buffer,
+            w.shape[0],
+            Finish {
+                scales: Some(&scales),
+                bias: bias.as_ref(),
+                swiglu: true,
+                ..Finish::default()
             },
         )
     }
@@ -583,6 +660,7 @@ impl Weights {
                 bias: bias.as_ref(),
                 addend: None,
                 lora: None,
+                swiglu: false,
             },
         )
     }
@@ -680,6 +758,7 @@ impl Weights {
                 bias: bias.as_ref(),
                 addend,
                 lora,
+                swiglu: false,
             },
         )
     }

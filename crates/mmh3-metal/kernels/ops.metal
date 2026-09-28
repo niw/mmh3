@@ -449,6 +449,30 @@ kernel void swiglu(device const float *x [[buffer(0)]], device float *y [[buffer
     y[i] = gate / (1 + exp(-gate)) * x[at + width];
 }
 
+// swiglu of rows whose outputs alternate 16 gates and their 16 up values, as a SwiGLU layer's
+// weights do once `interleave_swiglu` has put them in that order.
+kernel void swiglu_interleaved(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                               constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint width = p[1], c = i % width, at = i / width * 2 * width + c / 16 * 32 + c % 16;
+    const float gate = x[at];
+    y[i] = gate / (1 + exp(-gate)) * x[at + 16];
+}
+
+// The rows of a SwiGLU layer's gate half and up half, p[0] rows of p[1] bytes, reordered to
+// alternate 16 gate rows and their 16 up rows. One thread a byte.
+kernel void interleave_swiglu_rows(device const uchar *x [[buffer(0)]], device uchar *y [[buffer(1)]],
+                                   constant uint *p [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) {
+    const uint rows = p[0], row_bytes = p[1];
+    if (i >= rows * row_bytes)
+        return;
+    const uint row = i / row_bytes, pair = row / 32, k = row % 32;
+    const uint source = (k < 16 ? 0 : rows / 2) + pair * 16 + k % 16;
+    y[i] = x[source * row_bytes + i % row_bytes];
+}
+
 // A block's attention inputs from its qkv projection, rows of [3][heads][p[4]], or of
 // [heads][3][p[4]] with p[5] = 1, for heads of up to 256: the queries and keys RMS-normalized per
 // head by their weights, and with p[1] pairs of angles a token rotated in the first 2 × p[1]

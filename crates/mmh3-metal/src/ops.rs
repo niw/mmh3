@@ -68,6 +68,10 @@ pub(crate) struct Finish<'a> {
     /// A LoRA whose up projection is still to run. The products on the matrix units run it a tile
     /// at a time, so its output is never written whole.
     pub lora: Option<Lora<'a>>,
+    /// SwiGLU of the result, whose outputs alternate 16 gates and their 16 up values, as
+    /// `Weights::interleave_swiglu` orders a layer's: half as many outputs, and only the INT8
+    /// product on the matrix units takes it.
+    pub swiglu: bool,
 }
 
 /// The result of a LoRA's down projection, `mid`, and the FP16 weights of its up projection, with
@@ -90,6 +94,10 @@ impl Finish<'_> {
                 .lora
                 .as_ref()
                 .is_some_and(|l| l.mid.rows != rows || l.up.0.bytes != outputs * l.mid.cols * 2)
+            || (self.swiglu
+                && (self.addend.is_some()
+                    || self.lora.is_some()
+                    || !outputs.is_multiple_of(INT8_GROUP.1)))
         {
             return Err(Error::new("product finish shapes mismatch".into()));
         }
@@ -101,6 +109,7 @@ impl Finish<'_> {
             | (self.bias.is_some() as u32) << 1
             | (self.addend.is_some() as u32) << 2
             | (self.lora.is_some() as u32) << 3
+            | (self.swiglu as u32) << 4
     }
 
     /// The LoRA's up projection run whole and added to the addend, for a product that cannot run
@@ -119,6 +128,9 @@ impl Finish<'_> {
     /// The same steps, a pass each, for a product that cannot take them itself.
     pub(crate) fn apply(self, mut result: Array) -> Result<Array> {
         self.check(result.rows, result.cols)?;
+        if self.swiglu {
+            return Err(Error::new("SwiGLU is the INT8 product's own".into()));
+        }
         let this = self.lora_into_addend(result.cols)?;
         if let Some(scales) = this.scales {
             result = result.mul(scales)?;
@@ -479,6 +491,9 @@ impl Array {
         finish: Finish,
     ) -> Result<Self> {
         finish.check(rows, outputs)?;
+        if finish.swiglu && precision != LinearPrecision::Int8 {
+            return Err(Error::new("SwiGLU is the INT8 product's own".into()));
+        }
         let finish = if precision == LinearPrecision::MpsFp16 {
             finish.lora_into_addend(outputs)?
         } else {
@@ -536,6 +551,7 @@ impl Array {
         };
         let out = match finish.addend {
             Some(addend) => addend,
+            None if finish.swiglu => Self::empty(device, rows, outputs / 2)?,
             None => Self::empty(device, rows, outputs)?,
         };
         device.run(
@@ -962,6 +978,25 @@ impl Array {
             false,
         )?;
         Ok(copy)
+    }
+
+    /// `swiglu` of rows whose values alternate 16 gates and their 16 up values.
+    pub(crate) fn swiglu_interleaved(&self) -> Result<Self> {
+        if !self.cols.is_multiple_of(32) {
+            return Err(Error::new(
+                "interleaved SwiGLU needs whole groups of 32".into(),
+            ));
+        }
+
+        let out = Self::empty(self.device(), self.rows, self.cols / 2)?;
+        self.device().run(
+            "swiglu_interleaved",
+            &[&self.buffer, &out.buffer],
+            &[out.len() as u32, out.cols as u32],
+            out.len(),
+            false,
+        )?;
+        Ok(out)
     }
 
     pub fn swiglu(&self) -> Result<Self> {
@@ -1873,6 +1908,102 @@ mod tests {
         }
     }
 
+    /// The INT8 product of a SwiGLU layer whose rows alternate 16 gates and their 16 up rows
+    /// writes, to the bit, SwiGLU of the product of the layer as it was, whether its rows fill
+    /// whole groups or not; so does swiglu_interleaved after the product without it.
+    #[test]
+    fn a_product_of_interleaved_rows_takes_swiglu_itself() {
+        let device = Device::new().unwrap();
+        if !device.supports_tensor_ops() {
+            return;
+        }
+        let (cols, outputs) = (1280usize, 96usize);
+        let order: Vec<usize> = (0..outputs)
+            .map(|row| {
+                let (pair, k) = (row / 32, row % 32);
+                (if k < 16 { 0 } else { outputs / 2 }) + pair * 16 + k % 16
+            })
+            .collect();
+        let bytes: Vec<u8> = (0..outputs * cols).map(|i| (i * 37 % 251) as u8).collect();
+        let interleaved: Vec<u8> = order
+            .iter()
+            .flat_map(|&row| bytes[row * cols..(row + 1) * cols].to_vec())
+            .collect();
+        let weight = device.alloc(bytes.len(), Some(&bytes)).unwrap();
+        let reordered = device.alloc(bytes.len(), None).unwrap();
+        device
+            .run(
+                "interleave_swiglu_rows",
+                &[&weight, &reordered],
+                &[outputs as u32, cols as u32],
+                bytes.len(),
+                false,
+            )
+            .unwrap();
+        assert_eq!(reordered.to_bytes().unwrap(), interleaved);
+
+        let vector = |values: Vec<f32>| Array::from_f32(&device, 1, outputs, &values).unwrap();
+        let scale: Vec<f32> = (0..outputs)
+            .map(|i| 0.01 + (i % 7) as f32 * 0.003)
+            .collect();
+        let bias: Vec<f32> = (0..outputs).map(|i| (i % 5) as f32 * 0.2 - 0.4).collect();
+        let (scales, biases) = (vector(scale.clone()), vector(bias.clone()));
+        let (scales_in, biases_in) = (
+            vector(order.iter().map(|&row| scale[row]).collect()),
+            vector(order.iter().map(|&row| bias[row]).collect()),
+        );
+        for rows in [37usize, 200] {
+            let x = Array::from_f32(
+                &device,
+                rows,
+                cols,
+                &(0..rows * cols)
+                    .map(|i| ((i * 31) % 251) as f32 / 25.0 - 5.0)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let finish = |scales, bias, swiglu| Finish {
+                scales: Some(scales),
+                bias: Some(bias),
+                swiglu,
+                ..Finish::default()
+            };
+            let expected = x
+                .rotate_linear_int8(
+                    &weight,
+                    outputs,
+                    LinearPrecision::Int8,
+                    finish(&scales, &biases, false),
+                )
+                .unwrap()
+                .swiglu()
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            let fused = x
+                .pack(Packing::Rotate, LinearPrecision::Int8)
+                .unwrap()
+                .product(&reordered, outputs, finish(&scales_in, &biases_in, true))
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            assert_eq!(fused, expected, "{rows} rows");
+            let separate = x
+                .rotate_linear_int8(
+                    &reordered,
+                    outputs,
+                    LinearPrecision::Int8,
+                    finish(&scales_in, &biases_in, false),
+                )
+                .unwrap()
+                .swiglu_interleaved()
+                .unwrap()
+                .to_f32()
+                .unwrap();
+            assert_eq!(separate, expected, "{rows} rows");
+        }
+    }
+
     /// Adding, normalizing and packing in one pass gives what add_gated, norm_modulate and the
     /// packing product give in three. The residual is the same to the bit; the norm sums in
     /// another order, so a packed value can land on the other side of a rounding edge.
@@ -2337,6 +2468,7 @@ mod tests {
                         mid: upload(&mid, rows, rank),
                         up: &up_buffer,
                     }),
+                    swiglu: false,
                 },
             )
             .unwrap()
