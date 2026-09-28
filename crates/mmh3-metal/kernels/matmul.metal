@@ -592,6 +592,24 @@ void product_depth(thread vec<int, 8> (&acc)[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAG
     }
 }
 
+// product_depth<false> over one whole PRODUCT_DEPTH from `a` and `b`, which point at its start.
+// With the depth's length known and the offsets taken from its own start, the compiler keeps the
+// loads' addresses simple and overlaps four steps' loads with the products before them.
+void product_whole_depth(thread vec<int, 8> (&acc)[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS],
+                         device const int8_t *a, device const int8_t *b, int K, short2 at) {
+    _Pragma("clang loop unroll_count(4)") for (int k = 0; k < PRODUCT_DEPTH; k += FRAGMENT) {
+        vec<int8_t, 8> left[PRODUCT_FRAGMENT_ROWS], right[PRODUCT_FRAGMENT_COLS];
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+            left[m] = load_block<false, false, int8_t>(a + m * FRAGMENT * K + k, K, 0, 0, at);
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
+            right[n] = load_block<false, true, int8_t>(b + n * FRAGMENT * K + k, K, 0, 0, at);
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+            _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; n += 2)
+                multiply_fragments<true, int8_t, int8_t, int>(acc[m][n], acc[m][n + 1], left[m],
+                                                              right[n], right[n + 1]);
+    }
+}
+
 // A LoRA's up projection of its down projection's result `mid`, FP16 products added to a SIMD
 // group's outputs.
 template <bool CHECK>
@@ -613,13 +631,15 @@ void lora_up(thread fragment_float (&result)[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAG
     }
 }
 
-[[kernel, max_total_threads_per_threadgroup(256)]] void
-mpp_int8(device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],
-         device float *c [[buffer(2)]], device const float *scales [[buffer(3)]],
-         device const float *outputs [[buffer(4)]], device const float *bias [[buffer(5)]],
-         device float *mid [[buffer(6)]], device half *up [[buffer(7)]],
-         constant uint *p [[buffer(8)]], uint g [[threadgroup_position_in_grid]],
-         uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+// With INSIDE, the product of at least PRODUCT_GROUP_ROWS rows and PRODUCT_GROUP_COLS weights and
+// a depth of whole PRODUCT_DEPTHs. A group whose outputs run past the last row or column moves back
+// until they end there and writes only those of its own outputs it did not move over, so it reads
+// whole fragments and the product needs no checked loads, which slow the loop down by a tenth even
+// where they never run. Without INSIDE, the checked loads take any shape.
+template <bool INSIDE>
+void int8_product(device int8_t *a, device int8_t *b, device float *c, device const float *scales,
+                  device const float *outputs, device const float *bias, device float *mid,
+                  device half *up, constant uint *p, uint g, uint simd, uint lane) {
     constexpr int GROUP_COLUMNS = PRODUCT_TILE / PRODUCT_GROUP_COLS;
     const int M = p[0], N = p[1], K = p[2], rank = p[4];
     const uint flags = p[3];
@@ -627,12 +647,15 @@ mpp_int8(device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],
     const int row_tiles = (M + PRODUCT_TILE - 1) / PRODUCT_TILE, BAND = max(int(p[5]), 1);
     const int band = g / (BAND * tiles), in_band = g % (BAND * tiles);
     const int band_rows = min(BAND, row_tiles - band * BAND);
-    const int row = (band * BAND + in_band % band_rows) * PRODUCT_TILE +
-                    int(simd / GROUP_COLUMNS) * PRODUCT_GROUP_ROWS;
-    const int col =
+    // The group's own first output row and column, and those it reads from.
+    const int own_row = (band * BAND + in_band % band_rows) * PRODUCT_TILE +
+                        int(simd / GROUP_COLUMNS) * PRODUCT_GROUP_ROWS;
+    const int own_col =
         (in_band / band_rows) * PRODUCT_TILE + int(simd % GROUP_COLUMNS) * PRODUCT_GROUP_COLS;
+    const int row = INSIDE ? min(own_row, M - PRODUCT_GROUP_ROWS) : own_row;
+    const int col = INSIDE ? min(own_col, N - PRODUCT_GROUP_COLS) : own_col;
     // A group past the last rows or columns still takes every depth, since the eight take it
-    // together; its checked loads read nothing.
+    // together; its checked loads read nothing, or with INSIDE it reads the last outputs again.
     const int rows = M - row, cols = N - col;
     const short2 at = fragment_coord(lane);
 
@@ -641,10 +664,14 @@ mpp_int8(device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],
         _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
             acc[m][n] = 0;
     const bool whole =
-        rows >= PRODUCT_GROUP_ROWS && cols >= PRODUCT_GROUP_COLS && K % FRAGMENT == 0;
+        INSIDE || (rows >= PRODUCT_GROUP_ROWS && cols >= PRODUCT_GROUP_COLS && K % FRAGMENT == 0);
     device const int8_t *left = a + max(row, 0) * K, *right = b + max(col, 0) * K;
     for (int depth = 0; depth < K; depth += PRODUCT_DEPTH) {
         threadgroup_barrier(mem_flags::mem_none);
+        if (INSIDE) {
+            product_whole_depth(acc, left + depth, right + depth, K, at);
+            continue;
+        }
         const int end = min(depth + PRODUCT_DEPTH, K);
         if (whole)
             product_depth<false>(acc, left, right, K, rows, cols, depth, end, at);
@@ -684,7 +711,7 @@ mpp_int8(device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],
                 const int r = row + m * FRAGMENT + at.y + i * 8;
                 _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
                     const int column = col + n * FRAGMENT + at.x + fragment_column(j);
-                    if (r < M && column < N) {
+                    if (r >= own_row && r < M && column >= own_col && column < N) {
                         const float value = result[m][n][i * 4 + j];
                         c[r * N + column] = flags & ACCUMULATE ? c[r * N + column] + value : value;
                     }
@@ -693,3 +720,17 @@ mpp_int8(device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],
         }
     }
 }
+
+#define INT8_PRODUCT(NAME, INSIDE)                                                                 \
+    [[kernel, max_total_threads_per_threadgroup(256)]] void NAME(                                  \
+        device int8_t *a [[buffer(0)]], device int8_t *b [[buffer(1)]],                            \
+        device float *c [[buffer(2)]], device const float *scales [[buffer(3)]],                   \
+        device const float *outputs [[buffer(4)]], device const float *bias [[buffer(5)]],         \
+        device float *mid [[buffer(6)]], device half *up [[buffer(7)]],                            \
+        constant uint *p [[buffer(8)]], uint g [[threadgroup_position_in_grid]],                   \
+        uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {   \
+        int8_product<INSIDE>(a, b, c, scales, outputs, bias, mid, up, p, g, simd, lane);           \
+    }
+INT8_PRODUCT(mpp_int8, false)
+INT8_PRODUCT(mpp_int8_inside, true)
+#undef INT8_PRODUCT

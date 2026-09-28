@@ -539,10 +539,15 @@ impl Array {
             None => Self::empty(device, rows, outputs)?,
         };
         device.run(
-            if precision == LinearPrecision::Int8 {
-                "mpp_int8"
-            } else {
+            if precision != LinearPrecision::Int8 {
                 "mpp_fp16"
+            } else if rows >= INT8_GROUP.0
+                && outputs >= INT8_GROUP.1
+                && cols.is_multiple_of(INT8_PRODUCT_DEPTH)
+            {
+                "mpp_int8_inside"
+            } else {
+                "mpp_int8"
             },
             &[
                 packed,
@@ -1233,6 +1238,11 @@ impl Array {
 }
 /// Outputs a side of one threadgroup of the INT8 product, `PRODUCT_TILE` in matmul.metal.
 const INT8_PRODUCT_TILE: usize = 128;
+/// The rows and weights one SIMD group of the INT8 product answers, `PRODUCT_GROUP_ROWS` and
+/// `PRODUCT_GROUP_COLS`, and the depth its groups take together, `PRODUCT_DEPTH`. A product of at
+/// least one group's outputs and whole depths runs `mpp_int8_inside`, which needs no checked loads.
+const INT8_GROUP: (usize, usize) = (64, 32);
+const INT8_PRODUCT_DEPTH: usize = 256;
 /// The row tiles the threadgroups of the INT8 product go down before taking the next column tile.
 /// Bands of 4 were the fastest for every product of a MiniMax H3 block.
 const INT8_PRODUCT_BAND: u32 = 4;
