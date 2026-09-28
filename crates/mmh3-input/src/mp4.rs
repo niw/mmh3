@@ -1,7 +1,8 @@
 //! MP4 demuxing of a file's H.264 video track.
 //!
 //! Only what a reference clip needs: the track's size, its parameter sets and its samples in
-//! decoding order, handed out as Annex B access units for a hardware decoder. Audio itself goes
+//! decoding order, handed out as Annex B access units for a hardware decoder, with where each is
+//! presented for a decoder that leaves the reordering of B-frames to its caller. Audio itself goes
 //! through Symphonia, which reads MP4, but the edit list that hides a codec's priming comes from
 //! here, since Symphonia reports the whole media instead.
 
@@ -75,6 +76,9 @@ pub struct Sample {
     pub size: usize,
     /// Ticks of the track's timescale the frame lasts.
     pub duration: u32,
+    /// Ticks of the track's timescale the frame is presented after it is decoded, which lets
+    /// B-frames come out after the frames they refer to.
+    pub composition_offset: i32,
     /// Whether the sample starts a group of pictures.
     pub keyframe: bool,
 }
@@ -104,6 +108,28 @@ impl VideoTrack {
             return 0.0;
         }
         self.samples.len() as f64 * f64::from(self.timescale) / ticks as f64
+    }
+
+    /// Where every sample is presented, counted in frames: the samples ordered by the time they
+    /// are decoded plus their composition offsets.
+    pub fn display_positions(&self) -> Vec<usize> {
+        let mut decoded = 0i64;
+        let times: Vec<i64> = self
+            .samples
+            .iter()
+            .map(|sample| {
+                let time = decoded + i64::from(sample.composition_offset);
+                decoded += i64::from(sample.duration);
+                time
+            })
+            .collect();
+        let mut order: Vec<usize> = (0..times.len()).collect();
+        order.sort_by_key(|&index| (times[index], index));
+        let mut positions = vec![0; order.len()];
+        for (position, index) in order.into_iter().enumerate() {
+            positions[index] = position;
+        }
+        positions
     }
 }
 
@@ -285,6 +311,7 @@ fn avc_configuration(description: &[u8]) -> io::Result<(usize, usize, Vec<u8>, u
 fn samples(table: &[u8]) -> io::Result<Vec<Sample>> {
     let sizes = sample_sizes(child(table, b"stsz")?)?;
     let durations = sample_durations(child(table, b"stts")?, sizes.len())?;
+    let composition_offsets = composition_offsets(table, sizes.len())?;
     let offsets = chunk_offsets(table)?;
     let runs = sample_to_chunk(child(table, b"stsc")?)?;
     let sync = sync_samples(table)?;
@@ -309,6 +336,7 @@ fn samples(table: &[u8]) -> io::Result<Vec<Sample>> {
                 offset: position,
                 size: sizes[index],
                 duration: durations[index],
+                composition_offset: composition_offsets[index],
                 keyframe: sync.as_ref().is_none_or(|sync| sync.contains(&index)),
             });
             position += sizes[index] as u64;
@@ -347,6 +375,27 @@ fn sample_durations(payload: &[u8], samples: usize) -> io::Result<Vec<u32>> {
     let last = durations.last().copied().unwrap_or(0);
     durations.resize(samples, last);
     Ok(durations)
+}
+
+/// The composition offsets of the samples, all zero without a table, when the frames are
+/// presented in the order they are decoded.
+fn composition_offsets(table: &[u8], samples: usize) -> io::Result<Vec<i32>> {
+    let Ok(payload) = child(table, b"ctts") else {
+        return Ok(vec![0; samples]);
+    };
+    let entries = u32_at(payload, 4)? as usize;
+    let mut offsets = Vec::with_capacity(samples);
+    for entry in 0..entries {
+        let count = u32_at(payload, 8 + entry * 8)? as usize;
+        // Version 0 declares the offsets unsigned, but writers put negative ones there too.
+        let offset = u32_at(payload, 12 + entry * 8)? as i32;
+        offsets.extend(std::iter::repeat_n(
+            offset,
+            count.min(samples - offsets.len()),
+        ));
+    }
+    offsets.resize(samples, 0);
+    Ok(offsets)
 }
 
 fn chunk_offsets(table: &[u8]) -> io::Result<Vec<u64>> {
@@ -496,6 +545,8 @@ mod tests {
         let movie = |offsets: &[u32]| {
             let mut stbl = atom(b"stsd", &description);
             stbl.extend(table(b"stts", &[samples.len() as u32, 40], 2));
+            // The second sample is presented last, as a P-frame before a B-frame is.
+            stbl.extend(table(b"ctts", &[1, 0, 1, 80, 1, 0], 2));
             stbl.extend(table(b"stsc", &[1, 1, 1], 3));
             stbl.extend(atom(b"stsz", &sizes));
             stbl.extend(table(b"stss", &[1], 1));
@@ -559,6 +610,8 @@ mod tests {
         assert_eq!(track.samples.len(), 3);
         // 1000 ticks per second and 40 ticks per frame make 25 frames per second.
         assert!((track.fps() - 25.0).abs() < 1e-9);
+        // Decoded at 0, 40 and 80 ticks, the samples are presented at 0, 120 and 80.
+        assert_eq!(track.display_positions(), vec![0, 2, 1]);
         // The sync table names the first sample alone.
         assert_eq!(
             track

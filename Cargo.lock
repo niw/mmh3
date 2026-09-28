@@ -524,6 +524,7 @@ dependencies = [
  "mmh3-cuda",
  "mmh3-input",
  "mmh3-input-nvdec",
+ "mmh3-input-videotoolbox",
  "mmh3-metal",
  "mmh3-output",
  "mmh3-output-nvenc",
@@ -559,6 +560,7 @@ dependencies = [
 name = "mmh3-input"
 version = "0.1.0"
 dependencies = [
+ "mmh3-core",
  "tempfile",
 ]
 
@@ -569,6 +571,16 @@ dependencies = [
  "cc",
  "mmh3-core",
  "mmh3-input",
+]
+
+[[package]]
+name = "mmh3-input-videotoolbox"
+version = "0.1.0"
+dependencies = [
+ "mmh3-core",
+ "mmh3-input",
+ "mmh3-swift-build",
+ "tempfile",
 ]
 
 [[package]]

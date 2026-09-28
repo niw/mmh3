@@ -1,5 +1,5 @@
 [package]
-name = "mmh3-input"
+name = "mmh3-input-videotoolbox"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,6 +7,10 @@ publish = false
 
 [dependencies]
 mmh3-core = { path = "../mmh3-core" }
+mmh3-input = { path = "../mmh3-input" }
+
+[build-dependencies]
+mmh3-swift-build = { path = "../mmh3-swift-build" }
 
 [dev-dependencies]
 tempfile = "3"
