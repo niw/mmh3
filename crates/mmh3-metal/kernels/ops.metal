@@ -540,20 +540,28 @@ float radix4(float a, float b, float c, float d, uint digit) {
 // ConvRot's rotation of one 256-value block in a SIMD group's registers, eight values a lane at
 // index lane + 32 j. The four digits of an index are its bit pairs: the first two are the lane's
 // low bits, the third the lane's top bit with j's lowest, and the last j's top bits. The stages and
-// their sums are the hadamard kernel's, in its order, so the results are the same.
+// their sums are the hadamard kernel's, in its order, so the results are the same. A lane holds one
+// of the four values of each butterfly and takes the other three from the lanes whose digit differs
+// from its own, rather than shuffling all four in: the shuffles, not memory, bounded the kernels.
 void hadamard_registers(thread float *x, uint lane) {
     for (uint s = 1; s <= 4; s *= 4) {
-        const uint digit = lane / s % 4, base = lane - digit * s;
+        const uint digit = lane / s % 4;
         for (uint j = 0; j < 8; ++j) {
-            const float a = simd_shuffle(x[j], base), b = simd_shuffle(x[j], base + s),
-                        c = simd_shuffle(x[j], base + 2 * s), d = simd_shuffle(x[j], base + 3 * s);
+            // The lanes that differ in this digit, by how far their digit is from this lane's.
+            const float own = x[j], one = simd_shuffle_xor(own, s),
+                        two = simd_shuffle_xor(own, 2 * s), three = simd_shuffle_xor(own, 3 * s);
+            const float a = digit == 0 ? own : digit == 1 ? one : digit == 2 ? two : three;
+            const float b = digit == 1 ? own : digit == 0 ? one : digit == 3 ? two : three;
+            const float c = digit == 2 ? own : digit == 3 ? one : digit == 0 ? two : three;
+            const float d = digit == 3 ? own : digit == 2 ? one : digit == 1 ? two : three;
             x[j] = radix4(a, b, c, d, digit);
         }
     }
-    const uint low = lane & ~16u, high = lane | 16u, bit = lane / 16;
+    const uint bit = lane / 16;
     for (uint j = 0; j < 8; j += 2) {
-        const float a = simd_shuffle(x[j], low), b = simd_shuffle(x[j], high),
-                    c = simd_shuffle(x[j + 1], low), d = simd_shuffle(x[j + 1], high);
+        const float first = simd_shuffle_xor(x[j], 16), second = simd_shuffle_xor(x[j + 1], 16);
+        const float a = bit ? first : x[j], b = bit ? x[j] : first;
+        const float c = bit ? second : x[j + 1], d = bit ? x[j + 1] : second;
         x[j] = radix4(a, b, c, d, bit);
         x[j + 1] = radix4(a, b, c, d, 2 + bit);
     }
