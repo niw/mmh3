@@ -2,7 +2,7 @@
 use crate::{
     AttentionPrecision, Device, Error, LinearPrecision, Result,
     model::Weights,
-    ops::{Array, attends_in_half},
+    ops::{Array, PackedRows, RowMap, attends_in_half},
 };
 use mmh3_core::{
     media::Yuv420,
@@ -266,16 +266,10 @@ impl MetalVideoDecoder {
             &rope_angles(frames, height, width, self.registers + 1, 8, 100.0),
         )?;
         let ones = Array::from_f32(&w.device, 1, 64, &[1.0; 64])?;
-
-        for i in 0..self.layers {
-            let p = format!("decoder.transformer_blocks.{i}");
-            let qkv = w.linear(
-                &w.norm(&x, &format!("{p}.norm1"), 1e-5)?,
-                &format!("{p}.attn.to_qkv"),
-            )?;
-            // Each head's query, key and value lie side by side, and the query and key norms
-            // have no weights of their own.
-            let attended = w.linear(
+        // Each head's query, key and value lie side by side, and the query and key norms have no
+        // weights of their own.
+        let attend = |qkv: &Array, p: &str| -> Result<Array> {
+            w.linear(
                 &qkv.attention_inputs(
                     heads,
                     (&ones, &ones),
@@ -287,14 +281,76 @@ impl MetalVideoDecoder {
                 )?
                 .attend()?,
                 &format!("{p}.attn.to_out"),
-            )?;
-            x = x.add_scaled(&attended, &w.vector(&format!("{p}.scale1"))?)?;
-            let expanded = w.linear(
-                &w.norm(&x, &format!("{p}.norm2"), 1e-5)?,
-                &format!("{p}.ff.w1"),
-            )?;
-            let delta = w.linear_gated(&expanded, &format!("{p}.ff.w2"))?;
-            x = x.add_scaled(&delta, &w.vector(&format!("{p}.scale2"))?)?;
+            )
+        };
+
+        // One pass takes the residual's update, the norm and the packing of the next product's
+        // input, as in the DiT, where the rows fit in registers and the products are INT8. The
+        // norms modulate nothing, so every row reads a table of zeros, and a residual's scale
+        // is its gate.
+        let fused = PackedRows::fit(self.dim, w.linear_precision)
+            && (0..self.layers).all(|i| {
+                let p = format!("decoder.transformer_blocks.{i}");
+                w.is_int8(&format!("{p}.attn.to_qkv"))
+                    && w.is_int8(&format!("{p}.ff.w1"))
+                    && !w.contains(&format!("{p}.norm1.bias"))
+                    && !w.contains(&format!("{p}.norm2.bias"))
+            });
+        if fused {
+            let zeros = Array::zeros(&w.device, 1, self.dim)?;
+            let rows = RowMap::new(&w.device, &vec![0; tokens])?;
+            let mut pending: Option<(Array, Array)> = None;
+            for i in 0..self.layers {
+                let p = format!("decoder.transformer_blocks.{i}");
+                let (updated, normed, packed) = x.add_norm_pack(
+                    pending.as_ref().map(|(delta, scale)| (delta, scale, 0)),
+                    &w.vector(&format!("{p}.norm1.weight"))?,
+                    1e-5,
+                    (&zeros, &rows, 0, 0),
+                    w.linear_precision,
+                    w.adapter_reads_rows(&format!("{p}.attn.to_qkv")),
+                )?;
+                if let Some(updated) = updated {
+                    x = updated;
+                }
+                let qkv =
+                    w.linear_prepacked(&packed, normed.as_ref(), &format!("{p}.attn.to_qkv"))?;
+                let attended = attend(&qkv, &p)?;
+                let (updated, normed, packed) = x.add_norm_pack(
+                    Some((&attended, &w.vector(&format!("{p}.scale1"))?, 0)),
+                    &w.vector(&format!("{p}.norm2.weight"))?,
+                    1e-5,
+                    (&zeros, &rows, 0, 0),
+                    w.linear_precision,
+                    w.adapter_reads_rows(&format!("{p}.ff.w1")),
+                )?;
+                x = updated.expect("a pass given a delta updates the residual");
+                let expanded =
+                    w.linear_prepacked(&packed, normed.as_ref(), &format!("{p}.ff.w1"))?;
+                pending = Some((
+                    w.linear_gated(&expanded, &format!("{p}.ff.w2"))?,
+                    w.vector(&format!("{p}.scale2"))?,
+                ));
+            }
+            if let Some((delta, scale)) = pending {
+                x = x.add_scaled(&delta, &scale)?;
+            }
+        } else {
+            for i in 0..self.layers {
+                let p = format!("decoder.transformer_blocks.{i}");
+                let qkv = w.linear(
+                    &w.norm(&x, &format!("{p}.norm1"), 1e-5)?,
+                    &format!("{p}.attn.to_qkv"),
+                )?;
+                let attended = attend(&qkv, &p)?;
+                x = x.add_scaled(&attended, &w.vector(&format!("{p}.scale1"))?)?;
+                let expanded = w.linear(
+                    &w.norm(&x, &format!("{p}.norm2"), 1e-5)?,
+                    &format!("{p}.ff.w1"),
+                )?;
+                let delta = w.linear_gated(&expanded, &format!("{p}.ff.w2"))?;
+                x = x.add_scaled(&delta, &w.vector(&format!("{p}.scale2"))?)?;
+            }
         }
 
         let projected = w
