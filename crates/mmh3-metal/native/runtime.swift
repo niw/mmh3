@@ -17,7 +17,9 @@ private func pooled(_ change: Int) {
 // One context serves every thread of the process, one thread at a time: its lock is taken for the
 // whole of every call that touches it, since its queue, its pipelines and its batch are one of
 // each. Command buffers retain their inputs until completion. Host reads and foreign-queue exports
-// synchronize; batches are bounded by work and allocation.
+// synchronize; batches are bounded by work and allocation. A full batch is committed without
+// waiting for it, so the GPU runs it while the next one is encoded, and at most `inFlightLimit`
+// run at once.
 private final class Context {
     let lock = NSLock()
     let device: MTLDevice
@@ -33,6 +35,10 @@ private final class Context {
     var products: [String: MPSMatrixMultiplication] = [:]
     var reusable: [MTLBuffer] = []
     var retired: [MTLBuffer] = []
+    /// Committed batches not known to be done, oldest first, each with the buffers let go of while
+    /// it or one before it could still read them, which are free once it completes.
+    var inFlight: [(command: MTLCommandBuffer, retired: [MTLBuffer])] = []
+    let inFlightLimit = 2
     var pooledBytes = 0 {
         didSet { pooled(pooledBytes - oldValue) }
     }
@@ -127,27 +133,39 @@ private final class Context {
         return command
     }
 
-    func synchronize() throws {
+    /// Commits the batch being encoded, if any, without waiting for it, and waits for the oldest
+    /// batches until no more than `limit` are in flight.
+    func flush(leaving limit: Int) throws {
         if let executionError {
             throw executionError
         }
 
-        guard let command = pending else {
-            return
+        if let command = pending {
+            pending = nil
+            operations = 0
+            allocatedSinceSync = 0
+            submissions += 1
+            command.commit()
+            inFlight.append((command, retired))
+            retired.removeAll(keepingCapacity: true)
         }
 
-        pending = nil
-        operations = 0
-        allocatedSinceSync = 0
-        submissions += 1
+        while inFlight.count > limit {
+            let (command, freed) = inFlight.removeFirst()
+            do {
+                try complete(command)
+            } catch {
+                executionError = error
+                throw error
+            }
 
-        do {
-            try complete(command)
-        } catch {
-            executionError = error
-            throw error
+            reusable.append(contentsOf: freed)
         }
+    }
 
+    func synchronize() throws {
+        try flush(leaving: 0)
+        // Buffers let go of with nothing pending were read by nothing after the last batch.
         reusable.append(contentsOf: retired)
         retired.removeAll(keepingCapacity: true)
     }
@@ -155,7 +173,7 @@ private final class Context {
     func encoded() throws {
         operations += 1
         if operations >= 64 {
-            try synchronize()
+            try flush(leaving: inFlightLimit)
         }
     }
 
@@ -177,7 +195,7 @@ private final class Context {
         }
 
         pooledBytes += buffer.length
-        if pending == nil {
+        if pending == nil, inFlight.isEmpty {
             reusable.append(buffer)
         } else {
             retired.append(buffer)
@@ -341,7 +359,6 @@ private func buffer(_ pointer: UnsafeMutableRawPointer) -> MTLBuffer {
 }
 
 private func complete(_ command: MTLCommandBuffer) throws {
-    command.commit()
     command.waitUntilCompleted()
     guard command.status == .completed else {
         throw command.error ?? BridgeError.message("Metal command failed")
@@ -443,8 +460,10 @@ func metalAlloc(_ pointer: UnsafeMutableRawPointer, _ bytes: Int, _ data: Unsafe
                     throw error
                 }
 
+                // The batches before this one hand back the buffers let go of while they ran, so
+                // an allocation this large waits for them, but not for the batch being encoded.
                 if ctx.pending != nil, ctx.allocatedSinceSync + bytes > 256 * 1024 * 1024 {
-                    try ctx.synchronize()
+                    try ctx.flush(leaving: 1)
                 }
             } catch {
                 _ = fail(error)
