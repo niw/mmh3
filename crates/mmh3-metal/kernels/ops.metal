@@ -1293,3 +1293,136 @@ kernel void attention_sparse_128(
         }
     }
 }
+
+// Kernels of the video VAE's encoder, whose activations are FP16 [sequences, frames, height,
+// width, channels]: a sequence is one tile of one clip, and the group norms' statistics are those
+// of one frame of one sequence.
+constant constexpr uint VIDEO_GROUPS = 32;
+// Pixels one threadgroup of video_encoder_norm_partials sums.
+constant constexpr uint VIDEO_NORM_PIXELS = 1024;
+// Channels each of its threads sums at most, which holds the encoder's 1024.
+constant constexpr uint VIDEO_NORM_SLOTS = 4;
+
+// The tiles of the canvas [frames, height, width, 3] in [0, 1], normalized with the ImageNet
+// statistics, into [sequences, frames, tile height, tile width, p[7]] with the channels past the
+// third zero, so the first convolution reads whole fragments. `tiles` holds each sequence's first
+// frame, top and left, and a frame past the canvas repeats its last one, as the reference pads a
+// short clip.
+//
+// p: values, canvas frames, height, width, frames, tile height, tile width, channels.
+kernel void video_encoder_tile_input(device const float *canvas [[buffer(0)]],
+                                     device const uint *tiles [[buffer(1)]],
+                                     device half *y [[buffer(2)]], constant uint *p [[buffer(3)]],
+                                     uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint channels = p[7], tile_pixels = p[5] * p[6];
+    const uint channel = i % channels, pixel = i / channels % tile_pixels;
+    const uint frame = i / (channels * tile_pixels) % p[4];
+    const uint sequence = i / (channels * tile_pixels * p[4]);
+    if (channel >= 3) {
+        y[i] = 0;
+        return;
+    }
+    const float mean[3] = {0.485, 0.456, 0.406}, deviation[3] = {0.229, 0.224, 0.225};
+    device const uint *tile = tiles + sequence * 3;
+    const uint source_frame = min(tile[0] + frame, p[1] - 1);
+    const uint row = pixel / p[6] + tile[1], column = pixel % p[6] + tile[2];
+    const float value = canvas[((size_t(source_frame) * p[2] + row) * p[3] + column) * 3 + channel];
+    y[i] = half((value - mean[channel]) / deviation[channel]);
+}
+
+// Sums and sums of squares of each group over VIDEO_NORM_PIXELS pixels of one frame, into
+// partials[frame, chunk, group, 2]. The values are taken from the group's first value in the frame,
+// so that a mean far from zero does not swallow the variance. A thread's channels land in their own
+// slots and a group adds them up in a fixed order, so two encodes of one input agree.
+//
+// p: pixels, channels, chunks of a frame.
+kernel void video_encoder_norm_partials(device const half *x [[buffer(0)]],
+                                        device float *partials [[buffer(1)]],
+                                        constant uint *p [[buffer(2)]],
+                                        uint g [[threadgroup_position_in_grid]],
+                                        uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float sums[256 * VIDEO_NORM_SLOTS * 2];
+    const uint pixels = p[0], channels = p[1], chunks = p[2];
+    const uint group_size = channels / VIDEO_GROUPS;
+    x += size_t(g / chunks) * pixels * channels;
+    // Threads go across a pixel's channels, so the reads of one pixel are contiguous.
+    const uint lanes = min(channels, 256u), lane = tid % lanes, step = 256 / lanes;
+    const uint first = g % chunks * VIDEO_NORM_PIXELS;
+    const uint last = min(first + VIDEO_NORM_PIXELS, pixels);
+    for (uint slot = 0; slot < VIDEO_NORM_SLOTS; ++slot) {
+        const uint channel = lane + slot * 256;
+        float sum = 0, squares = 0;
+        if (channel < channels) {
+            const float shift = float(x[channel / group_size * group_size]);
+            for (uint pixel = first + tid / lanes; pixel < last; pixel += step) {
+                const float value = float(x[size_t(pixel) * channels + channel]) - shift;
+                sum += value;
+                squares = fma(value, value, squares);
+            }
+        }
+        sums[(tid * VIDEO_NORM_SLOTS + slot) * 2] = sum;
+        sums[(tid * VIDEO_NORM_SLOTS + slot) * 2 + 1] = squares;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid >= VIDEO_GROUPS)
+        return;
+    float sum = 0, squares = 0;
+    for (uint other = 0; other < 256; ++other) {
+        for (uint slot = 0; slot < VIDEO_NORM_SLOTS; ++slot) {
+            const uint channel = other % lanes + slot * 256;
+            if (channel < channels && channel / group_size == tid) {
+                sum += sums[(other * VIDEO_NORM_SLOTS + slot) * 2];
+                squares += sums[(other * VIDEO_NORM_SLOTS + slot) * 2 + 1];
+            }
+        }
+    }
+    partials[(size_t(g) * VIDEO_GROUPS + tid) * 2] = sum;
+    partials[(size_t(g) * VIDEO_GROUPS + tid) * 2 + 1] = squares;
+}
+
+// The mean and reciprocal standard deviation of each group of each frame from its partials, into
+// statistics[frame, group, 2].
+//
+// p: frames × groups, pixels, channels, chunks of a frame, epsilon.
+kernel void video_encoder_norm_statistics(device const half *x [[buffer(0)]],
+                                          device const float *partials [[buffer(1)]],
+                                          device float *statistics [[buffer(2)]],
+                                          constant uint *p [[buffer(3)]],
+                                          uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint frame = i / VIDEO_GROUPS, group = i % VIDEO_GROUPS;
+    const uint pixels = p[1], channels = p[2], chunks = p[3], group_size = channels / VIDEO_GROUPS;
+    float sum = 0, squares = 0;
+    for (uint chunk = 0; chunk < chunks; ++chunk) {
+        const size_t at = ((size_t(frame) * chunks + chunk) * VIDEO_GROUPS + group) * 2;
+        sum += partials[at];
+        squares += partials[at + 1];
+    }
+    const float count = float(pixels * group_size);
+    const float mean = sum / count, variance = max(squares / count - mean * mean, 0.0f);
+    const float shift = float(x[size_t(frame) * pixels * channels + group * group_size]);
+    statistics[i * 2] = shift + mean;
+    statistics[i * 2 + 1] = rsqrt(variance + as_type<float>(p[4]));
+}
+
+// SiLU of the group-normalized input with a per-channel affine, each frame with its own
+// statistics.
+//
+// p: values, pixels of a frame, channels.
+kernel void video_encoder_norm_silu(device const half *x [[buffer(0)]],
+                                    device const float *statistics [[buffer(1)]],
+                                    device const float *w [[buffer(2)]],
+                                    device const float *b [[buffer(3)]],
+                                    device half *y [[buffer(4)]], constant uint *p [[buffer(5)]],
+                                    uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint channels = p[2], channel = i % channels;
+    const uint group = i / (channels * p[1]) * VIDEO_GROUPS + channel / (channels / VIDEO_GROUPS);
+    const float value =
+        (float(x[i]) - statistics[group * 2]) * statistics[group * 2 + 1] * w[channel] + b[channel];
+    y[i] = half(value / (1 + exp(-value)));
+}

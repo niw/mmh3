@@ -754,3 +754,134 @@ void int8_product(device int8_t *a, device int8_t *b, device float *c, device co
 INT8_PRODUCT(mpp_int8, false)
 INT8_PRODUCT(mpp_int8_inside, true)
 #undef INT8_PRODUCT
+
+// A convolution of the video VAE's encoder as a product over im2col rows that are never written:
+// each SIMD group reads the taps of its output pixels straight from the FP16 activation
+// [sequences, frames, height, width, channels], so the nine or twenty-seven columns of every pixel
+// come from the cache rather than from memory. A tap reflects its pixel at the edges, one pixel on
+// each side at stride one and one after the input at stride two, and reads zeros before the first
+// frame of its sequence, the reference's causal padding. The weights are FP16 [outputs, (kt, ky,
+// kx, channel)], and the products accumulate in FP32.
+//
+// A threadgroup takes 128 × 128 outputs and each of its eight SIMD groups 64 × 32 of them, as
+// int8_product does. Rows and weights past the end are read at the last one and never written, so
+// the loads need no checks.
+//
+// p: rows, outputs, channels, input frames, height and width, output frames, height and width,
+// kernel, temporal taps, stride, temporal stride, and whether to add `residual`, which is
+// [rows, outputs] like the output.
+[[kernel, max_total_threads_per_threadgroup(256)]] void
+mpp_video_convolution(device const half *x [[buffer(0)]], device const half *w [[buffer(1)]],
+                      device const float *bias [[buffer(2)]],
+                      device const half *residual [[buffer(3)]], device half *y [[buffer(4)]],
+                      constant uint *p [[buffer(5)]], uint g [[threadgroup_position_in_grid]],
+                      uint simd [[simdgroup_index_in_threadgroup]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+    constexpr int GROUP_COLUMNS = PRODUCT_TILE / PRODUCT_GROUP_COLS;
+    const int M = p[0], N = p[1], C = p[2];
+    const int input_frames = p[3], input_height = p[4], input_width = p[5];
+    const int output_frames = p[6], output_height = p[7], output_width = p[8];
+    const int size = p[9], taps = p[10], stride = p[11], time_stride = p[12];
+    const bool add_residual = p[13];
+    const int K = taps * size * size * C, pad = size == 3 && stride == 1 ? 1 : 0;
+    const int tiles = (N + PRODUCT_TILE - 1) / PRODUCT_TILE;
+    const int row = int(g) / tiles * PRODUCT_TILE + int(simd / GROUP_COLUMNS) * PRODUCT_GROUP_ROWS;
+    const int col = int(g) % tiles * PRODUCT_TILE + int(simd % GROUP_COLUMNS) * PRODUCT_GROUP_COLS;
+    const short2 at = fragment_coord(lane);
+
+    // The first input frame of the sequence of each of the lane's rows, and the frame, row and
+    // column its first tap reads.
+    int first_frame[PRODUCT_FRAGMENT_ROWS][2], frame[PRODUCT_FRAGMENT_ROWS][2];
+    int pixel_y[PRODUCT_FRAGMENT_ROWS][2], pixel_x[PRODUCT_FRAGMENT_ROWS][2];
+    const int plane = output_height * output_width;
+    _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+        _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+            const int r = min(row + m * FRAGMENT + at.y + i * 8, M - 1);
+            const int sequence_frame = r / plane, pixel = r % plane;
+            first_frame[m][i] = sequence_frame / output_frames * input_frames;
+            frame[m][i] = sequence_frame % output_frames * time_stride - (taps - 1);
+            pixel_y[m][i] = pixel / output_width * stride - pad;
+            pixel_x[m][i] = pixel % output_width * stride - pad;
+        }
+    }
+    // The weight rows a lane reads, those past the last output at the last one: with
+    // FRAGMENT_PAIRS its four columns of a fragment, and otherwise its two rows.
+    device const half *weights[PRODUCT_FRAGMENT_COLS][4];
+    _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n) {
+        _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+            const int output = FRAGMENT_PAIRS ? col + n * FRAGMENT + at.x + fragment_column(j)
+                                              : col + n * FRAGMENT + at.y + (j & 1) * 8;
+            weights[n][j] = w + min(output, N - 1) * K;
+        }
+    }
+
+    fragment_float acc[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS];
+    _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
+            acc[m][n] = 0;
+    const int kernel_taps = taps * size * size;
+    for (int tap = 0; tap < kernel_taps; ++tap) {
+        threadgroup_barrier(mem_flags::mem_none);
+        const int kt = tap / (size * size), ky = tap / size % size, kx = tap % size;
+        // Where each of the lane's rows reads this tap, and whether it is a frame of its sequence
+        // rather than the zeros before it.
+        device const half *source[PRODUCT_FRAGMENT_ROWS][2];
+        bool inside[PRODUCT_FRAGMENT_ROWS][2];
+        _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                const int t = frame[m][i] + kt;
+                int sy = pixel_y[m][i] + ky, sx = pixel_x[m][i] + kx;
+                sy = sy < 0 ? -sy : (sy >= input_height ? 2 * input_height - 2 - sy : sy);
+                sx = sx < 0 ? -sx : (sx >= input_width ? 2 * input_width - 2 - sx : sx);
+                inside[m][i] = t >= 0;
+                source[m][i] =
+                    x +
+                    ((size_t(first_frame[m][i] + max(t, 0)) * input_height + sy) * input_width +
+                     sx) *
+                        C +
+                    at.x;
+            }
+        }
+        const int depth = tap * C;
+        for (int k = 0; k < C; k += FRAGMENT) {
+            fragment_half left[PRODUCT_FRAGMENT_ROWS], right[PRODUCT_FRAGMENT_COLS];
+            _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+                _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                    _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                        const half value = source[m][i][k + fragment_column(j)];
+                        left[m][i * 4 + j] = inside[m][i] ? value : half(0);
+                    }
+                }
+            }
+            _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n) {
+                _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                    _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                        right[n][i * 4 + j] =
+                            FRAGMENT_PAIRS ? weights[n][j][depth + k + at.y + i * 8]
+                                           : weights[n][i][depth + k + at.x + fragment_column(j)];
+                    }
+                }
+            }
+            _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
+                multiply_fragments<true, half, half, float>(acc[m][0], acc[m][1], left[m], right[0],
+                                                            right[1]);
+        }
+    }
+
+    _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m) {
+        _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n) {
+            _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
+                const int r = row + m * FRAGMENT + at.y + i * 8;
+                _Pragma("clang loop unroll(full)") for (short j = 0; j < 4; ++j) {
+                    const int column = col + n * FRAGMENT + at.x + fragment_column(j);
+                    if (r < M && column < N) {
+                        float value = acc[m][n][i * 4 + j] + bias[column];
+                        if (add_residual)
+                            value += float(residual[size_t(r) * N + column]);
+                        y[size_t(r) * N + column] = half(value);
+                    }
+                }
+            }
+        }
+    }
+}
