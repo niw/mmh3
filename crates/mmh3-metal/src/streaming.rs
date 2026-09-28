@@ -8,7 +8,8 @@
 //! they lie. A unit read on the way lands in one of a few regions that the units take turns in,
 //! while the ones before it run. A region is read into again only once Metal has let go of every
 //! buffer over it, which is after the last command that reads them completes. A unit kept back
-//! has a region of its own.
+//! has a region of its own, read the first time a call runs it, so that its read overlaps the work
+//! before it as a unit read on the way does.
 //!
 //! Metal does not refuse memory past the GPU's share: it pages. So a model decides from what the
 //! device says it has left whether a whole checkpoint fits, and keeps back units only within it.
@@ -117,6 +118,8 @@ pub(crate) struct Stream {
     /// The order in which the units are given up.
     give_up: Vec<usize>,
     kept: Vec<bool>,
+    /// Which of the units kept back are on the device yet.
+    loaded: Vec<bool>,
     /// The memory a call computes in that the kept units were chosen beside, once they were.
     settled: Option<usize>,
     loader: Option<Loader>,
@@ -144,6 +147,7 @@ impl Stream {
             what,
             files,
             kept: vec![false; units.len()],
+            loaded: vec![false; units.len()],
             units,
             give_up,
             settled: None,
@@ -166,12 +170,7 @@ impl Stream {
         file: &SafeTensors,
         info: &TensorInfo,
     ) {
-        for (unit, kept) in self.units.iter().zip(&mut self.kept) {
-            if *kept {
-                weights.unload_unit(unit.tensors().iter().map(|tensor| tensor.name.as_str()));
-                *kept = false;
-            }
-        }
+        self.let_go(weights);
         self.settled = None;
         self.loader = None;
         self.spare.clear();
@@ -191,6 +190,17 @@ impl Stream {
     /// unit kept back only holds memory that the model after it wants.
     pub(crate) fn keep_none(&mut self) {
         self.keeps = false;
+    }
+
+    /// Lets go of the units kept back.
+    fn let_go(&mut self, weights: &Weights) {
+        for ((unit, kept), loaded) in self.units.iter().zip(&mut self.kept).zip(&mut self.loaded) {
+            if *loaded {
+                weights.unload_unit(unit.tensors().iter().map(|tensor| tensor.name.as_str()));
+            }
+            *kept = false;
+            *loaded = false;
+        }
     }
 
     fn largest(&self) -> usize {
@@ -269,12 +279,7 @@ impl Stream {
         if self.settled.is_some_and(|settled| settled >= work) {
             return Ok(());
         }
-        for (unit, kept) in self.units.iter().zip(&mut self.kept) {
-            if *kept {
-                weights.unload_unit(unit.tensors().iter().map(|tensor| tensor.name.as_str()));
-                *kept = false;
-            }
-        }
+        self.let_go(weights);
         // The units let go of are the device's again once the work that reads them is done.
         weights.device.synchronize()?;
         self.start()?;
@@ -293,23 +298,6 @@ impl Stream {
             }
             room -= bytes;
             chosen.push(index);
-        }
-        // Each unit kept back is read into a region of its own, a couple of them ahead.
-        let loader = self.loader.as_ref().expect("started above");
-        let mut sent = VecDeque::new();
-        for &index in &chosen {
-            if sent.len() == 2 {
-                let region = loader.answer()?;
-                let unit = &self.units[sent.pop_front().expect("a unit being read")];
-                weights.load_unit(Self::buffers(weights, unit, &region)?);
-            }
-            let unit = &self.units[index];
-            loader.send(unit, Region::new(unit.bytes())?)?;
-            sent.push_back(index);
-        }
-        while let Some(index) = sent.pop_front() {
-            let region = loader.answer()?;
-            weights.load_unit(Self::buffers(weights, &self.units[index], &region)?);
         }
         println!(
             "keeping {} of {} {} on the device and reading the rest as they run",
@@ -333,7 +321,7 @@ impl Stream {
         self.start()?;
         let queue = order
             .into_iter()
-            .filter(|&index| !self.kept[index])
+            .filter(|&index| !self.loaded[index])
             .collect();
         let mut pass = Pass {
             stream: self,
@@ -362,15 +350,30 @@ pub(crate) struct Pass<'a> {
 }
 
 impl Pass<'_> {
-    /// Asks for the next units while there are regions to read them into.
+    /// Asks for the next units while there are regions to read them into. A unit kept back has
+    /// a region of its own.
     fn request(&mut self) -> Result<()> {
         while let Some(&index) = self.queue.get(self.next) {
-            let Some(region) = self.stream.free_region()? else {
-                break;
+            let region = match self.stream.kept[index] {
+                true => Region::new(self.stream.units[index].bytes())?,
+                false => match self.stream.free_region()? {
+                    Some(region) => region,
+                    None => break,
+                },
             };
             self.send(index, region)?;
         }
         Ok(())
+    }
+
+    /// Takes back the region of a unit read and not run, or counts it lost with a read that
+    /// failed. A kept unit's region goes with it.
+    fn take_back(&mut self, index: usize, region: Option<Arc<Region>>) {
+        match (region, self.stream.kept[index]) {
+            (Some(region), false) => self.stream.spare.push(region),
+            (None, false) => self.stream.regions -= 1,
+            (_, true) => {}
+        }
     }
 
     fn send(&mut self, index: usize, region: Arc<Region>) -> Result<()> {
@@ -387,7 +390,7 @@ impl Pass<'_> {
 
     /// Brings `index`'s tensors to the device, before the work that reads them is encoded.
     pub(crate) fn enter(&mut self, index: usize) -> Result<()> {
-        if self.stream.kept[index] {
+        if self.stream.loaded[index] {
             return Ok(());
         }
         while !self.ready.contains_key(&index) {
@@ -407,20 +410,31 @@ impl Pass<'_> {
                 .loader
                 .as_ref()
                 .expect("a pass starts the loader");
-            // A read that failed loses its region, which the next one makes again.
-            let region = loader.answer().inspect_err(|_| self.stream.regions -= 1)?;
-            self.ready.insert(answered, region);
+            match loader.answer() {
+                Ok(region) => {
+                    self.ready.insert(answered, region);
+                }
+                // A read that failed loses its region, which the next one makes again.
+                Err(error) => {
+                    self.take_back(answered, None);
+                    return Err(error);
+                }
+            }
         }
         let region = self.ready.remove(&index).expect("read above");
-        let buffers = Stream::buffers(self.weights, &self.stream.units[index], &region);
-        self.stream.used.push_back(region);
-        self.weights.load_unit(buffers?);
+        let buffers = Stream::buffers(self.weights, &self.stream.units[index], &region)?;
+        if self.stream.kept[index] {
+            self.stream.loaded[index] = true;
+        } else {
+            self.stream.used.push_back(region);
+        }
+        self.weights.load_unit(buffers);
         self.request()
     }
 
     /// Lets go of `index`'s tensors. The work already encoded keeps their buffers until it is done.
     pub(crate) fn leave(&mut self, index: usize) {
-        if !self.stream.kept[index] {
+        if !self.stream.loaded[index] {
             let unit = &self.stream.units[index];
             self.weights
                 .unload_unit(unit.tensors().iter().map(|tensor| tensor.name.as_str()));
@@ -432,19 +446,17 @@ impl Drop for Pass<'_> {
     /// Waits for the reads still under way, so that the next pass reads only its own answers, and
     /// takes back their regions. A read that failed leaves one to make again.
     fn drop(&mut self) {
-        while self.loading.pop_front().is_some() {
+        while let Some(index) = self.loading.pop_front() {
             let loader = self
                 .stream
                 .loader
                 .as_ref()
                 .expect("a pass starts the loader");
-            match loader.answer() {
-                Ok(region) => self.stream.spare.push(region),
-                Err(_) => self.stream.regions -= 1,
-            }
+            let region = loader.answer().ok();
+            self.take_back(index, region);
         }
-        self.stream
-            .spare
-            .extend(self.ready.drain().map(|(_, region)| region));
+        for (index, region) in std::mem::take(&mut self.ready) {
+            self.take_back(index, Some(region));
+        }
     }
 }
