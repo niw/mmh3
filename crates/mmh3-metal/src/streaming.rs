@@ -126,6 +126,8 @@ pub(crate) struct Stream {
     used: VecDeque<Arc<Region>>,
     /// How many of them there are, wherever they are.
     regions: usize,
+    /// Whether units may be kept back at all.
+    keeps: bool,
 }
 
 impl Stream {
@@ -149,6 +151,7 @@ impl Stream {
             spare: Vec::new(),
             used: VecDeque::new(),
             regions: 0,
+            keeps: true,
         }
     }
 
@@ -182,6 +185,12 @@ impl Stream {
             vec![piece],
             Arrangement::Contiguous,
         );
+    }
+
+    /// Keeps no unit back, for a model that runs once: it reads each unit once either way, and a
+    /// unit kept back only holds memory that the model after it wants.
+    pub(crate) fn keep_none(&mut self) {
+        self.keeps = false;
     }
 
     fn largest(&self) -> usize {
@@ -272,7 +281,10 @@ impl Stream {
         // The regions units read on the way take turns in, and one more for a region Metal has not
         // let go of yet, besides what the call computes in.
         let reserved = work + (REGIONS + 1) * self.largest() + HEADROOM;
-        let mut room = free_bytes()?.saturating_sub(reserved);
+        let mut room = match self.keeps {
+            true => free_bytes()?.saturating_sub(reserved),
+            false => 0,
+        };
         let mut chosen = Vec::new();
         for &index in self.give_up.iter().rev() {
             let bytes = self.units[index].bytes();

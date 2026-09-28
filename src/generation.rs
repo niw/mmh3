@@ -634,6 +634,10 @@ pub fn sample(
                             crate::metal::default_linear_precision(),
                             crate::metal::attention_precision(options)?,
                         )?;
+                        // One prompt reads every layer once, so a Mac that streams the encoder
+                        // keeps none of its layers back.
+                        #[cfg(feature = "metal")]
+                        encoder.read_once();
                         #[cfg(any(feature = "cuda", feature = "metal"))]
                         let context = if prompt_references.is_empty() {
                             let ids = Tokenizer::h3().encode(&prompt);

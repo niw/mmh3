@@ -122,6 +122,15 @@ impl MetalTextEncoder {
         Self::from_weights(weights, Some(stream), Some(embedding))
     }
 
+    /// Reads every layer on the way, keeping none back, for an encoder that encodes one prompt.
+    /// It reads each layer once either way, and layers kept back would press the rest of the
+    /// system's memory into swap and hold what the DiT wants next.
+    pub fn read_once(&mut self) {
+        if let Some(stream) = &self.stream {
+            stream.borrow_mut().keep_none();
+        }
+    }
+
     fn from_weights(
         weights: Weights,
         stream: Option<Stream>,

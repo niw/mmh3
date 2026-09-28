@@ -17,7 +17,9 @@ when they fit in the share of memory the GPU may fill. When one does not, it kee
 layers as fit beside what the run computes in, and reads the others from the disk each time they
 run, while the layers before them compute. A line such as `keeping 25 of 52 DiT blocks on the
 device and reading the rest as they run` says how many it kept. The GPU reads the layers where
-they land from the disk, with no copy. The text encoder also leaves its embedding table on the
+they land from the disk, with no copy. A text encoder that does not fit keeps none of its layers,
+since `generate` encodes one prompt and reads each layer once either way, and layers kept would
+only push the rest of the system's memory into swap. It also leaves its embedding table on the
 disk and reads the rows of the prompt from there. A 24 GB Mac generates the clip of
 `make generate` this way within 18 GB.
 
