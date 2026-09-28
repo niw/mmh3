@@ -1,11 +1,12 @@
 use crate::{
-    AttentionPrecision, Buffer, Device, Error, LinearPrecision, Result,
+    AttentionPrecision, Buffer, Device, Error, LinearPrecision, Region, Result,
     ops::{Array, Finish, Lora, PackedRows, Packing, convert, dtype_code},
 };
 use mmh3_core::{
     json,
     numeric::f32_to_f16,
     safetensors::{DType, SafeTensors, TensorInfo},
+    streaming::{Arrangement, Files, UnitReader},
     tensor::Tensor,
 };
 use std::cell::RefCell;
@@ -130,6 +131,11 @@ impl Weights {
         let device = Device::shared()?;
         let mut tensors = HashMap::new();
         let mut absent = HashMap::new();
+        // The tensors kept are read from the disk in one pass into one region, which the GPU reads
+        // where they land: faster than faulting in the mapped file, and the page cache does not
+        // hold the checkpoint a second time.
+        let mut files = Files::default();
+        let mut kept = crate::streaming::unit("weights");
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
@@ -165,14 +171,30 @@ impl Weights {
                 continue;
             }
 
-            tensors.insert(
-                name.to_owned(),
-                Weight {
-                    buffer: device.alloc(info.byte_count(), Some(file.data(info)))?,
-                    shape: info.shape.clone(),
-                    dtype: info.dtype,
-                },
+            kept.insert(
+                name,
+                info.dtype,
+                info.shape.clone(),
+                vec![files.piece(file, info)],
+                Arrangement::Contiguous,
             );
+        }
+        if !kept.tensors().is_empty() {
+            let mut region = Region::new(kept.bytes())?;
+            UnitReader::new(&files)?.read(
+                &kept,
+                Region::bytes_mut(&mut region).expect("nothing else holds a new region"),
+            )?;
+            for tensor in kept.tensors() {
+                tensors.insert(
+                    tensor.name.clone(),
+                    Weight {
+                        buffer: device.wrap(&region, tensor.offset, tensor.bytes())?,
+                        shape: tensor.shape.clone(),
+                        dtype: tensor.dtype,
+                    },
+                );
+            }
         }
 
         let described: HashMap<&str, (DType, &[usize])> = tensors

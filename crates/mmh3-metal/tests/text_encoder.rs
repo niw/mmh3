@@ -62,8 +62,9 @@ fn language_tower_preserves_causal_prefixes_and_captures_final_hidden_states() {
     )
     .unwrap();
     let file = SafeTensors::open(&path).unwrap();
-    std::fs::remove_file(&path).unwrap();
+    // The encoder reads its weights from the file, so it goes once they are loaded.
     let encoder = MetalTextEncoder::load(&file).unwrap();
+    std::fs::remove_file(&path).unwrap();
     let prefix = encoder.encode(&[2, 1], &[]).unwrap();
     let full = encoder.encode(&[2, 1, 5, 3], &[0, 1]).unwrap();
     assert_eq!(full.context.shape, [4, 32]);
