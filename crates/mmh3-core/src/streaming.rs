@@ -79,19 +79,32 @@ impl UnitTensor {
 }
 
 /// A group of tensors the device keeps or reads again together, such as one block of a model.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Unit {
     pub name: String,
     tensors: Vec<UnitTensor>,
     bytes: usize,
+    /// What the tensors' offsets and the region's size are multiples of.
+    alignment: usize,
 }
 
 impl Unit {
     pub fn new(name: &str) -> Self {
+        Self::aligned(name, UNIT_ALIGNMENT)
+    }
+
+    /// A unit whose tensors start at multiples of `alignment`, a multiple of `UNIT_ALIGNMENT`,
+    /// such as a page, so that a backend can hand each tensor to the device where it lies.
+    pub fn aligned(name: &str, alignment: usize) -> Self {
+        assert!(
+            alignment.is_multiple_of(UNIT_ALIGNMENT),
+            "{name}: an alignment of {alignment} bytes"
+        );
         Unit {
             name: name.to_owned(),
             tensors: Vec::new(),
             bytes: 0,
+            alignment,
         }
     }
 
@@ -138,7 +151,7 @@ impl Unit {
         let mut offset = 0;
         for tensor in &mut self.tensors {
             tensor.offset = offset;
-            offset = (offset + tensor.bytes()).next_multiple_of(UNIT_ALIGNMENT);
+            offset = (offset + tensor.bytes()).next_multiple_of(self.alignment);
         }
         self.bytes = offset;
     }
@@ -412,6 +425,19 @@ mod tests {
         );
         assert_eq!(unit.get("rows").unwrap().offset, 1536);
         assert_eq!(unit.bytes(), 1536 + 256);
+
+        let mut paged = Unit::aligned("layer", 4096);
+        for tensor in unit.tensors() {
+            paged.insert(
+                &tensor.name,
+                tensor.dtype,
+                tensor.shape.clone(),
+                tensor.pieces.clone(),
+                tensor.arrangement,
+            );
+        }
+        assert_eq!(paged.get("rows").unwrap().offset, 4096);
+        assert_eq!(paged.bytes(), 8192);
 
         let mut destination = vec![0u8; unit.bytes()];
         UnitReader::new(&files)

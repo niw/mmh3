@@ -107,8 +107,10 @@ impl MetalDit {
         let config = DitConfig::of(file, prefix)?;
         let mut files = Files::default();
         let mut units: Vec<Unit> = (0..config.refiner_layers)
-            .map(|layer| Unit::new(&format!("token_refiner.blocks.{layer}")))
-            .chain((0..config.layers).map(|layer| Unit::new(&format!("blocks.{layer}"))))
+            .map(|layer| crate::streaming::unit(&format!("token_refiner.blocks.{layer}")))
+            .chain(
+                (0..config.layers).map(|layer| crate::streaming::unit(&format!("blocks.{layer}"))),
+            )
             .collect();
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(prefix) else {

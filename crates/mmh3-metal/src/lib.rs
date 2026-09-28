@@ -126,6 +126,13 @@ unsafe extern "C" {
     fn mmh3_metal_name(context: *mut c_void) -> *const c_char;
     fn mmh3_metal_synchronize(context: *mut c_void) -> i32;
     fn mmh3_metal_alloc(context: *mut c_void, bytes: usize, data: *const c_void) -> *mut c_void;
+    fn mmh3_metal_wrap(
+        context: *mut c_void,
+        pointer: *mut c_void,
+        bytes: usize,
+        release: extern "C" fn(*const c_void),
+        owner: *const c_void,
+    ) -> *mut c_void;
     fn mmh3_metal_free(context: *mut c_void, buffer: *mut c_void);
     fn mmh3_metal_stats(context: *mut c_void, output: *mut u64);
     fn mmh3_metal_memory_info(output: *mut u64) -> i32;
@@ -208,6 +215,71 @@ pub fn allocated_bytes() -> usize {
 pub fn set_allocation_limit(bytes: usize) {
     LIMIT.store(bytes, Ordering::Relaxed);
 }
+
+/// Counts `bytes` more in this process's allocations, unless they would take it past its limit.
+fn reserve(bytes: usize) -> Result<()> {
+    ALLOCATED
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+            let limit = LIMIT.load(Ordering::Relaxed);
+            allocated
+                .checked_add(bytes)
+                .filter(|&total| limit == 0 || total <= limit)
+        })
+        .map(|_| ())
+        .map_err(|_| {
+            Error::out_of_memory(format!(
+                "{bytes} bytes would take this process past its limit"
+            ))
+        })
+}
+
+/// The pages of Apple silicon, which a buffer over host memory starts on and spans whole.
+pub(crate) const PAGE: usize = 16 << 10;
+
+/// Host memory the GPU reads where it lies, through the buffers `Device::wrap` makes over it.
+/// It is whole pages, and it counts against the device only while a buffer is over it.
+pub(crate) struct Region {
+    pointer: NonNull<u8>,
+    bytes: usize,
+}
+
+impl Region {
+    pub(crate) fn new(bytes: usize) -> Result<Arc<Self>> {
+        let bytes = bytes.max(1).next_multiple_of(PAGE);
+        let layout = std::alloc::Layout::from_size_align(bytes, PAGE)
+            .map_err(|error| Error::new(error.to_string()))?;
+        // SAFETY: the layout has a non-zero size.
+        let pointer = NonNull::new(unsafe { std::alloc::alloc(layout) }).ok_or_else(|| {
+            Error::out_of_memory(format!("{bytes} bytes of host memory are not available"))
+        })?;
+        Ok(Arc::new(Region { pointer, bytes }))
+    }
+
+    /// Whether nothing else holds the region, so that it may be written.
+    pub(crate) fn unused(region: &Arc<Self>) -> bool {
+        Arc::strong_count(region) == 1
+    }
+
+    /// The region's bytes, to write while nothing else holds it.
+    pub(crate) fn bytes_mut(region: &mut Arc<Self>) -> Option<&mut [u8]> {
+        let region = Arc::get_mut(region)?;
+        // SAFETY: the allocation holds `bytes` bytes, and no buffer or other reference is over it.
+        Some(unsafe { std::slice::from_raw_parts_mut(region.pointer.as_ptr(), region.bytes) })
+    }
+}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(self.bytes, PAGE).expect("made in new");
+        // SAFETY: the pointer came from `alloc` with this layout.
+        unsafe { std::alloc::dealloc(self.pointer.as_ptr(), layout) }
+    }
+}
+
+// SAFETY: a region is plain memory. It is written only through `bytes_mut`, which asks that nothing
+// else holds it, and otherwise read only by the GPU.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
 
 fn check(status: i32) -> Result<()> {
     if status == 0 {
@@ -312,24 +384,55 @@ impl Device {
 
         // Reserve before entering the native runtime: its lock does not cover this counter,
         // and another thread must count this allocation even while it is waiting for that lock.
-        ALLOCATED
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
-                let limit = LIMIT.load(Ordering::Relaxed);
-                allocated
-                    .checked_add(bytes)
-                    .filter(|&total| limit == 0 || total <= limit)
-            })
-            .map_err(|_| {
-                Error::out_of_memory(format!(
-                    "{bytes} bytes would take this process past its limit"
-                ))
-            })?;
+        reserve(bytes)?;
         // SAFETY: optional data covers bytes, and the native call copies it before returning.
         let pointer = NonNull::new(unsafe {
             mmh3_metal_alloc(
                 self.0.0.as_ptr(),
                 bytes,
                 data.map_or(std::ptr::null(), |data| data.as_ptr().cast()),
+            )
+        })
+        .ok_or_else(|| {
+            ALLOCATED.fetch_sub(bytes, Ordering::Relaxed);
+            native_error()
+        })?;
+        Ok(Buffer(Arc::new(Allocation {
+            pointer,
+            bytes,
+            device: self.clone(),
+        })))
+    }
+
+    /// A buffer over `bytes` of `region`, `offset` bytes in, which the GPU reads where they lie.
+    /// The buffer holds the region, so the region is `Region::unused` again only once Metal has
+    /// let go of every buffer over it, which is after the last command that reads one completes.
+    pub(crate) fn wrap(&self, region: &Arc<Region>, offset: usize, bytes: usize) -> Result<Buffer> {
+        // Metal takes whole pages, so a buffer's length runs to the end of its last page.
+        let length = bytes.next_multiple_of(PAGE);
+        if bytes == 0 || !offset.is_multiple_of(PAGE) || offset + length > region.bytes {
+            return Err(Error::new(format!(
+                "{bytes} bytes at {offset} are not whole pages of a {}-byte region",
+                region.bytes
+            )));
+        }
+        reserve(bytes)?;
+
+        extern "C" fn release(owner: *const c_void) {
+            // SAFETY: the owner is the reference `wrap` gave Metal, which lets go of it once.
+            drop(unsafe { Arc::from_raw(owner.cast::<Region>()) });
+        }
+
+        let owner = Arc::into_raw(region.clone()).cast::<c_void>();
+        // SAFETY: the pages lie within the region, which the owner keeps alive until Metal calls
+        // release, and the native call calls it itself when it cannot make the buffer.
+        let pointer = NonNull::new(unsafe {
+            mmh3_metal_wrap(
+                self.0.0.as_ptr(),
+                region.pointer.as_ptr().add(offset).cast(),
+                length,
+                release,
+                owner,
             )
         })
         .ok_or_else(|| {
@@ -470,7 +573,7 @@ impl Buffer {
 
 #[cfg(test)]
 mod tests {
-    use super::Device;
+    use super::{Device, PAGE, Region};
 
     /// Memory no device has is the one failure a caller can answer by letting go of something.
     #[test]
@@ -480,5 +583,34 @@ mod tests {
             panic!("a device found 256 TB");
         };
         assert!(error.is_out_of_memory(), "{error}");
+    }
+
+    /// A region is free to write again once Metal lets go of the buffers over it, and not before.
+    #[test]
+    fn a_region_is_unused_once_its_buffers_are_gone() {
+        let device = Device::new().unwrap();
+        let mut region = Region::new(2 * PAGE).unwrap();
+        Region::bytes_mut(&mut region).unwrap().fill(7);
+        let buffer = device.wrap(&region, PAGE, 100).unwrap();
+        assert!(
+            device.wrap(&region, 100, 100).is_err(),
+            "a buffer off a page"
+        );
+        assert!(
+            device.wrap(&region, PAGE, PAGE + 1).is_err(),
+            "a buffer past the region"
+        );
+        assert!(!Region::unused(&region));
+        assert!(Region::bytes_mut(&mut region).is_none());
+        assert_eq!(buffer.to_bytes().unwrap(), vec![7; 100]);
+
+        drop(buffer);
+        device.synchronize().unwrap();
+        let start = std::time::Instant::now();
+        while !Region::unused(&region) {
+            assert!(start.elapsed().as_secs() < 10, "Metal kept the buffer");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(Region::bytes_mut(&mut region).is_some());
     }
 }

@@ -16,9 +16,10 @@ A Mac whose GPU may not hold a whole model runs it anyway. The text encoder and 
 when they fit in the share of memory the GPU may fill. When one does not, it keeps as many of its
 layers as fit beside what the run computes in, and reads the others from the disk each time they
 run, while the layers before them compute. A line such as `keeping 25 of 52 DiT blocks on the
-device and reading the rest as they run` says how many it kept. The text encoder also leaves its
-embedding table on the disk and reads the rows of the prompt from there. A 24 GB Mac generates the
-clip of `make generate` this way within 18 GB.
+device and reading the rest as they run` says how many it kept. The GPU reads the layers where
+they land from the disk, with no copy. The text encoder also leaves its embedding table on the
+disk and reads the rows of the prompt from there. A 24 GB Mac generates the clip of
+`make generate` this way within 18 GB.
 
 A worker is the exception: it keeps what it has read for the runs that follow, so a Mac serving one
 holds several models at once and lets go of the one it used least when the device has no memory

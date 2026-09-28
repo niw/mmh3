@@ -3,25 +3,39 @@
 //! holds what the backends share: the layouts, the reads from the disk and the order units are
 //! given up in.
 //!
-//! The GPU reads the host's memory, so a unit read on the way needs no copy stream. A thread of its
-//! own reads the next unit from the disk while the one before runs, and the unit's tensors become
-//! buffers of their own when it runs, which the command buffers that read them keep alive until
-//! they are done. The runtime waits for its batch before an allocation this large, so no more than
-//! a unit or two are alive at a time.
+//! The GPU reads the host's memory, so a unit needs no copy at all: a thread of its own reads it
+//! from the disk into a region of pages, and its tensors become buffers over that region where
+//! they lie. A unit read on the way lands in one of a few regions that the units take turns in,
+//! while the ones before it run. A region is read into again only once Metal has let go of every
+//! buffer over it, which is after the last command that reads them completes. A unit kept back
+//! has a region of its own.
 //!
 //! Metal does not refuse memory past the GPU's share: it pages. So a model decides from what the
 //! device says it has left whether a whole checkpoint fits, and keeps back units only within it.
 
 use crate::model::{Weight, Weights};
-use crate::{Error, Result, free_bytes};
+use crate::{Error, PAGE, Region, Result, free_bytes};
 use mmh3_core::safetensors::{SafeTensors, TensorInfo};
 use mmh3_core::streaming::{Arrangement, Files, Unit, UnitReader};
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 /// Memory a model leaves free beside what it keeps and what its calls compute in.
 const HEADROOM: usize = 1 << 30;
+/// The regions units read on the way take turns in: one the GPU reads, one ready for it, and one
+/// the reader fills.
+const REGIONS: usize = 3;
+/// How long a unit waits for Metal to let go of a region after the work over it has completed.
+const RELEASE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A unit laid out so that each of its tensors starts on a page, where a buffer can be made over
+/// it.
+pub(crate) fn unit(name: &str) -> Unit {
+    Unit::aligned(name, PAGE)
+}
 
 /// Whether `bytes` more fit in the GPU's share of memory beside the headroom.
 pub(crate) fn fits(bytes: usize) -> Result<bool> {
@@ -33,26 +47,27 @@ fn read_error(error: impl std::fmt::Display) -> Error {
     Error::new(format!("reading weights: {error}"))
 }
 
-/// The thread that reads units into host memory.
+/// The thread that reads units into regions.
 struct Loader {
-    requests: Option<Sender<(Unit, Vec<u8>)>>,
-    answers: Receiver<std::result::Result<Vec<u8>, String>>,
+    requests: Option<Sender<(Unit, Arc<Region>)>>,
+    answers: Receiver<std::result::Result<Arc<Region>, String>>,
     thread: Option<JoinHandle<()>>,
 }
 
 impl Loader {
     fn start(files: &Files) -> Result<Self> {
         let mut reader = UnitReader::new(files).map_err(read_error)?;
-        let (requests, received) = channel::<(Unit, Vec<u8>)>();
+        let (requests, received) = channel::<(Unit, Arc<Region>)>();
         let (answer, answers) = channel();
         let thread = std::thread::Builder::new()
             .name("weights".to_owned())
             .spawn(move || {
-                for (unit, mut host) in received {
-                    let result = reader
-                        .read(&unit, &mut host)
-                        .map(|()| host)
-                        .map_err(|error| error.to_string());
+                for (unit, mut region) in received {
+                    let result = match Region::bytes_mut(&mut region) {
+                        Some(bytes) => reader.read(&unit, bytes).map_err(|error| error.to_string()),
+                        None => Err(format!("{}: its region is still in use", unit.name)),
+                    }
+                    .map(|()| region);
                     if answer.send(result).is_err() {
                         break;
                     }
@@ -66,18 +81,18 @@ impl Loader {
         })
     }
 
-    fn send(&self, unit: &Unit, host: Vec<u8>) -> Result<()> {
+    fn send(&self, unit: &Unit, region: Arc<Region>) -> Result<()> {
         self.requests
             .as_ref()
             .expect("the requests close only on drop")
-            .send((unit.clone(), host))
+            .send((unit.clone(), region))
             .map_err(|_| Error::new("the weight reader stopped".into()))
     }
 
     /// Waits for the oldest unit asked for and not answered yet.
-    fn answer(&self) -> Result<Vec<u8>> {
+    fn answer(&self) -> Result<Arc<Region>> {
         match self.answers.recv() {
-            Ok(Ok(host)) => Ok(host),
+            Ok(Ok(region)) => Ok(region),
             Ok(Err(error)) => Err(read_error(error)),
             Err(_) => Err(Error::new("the weight reader stopped".into())),
         }
@@ -105,8 +120,12 @@ pub(crate) struct Stream {
     /// The memory a call computes in that the kept units were chosen beside, once they were.
     settled: Option<usize>,
     loader: Option<Loader>,
-    /// The host buffers units are read into, two of them while no read is under way.
-    spare: Vec<Vec<u8>>,
+    /// The regions units read on the way take turns in, which nothing holds.
+    spare: Vec<Arc<Region>>,
+    /// Those whose units have run, until Metal lets go of the buffers over them.
+    used: VecDeque<Arc<Region>>,
+    /// How many of them there are, wherever they are.
+    regions: usize,
 }
 
 impl Stream {
@@ -128,11 +147,13 @@ impl Stream {
             settled: None,
             loader: None,
             spare: Vec::new(),
+            used: VecDeque::new(),
+            regions: 0,
         }
     }
 
     /// Adds `file`'s tensor to unit `index` or replaces the unit's own, which a patch does. The
-    /// units kept back are let go of, and the reader and its host buffers are made again, since the
+    /// units kept back are let go of, and the reader and its regions are made again, since the
     /// units' files and sizes have changed.
     pub(crate) fn insert(
         &mut self,
@@ -151,6 +172,8 @@ impl Stream {
         self.settled = None;
         self.loader = None;
         self.spare.clear();
+        self.used.clear();
+        self.regions = 0;
         let piece = self.files.piece(file, info);
         self.units[index].insert(
             name,
@@ -165,28 +188,63 @@ impl Stream {
         self.units.iter().map(Unit::bytes).max().unwrap_or(0)
     }
 
-    /// Starts the thread and makes its host buffers, the first time a unit is read.
+    /// Starts the thread, the first time a unit is read.
     fn start(&mut self) -> Result<()> {
         if self.loader.is_none() {
             self.loader = Some(Loader::start(&self.files)?);
         }
-        let largest = self.largest();
-        while self.spare.len() < 2 {
-            self.spare.push(vec![0; largest]);
-        }
         Ok(())
     }
 
-    /// The buffers of `unit`'s tensors, from its bytes in `host`.
-    fn buffers(weights: &Weights, unit: &Unit, host: &[u8]) -> Result<Vec<(String, Weight)>> {
+    /// A region to read a unit on the way into, if one is free: a spare one, one Metal has let go
+    /// of, or, while there are fewer than `REGIONS`, a new one.
+    fn free_region(&mut self) -> Result<Option<Arc<Region>>> {
+        if let Some(position) = self.used.iter().position(Region::unused) {
+            let region = self.used.remove(position).expect("found above");
+            self.spare.push(region);
+        }
+        if let Some(region) = self.spare.pop() {
+            return Ok(Some(region));
+        }
+        if self.regions < REGIONS {
+            self.regions += 1;
+            return Region::new(self.largest()).map(Some);
+        }
+        Ok(None)
+    }
+
+    /// Waits for Metal to let go of a region a unit has run from, once the work that reads it has
+    /// completed.
+    fn wait_for_region(&mut self, weights: &Weights) -> Result<Arc<Region>> {
+        weights.device.synchronize()?;
+        let start = Instant::now();
+        loop {
+            if let Some(region) = self.free_region()? {
+                return Ok(region);
+            }
+            if self.used.is_empty() || start.elapsed() > RELEASE_TIMEOUT {
+                return Err(Error::new(format!(
+                    "the {} read on the way still hold their regions",
+                    self.what
+                )));
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+    }
+
+    /// The buffers of `unit`'s tensors, over its bytes in `region`.
+    fn buffers(
+        weights: &Weights,
+        unit: &Unit,
+        region: &Arc<Region>,
+    ) -> Result<Vec<(String, Weight)>> {
         unit.tensors()
             .iter()
             .map(|tensor| {
-                let bytes = &host[tensor.offset..tensor.offset + tensor.bytes()];
                 Ok((
                     tensor.name.clone(),
                     Weight {
-                        buffer: weights.device.alloc(bytes.len(), Some(bytes))?,
+                        buffer: weights.device.wrap(region, tensor.offset, tensor.bytes())?,
                         shape: tensor.shape.clone(),
                         dtype: tensor.dtype,
                     },
@@ -211,9 +269,9 @@ impl Stream {
         // The units let go of are the device's again once the work that reads them is done.
         weights.device.synchronize()?;
         self.start()?;
-        // Two host buffers, and the units of the call before still in flight when the next one
-        // is made, besides what the call computes in.
-        let reserved = work + 4 * self.largest() + HEADROOM;
+        // The regions units read on the way take turns in, and one more for a region Metal has not
+        // let go of yet, besides what the call computes in.
+        let reserved = work + (REGIONS + 1) * self.largest() + HEADROOM;
         let mut room = free_bytes()?.saturating_sub(reserved);
         let mut chosen = Vec::new();
         for &index in self.give_up.iter().rev() {
@@ -224,25 +282,22 @@ impl Stream {
             room -= bytes;
             chosen.push(index);
         }
+        // Each unit kept back is read into a region of its own, a couple of them ahead.
         let loader = self.loader.as_ref().expect("started above");
         let mut sent = VecDeque::new();
         for &index in &chosen {
-            if self.spare.is_empty() {
-                let host = loader.answer()?;
+            if sent.len() == 2 {
+                let region = loader.answer()?;
                 let unit = &self.units[sent.pop_front().expect("a unit being read")];
-                weights.load_unit(Self::buffers(weights, unit, &host)?);
-                self.spare.push(host);
+                weights.load_unit(Self::buffers(weights, unit, &region)?);
             }
-            loader.send(
-                &self.units[index],
-                self.spare.pop().expect("a spare buffer"),
-            )?;
+            let unit = &self.units[index];
+            loader.send(unit, Region::new(unit.bytes())?)?;
             sent.push_back(index);
         }
         while let Some(index) = sent.pop_front() {
-            let host = loader.answer()?;
-            weights.load_unit(Self::buffers(weights, &self.units[index], &host)?);
-            self.spare.push(host);
+            let region = loader.answer()?;
+            weights.load_unit(Self::buffers(weights, &self.units[index], &region)?);
         }
         println!(
             "keeping {} of {} {} on the device and reading the rest as they run",
@@ -291,25 +346,30 @@ pub(crate) struct Pass<'a> {
     /// Units asked for whose answers have not come yet, oldest first.
     loading: VecDeque<usize>,
     /// Units read and not run yet.
-    ready: HashMap<usize, Vec<u8>>,
+    ready: HashMap<usize, Arc<Region>>,
 }
 
 impl Pass<'_> {
-    /// Asks for the next units while there are host buffers to read them into.
+    /// Asks for the next units while there are regions to read them into.
     fn request(&mut self) -> Result<()> {
         while let Some(&index) = self.queue.get(self.next) {
-            let Some(host) = self.stream.spare.pop() else {
+            let Some(region) = self.stream.free_region()? else {
                 break;
             };
-            let loader = self
-                .stream
-                .loader
-                .as_ref()
-                .expect("a pass starts the loader");
-            loader.send(&self.stream.units[index], host)?;
-            self.loading.push_back(index);
-            self.next += 1;
+            self.send(index, region)?;
         }
+        Ok(())
+    }
+
+    fn send(&mut self, index: usize, region: Arc<Region>) -> Result<()> {
+        let loader = self
+            .stream
+            .loader
+            .as_ref()
+            .expect("a pass starts the loader");
+        loader.send(&self.stream.units[index], region)?;
+        self.loading.push_back(index);
+        self.next += 1;
         Ok(())
     }
 
@@ -319,6 +379,11 @@ impl Pass<'_> {
             return Ok(());
         }
         while !self.ready.contains_key(&index) {
+            // Every region holds a unit that has run, so the next one waits for one of them.
+            if self.loading.is_empty() && self.queue.get(self.next) == Some(&index) {
+                let region = self.stream.wait_for_region(self.weights)?;
+                self.send(index, region)?;
+            }
             let Some(answered) = self.loading.pop_front() else {
                 return Err(Error::new(format!(
                     "{} runs out of the order its pass was given",
@@ -330,12 +395,13 @@ impl Pass<'_> {
                 .loader
                 .as_ref()
                 .expect("a pass starts the loader");
-            let host = loader.answer()?;
-            self.ready.insert(answered, host);
+            // A read that failed loses its region, which the next one makes again.
+            let region = loader.answer().inspect_err(|_| self.stream.regions -= 1)?;
+            self.ready.insert(answered, region);
         }
-        let host = self.ready.remove(&index).expect("read above");
-        let buffers = Stream::buffers(self.weights, &self.stream.units[index], &host);
-        self.stream.spare.push(host);
+        let region = self.ready.remove(&index).expect("read above");
+        let buffers = Stream::buffers(self.weights, &self.stream.units[index], &region);
+        self.stream.used.push_back(region);
         self.weights.load_unit(buffers?);
         self.request()
     }
@@ -352,7 +418,7 @@ impl Pass<'_> {
 
 impl Drop for Pass<'_> {
     /// Waits for the reads still under way, so that the next pass reads only its own answers, and
-    /// takes back their host buffers. A read that failed leaves one to make again.
+    /// takes back their regions. A read that failed leaves one to make again.
     fn drop(&mut self) {
         while self.loading.pop_front().is_some() {
             let loader = self
@@ -360,12 +426,13 @@ impl Drop for Pass<'_> {
                 .loader
                 .as_ref()
                 .expect("a pass starts the loader");
-            if let Ok(host) = loader.answer() {
-                self.stream.spare.push(host);
+            match loader.answer() {
+                Ok(region) => self.stream.spare.push(region),
+                Err(_) => self.stream.regions -= 1,
             }
         }
         self.stream
             .spare
-            .extend(self.ready.drain().map(|(_, host)| host));
+            .extend(self.ready.drain().map(|(_, region)| region));
     }
 }

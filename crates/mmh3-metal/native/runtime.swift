@@ -491,15 +491,57 @@ func metalAlloc(_ pointer: UnsafeMutableRawPointer, _ bytes: Int, _ data: Unsafe
     }
 }
 
+/// A buffer over `bytes` of host memory at `address`, whole pages, which the GPU reads where they
+/// lie. Metal calls `release` with `owner` once it lets go of the buffer, after the last command
+/// that reads it; so does this call when it cannot make the buffer.
+@_cdecl("mmh3_metal_wrap")
+func metalWrap(
+    _ pointer: UnsafeMutableRawPointer, _ address: UnsafeMutableRawPointer, _ bytes: Int,
+    _ release: @escaping @convention(c) (UnsafeRawPointer?) -> Void, _ owner: UnsafeRawPointer?
+) -> UnsafeMutableRawPointer? {
+    autoreleasepool {
+        locked(pointer) { ctx in
+            if let error = ctx.executionError {
+                release(owner)
+                _ = fail(error)
+                return nil
+            }
+
+            guard let result = ctx.device.makeBuffer(
+                bytesNoCopy: address, length: bytes, options: .storageModeShared,
+                deallocator: { _, _ in release(owner) }
+            ) else {
+                release(owner)
+                _ = fail(
+                    BridgeError.message("Metal could not use \(bytes) bytes of host memory"),
+                    outOfMemory: true
+                )
+                return nil
+            }
+
+            // Weights, which go back to the device with the model rather than into the pool.
+            result.label = weightsLabel
+            ctx.peakBytes = max(ctx.peakBytes, UInt64(ctx.device.currentAllocatedSize))
+            return Unmanaged.passRetained(result as AnyObject).toOpaque()
+        }
+    }
+}
+
+// Both drain what they autorelease: a buffer over host memory must go when its last owner lets go,
+// since its memory is handed out again only then, and these are called from threads with no pool.
 @_cdecl("mmh3_metal_free")
 func metalFree(_ ctx: UnsafeMutableRawPointer, _ pointer: UnsafeMutableRawPointer) {
-    let allocation = Unmanaged<AnyObject>.fromOpaque(pointer).takeRetainedValue() as! MTLBuffer
-    locked(ctx) { $0.recycle(allocation) }
+    autoreleasepool {
+        let allocation = Unmanaged<AnyObject>.fromOpaque(pointer).takeRetainedValue() as! MTLBuffer
+        locked(ctx) { $0.recycle(allocation) }
+    }
 }
 
 @_cdecl("mmh3_metal_read")
 func metalRead(_ pointer: UnsafeMutableRawPointer, _ output: UnsafeMutableRawPointer, _ bytes: Int) {
-    output.copyMemory(from: buffer(pointer).contents(), byteCount: bytes)
+    autoreleasepool {
+        output.copyMemory(from: buffer(pointer).contents(), byteCount: bytes)
+    }
 }
 
 @_cdecl("mmh3_metal_dispatch")

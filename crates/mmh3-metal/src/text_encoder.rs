@@ -10,7 +10,7 @@ use crate::{
 };
 use mmh3_core::{
     safetensors::{DType, SafeTensors},
-    streaming::{Arrangement, Files, Unit, give_up_order},
+    streaming::{Arrangement, Files, give_up_order},
     tensor::Tensor,
 };
 use std::cell::RefCell;
@@ -93,7 +93,7 @@ impl MetalTextEncoder {
                 continue;
             }
             while units.len() <= layer {
-                units.push(Unit::new(&format!("layers.{}", units.len())));
+                units.push(crate::streaming::unit(&format!("layers.{}", units.len())));
             }
             units[layer].insert(
                 name,
