@@ -358,15 +358,18 @@ ATTENTION(64)
 ATTENTION(128)
 ATTENTION(256)
 #undef ATTENTION
+// im2col rows of sequences of p[1] samples, p[2] channels each, for a kernel of p[3] taps p[4]
+// apart that steps p[5] samples a row over p[6] samples of zero padding, giving p[7] rows a
+// sequence. The rows start at output row p[8], so that a long signal's go a slice at a time.
 kernel void audio_columns(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
                           constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p[0])
         return;
-    uint channels = p[2], kernel_size = p[3], row = i / (channels * kernel_size),
+    uint channels = p[2], kernel_size = p[3], row = i / (channels * kernel_size) + p[8],
          tap = i / channels % kernel_size;
-    int source = int(row % p[1]) + int(tap * p[4]) - int(p[4] * (kernel_size - 1) / 2);
+    int source = int(row % p[7] * p[5] + tap * p[4]) - int(p[6]);
     y[i] = source >= 0 && source < int(p[1])
-               ? x[((row / p[1]) * p[1] + source) * channels + i % channels]
+               ? x[((row / p[7]) * p[1] + source) * channels + i % channels]
                : 0;
 }
 
@@ -429,6 +432,43 @@ kernel void audio_snake(device const float *x [[buffer(0)]],
     }
 
     y[i] = sum;
+}
+
+// Snake with one parameter per channel of p[1], which the audio encoder uses as both α and β:
+// x + sin²(αx) / (α + 1e-9).
+kernel void audio_encoder_snake(device const float *x [[buffer(0)]],
+                                device const float *alpha [[buffer(1)]],
+                                device float *y [[buffer(2)]], constant uint *p [[buffer(3)]],
+                                uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    float a = alpha[i % p[1]], v = x[i], sine = sin(a * v);
+    y[i] = v + sine * sine / (a + 1e-9f);
+}
+
+// The mean of the p[1] heads of p[2] values in a row of attention output, then average pooling
+// of the head's values down to p[3] groups, bounded as adaptive pooling bounds them.
+kernel void audio_pool_heads(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                             constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    uint heads = p[1], dim = p[2], outputs = p[3], output = i % outputs, row = i / outputs;
+    uint start = output * dim / outputs, end = (output * dim + dim + outputs - 1) / outputs;
+    float sum = 0;
+    for (uint head = 0; head < heads; ++head)
+        for (uint c = start; c < end; ++c)
+            sum += x[(row * heads + head) * dim + c];
+    y[i] = sum / float(heads * (end - start));
+}
+
+// GeGLU: the gate through GELU with the tanh approximation, times the value.
+kernel void audio_geglu(device const float *gate [[buffer(0)]],
+                        device const float *value [[buffer(1)]], device float *y [[buffer(2)]],
+                        constant uint *p [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    float x = gate[i], inner = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    y[i] = 0.5f * x * (1 + tanh(inner)) * value[i];
 }
 
 kernel void video_unpatch(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],

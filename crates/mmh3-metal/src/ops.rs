@@ -238,6 +238,36 @@ impl Array {
         Ok(out)
     }
 
+    /// `linear` written into `out` from its row `row` on, for a product whose input rows are built
+    /// a slice at a time, such as the im2col rows of a long signal.
+    pub(crate) fn linear_into(&self, weight: &Self, out: &Self, row: usize) -> Result<()> {
+        if self.cols != weight.cols
+            || out.cols != weight.rows
+            || row.checked_add(self.rows).is_none_or(|end| end > out.rows)
+            || !std::sync::Arc::ptr_eq(&self.device().0, &weight.device().0)
+            || !std::sync::Arc::ptr_eq(&self.device().0, &out.device().0)
+        {
+            return Err(Error::new("matrix product shapes or devices differ".into()));
+        }
+
+        // SAFETY: input, weight and output extents match M×K, N×K and the M×N rows of the output
+        // from `row`. All share a device.
+        check(unsafe {
+            mmh3_metal_matmul(
+                self.device().0.0.as_ptr(),
+                self.buffer.0.pointer.as_ptr(),
+                weight.buffer.0.pointer.as_ptr(),
+                out.buffer.0.pointer.as_ptr(),
+                self.rows,
+                weight.rows,
+                self.cols,
+                out.cols,
+                row * out.cols,
+                false,
+            )
+        })
+    }
+
     /// Expand packed weights in reusable FP32 slabs of at most 32 MiB (or one weight row).
     /// Consecutive encoders on the same queue order scratch writes after the previous MPS read.
     pub(crate) fn linear_packed(

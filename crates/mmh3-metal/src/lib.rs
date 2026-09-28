@@ -3,6 +3,7 @@
 //! than to a thread. Bounded batches complete at host reads or explicit waits.
 #![cfg(target_os = "macos")]
 
+pub mod audio_encoder;
 pub mod audio_vae;
 pub mod bench;
 pub mod dit;
