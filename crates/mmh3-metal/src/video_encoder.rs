@@ -458,58 +458,63 @@ impl MetalVideoEncoder {
         if latent_frames == 0 {
             return Err(Error::new(format!("{frames} frames give no latent frames")));
         }
-        // Every tile of every clip is a sequence of its own, each clip's tiles in the order
-        // blend_encoded_tiles takes them.
-        let mut sequences = Vec::new();
-        for clip in 0..clips {
-            for &top in &rows.starts {
-                for &left in &columns.starts {
-                    sequences.push([(clip * clip_frames) as u32, top as u32, left as u32]);
-                }
-            }
-        }
-        let batch = (BATCH_PIXELS / (clip_frames * tile_height * tile_width)).max(1);
+        // The encoder is causal in time and its group norms take each frame on its own, so a
+        // clip's first latent frames read its first frames alone. The last clip, whose later ones
+        // the reference drops, goes in with only the frames the ones it keeps read: for a clip of
+        // 17n + 5 frames that is its five real frames, and none of the twelve repeated after them.
+        let kept = latent_frames - (clips - 1) * tokens;
+        let last_frames = (TEMPORAL_RATIO * (kept - 1) + 1).min(clip_frames);
         let tile_latent_pixels = (tile_height / SPATIAL_RATIO) * (tile_width / SPATIAL_RATIO);
-        let tile_values = tokens * tile_latent_pixels * 2 * LATENT_CHANNELS;
-        let mut moments = Vec::with_capacity(sequences.len() * tile_values);
-        for part in sequences.chunks(batch) {
-            let encoded = self.encode_tiles(
-                &canvas,
-                [frames, height, width],
-                clip_frames,
-                part,
-                [tile_height, tile_width],
-            )?;
-            if encoded.values() != part.len() * tile_values {
-                return Err(Error::new(
-                    "the encoder's moments have the wrong shape".into(),
-                ));
-            }
-            moments.extend(
-                encoded
-                    .buffer
-                    .to_bytes()?
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|&pair| f16_to_f32(u16::from_le_bytes(pair))),
-            );
-        }
-
         let tiles_per_clip = rows.starts.len() * columns.starts.len();
         let (latent_height, latent_width) = (height / SPATIAL_RATIO, width / SPATIAL_RATIO);
         let plane = latent_height * latent_width;
         let mut mean = vec![0.0; LATENT_CHANNELS * latent_frames * plane];
         let mut deviation = vec![0.0; LATENT_CHANNELS * latent_frames * plane];
         for clip in 0..clips {
-            let tiles =
-                &moments[clip * tiles_per_clip * tile_values..][..tiles_per_clip * tile_values];
-            for token in 0..tokens {
-                let latent_frame = clip * tokens + token;
-                if latent_frame >= latent_frames {
-                    break;
+            let (sequence_frames, clip_tokens) = match clip + 1 == clips {
+                true => (last_frames, kept),
+                false => (clip_frames, tokens),
+            };
+            // Every tile of the clip is a sequence of its own, in the order blend_encoded_tiles
+            // takes them.
+            let sequences: Vec<[u32; 3]> =
+                rows.starts
+                    .iter()
+                    .flat_map(|&top| {
+                        columns.starts.iter().map(move |&left| {
+                            [(clip * clip_frames) as u32, top as u32, left as u32]
+                        })
+                    })
+                    .collect();
+            let batch = (BATCH_PIXELS / (sequence_frames * tile_height * tile_width)).max(1);
+            let tile_values = clip_tokens * tile_latent_pixels * 2 * LATENT_CHANNELS;
+            let mut moments = Vec::with_capacity(tiles_per_clip * tile_values);
+            for part in sequences.chunks(batch) {
+                let encoded = self.encode_tiles(
+                    &canvas,
+                    [frames, height, width],
+                    sequence_frames,
+                    part,
+                    [tile_height, tile_width],
+                )?;
+                if encoded.values() != part.len() * tile_values {
+                    return Err(Error::new(
+                        "the encoder's moments have the wrong shape".into(),
+                    ));
                 }
-                let frame: Vec<&[f32]> = tiles
+                moments.extend(
+                    encoded
+                        .buffer
+                        .to_bytes()?
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|&pair| f16_to_f32(u16::from_le_bytes(pair))),
+                );
+            }
+            for token in 0..clip_tokens {
+                let latent_frame = clip * tokens + token;
+                let frame: Vec<&[f32]> = moments
                     .chunks(tile_values)
                     .map(|tile| {
                         let values = tile_latent_pixels * 2 * LATENT_CHANNELS;

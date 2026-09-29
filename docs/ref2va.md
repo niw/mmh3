@@ -144,9 +144,11 @@ itself, and 124 frames of 1344×768 take 37 s, so a long reference at full size 
 both counts.
 
 On an M6 with 24 GB, a 448×256 video of 73 frames from a 448×256 picture, a 39-frame 448×256 clip
-with its soundtrack and a two-second sound, with the Turbo LoRA in eight steps, takes 120 s in all,
-steps 12 s with 23 of the DiT's 52 blocks kept on the device. Encoding the prompt takes 6.0 s, the
-picture 0.4 s, the clip 5.0 s and each sound 0.2 to 0.3 s.
+with its soundtrack and a two-second sound, with the Turbo LoRA in eight steps, takes 101 s in all,
+steps 10 s with 23 of the DiT's 52 blocks kept on the device. Encoding the prompt takes 5.7 s, the
+picture 0.3 s, the clip 3.8 s and each sound 0.2 s. The clip's last group of seventeen frames
+goes through the encoder with only the five frames its two kept latent frames read, which the
+causal encoder makes exact.
 
 Against ComfyUI in FP32 at 448×256 with two reference pictures, one of them 128×256, the DiT's
 velocity is within 1.1e-2 for video and 1.9e-2 for audio, as close as with keyframes. With one
