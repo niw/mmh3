@@ -423,6 +423,7 @@ void flash_attention(device half *q, device half *k, device half *v, device floa
         flash_attention<D, false>(q, k, v, o, nullptr, nullptr, nullptr, p, g, simd, lane);        \
     }
 ATTENTION(64)
+ATTENTION(96)
 ATTENTION(128)
 #undef ATTENTION
 

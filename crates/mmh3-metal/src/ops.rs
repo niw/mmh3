@@ -892,7 +892,7 @@ impl Array {
         Ok(out)
     }
 
-    /// `attention` at `precision`. FP16 takes the matrix units for heads of 64 or 128 where the
+    /// `attention` at `precision`. FP16 takes the matrix units for heads of up to 128 where the
     /// device has them, and anything else is the FP32 attention.
     pub fn attention_at(
         &self,
@@ -908,7 +908,7 @@ impl Array {
             && kv_heads > 0
             && heads.is_multiple_of(kv_heads)
             && self.cols.is_multiple_of(heads)
-            && [64, 128].contains(&(self.cols / heads))
+            && self.cols / heads <= 128
             && key.cols == kv_heads * (self.cols / heads)
             && key.shape() == value.shape()
             && !(causal && self.rows != key.rows)
@@ -919,8 +919,10 @@ impl Array {
         self.attention(key, value, heads, kv_heads, causal)
     }
 
-    /// Attention over heads of 64 or 128 on the matrix units: FP16 copies of the inputs, FP32
-    /// softmax and accumulation. See `flash_attention`.
+    /// Attention over heads of up to 128 on the matrix units: FP16 copies of the inputs, FP32
+    /// softmax and accumulation. See `flash_attention`, which takes heads of 64, 96 or 128, so a
+    /// head of another width goes in padded with zeros to the next of them. The zeros add nothing
+    /// to the scores or the output, and the queries take the scale of the padded width off.
     fn tensor_attention(
         &self,
         key: &Self,
@@ -929,16 +931,63 @@ impl Array {
         kv_heads: usize,
         causal: bool,
     ) -> Result<Self> {
-        let (q, k, v) = (self.to_half()?, key.to_half()?, value.to_half()?);
-        half_attention(
+        let dim = self.cols / heads;
+        let Some(&padded) = [64, 96, 128].iter().find(|&&width| width >= dim) else {
+            return Err(Error::new(format!(
+                "no attention on the matrix units for heads of {dim}"
+            )));
+        };
+        if padded == dim {
+            let (q, k, v) = (self.to_half()?, key.to_half()?, value.to_half()?);
+            return half_attention(
+                self.device(),
+                [&q, &k, &v],
+                [self.rows, key.rows],
+                heads,
+                kv_heads,
+                dim,
+                causal,
+            );
+        }
+        let scale = (padded as f32 / dim as f32).sqrt();
+        let (q, k, v) = (
+            self.pad_heads(dim, padded, scale)?,
+            key.pad_heads(dim, padded, 1.0)?,
+            value.pad_heads(dim, padded, 1.0)?,
+        );
+        let out = half_attention(
             self.device(),
             [&q, &k, &v],
             [self.rows, key.rows],
             heads,
             kv_heads,
-            self.cols / heads,
+            padded,
             causal,
-        )
+        )?;
+        let unpadded = Self::empty(self.device(), self.rows, self.cols)?;
+        self.device().run(
+            "unpad_heads",
+            &[&out.buffer, &unpadded.buffer],
+            &[unpadded.len() as u32, dim as u32, padded as u32],
+            unpadded.len(),
+            false,
+        )?;
+        Ok(unpadded)
+    }
+
+    /// The FP16 copy of an attention input with each head of `dim` values padded with zeros to
+    /// `padded` and multiplied by `scale`.
+    fn pad_heads(&self, dim: usize, padded: usize, scale: f32) -> Result<Buffer> {
+        let values = self.len() / dim * padded;
+        let copy = self.device().alloc(values * 2, None)?;
+        self.device().run(
+            "pad_heads_to_half",
+            &[&self.buffer, &copy],
+            &[values as u32, dim as u32, padded as u32, scale.to_bits()],
+            values,
+            false,
+        )?;
+        Ok(copy)
     }
 
     /// A block's attention inputs from its qkv projection's output, rows of `[3][heads][dim]`, or
@@ -1756,7 +1805,8 @@ mod tests {
             (130, 300, 2, 1, false, 0.1),
             (200, 200, 2, 2, true, 0.1),
         ] {
-            for dim in [64, 128] {
+            // 72 and 40 go in padded, to 96 and 64.
+            for dim in [40, 64, 72, 96, 128] {
                 let fill = |n: usize, seed: usize| -> Vec<f32> {
                     (0..n)
                         .map(|i| ((i * seed + 7) % 89) as f32 / 44.0 - 1.0)

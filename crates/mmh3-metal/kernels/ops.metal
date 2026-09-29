@@ -894,6 +894,24 @@ kernel void float_to_half(device const float *x [[buffer(0)]], device half *y [[
         y[i] = half(x[i]);
 }
 
+// float_to_half of heads of p[1] values, each padded with zeros to p[2] values and multiplied by
+// the float in p[3], for the attention on the matrix units, which takes only some head widths.
+// p[0] is the output's length.
+kernel void pad_heads_to_half(device const float *x [[buffer(0)]], device half *y [[buffer(1)]],
+                              constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint dim = p[1], padded = p[2], column = i % padded, head = i / padded;
+    y[i] = column < dim ? half(x[head * dim + column] * as_type<float>(p[3])) : half(0);
+}
+
+// The first p[1] of every p[2] values: the heads of a padded attention's output at their width.
+kernel void unpad_heads(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                        constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
+    if (i < p[0])
+        y[i] = x[i / p[1] * p[2] + i % p[1]];
+}
+
 // MPS comparison path: INT8 is exactly representable as FP16.
 kernel void int8_to_half(device const char *x [[buffer(0)]], device half *y [[buffer(1)]],
                          constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {

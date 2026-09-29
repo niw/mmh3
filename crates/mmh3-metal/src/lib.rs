@@ -471,6 +471,7 @@ impl Device {
         let group_size = match name {
             "mpp_lora"
             | "mpp_attention_64"
+            | "mpp_attention_96"
             | "mpp_attention_128"
             | "mpp_attention_int8_128"
             | "mpp_sparse_attention_128"
