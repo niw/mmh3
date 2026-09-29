@@ -5,7 +5,7 @@
 use mmh3_core::safetensors::{SafeTensors, write_f32};
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vision::PATCH_VALUES;
-use mmh3_metal::{Device, vision::MetalVisionEncoder};
+use mmh3_metal::{AttentionPrecision, Device, LinearPrecision, vision::MetalVisionEncoder};
 use std::path::Path;
 use std::time::Instant;
 
@@ -99,7 +99,6 @@ fn tiny_tower_embeds_pictures_and_pairs_of_frames() {
         .unwrap();
         SafeTensors::open(&path).unwrap()
     };
-    let encoder = MetalVisionEncoder::load(&write(&tensors)).unwrap();
     // Without the DeepStack mergers the tower is not Qwen3-VL's.
     let without: Vec<_> = tensors
         .iter()
@@ -107,7 +106,8 @@ fn tiny_tower_embeds_pictures_and_pairs_of_frames() {
         .cloned()
         .collect();
     assert!(MetalVisionEncoder::load(&write(&without)).is_err());
-    std::fs::remove_file(&path).unwrap();
+    // The file stays until the end, since the encoder reads it again when its precision changes.
+    let mut encoder = MetalVisionEncoder::load(&write(&tensors)).unwrap();
     assert_eq!(encoder.output_width(), 40);
 
     let first = picture(64, 96, 0.0);
@@ -134,6 +134,26 @@ fn tiny_tower_embeds_pictures_and_pairs_of_frames() {
     for (token, (a, b)) in merged.chunks(40).zip(other.chunks(40)).enumerate() {
         assert_ne!(a, b, "token {token} does not see the first patch");
     }
+
+    // FP16 products and attention on the matrix units, the 72-wide head padded for it, stay
+    // with FP32's.
+    if Device::shared().unwrap().supports_tensor_ops() {
+        encoder
+            .set_precision(LinearPrecision::Fp16, AttentionPrecision::Fp16)
+            .unwrap();
+        let embeddings = encoder.encode(&first).unwrap();
+        let (cosine, worst) = compare(&embeddings.merged.to_f32().unwrap(), &merged);
+        assert!(cosine > 0.9999 && worst < 2e-2, "{cosine}, {worst}");
+        assert_eq!(encoder.output_width(), 40);
+        encoder
+            .set_precision(LinearPrecision::Fp32, AttentionPrecision::Fp32)
+            .unwrap();
+        assert_eq!(
+            encoder.encode(&first).unwrap().merged.to_f32().unwrap(),
+            merged
+        );
+    }
+    std::fs::remove_file(&path).unwrap();
 }
 
 /// Cosine similarity and the largest error relative to the largest reference value.
@@ -161,7 +181,8 @@ fn compare(actual: &[f32], expected: &[f32]) -> (f64, f64) {
 }
 
 /// Compares the tower on the text encoder checkpoint `MMH3_TEXT_ENCODER` with ComfyUI's outputs
-/// in `MMH3_VISION_GOLDEN`, which tools/golden/vision.py writes. Only the tower is read.
+/// in `MMH3_VISION_GOLDEN`, which tools/golden/vision.py writes. Only the tower is read. It runs
+/// in FP32, then with FP16 products and attention on the matrix units where the device has them.
 #[test]
 #[ignore = "needs the text encoder checkpoint and a golden file from tools/golden/vision.py"]
 fn matches_comfyui_on_the_checkpoint() {
@@ -170,38 +191,57 @@ fn matches_comfyui_on_the_checkpoint() {
     let golden = SafeTensors::open(Path::new(&variable("MMH3_VISION_GOLDEN"))).unwrap();
     let tensor = |name: &str| Tensor::load(&golden, golden.get(name).unwrap()).unwrap();
 
-    let encoder = MetalVisionEncoder::load(&checkpoint).unwrap();
+    let mut encoder = MetalVisionEncoder::load(&checkpoint).unwrap();
     let first = tensor("picture.0");
-    let encode = || match golden.get("picture.1") {
-        Some(_) => encoder.encode_frames(&first, &tensor("picture.1")),
-        None => encoder.encode(&first),
-    };
-    // The first run compiles and warms up the kernels.
-    encode().unwrap();
-    let started = Instant::now();
-    let embeddings = encode().unwrap();
-    let merged = embeddings.merged.to_f32().unwrap();
-    println!(
-        "{:?} picture in {:.3} s, {:.2} GB on the device at most",
-        first.shape,
-        started.elapsed().as_secs_f64(),
-        Device::shared().unwrap().stats().peak_allocated_bytes as f64 / 1e9
-    );
-    let (cosine, worst) = compare(&merged, &tensor("merged").data);
-    println!(
-        "merged: 1 − cosine {:.1e}, max error {worst:.2e} of the largest value",
-        1.0 - cosine
-    );
-    assert!(cosine > 0.99999 && worst < 1e-3);
-    for (index, features) in embeddings.deepstack.iter().enumerate() {
-        let (cosine, worst) = compare(
-            &features.to_f32().unwrap(),
-            &tensor(&format!("deepstack.{index}")).data,
-        );
+    let mut precisions = vec![(
+        "FP32",
+        LinearPrecision::Fp32,
+        AttentionPrecision::Fp32,
+        1e-5,
+        1e-3,
+    )];
+    if Device::shared().unwrap().supports_tensor_ops() {
+        precisions.push((
+            "FP16",
+            LinearPrecision::Fp16,
+            AttentionPrecision::Fp16,
+            1e-4,
+            2e-2,
+        ));
+    }
+    for (label, linear, attention, distance, largest) in precisions {
+        encoder.set_precision(linear, attention).unwrap();
+        let encode = || match golden.get("picture.1") {
+            Some(_) => encoder.encode_frames(&first, &tensor("picture.1")),
+            None => encoder.encode(&first),
+        };
+        // The first run compiles and warms up the kernels.
+        encode().unwrap();
+        let started = Instant::now();
+        let embeddings = encode().unwrap();
+        let merged = embeddings.merged.to_f32().unwrap();
         println!(
-            "deepstack {index}: 1 − cosine {:.1e}, max error {worst:.2e} of the largest value",
-            1.0 - cosine
+            "{label}: {:?} picture in {:.3} s, {:.2} GB on the device at most",
+            first.shape,
+            started.elapsed().as_secs_f64(),
+            Device::shared().unwrap().stats().peak_allocated_bytes as f64 / 1e9
         );
-        assert!(cosine > 0.99999 && worst < 1e-3);
+        let outputs = std::iter::once(("merged".to_owned(), merged)).chain(
+            embeddings
+                .deepstack
+                .iter()
+                .enumerate()
+                .map(|(index, features)| {
+                    (format!("deepstack.{index}"), features.to_f32().unwrap())
+                }),
+        );
+        for (name, actual) in outputs {
+            let (cosine, worst) = compare(&actual, &tensor(&name).data);
+            println!(
+                "{label} {name}: 1 − cosine {:.1e}, max error {worst:.2e} of the largest value",
+                1.0 - cosine
+            );
+            assert!(1.0 - cosine < distance && worst < largest);
+        }
     }
 }

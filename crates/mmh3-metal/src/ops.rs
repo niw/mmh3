@@ -1459,6 +1459,61 @@ impl PackedRows {
             finish,
         )
     }
+
+    /// The product of these FP16 rows with FP16 `weight` of `outputs` rows, plus `bias`, on the
+    /// matrix units: `mpp_fp16` for a model whose weights are FP16 rather than INT8.
+    pub(crate) fn product_half(
+        &self,
+        weight: &Buffer,
+        outputs: usize,
+        bias: Option<&Array>,
+    ) -> Result<Array> {
+        if self.precision != LinearPrecision::Fp16
+            || outputs.checked_mul(self.cols * 2) != Some(weight.0.bytes)
+            || bias.is_some_and(|bias| bias.shape() != [1, outputs])
+            || [
+                self.rows * self.cols,
+                outputs * self.cols,
+                self.rows * outputs,
+            ]
+            .iter()
+            .any(|&n| n > i32::MAX as usize)
+        {
+            return Err(Error::new("FP16 product shape mismatch".into()));
+        }
+        let device = self.scales.device();
+        let out = Array::empty(device, self.rows, outputs)?;
+        // An absent vector binds the row scales in its place, which the flags then never read.
+        let unused = &self.scales.buffer;
+        device.run(
+            "mpp_fp16_weights",
+            &[
+                &self.buffer,
+                weight,
+                &out.buffer,
+                unused,
+                unused,
+                bias.map_or(unused, |bias| &bias.buffer),
+                unused,
+                unused,
+            ],
+            &[
+                self.rows as u32,
+                outputs as u32,
+                self.cols as u32,
+                Finish {
+                    bias,
+                    ..Default::default()
+                }
+                .flags(),
+                0,
+                product_band(self.rows, outputs, self.cols),
+            ],
+            self.rows.div_ceil(PRODUCT_TILE.0) * outputs.div_ceil(PRODUCT_TILE.1),
+            true,
+        )?;
+        Ok(out)
+    }
 }
 
 /// The widest rows `add_norm_pack` keeps in registers: three 256-value blocks for each of eight SIMD

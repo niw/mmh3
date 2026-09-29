@@ -21,8 +21,8 @@ constant constexpr uint SCALE_OUTPUTS = 1, ADD_BIAS = 2, ACCUMULATE = 4, ADD_LOR
 // so the tile's share goes to threadgroup memory and the product's writes add it. It goes in FP16:
 // in FP32 it would fill the 32 KB a threadgroup has and slow the product, and its rounding is a
 // small fraction of the INT8 activations' own.
-template <typename Input, typename Accumulator, int GROUPS>
-void packed_product(device Input *a, device int8_t *b, device float *c, device const float *scales,
+template <typename Input, typename Weight, typename Accumulator, int GROUPS>
+void packed_product(device Input *a, device Weight *b, device float *c, device const float *scales,
                     device const float *outputs, device const float *bias, device float *mid,
                     device half *up, constant uint *p, uint g, threadgroup half *lora) {
     constexpr int TM = 128, TN = 64;
@@ -61,7 +61,7 @@ void packed_product(device Input *a, device int8_t *b, device float *c, device c
 
     tensor<device Input, dextents<int, 2>, tensor_inline> A(a, dextents<int, 2>(K, M),
                                                             array<int, 2>{1, K});
-    tensor<device int8_t, dextents<int, 2>, tensor_inline> B(b, dextents<int, 2>(K, N),
+    tensor<device Weight, dextents<int, 2>, tensor_inline> B(b, dextents<int, 2>(K, N),
                                                              array<int, 2>{1, K});
     auto at = A.slice(0, row);
     auto bt = B.slice(0, col);
@@ -90,18 +90,20 @@ void packed_product(device Input *a, device int8_t *b, device float *c, device c
     }
 }
 
-#define PACKED_PRODUCT(NAME, INPUT, ACCUMULATOR, GROUPS)                                           \
-    kernel void NAME(device INPUT *a [[buffer(0)]], device int8_t *b [[buffer(1)]],                \
+#define PACKED_PRODUCT(NAME, INPUT, WEIGHT, ACCUMULATOR, GROUPS)                                   \
+    kernel void NAME(device INPUT *a [[buffer(0)]], device WEIGHT *b [[buffer(1)]],                \
                      device float *c [[buffer(2)]], device const float *scales [[buffer(3)]],      \
                      device const float *outputs [[buffer(4)]],                                    \
                      device const float *bias [[buffer(5)]], device float *mid [[buffer(6)]],      \
                      device half *up [[buffer(7)]], constant uint *p [[buffer(8)]],                \
                      uint g [[threadgroup_position_in_grid]]) {                                    \
         threadgroup half lora[128 * 64];                                                           \
-        packed_product<INPUT, ACCUMULATOR, GROUPS>(a, b, c, scales, outputs, bias, mid, up, p, g,  \
-                                                   lora);                                          \
+        packed_product<INPUT, WEIGHT, ACCUMULATOR, GROUPS>(a, b, c, scales, outputs, bias, mid,    \
+                                                           up, p, g, lora);                        \
     }
-PACKED_PRODUCT(mpp_fp16, half, float, 8)
+PACKED_PRODUCT(mpp_fp16, half, int8_t, float, 8)
+// mpp_fp16 of FP16 weights, for a model whose checkpoint is not INT8.
+PACKED_PRODUCT(mpp_fp16_weights, half, half, float, 8)
 #undef PACKED_PRODUCT
 
 // C = A · Bᵀ for FP32 activations and FP16 weights, the two products of a LoRA. A 64×64 tile a
