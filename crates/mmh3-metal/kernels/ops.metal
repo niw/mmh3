@@ -462,8 +462,8 @@ kernel void swiglu_interleaved(device const float *x [[buffer(0)]], device float
 
 // The rows of a SwiGLU layer's gate half and up half, p[0] rows of p[1] bytes, reordered to
 // alternate 16 gate rows and their 16 up rows. One thread a byte.
-kernel void interleave_swiglu_rows(device const uchar *x [[buffer(0)]], device uchar *y [[buffer(1)]],
-                                   constant uint *p [[buffer(2)]],
+kernel void interleave_swiglu_rows(device const uchar *x [[buffer(0)]],
+                                   device uchar *y [[buffer(1)]], constant uint *p [[buffer(2)]],
                                    uint i [[thread_position_in_grid]]) {
     const uint rows = p[0], row_bytes = p[1];
     if (i >= rows * row_bytes)
