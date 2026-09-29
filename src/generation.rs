@@ -712,26 +712,10 @@ pub fn sample(
     #[cfg(any(feature = "cuda", feature = "metal"))]
     let hands_out = !prepared_workers.is_empty();
     // The prompt is encoded before the DiT is read, so the text encoder is gone by the time the
-    // DiT arrives and the device holds one checkpoint at a time.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    let (context, context_modalities, mut dit) = {
-        let (context, modalities) =
-            encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
-        let dit = match hands_out {
-            true => None,
-            false => Some(load_dit(options, "dit", dit_file)?),
-        };
-        (context, modalities, dit)
-    };
-    // A build with no backend never holds a DiT. `Infallible` says so in the type: there is no
-    // value this could be, which is what makes every arm that would use one unreachable here.
-    #[cfg(not(any(feature = "cuda", feature = "metal")))]
-    let (context, context_modalities, _dit) = {
-        let (context, modalities) =
-            encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
-        let _dit: Option<std::convert::Infallible> = None;
-        (context, modalities, _dit)
-    };
+    // DiT arrives and the device holds one checkpoint at a time. The pictures, clips and sounds
+    // encode in between, so that a DiT that does not fit keeps back what they leave free.
+    let (context, context_modalities) =
+        encode_context().map_err(|error| -> Box<dyn Error> { error.into() })?;
     if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
     }
@@ -758,6 +742,15 @@ pub fn sample(
     )?;
     #[cfg(not(feature = "cuda"))]
     let soundtrack_latents: Vec<Tensor> = Vec::new();
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    let mut dit = match hands_out {
+        true => None,
+        false => Some(load_dit(options, "dit", dit_file)?),
+    };
+    // A build with no backend never holds a DiT. `Infallible` says so in the type: there is no
+    // value this could be, which is what makes every arm that would use one unreachable here.
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    let _dit: Option<std::convert::Infallible> = None;
 
     let (keyframes, references) = if !has_references {
         let keyframes = settings
