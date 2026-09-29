@@ -7,13 +7,15 @@ use crate::cli::{option_float, option_number, option_values};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::models::load_dit;
 #[cfg(feature = "cuda")]
-use crate::models::{AUDIO_VAE_FILE, save_algorithm_cache, video_vae_path};
+use crate::models::save_algorithm_cache;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+use crate::models::{AUDIO_VAE_FILE, video_vae_path};
 use crate::models::{DIT_FILE, REFERENCE_DIT_FILE, sparse_attention};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::models::{TEXT_ENCODER_FILE, option_path};
 use crate::pictures::load_picture;
 use crate::video::{ReferenceClip, block_seconds};
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::video::{block_frames, load_clip};
 use mmh3_core::dit::sampler::Schedule;
 use mmh3_core::generation::GenerationShape;
@@ -162,11 +164,11 @@ pub fn starting() {
 
 /// The seed of the noise keyframes and reference pictures sample from the video VAE's posterior,
 /// as the reference pipeline fixes it.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const KEYFRAME_POSTERIOR_SEED: u64 = 42;
 /// Mixed into the seed for the noise of keyframes and reference pictures, which comes from its own
 /// stream so that a seed keeps the target noise it has without them.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const KEYFRAME_NOISE_STREAM: u64 = 0x6b65_7966_7261_6d65;
 /// The most reference pictures the official pipeline takes.
 const MAX_REFERENCE_PICTURES: usize = 9;
@@ -175,7 +177,7 @@ const MAX_REFERENCE_SOUNDS: usize = 3;
 /// The most reference clips the official pipeline takes.
 const MAX_REFERENCE_CLIPS: usize = 3;
 /// Mixed into the seed for the noise of reference clips, so that they take their own stream.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const CLIP_NOISE_STREAM: u64 = 0x636c_6970_6e6f_6973;
 
 /// A picture that a frame of the generation starts from or reaches, fitted to the canvas.
@@ -371,7 +373,6 @@ impl Settings {
         }
         #[cfg(feature = "metal")]
         {
-            crate::metal::validate_options(options)?;
             // A run with no worker to hand a step to runs every one here, so what this machine
             // cannot run it can refuse now rather than after encoding a prompt. A run that means
             // to hand them out is judged by `load_dit`, which is reached only if it ends up
@@ -460,12 +461,12 @@ impl Settings {
         };
         let shape = GenerationShape::new(width, height, option_number(options, "frames", 124)?)?;
         // A clip is never longer than the video it is a reference for.
-        #[cfg(feature = "cuda")]
+        #[cfg(any(feature = "cuda", feature = "metal"))]
         let clips = files
             .into_iter()
             .map(|path| load_clip(Path::new(path), shape.frames))
             .collect::<Result<Vec<_>, _>>()?;
-        #[cfg(not(feature = "cuda"))]
+        #[cfg(not(any(feature = "cuda", feature = "metal")))]
         let clips: Vec<ReferenceClip> = Vec::new();
         // The first picture stretches to the canvas and the other covers it, as the reference
         // pipeline fits them.
@@ -551,7 +552,7 @@ pub fn sample(
         .chain(&settings.references)
         .map(|picture| picture.to_tensor())
         .collect();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let clip_blocks: Vec<Vec<Tensor>> = settings
         .clips
         .iter()
@@ -643,20 +644,20 @@ pub fn sample(
                             let ids = Tokenizer::h3().encode(&prompt);
                             encoder.encode(&ids, &[])?.context
                         } else {
-                            #[cfg(feature = "metal")]
-                            return Err(
-                                "picture and sound prompts are not implemented on Metal yet".into(),
-                            );
-                            #[cfg(feature = "cuda")]
                             {
                                 use mmh3_core::vision::vision_prompt;
-                                use mmh3_cuda::vision::CudaVisionEncoder;
+                                #[cfg(feature = "cuda")]
+                                use mmh3_cuda::vision::CudaVisionEncoder as VisionEncoder;
+                                #[cfg(feature = "metal")]
+                                use mmh3_metal::vision::MetalVisionEncoder as VisionEncoder;
 
                                 // One embedding per vision block: the pictures, then the pairs of every clip.
+                                // The tower is gone before the prompt encodes, since a Mac that streams
+                                // the text encoder keeps back what the free memory allows.
                                 let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
                                     Vec::new()
                                 } else {
-                                    let vision = CudaVisionEncoder::load(&file)?;
+                                    let vision = VisionEncoder::load(&file)?;
                                     let mut embeddings = pictures
                                         .iter()
                                         .map(|picture| vision.encode(picture))
@@ -719,19 +720,19 @@ pub fn sample(
     if options.contains_key("context") && !prompt_references.is_empty() {
         return Err("keyframes and references need a prompt, not --context".into());
     }
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let latents = encode_pictures(options, settings.seed, &pictures)?;
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let latents: Vec<Tensor> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let clip_latents = encode_clips(options, settings.seed, &settings.clips)?;
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let clip_latents: Vec<Tensor> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let sound_latents = encode_sounds(options, &settings.sounds)?;
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let sound_latents: Vec<Tensor> = Vec::new();
-    #[cfg(feature = "cuda")]
+    #[cfg(any(feature = "cuda", feature = "metal"))]
     let soundtrack_latents = encode_sounds(
         options,
         &settings
@@ -740,7 +741,7 @@ pub fn sample(
             .filter_map(|clip| clip.sound.clone())
             .collect::<Vec<_>>(),
     )?;
-    #[cfg(not(feature = "cuda"))]
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
     let soundtrack_latents: Vec<Tensor> = Vec::new();
     #[cfg(any(feature = "cuda", feature = "metal"))]
     let mut dit = match hands_out {
@@ -976,13 +977,16 @@ fn encode_on_worker(settings: &Settings, ids: &[u32]) -> Result<Option<Tensor>, 
 
 /// The posterior means of the reference sounds, `[latent channels, stereo channels, frames]` each.
 /// They take no condition noise, as the reference pipeline leaves reference audio clean.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn encode_sounds(
     options: &HashMap<&str, &str>,
     sounds: &[Tensor],
 ) -> Result<Vec<Tensor>, Box<dyn Error>> {
     use mmh3_core::audio::LATENT_RATE;
-    use mmh3_cuda::audio_encoder::CudaAudioEncoder;
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::audio_encoder::CudaAudioEncoder as AudioEncoder;
+    #[cfg(feature = "metal")]
+    use mmh3_metal::audio_encoder::MetalAudioEncoder as AudioEncoder;
     use std::time::Instant;
 
     if sounds.is_empty() {
@@ -990,7 +994,7 @@ fn encode_sounds(
     }
     let started = Instant::now();
     let path = option_path(options, "audio-vae", AUDIO_VAE_FILE)?;
-    let encoder = CudaAudioEncoder::load(&SafeTensors::open(Path::new(&path))?, "")?;
+    let encoder = AudioEncoder::load(&SafeTensors::open(Path::new(&path))?, "")?;
     let latents = sounds
         .iter()
         .map(|waveform| encoder.encode(waveform))
@@ -1007,7 +1011,7 @@ fn encode_sounds(
 
 /// The latents of the reference clips, sampled from the video VAE's posterior and mixed with the
 /// condition noise, as the reference pictures are.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn encode_clips(
     options: &HashMap<&str, &str>,
     seed: u64,
@@ -1015,8 +1019,13 @@ fn encode_clips(
 ) -> Result<Vec<Tensor>, Box<dyn Error>> {
     use mmh3_core::dit::timestep::VIDEO_CONDITION_TIMESTEP;
     use mmh3_core::random::NormalSampler;
+    #[cfg(feature = "cuda")]
     use mmh3_cuda::video_encoder::{
-        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+        CudaVideoEncoder as VideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
+    #[cfg(feature = "metal")]
+    use mmh3_metal::video_encoder::{
+        DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, MetalVideoEncoder as VideoEncoder, Temporal,
     };
     use std::time::Instant;
 
@@ -1025,7 +1034,7 @@ fn encode_clips(
     }
     let started = Instant::now();
     let path = video_vae_path(options)?;
-    let encoder = CudaVideoEncoder::load(
+    let encoder = VideoEncoder::load(
         &SafeTensors::open(Path::new(&path))?,
         Temporal::Clip,
         DEFAULT_TILE_SIZE,
@@ -1057,7 +1066,7 @@ fn encode_clips(
 
 /// The latents of keyframes or reference pictures as the DiT sees them: a sample of the video VAE's
 /// posterior for each picture with 0.1% of noise mixed in.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn encode_pictures(
     options: &HashMap<&str, &str>,
     seed: u64,
@@ -1065,8 +1074,13 @@ fn encode_pictures(
 ) -> Result<Vec<Tensor>, Box<dyn Error>> {
     use mmh3_core::dit::timestep::VIDEO_CONDITION_TIMESTEP;
     use mmh3_core::random::NormalSampler;
+    #[cfg(feature = "cuda")]
     use mmh3_cuda::video_encoder::{
-        CudaVideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+        CudaVideoEncoder as VideoEncoder, DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, Temporal,
+    };
+    #[cfg(feature = "metal")]
+    use mmh3_metal::video_encoder::{
+        DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE, MetalVideoEncoder as VideoEncoder, Temporal,
     };
     use std::time::Instant;
 
@@ -1075,7 +1089,7 @@ fn encode_pictures(
     }
     let started = Instant::now();
     let path = video_vae_path(options)?;
-    let encoder = CudaVideoEncoder::load(
+    let encoder = VideoEncoder::load(
         &SafeTensors::open(Path::new(&path))?,
         Temporal::Frame,
         DEFAULT_TILE_SIZE,

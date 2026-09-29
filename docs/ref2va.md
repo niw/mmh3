@@ -109,7 +109,8 @@ unless `--width` and `--height` say otherwise, as the references do not set it. 
 - A sound is padded with silence to a whole latent frame, which is what the official pipeline
   does. ComfyUI's VAE wrapper crops the tail to a whole frame instead, so a sound whose length is
   not a multiple of 800 samples gives it one frame less.
-- A clip's frames are demuxed by mmh3 itself and decoded with NVDEC. They go on the canvas of
+- A clip's frames are demuxed by mmh3 itself and decoded with NVDEC on CUDA and VideoToolbox on
+  Metal, both in the colour matrix and range the stream declares. They go on the canvas of
   their own aspect ratio, or keep their own size on the 32-pixel grid when that is smaller, since
   a clip is never scaled up, and their count is cut to the video being generated and then down to
   the 17n + 5 frames the VAE's clips cover.
@@ -141,6 +142,11 @@ runs at 15.1 s per step with it, about two and a half minutes for the eight step
 frames at 1344×768 take 9.3 s to encode instead and bring about 37,000 rows, as many as the target
 itself, and 124 frames of 1344×768 take 37 s, so a long reference at full size is expensive on
 both counts.
+
+On an M6 with 24 GB, a 448×256 video of 73 frames from a 448×256 picture, a 39-frame 448×256 clip
+with its soundtrack and a two-second sound, with the Turbo LoRA in eight steps, takes 120 s in all,
+steps 12 s with 23 of the DiT's 52 blocks kept on the device. Encoding the prompt takes 6.0 s, the
+picture 0.4 s, the clip 5.0 s and each sound 0.2 to 0.3 s.
 
 Against ComfyUI in FP32 at 448×256 with two reference pictures, one of them 128×256, the DiT's
 velocity is within 1.1e-2 for video and 1.9e-2 for audio, as close as with keyframes. With one

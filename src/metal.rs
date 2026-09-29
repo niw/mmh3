@@ -1,4 +1,4 @@
-//! Application-level selection and validation of the initial Metal backend.
+//! Application-level selection and validation of the Metal backend.
 use crate::{
     cli::option_float,
     models::{model_file, option_path},
@@ -6,26 +6,6 @@ use crate::{
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_metal::{AttentionPrecision, LinearPrecision, dit::MetalDit};
 use std::{collections::HashMap, error::Error, path::Path};
-
-/// Reject what this machine cannot do however a run is arranged, before reading images or weights.
-///
-/// Encoding a picture or a clip is this machine's own work whoever runs the steps, so a run that
-/// needs one cannot be arranged around this backend at all.
-pub fn validate_options(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
-    for option in [
-        "first-frame",
-        "last-frame",
-        "reference",
-        "reference-audio",
-        "reference-video",
-    ] {
-        if options.contains_key(option) {
-            return Err(format!("--{option} is not supported by the initial Metal backend. It supports text-to-video and adapter LoRAs").into());
-        }
-    }
-
-    Ok(())
-}
 
 /// Reject what this machine cannot do when it runs the steps itself.
 ///
@@ -111,7 +91,6 @@ pub fn load_dit(
     name: &str,
     default_file: &str,
 ) -> Result<MetalDit, Box<dyn Error>> {
-    validate_options(options)?;
     validate_step_options(options)?;
     let path = option_path(options, name, default_file)?;
     let started = std::time::Instant::now();
@@ -158,17 +137,11 @@ mod tests {
         pairs.iter().copied().collect()
     }
 
-    /// What a coordinator may ask for and what it may not, which is the whole of the split. A run
-    /// this machine hands out every step of never reaches `validate_step_options`, so the first
-    /// check has to let through everything that is only a step's business.
+    /// What only a step's machine runs is refused by the machine that runs the step.
     #[test]
-    fn a_coordinator_may_ask_for_what_it_cannot_run_itself() {
+    fn a_step_refuses_what_it_cannot_run() {
         for (option, value) in [("attention-precision", "int8-fp8"), ("lora-mode", "merge")] {
             let options = options(&[(option, value)]);
-            assert!(
-                validate_options(&options).is_ok(),
-                "--{option} {value} is a step's business, not this machine's"
-            );
             assert!(
                 validate_step_options(&options).is_err(),
                 "--{option} {value} must be refused by the machine that runs the step"
@@ -192,25 +165,6 @@ mod tests {
             assert!(
                 validate_step_options(&options).is_ok(),
                 "--{option} {value} runs on Metal"
-            );
-        }
-    }
-
-    /// Encoding a picture is this machine's own work whoever runs the steps, so no arrangement
-    /// makes it possible and the first check refuses it.
-    #[test]
-    fn what_no_worker_can_take_is_refused_whatever_the_run_arranges() {
-        for option in [
-            "first-frame",
-            "last-frame",
-            "reference",
-            "reference-audio",
-            "reference-video",
-        ] {
-            let options = options(&[(option, "missing.png")]);
-            assert!(
-                validate_options(&options).is_err(),
-                "--{option} cannot be handed to a worker"
             );
         }
     }

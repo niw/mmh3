@@ -54,6 +54,10 @@ pictures add about 4,100 rows to the sequence, which VSA attends from every vide
 takes about 5 s longer than without pictures. Encoding the prompt with the pictures takes 6.7 s
 and the keyframes 2.1 s.
 
+On an M6 with 24 GB, a first and a last frame at 448×256 and 73 frames with the FastH3 patch in
+four steps take 48 s in all, steps 7 to 10 s with 28 of the DiT's 52 blocks kept on the device.
+Encoding the prompt with the pictures takes 6.2 s and the keyframes 0.3 s.
+
 Against ComfyUI in FP32 at 448×256 with a first and a last frame, the DiT's velocity is within
 9.1e-3 for video and 2.3e-2 for audio, and the keyframe latents within 1.3e-3. The vision tower
 matches ComfyUI's FP32 run to three digits apart from ComfyUI's TF32 patch embedding.

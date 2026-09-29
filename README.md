@@ -80,8 +80,8 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps.
   build also targets Ada (`sm_89`), which runs on an RTX 4090.
 - Apple silicon with Metal on macOS 15 or later, tested on an M4 Max and an M6. Text to video with
   audio works with LoRAs, patches such as FastH3's, and Sol-Attn and VSA sparse attention, and a
-  Mac with 24 GB runs it by reading the layers that do not fit from the disk. Videos from frames or
-  references are not supported on Metal yet. See [Metal](docs/metal.md) for its current limits.
+  Mac with 24 GB runs it by reading the layers that do not fit from the disk. Videos from frames and
+  references work on macOS 26. See [Metal](docs/metal.md) for its current limits.
 - [Distributed generation](docs/distributed.md) works on both backends and between them, and from a
   machine with neither. Shares follow what each machine measures itself to do. Between two DGX
   Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark rather

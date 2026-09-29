@@ -50,7 +50,7 @@ through ffmpeg on a GPU or in a container without NVENC.
   MP4 or Matroska file, resampled to the audio VAE's 32 kHz. Switches the default DiT to the ref2va
   one as well.
 - `--reference-video FILE` (default none, repeatable): An H.264 MP4 the prompt refers to as
-  `<Video 1>`, `<Video 2>` and so on, its frames decoded with NVDEC and its soundtrack taken as the
+  `<Video 1>`, `<Video 2>` and so on, its frames decoded with NVDEC or VideoToolbox and its soundtrack taken as the
   `<Audio j>` before it. Switches the default DiT to the ref2va one as well.
 - `--steps N` (default 20): Model evaluations. The released checkpoint is guidance-distilled, so
   there is no CFG.
