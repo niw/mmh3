@@ -532,7 +532,9 @@ impl CudaVideoEncoder {
         let (tile_height, tile_width) = (rows.length, columns.length);
         // A single frame is its own clip and keeps its one latent frame. A clip runs in groups of
         // seventeen frames, the last padded by repeating its last frame, and drops the tokens the
-        // reference drops from the end.
+        // reference drops from the end. Latent frame t reads only frames up to 4t, since the
+        // encoder is causal in time, so the last group encodes only the frames its kept tokens
+        // read.
         let (clip_frames, tokens, dropped) = match self.temporal {
             Temporal::Frame => (1, 1, 0),
             Temporal::Clip => (CLIP_LENGTH, CHUNK_TOKENS, TOKEN_DROP),
@@ -544,6 +546,8 @@ impl CudaVideoEncoder {
                 "{frames} frames give no latent frames"
             )));
         }
+        let kept = latent_frames - (clips - 1) * tokens;
+        let last_frames = (TEMPORAL_RATIO * (kept - 1) + 1).min(clip_frames);
         let scratch = self.scratch(clip_frames, tile_height, tile_width)?;
         let tile_latent_pixels = (tile_height / SPATIAL_RATIO) * (tile_width / SPATIAL_RATIO);
         let (latent_height, latent_width) = (height / SPATIAL_RATIO, width / SPATIAL_RATIO);
@@ -551,6 +555,11 @@ impl CudaVideoEncoder {
         let mut mean = vec![0.0; LATENT_CHANNELS * latent_frames * plane];
         let mut deviation = vec![0.0; LATENT_CHANNELS * latent_frames * plane];
         for clip in 0..clips {
+            let (group_frames, group_tokens) = if clip + 1 == clips {
+                (last_frames, kept)
+            } else {
+                (clip_frames, tokens)
+            };
             let tiles = rows
                 .starts
                 .iter()
@@ -559,17 +568,14 @@ impl CudaVideoEncoder {
                     self.encode_tile(
                         &canvas,
                         [frames, height, width],
-                        [clip * clip_frames, clip_frames],
+                        [clip * clip_frames, group_frames],
                         [top, left, tile_height, tile_width],
                         &scratch,
                     )
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
-            for token in 0..tokens {
+            for token in 0..group_tokens {
                 let latent_frame = clip * tokens + token;
-                if latent_frame >= latent_frames {
-                    break;
-                }
                 let frame: Vec<&[f32]> = tiles
                     .iter()
                     .map(|tile| {

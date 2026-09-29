@@ -136,7 +136,7 @@ rows, two per latent frame at 40 frames per second, against about 2,300 rows for
 Encoding it takes 0.2 s, and a run with one 448×256 reference picture and a two-second sound at
 1344×768 and 124 frames takes 14.4 s per step, the same as without the sound.
 
-A clip costs what its own size and length ask for. A 22-frame clip of 448×256 encodes in 0.7 s and
+A clip costs what its own size and length ask for. A 22-frame clip of 448×256 encodes in 0.5 s and
 adds 784 video rows, 74 audio rows and one vision block, and a 1344×768 video of 124 frames still
 runs at 15.1 s per step with it, about two and a half minutes for the eight steps. The same 22
 frames at 1344×768 take 9.3 s to encode instead and bring about 37,000 rows, as many as the target
