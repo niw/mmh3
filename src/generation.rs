@@ -657,7 +657,13 @@ pub fn sample(
                                 let embeddings = if pictures.is_empty() && clip_blocks.is_empty() {
                                     Vec::new()
                                 } else {
-                                    let vision = VisionEncoder::load(&file)?;
+                                    #[allow(unused_mut)]
+                                    let mut vision = VisionEncoder::load(&file)?;
+                                    #[cfg(feature = "metal")]
+                                    vision.set_precision(
+                                        crate::metal::default_linear_precision(),
+                                        crate::metal::attention_precision(options)?,
+                                    )?;
                                     let mut embeddings = pictures
                                         .iter()
                                         .map(|picture| vision.encode(picture))
