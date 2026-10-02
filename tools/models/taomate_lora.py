@@ -31,25 +31,10 @@ from pathlib import Path
 
 import numpy as np
 
-from checkpoint import SafeTensors, write_safetensors
+from checkpoint import SafeTensors, bf16_bytes, update_svd, write_safetensors
 
 PREFIX = "diffusion_model."
 RANK_STEP = 64
-
-
-def bf16_bytes(values):
-    """Little-endian bytes of float32 values rounded to BF16, to nearest even."""
-    bits = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32)
-    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
-    return rounded.astype(np.uint16).tobytes()
-
-
-def update_svd(lora_b, lora_a, scale):
-    """The SVD of scale · lora_b @ lora_a through QR factors of both, in float64."""
-    left, left_r = np.linalg.qr(lora_b.astype(np.float64))
-    right, right_r = np.linalg.qr(lora_a.astype(np.float64).T)
-    core_left, singular, core_right = np.linalg.svd(scale * left_r @ right_r.T)
-    return left @ core_left, singular, core_right @ right.T
 
 
 def main():

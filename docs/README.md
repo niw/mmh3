@@ -21,6 +21,7 @@ Generating in fewer steps:
 - [FastH3](fasth3.md): a 4-step patch, with video sparse attention.
 - [lightx2v Turbo LoRA](lightx2v-turbo.md): a 4-step LoRA.
 - [TaoMate-H3](taomate.md): a 3-step LoRA.
+- [PDMD](pdmd.md): a 2-step LoRA.
 
 Going faster, and looking underneath:
 

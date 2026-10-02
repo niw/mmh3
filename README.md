@@ -39,7 +39,7 @@ files. [Performance and accuracy](docs/performance.md) has the times of each sta
 `make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT, with
 its video sparse attention, INT8/FP8 attention and the INT8 video VAE, and writes MP4 with NVENC
 H.264 and AAC. Compared with mmh3's defaults, these can change image details and the composition.
-mmh3 also runs two other few-step models with the settings on their pages.
+mmh3 also runs three other few-step models with the settings on their pages.
 
 On a DGX Spark, a complete generation took:
 
@@ -48,6 +48,7 @@ On a DGX Spark, a complete generation took:
 | [FastH3](docs/fasth3.md) | 4 | 14 s | 80 s |
 | [lightx2v Turbo LoRA](docs/lightx2v-turbo.md) | 4 | 14 s | 81 s |
 | [TaoMate-H3](docs/taomate.md) | 3 | 14 s | 66 s |
+| [PDMD](docs/pdmd.md) | 2 | 14 s | 52 s |
 
 Each generated a 1344×768, 124-frame video, 5.2 seconds at 24 fps.
 

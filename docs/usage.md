@@ -120,3 +120,4 @@ non_diegetic_music: A slow, swelling orchestral string theme.
   DiT. `make generate` uses it on CUDA.
 - [lightx2v Turbo LoRA](lightx2v-turbo.md): a LoRA that generates in four steps.
 - [TaoMate-H3](taomate.md): a LoRA that generates in three steps with `--schedule taomate`.
+- [PDMD](pdmd.md): a LoRA that generates in two steps.

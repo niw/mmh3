@@ -23,7 +23,9 @@ pictures](ref2va.md), `--no-fasth3` skips the [FastH3](fasth3.md) patch, `--ligh
 downloads the [Turbo LoRA](lightx2v-turbo.md),
 `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` from
 lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the [TaoMate-H3](taomate.md) LoRA,
-`loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, and
+`loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, `--pdmd`
+also downloads the [PDMD](pdmd.md) LoRA,
+`loras/minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, and
 `--models DIR` downloads into another directory.
 
 Patches, such as the FastH3 patch, go into `patches` of the models directory. `--patch` and `--lora`

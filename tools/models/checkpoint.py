@@ -28,7 +28,7 @@ class SafeTensors:
         with open(path, "rb") as file:
             length = struct.unpack("<Q", file.read(8))[0]
             self.header = json.loads(file.read(length))
-        self.header.pop("__metadata__", None)
+        self.metadata = self.header.pop("__metadata__", {})
         self.base = 8 + length
 
     def __contains__(self, name):
@@ -83,6 +83,21 @@ def write_safetensors(path, tensors, metadata):
         output.write(encoded)
         for _, _, data in tensors.values():
             output.write(data)
+
+
+def bf16_bytes(values):
+    """Little-endian bytes of float32 values rounded to BF16, to nearest even."""
+    bits = np.ascontiguousarray(values, dtype=np.float32).view(np.uint32)
+    rounded = (bits + 0x7FFF + ((bits >> 16) & 1)) >> 16
+    return rounded.astype(np.uint16).tobytes()
+
+
+def update_svd(lora_b, lora_a, scale):
+    """The SVD of scale · lora_b @ lora_a through QR factors of both, in float64."""
+    left, left_r = np.linalg.qr(lora_b.astype(np.float64))
+    right, right_r = np.linalg.qr(lora_a.astype(np.float64).T)
+    core_left, singular, core_right = np.linalg.svd(scale * left_r @ right_r.T)
+    return left @ core_left, singular, core_right @ right.T
 
 
 def hadamard():

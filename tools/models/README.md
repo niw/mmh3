@@ -168,3 +168,33 @@ SVD. One dense step at sigma 1 tells them apart better. There, against rank 128,
 of every variant deviates by about 0.24 to 0.26 of TaoMate's own change of the velocity, as much as
 the BF16 rounding alone, and the audio velocity by 0.08 for the rounding and 0.09 for `--rank 64` and
 `--energy 0.98`. In one listening test on two prompts, rank 128 sounded best.
+
+## pdmd_lora.py
+
+Converts the [PDMD](https://pdmd2026.github.io/) LoRA of MiniMax H3 into a ComfyUI LoRA, which mmh3
+applies with `--lora`. The 2-NFE LoRA runs in two steps, see [PDMD](../../docs/pdmd.md). The LoRA is
+a rank-128 BF16 LoRA of the 208 linear layers of the blocks and the text refiner, under the
+Diffusers names with q, k and v apart, which neither mmh3 nor ComfyUI reads as it is. The converter
+fuses q, k and v into one update and swaps the two halves of the feed-forward input update, because
+Diffusers puts the up half first and the DiT puts the gate half first. The LoRA built with the
+defaults from the 2-NFE LoRA is published at
+[yniw/MiniMax-H3-mmh3](https://huggingface.co/yniw/MiniMax-H3-mmh3), and
+`tools/download-models.sh --pdmd` downloads it. The Hugging Face CLI prints where it puts the LoRA:
+
+```sh
+hf download pdmd2026/pdmd_2NFE_lora lora_model_0.safetensors
+
+uv run tools/models/pdmd_lora.py \
+  --lora /path/to/pdmd_2NFE_lora/lora_model_0.safetensors \
+  --out models/loras/minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors
+```
+
+It computes on the CPU with NumPy and takes about 35 seconds on a DGX Spark. Each layer's update
+B·A is factored again by its SVD and cut to `--max-rank`, 128 by default, which keeps the other
+layers whole and cuts only the fused q, k and v updates from rank 384. `--max-rank 384` keeps them
+whole too, and `--energy X` gives each layer the smallest multiple of 64 up to `--max-rank` that
+keeps the fraction X of the update's squared Frobenius norm.
+
+mmh3 pads the down projections of INT8 layers to 128 rows, so ranks below 128 only make the up
+projections cheaper, and ranks above it cost time. The default's q, k and v updates keep 97% of
+their energy on average.
