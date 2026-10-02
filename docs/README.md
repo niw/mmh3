@@ -2,7 +2,7 @@
 
 Setting a machine up:
 
-- [CUDA on Linux](cuda.md): what the CUDA backend needs and what it writes.
+- [CUDA on Linux and Windows (WSL)](cuda.md): what the CUDA backend needs and what it writes.
 - [Metal on macOS](metal.md): what the Metal backend needs, and its limits.
 - [Models](models.md): the models directory and what is downloaded into it.
 - [Build](build.md): build options and Cargo features.

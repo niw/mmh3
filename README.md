@@ -11,8 +11,8 @@ splitting every diffusion step between them over RDMA where there is a path for 
 sockets where there is not. The machine that hands the work out runs none of it, so it needs no GPU
 of its own.
 
-The backends are [CUDA](docs/cuda.md) on Linux and [Metal](docs/metal.md) on macOS, each with its
-own kernels. Each page says what that backend needs.
+The backends are [CUDA](docs/cuda.md) on Linux and Windows (WSL) and [Metal](docs/metal.md) on
+macOS, each with its own kernels. Each page says what that backend needs.
 
 ## Getting started
 
@@ -25,16 +25,16 @@ make download-models
 make generate
 ```
 
-`make` builds mmh3 with Metal on macOS and CUDA on Linux. `make download-models` downloads the
-models into `models`, and `make generate` writes a video with audio from a sample prompt to
-`out.mp4`. See [Usage](docs/usage.md) for the other settings.
+`make` builds mmh3 with Metal on macOS and CUDA on Linux and Windows (WSL).
+`make download-models` downloads the models into `models`, and `make generate` writes a video with
+audio from a sample prompt to `out.mp4`. See [Usage](docs/usage.md) for the other settings.
 
 ## Performance
 
 These are the times of `make generate`, including model loading and encoding, with warm model
 files. [Performance and accuracy](docs/performance.md) has the times of each stage.
 
-### CUDA on Linux
+### CUDA on Linux and Windows (WSL)
 
 `make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT, with
 its video sparse attention, INT8/FP8 attention and the INT8 video VAE, and writes MP4 with NVENC

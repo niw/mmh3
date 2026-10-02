@@ -8,7 +8,7 @@ make
 `mmh3` in release mode. Override the selection with `make FEATURES=metal` or
 `make FEATURES=cuda,mp4`. See [Metal](metal.md) for macOS requirements and supported options.
 
-On Linux, the default builds CUDA, native MP4 output and the ffmpeg CLI output:
+On Linux and Windows (WSL), the default builds CUDA, native MP4 output and the ffmpeg CLI output:
 `cargo build --release --features cuda,mp4 --bin mmh3`. `make FEATURES=cuda,webm` builds native WebM
 output instead of MP4, for GPUs without NVENC. It needs the VP9/Opus dependencies and the libvpx
 download. `make FEATURES=cuda,mp4,webm` builds both. `CUDA_HOME` points at the CUDA toolkit (default

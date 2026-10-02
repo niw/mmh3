@@ -1,12 +1,13 @@
-# CUDA on Linux
+# CUDA on Linux and Windows (WSL)
 
 The `cuda` backend runs every part of a generation on an NVIDIA GPU, with the kernels in
 `crates/mmh3-cuda`. MP4 output uses NVENC for H.264 video and a built-in AAC encoder.
 
 ## Requirements
 
-- Linux with an NVIDIA Blackwell GPU (developed on a GB10, aarch64) or an Ada GPU (`sm_89`, tested
-  on an RTX 4090). Ada cards copy tiles without TMA, and NVFP4 needs Blackwell.
+- Linux or Windows (WSL) with an NVIDIA Blackwell GPU (developed on a GB10, aarch64) or an Ada
+  GPU (`sm_89`, tested on an RTX 4090). Ada cards copy tiles without TMA, and NVFP4 needs
+  Blackwell.
 - The CUDA toolkit with `nvcc` and cuBLASLt, including its headers, which Ubuntu packages as
   `libcublas-dev-13-0` (developed with CUDA 13.0).
 - Rust with edition 2024 support (developed with 1.98).
