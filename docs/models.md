@@ -26,7 +26,8 @@ lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the [TaoMate-H3](taomate.m
 `loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, `--pdmd`
 also downloads the [PDMD](pdmd.md) LoRA,
 `loras/minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, and
-`--models DIR` downloads into another directory.
+`--models DIR` downloads into another directory. `make download-models LORA=pdmd`, `LORA=turbo` or
+`LORA=taomate` passes `--pdmd`, `--lightx2v-turbo` or `--taomate` to the script.
 
 Patches, such as the FastH3 patch, go into `patches` of the models directory. `--patch` and `--lora`
 take a path, or a file name that mmh3 looks up in `patches` and then `loras` of the models directory

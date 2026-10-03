@@ -25,6 +25,15 @@ make generate \
   SEED=2 OUT=panda.mp4
 ```
 
+`LORA` runs a few-step LoRA with the settings on its page in place of the FastH3 patch: `pdmd` for
+[PDMD](pdmd.md), `turbo` for the [lightx2v Turbo LoRA](lightx2v-turbo.md) and `taomate` for
+[TaoMate-H3](taomate.md). `make download-models` with the same `LORA` also downloads that LoRA:
+
+```sh
+make download-models LORA=pdmd
+make generate LORA=pdmd
+```
+
 `OUTPUT_OPTIONS` goes last on the line, so `make generate OUTPUT_OPTIONS=--ffmpeg` writes the MP4
 through ffmpeg on a GPU or in a container without NVENC.
 

@@ -20,9 +20,26 @@ BACKEND_OPTIONS = --width 672 --height 384 --frames 73
 else
 BACKEND_OPTIONS = --attention-precision int8-fp8
 endif
+# A few-step LoRA in place of the FastH3 patch, with the settings on its page in docs.
+LORA =
+LORA_OPTIONS_pdmd = --steps 2 --shift-video 12 --shift-audio 3 --attention sol --sparse-start 0 \
+	--lora minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors
+LORA_OPTIONS_turbo = --steps 4 --shift-video 6 --shift-audio 3 --attention sol --sparse-start 0 \
+	--lora minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
+LORA_OPTIONS_taomate = --schedule taomate --attention sol --sparse-start 0 \
+	--lora minimax_h3_taomate_3step_lora_rank128_bf16.safetensors
+LORA_DOWNLOAD_pdmd = --pdmd
+LORA_DOWNLOAD_turbo = --lightx2v-turbo
+LORA_DOWNLOAD_taomate = --taomate
+ifeq ($(LORA),)
 # FastVideo's FastH3 in four steps, as a patch on the base DiT, with VSA.
 GENERATE_OPTIONS = --steps 4 $(BACKEND_OPTIONS) \
 	--patch minimax_h3_fasth3_vsa_datafree_patch_rank64.safetensors
+else ifneq ($(LORA_OPTIONS_$(LORA)),)
+GENERATE_OPTIONS = $(BACKEND_OPTIONS) $(LORA_OPTIONS_$(LORA))
+else
+$(error LORA must be pdmd, turbo or taomate, not $(LORA))
+endif
 
 .PHONY: build
 build:
@@ -42,7 +59,7 @@ generate: build
 
 .PHONY: download-models
 download-models:
-	tools/download-models.sh --models "$(MODELS)"
+	tools/download-models.sh --models "$(MODELS)" $(LORA_DOWNLOAD_$(LORA))
 
 # Formats the Rust code with rustfmt, the Python tools with ruff, the Swift code with swiftformat
 # and the C++, CUDA and Metal code with clang-format. uvx runs pinned formatter versions, so the

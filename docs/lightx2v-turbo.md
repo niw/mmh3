@@ -23,6 +23,8 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
   --lora models/loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
 ```
 
+`make download-models LORA=turbo` and `make generate LORA=turbo` run these settings too.
+
 INT8/FP8 attention changes image details and needs about 0.76 GiB more memory. `--sparse-start 0`
 can also change the composition. `--sparse-start 0.2` keeps the first step dense and took 98.98 s.
 So far these settings have been compared visually on one prompt and seed only.

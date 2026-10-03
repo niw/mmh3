@@ -24,6 +24,8 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
   --lora models/loras/minimax_h3_taomate_3step_lora_rank128_bf16.safetensors
 ```
 
+`make download-models LORA=taomate` and `make generate LORA=taomate` run these settings too.
+
 At 1344×768 with Sol-Attn and INT8/FP8 attention, the three steps take 14.3, 13.8 and 13.9 s on a
 DGX Spark, against 13.8, 13.5 and 13.5 s for the DiT without a LoRA.
 
