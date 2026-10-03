@@ -2645,7 +2645,7 @@ mod tests {
         for r in 0..rows {
             for n in 0..outputs {
                 let lora: f32 = (0..rank)
-                    .map(|k| half(mid[r * rank + k]) * half(up[n * rank + k]))
+                    .map(|k| mid[r * rank + k] * half(up[n * rank + k]))
                     .sum();
                 let expected = plain[r * outputs + n] * output_scales[n]
                     + bias[n]
@@ -2655,7 +2655,9 @@ mod tests {
                     .max((finished[r * outputs + n] - expected).abs() / expected.abs().max(1.0));
             }
         }
-        assert!(worst < 1e-3, "{worst}");
+        // The LoRA's FP32 products on the matrix units round the mantissas of `mid` about as
+        // FP16 does, though not its range.
+        assert!(worst < 2e-3, "{worst}");
     }
 
     /// The INT8 product's tiles are 128 rows of eight SIMD groups, so rows past the first 64 of

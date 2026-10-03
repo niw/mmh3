@@ -18,13 +18,14 @@ constant constexpr uint SCALE_OUTPUTS = 1, ADD_BIAS = 2, ACCUMULATE = 4, ADD_LOR
 //
 // A LoRA's up projection is a product of its own over the tile, with the rank for depth. Written
 // out whole it would be an FP32 output the size of the layer's, written once and read back once,
-// so the tile's share goes to threadgroup memory and the product's writes add it. It goes in FP16:
-// in FP32 it would fill the 32 KB a threadgroup has and slow the product, and its rounding is a
-// small fraction of the INT8 activations' own.
+// so the tile's share goes to threadgroup memory and the product's writes add it. It goes in BF16:
+// in FP32 it would fill the 32 KB a threadgroup has and slow the product, and in FP16 a LoRA that
+// adds more than 65504 to an output, as the MLPs of the last blocks can, would add infinity. Its
+// rounding is a small fraction of the INT8 activations' own.
 template <typename Input, typename Weight, typename Accumulator, int GROUPS>
 void packed_product(device Input *a, device Weight *b, device float *c, device const float *scales,
                     device const float *outputs, device const float *bias, device float *mid,
-                    device half *up, constant uint *p, uint g, threadgroup half *lora) {
+                    device half *up, constant uint *p, uint g, threadgroup bfloat *lora) {
     constexpr int TM = 128, TN = 64;
     const int M = p[0], N = p[1], K = p[2], rank = p[4];
     const uint flags = p[3];
@@ -53,7 +54,7 @@ void packed_product(device Input *a, device Weight *b, device float *c, device c
         for (uint i = 0; i < added.get_capacity(); ++i) {
             if (added.is_valid_element(i)) {
                 auto xy = added.get_multidimensional_index(i);
-                lora[xy[1] * TN + xy[0]] = half(added[i]);
+                lora[xy[1] * TN + xy[0]] = bfloat(added[i]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -97,7 +98,7 @@ void packed_product(device Input *a, device Weight *b, device float *c, device c
                      device const float *bias [[buffer(5)]], device float *mid [[buffer(6)]],      \
                      device half *up [[buffer(7)]], constant uint *p [[buffer(8)]],                \
                      uint g [[threadgroup_position_in_grid]]) {                                    \
-        threadgroup half lora[128 * 64];                                                           \
+        threadgroup bfloat lora[128 * 64];                                                         \
         packed_product<INPUT, WEIGHT, ACCUMULATOR, GROUPS>(a, b, c, scales, outputs, bias, mid,    \
                                                            up, p, g, lora);                        \
     }
@@ -615,24 +616,25 @@ void product_whole_depth(thread vec<int, 8> (&acc)[PRODUCT_FRAGMENT_ROWS][PRODUC
     }
 }
 
-// A LoRA's up projection of its down projection's result `mid`, FP16 products added to a SIMD
-// group's outputs.
+// A LoRA's up projection of its down projection's result `mid`, FP32 products added to a SIMD
+// group's outputs. `mid` can pass FP16's largest value, 65504, in the MLPs of the last blocks,
+// where it would turn into infinity, and the rank is too small a depth for FP16 to save any time.
 template <bool CHECK>
 void lora_up(thread fragment_float (&result)[PRODUCT_FRAGMENT_ROWS][PRODUCT_FRAGMENT_COLS],
              device const float *mid, device const half *up, int rank, int row, int col, int rows,
              int cols, short2 at) {
     for (int k = 0; k < rank; k += FRAGMENT) {
-        fragment_half down[PRODUCT_FRAGMENT_ROWS], ups[PRODUCT_FRAGMENT_COLS];
+        fragment_float down[PRODUCT_FRAGMENT_ROWS], ups[PRODUCT_FRAGMENT_COLS];
         _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
-            down[m] = load_block<CHECK, false, half>(mid + (max(row, 0) + m * FRAGMENT) * rank + k,
-                                                     rank, rows - m * FRAGMENT, rank - k, at);
+            down[m] = load_block<CHECK, false, float>(mid + (max(row, 0) + m * FRAGMENT) * rank + k,
+                                                      rank, rows - m * FRAGMENT, rank - k, at);
         _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; ++n)
-            ups[n] = load_block<CHECK, true, half>(up + (max(col, 0) + n * FRAGMENT) * rank + k,
-                                                   rank, cols - n * FRAGMENT, rank - k, at);
+            ups[n] = load_block<CHECK, true, float>(up + (max(col, 0) + n * FRAGMENT) * rank + k,
+                                                    rank, cols - n * FRAGMENT, rank - k, at);
         _Pragma("clang loop unroll(full)") for (short m = 0; m < PRODUCT_FRAGMENT_ROWS; ++m)
             _Pragma("clang loop unroll(full)") for (short n = 0; n < PRODUCT_FRAGMENT_COLS; n += 2)
-                multiply_fragments<true>(result[m][n], result[m][n + 1], down[m], ups[n],
-                                         ups[n + 1]);
+                multiply_fragments<true, float, float>(result[m][n], result[m][n + 1], down[m],
+                                                       ups[n], ups[n + 1]);
     }
 }
 

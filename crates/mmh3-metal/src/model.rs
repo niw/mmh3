@@ -1169,10 +1169,44 @@ mod tests {
     /// tiles of the product and a rank that is not a whole tile, on every road.
     #[test]
     fn a_lora_adds_what_its_two_products_make() {
+        let tensor_ops = Device::new().unwrap().supports_tensor_ops();
+        // The down projection on the packed rows, rotated INT8 weights and all, is further from
+        // the FP64 product than the one on the rows as they are.
+        check_lora(
+            1.0,
+            &[
+                (LinearPrecision::Fp32, false, false, 3e-3),
+                (LinearPrecision::MpsFp16, false, false, 3e-3),
+                (LinearPrecision::MpsFp16, tensor_ops, false, 3e-3),
+                (LinearPrecision::Fp16, tensor_ops, false, 3e-3),
+                (LinearPrecision::Int8, tensor_ops, false, 3e-3),
+                (LinearPrecision::Fp16, tensor_ops, tensor_ops, 1e-2),
+                (LinearPrecision::Int8, tensor_ops, tensor_ops, 2e-2),
+            ],
+        );
+    }
+
+    /// A LoRA whose down projection and whose additions pass FP16's largest value, as the rows of
+    /// a late block's MLP can make them, still adds what it makes when the product takes it in.
+    #[test]
+    fn a_lora_adds_down_projections_past_the_range_of_fp16() {
+        let tensor_ops = Device::new().unwrap().supports_tensor_ops();
+        check_lora(
+            1e5,
+            &[
+                (LinearPrecision::Fp16, tensor_ops, tensor_ops, 1e-2),
+                (LinearPrecision::Int8, tensor_ops, tensor_ops, 2e-2),
+            ],
+        );
+    }
+
+    /// Checks each road's LoRA against the FP64 products, on rows `magnitude` times the size of
+    /// a block's.
+    fn check_lora(magnitude: f32, roads: &[(LinearPrecision, bool, bool, f64)]) {
         let device = Device::new().unwrap();
         let (rows, inputs, outputs, rank) = (200, 512, 130, 24);
         let x: Vec<f32> = (0..rows * inputs)
-            .map(|i| ((i * 13 % 97) as f32 - 48.0) / 31.0)
+            .map(|i| ((i * 13 % 97) as f32 - 48.0) / 31.0 * magnitude)
             .collect();
         let weight: Vec<u8> = (0..inputs * outputs)
             .map(|i| ((i * 7 % 255) as i32 - 127) as i8 as u8)
@@ -1234,19 +1268,22 @@ mod tests {
             })
             .collect();
         let largest = expected.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+        let largest_mid = (0..rows * rank).fold(0.0f64, |m, i| {
+            let (r, k) = (i / rank, i % rank);
+            let mid: f64 = (0..inputs)
+                .map(|j| x[r * inputs + j] as f64 * down[k * inputs + j] as f64)
+                .sum();
+            m.max(mid.abs())
+        });
+        if magnitude > 1.0 {
+            assert!(
+                largest_mid > 65504.0,
+                "a down projection of {largest_mid} fits in FP16"
+            );
+        }
 
         let tensor_ops = device.supports_tensor_ops();
-        // The down projection on the packed rows, rotated INT8 weights and all, is further from
-        // the FP64 product than the one on the rows as they are.
-        for (precision, half, rotated, tolerance) in [
-            (LinearPrecision::Fp32, false, false, 3e-3),
-            (LinearPrecision::MpsFp16, false, false, 3e-3),
-            (LinearPrecision::MpsFp16, tensor_ops, false, 3e-3),
-            (LinearPrecision::Fp16, tensor_ops, false, 3e-3),
-            (LinearPrecision::Int8, tensor_ops, false, 3e-3),
-            (LinearPrecision::Fp16, tensor_ops, tensor_ops, 1e-2),
-            (LinearPrecision::Int8, tensor_ops, tensor_ops, 2e-2),
-        ] {
+        for &(precision, half, rotated, tolerance) in roads {
             if matches!(precision, LinearPrecision::Fp16 | LinearPrecision::Int8) && !tensor_ops {
                 continue;
             }
