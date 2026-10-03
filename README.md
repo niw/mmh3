@@ -67,7 +67,8 @@ A complete generation took:
 | M4 Max | 128 GB | 27 s | 153 s |
 | M6 | 24 GB | 12 s | 67 s |
 
-Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps.
+Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps. On the M6, the 2-step
+[PDMD](docs/pdmd.md) LoRA generated a video of the same size in 45 s.
 
 ## Status
 
