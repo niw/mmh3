@@ -65,6 +65,10 @@ through ffmpeg on a GPU or in a container without NVENC.
   there is no CFG.
 - `--schedule uniform|taomate` (default `uniform`): `taomate` runs the three steps the TaoMate-H3
   LoRA was distilled for, states 0, 16, 33 and 49 of the 50-step schedule, in place of `--steps`.
+- `--sampler euler|renoise` (default `euler`): How a step moves to the next sigma. `euler` is the
+  official pipeline's Euler step. `renoise` takes the clean latent the step predicts and noises it
+  again to the next sigma with fresh noise from the seed, the rule DMD-style students are trained
+  with.
 - `--seed N` (default 0): Seed of the initial noise.
 - `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
   Turbo LoRA wants 6 and 3.

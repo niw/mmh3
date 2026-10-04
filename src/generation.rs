@@ -1,5 +1,5 @@
 //! Sampling shared by `mmh3 generate` and `mmh3-tools latent`: the generation settings, the
-//! prompt's text states and the DiT's Euler steps from the seed's noise, with the keyframes of
+//! prompt's text states and the DiT's steps from the seed's noise, with the keyframes of
 //! first and last frame generation or the reference pictures of reference to video generation.
 
 use crate::audio::load_audio;
@@ -17,7 +17,7 @@ use crate::pictures::load_picture;
 use crate::video::{ReferenceClip, block_seconds};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::video::{block_frames, load_clip};
-use mmh3_core::dit::sampler::Schedule;
+use mmh3_core::dit::sampler::{Sampler, Schedule};
 use mmh3_core::generation::GenerationShape;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
@@ -41,6 +41,7 @@ pub const OPTIONS: &[&str] = &[
     "reference-video",
     "steps",
     "schedule",
+    "sampler",
     "seed",
     "shift-video",
     "shift-audio",
@@ -197,6 +198,7 @@ pub struct Settings {
     /// Clips of `--reference-video` in their order, each on its own canvas with its soundtrack.
     pub clips: Vec<ReferenceClip>,
     pub schedule: Schedule,
+    pub sampler: Sampler,
     pub steps: usize,
     pub seed: u64,
     pub shift_video: f32,
@@ -404,6 +406,11 @@ impl Settings {
                 return Err(format!("--schedule must be uniform or taomate, not {other}").into());
             }
         };
+        let sampler = match options.get("sampler").copied().unwrap_or("euler") {
+            "euler" => Sampler::Euler,
+            "renoise" => Sampler::Renoise,
+            other => return Err(format!("--sampler must be euler or renoise, not {other}").into()),
+        };
         let pictures: Vec<(bool, mmh3_core::picture::Picture)> =
             [("first-frame", true), ("last-frame", false)]
                 .into_iter()
@@ -499,6 +506,7 @@ impl Settings {
             clips,
             steps: schedule.steps(),
             schedule,
+            sampler,
             seed: option_number(options, "seed", 0)? as u64,
             shift_video,
             shift_audio,
@@ -520,14 +528,14 @@ impl Settings {
     }
 }
 
-/// Encodes the prompt, or reads the text states of `--context`, and runs the DiT's Euler steps
+/// Encodes the prompt, or reads the text states of `--context`, and runs the DiT's steps
 /// from the seed's noise. Returns the final video and audio latents.
 pub fn sample(
     options: &HashMap<&str, &str>,
     settings: &Settings,
 ) -> Result<(Tensor, Tensor), Box<dyn Error>> {
     use mmh3_core::dit::inputs::{DitInputs, Keyframe, Reference};
-    use mmh3_core::dit::sampler::euler_step;
+    use mmh3_core::dit::sampler::{euler_step, renoise_step};
     use mmh3_core::generation::FPS;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tokenizer::Tokenizer;
@@ -919,18 +927,40 @@ pub fn sample(
                 }
             }
         };
-        euler_step(
-            &mut video.data,
-            &velocity.video,
-            schedule.video[step],
-            schedule.video[step + 1],
-        );
-        euler_step(
-            &mut audio.data,
-            &velocity.audio,
-            schedule.audio[step],
-            schedule.audio[step + 1],
-        );
+        // NOTE: the fresh noise of the re-noise rule continues the stream of the initial noise,
+        // video before audio. The last step lands on the clean latent, which the Euler step reaches
+        // too, so it draws no noise.
+        if settings.sampler == Sampler::Renoise && step + 1 < steps {
+            let fresh = noise.samples(video.data.len());
+            renoise_step(
+                &mut video.data,
+                &velocity.video,
+                &fresh,
+                schedule.video[step],
+                schedule.video[step + 1],
+            );
+            let fresh = noise.samples(audio.data.len());
+            renoise_step(
+                &mut audio.data,
+                &velocity.audio,
+                &fresh,
+                schedule.audio[step],
+                schedule.audio[step + 1],
+            );
+        } else {
+            euler_step(
+                &mut video.data,
+                &velocity.video,
+                schedule.video[step],
+                schedule.video[step + 1],
+            );
+            euler_step(
+                &mut audio.data,
+                &velocity.audio,
+                schedule.audio[step],
+                schedule.audio[step + 1],
+            );
+        }
         let routing = routed.map_or(String::new(), |fraction| {
             format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
         });

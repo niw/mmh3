@@ -1,4 +1,4 @@
-//! Sampling schedules and the Euler update of the rectified flow.
+//! Sampling schedules and the step rules of the rectified flow.
 
 use crate::dit::timestep::time_shift_sigma;
 
@@ -56,12 +56,36 @@ impl Schedule {
     }
 }
 
+/// How a step moves the latent from one sigma to the next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sampler {
+    /// The Euler step of the flow, the rule of the official pipeline.
+    Euler,
+    /// The multistep rule of DMD-style students: the clean latent the step predicts, noised again
+    /// with fresh noise to the next sigma.
+    Renoise,
+}
+
 /// One Euler step: x ← x + (sigma_next − sigma) · v, where v is the flow velocity
 /// (x0 = x − sigma · v).
 pub fn euler_step(latent: &mut [f32], velocity: &[f32], sigma: f32, sigma_next: f32) {
     let delta = sigma_next - sigma;
     for (value, &slope) in latent.iter_mut().zip(velocity) {
         *value += delta * slope;
+    }
+}
+
+/// One re-noise step: x ← (1 − sigma_next) · x0 + sigma_next · noise, where x0 = x − sigma · v.
+pub fn renoise_step(
+    latent: &mut [f32],
+    velocity: &[f32],
+    noise: &[f32],
+    sigma: f32,
+    sigma_next: f32,
+) {
+    for ((value, &slope), &fresh) in latent.iter_mut().zip(velocity).zip(noise) {
+        let clean = *value - sigma * slope;
+        *value = (1.0 - sigma_next) * clean + sigma_next * fresh;
     }
 }
 
@@ -104,6 +128,16 @@ mod tests {
             let (sigma, next) = (schedule.video[step], schedule.video[step + 1]);
             euler_step(&mut latent, &[noise - clean], sigma, next);
         }
+        assert!((latent[0] - clean).abs() < 1e-6);
+    }
+
+    #[test]
+    fn renoises_the_predicted_clean_latent() {
+        let (clean, noise, fresh) = (2.0f32, -1.0f32, 0.5f32);
+        let mut latent = [0.25 * noise + 0.75 * clean];
+        renoise_step(&mut latent, &[noise - clean], &[fresh], 0.25, 0.1);
+        assert!((latent[0] - (0.9 * clean + 0.1 * fresh)).abs() < 1e-6);
+        renoise_step(&mut latent, &[fresh - clean], &[fresh], 0.1, 0.0);
         assert!((latent[0] - clean).abs() < 1e-6);
     }
 }
