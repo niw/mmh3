@@ -198,3 +198,25 @@ keeps the fraction X of the update's squared Frobenius norm.
 mmh3 pads the down projections of INT8 layers to 128 rows, so ranks below 128 only make the up
 projections cheaper, and ranks above it cost time. The default's q, k and v updates keep 97% of
 their energy on average.
+
+## dmad_lora.py
+
+Converts a [DMAD](https://yzmblog.github.io/projects/DMAD/) LoRA of MiniMax H3 into a ComfyUI LoRA,
+which mmh3 applies with `--lora`. The 4-step students run with the re-noise step rule, see
+[DMAD](../../docs/dmad.md). Each student is a rank-128 BF16 LoRA of the same 208 layers as PDMD's,
+under the Diffusers names, and the converter shares `diffusers_lora.py` with `pdmd_lora.py`, so it
+converts them the same way and takes the same `--max-rank` and `--energy`. The LoRA built with the
+defaults from the student of the fully trained critic is published at
+[yniw/MiniMax-H3-mmh3](https://huggingface.co/yniw/MiniMax-H3-mmh3), and
+`tools/download-models.sh --dmad` downloads it:
+
+```sh
+hf download ZhengmingYu/DMAD --include "minimax_h3/*"
+
+uv run tools/models/dmad_lora.py \
+  --lora /path/to/DMAD/minimax_h3/dmad_minimax_h3_4step_full_critic.safetensors \
+  --out models/loras/minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors
+```
+
+It takes about 40 seconds on a DGX Spark. The default's q, k and v updates keep 96% of their energy
+on average, and 94% for the paper's checkpoint.

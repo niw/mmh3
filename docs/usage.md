@@ -26,8 +26,9 @@ make generate \
 ```
 
 `LORA` runs a few-step LoRA with the settings on its page in place of the FastH3 patch: `pdmd` for
-[PDMD](pdmd.md), `turbo` for the [lightx2v Turbo LoRA](lightx2v-turbo.md) and `taomate` for
-[TaoMate-H3](taomate.md). `make download-models` with the same `LORA` also downloads that LoRA:
+[PDMD](pdmd.md), `dmad` for [DMAD](dmad.md), `turbo` for the
+[lightx2v Turbo LoRA](lightx2v-turbo.md) and `taomate` for [TaoMate-H3](taomate.md).
+`make download-models` with the same `LORA` also downloads that LoRA:
 
 ```sh
 make download-models LORA=pdmd
@@ -67,8 +68,8 @@ through ffmpeg on a GPU or in a container without NVENC.
   LoRA was distilled for, states 0, 16, 33 and 49 of the 50-step schedule, in place of `--steps`.
 - `--sampler euler|renoise` (default `euler`): How a step moves to the next sigma. `euler` is the
   official pipeline's Euler step. `renoise` takes the clean latent the step predicts and noises it
-  again to the next sigma with fresh noise from the seed, the rule DMD-style students are trained
-  with.
+  again to the next sigma with fresh noise from the seed, the rule DMD-style students such as
+  [DMAD](dmad.md) are trained with.
 - `--seed N` (default 0): Seed of the initial noise.
 - `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
   Turbo LoRA wants 6 and 3.
@@ -134,3 +135,4 @@ non_diegetic_music: A slow, swelling orchestral string theme.
 - [lightx2v Turbo LoRA](lightx2v-turbo.md): a LoRA that generates in four steps.
 - [TaoMate-H3](taomate.md): a LoRA that generates in three steps with `--schedule taomate`.
 - [PDMD](pdmd.md): a LoRA that generates in two steps.
+- [DMAD](dmad.md): a LoRA that generates in four steps with `--sampler renoise`.

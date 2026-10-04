@@ -28,9 +28,12 @@ LORA_OPTIONS_turbo = --steps 4 --shift-video 6 --shift-audio 3 --attention sol -
 	--lora minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors
 LORA_OPTIONS_taomate = --schedule taomate --attention sol --sparse-start 0 \
 	--lora minimax_h3_taomate_3step_lora_rank128_bf16.safetensors
+LORA_OPTIONS_dmad = --steps 4 --shift-video 12 --shift-audio 2 --sampler renoise --attention sol \
+	--sparse-start 0 --lora minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors
 LORA_DOWNLOAD_pdmd = --pdmd
 LORA_DOWNLOAD_turbo = --lightx2v-turbo
 LORA_DOWNLOAD_taomate = --taomate
+LORA_DOWNLOAD_dmad = --dmad
 ifeq ($(LORA),)
 # FastVideo's FastH3 in four steps, as a patch on the base DiT, with VSA.
 GENERATE_OPTIONS = --steps 4 $(BACKEND_OPTIONS) \
@@ -38,7 +41,7 @@ GENERATE_OPTIONS = --steps 4 $(BACKEND_OPTIONS) \
 else ifneq ($(LORA_OPTIONS_$(LORA)),)
 GENERATE_OPTIONS = $(BACKEND_OPTIONS) $(LORA_OPTIONS_$(LORA))
 else
-$(error LORA must be pdmd, turbo or taomate, not $(LORA))
+$(error LORA must be pdmd, dmad, turbo or taomate, not $(LORA))
 endif
 
 .PHONY: build

@@ -7,7 +7,7 @@ usage() {
   cat <<EOF
 usage: $0 [--video-vae int8|fp16] [--ref2va | --no-ref2va] [--fasth3 | --no-fasth3]
        [--lightx2v-turbo | --no-lightx2v-turbo] [--taomate | --no-taomate] [--pdmd | --no-pdmd]
-       [--models DIR]
+       [--dmad | --no-dmad] [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf), or with curl
 when hf is not installed. curl sends HF_TOKEN when it is set. By default it downloads the ones make
@@ -29,6 +29,8 @@ VSA-DataFree patch.
   --no-taomate         No TaoMate LoRA (default).
   --pdmd               The 2-step PDMD LoRA from yniw/MiniMax-H3-mmh3, into loras.
   --no-pdmd            No PDMD LoRA (default).
+  --dmad               The 4-step DMAD LoRA from yniw/MiniMax-H3-mmh3, into loras.
+  --no-dmad            No DMAD LoRA (default).
   --models DIR         The models directory (default: models in the repository).
 EOF
 }
@@ -44,6 +46,7 @@ fasth3=1
 turbo=0
 taomate=0
 pdmd=0
+dmad=0
 models=$(cd "$(dirname "$0")/.." && pwd)/models
 
 while [[ $# -gt 0 ]]; do
@@ -63,6 +66,8 @@ while [[ $# -gt 0 ]]; do
     --no-taomate) taomate=0 ;;
     --pdmd) pdmd=1 ;;
     --no-pdmd) pdmd=0 ;;
+    --dmad) dmad=1 ;;
+    --no-dmad) dmad=0 ;;
     --models)
       [[ $# -ge 2 ]] || fail "--models needs a directory"
       models=$2
@@ -138,6 +143,9 @@ if [[ $taomate == 1 ]]; then
 fi
 if [[ $pdmd == 1 ]]; then
   mmh3_files+=(loras/minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors)
+fi
+if [[ $dmad == 1 ]]; then
+  mmh3_files+=(loras/minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors)
 fi
 if [[ ${#mmh3_files[@]} -gt 0 ]]; then
   download yniw/MiniMax-H3-mmh3 "$models" "${mmh3_files[@]}"
