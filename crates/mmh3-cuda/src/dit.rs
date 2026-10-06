@@ -20,6 +20,7 @@ use crate::nvfp4::{
 };
 use crate::shard::{self, Region, ShardContext, VelocityRows};
 use crate::streaming::{Pass, Stream};
+use crate::veda::{VedaPass, VedaWeights};
 use crate::{CudaError, DeviceBuffer, check, copy_device};
 use mmh3_core::dit::config::DitConfig;
 use mmh3_core::dit::inputs::DitInputs;
@@ -27,6 +28,7 @@ use mmh3_core::dit::latent::{pack_audio, patchify_video, unpack_audio, unpatchif
 use mmh3_core::dit::layout::{PackedLayout, SegmentKind};
 use mmh3_core::dit::sparse::{SparseAttention, SparseMethod, SparseSinks};
 use mmh3_core::dit::timestep::{MODALITY_COUNT, StepTimesteps};
+use mmh3_core::dit::veda::VedaPredictor;
 use mmh3_core::dit::vsa::VsaPlan;
 use mmh3_core::numeric::f32_to_bf16;
 use mmh3_core::safetensors::{DType, SafeTensors, TensorInfo};
@@ -248,6 +250,7 @@ struct ForwardBuffers {
     workspace: Option<Workspace>,
     sparse: Option<(AttentionPrecision, SparseWorkspace)>,
     vsa: Option<(AttentionPrecision, VsaPlan, VsaWorkspace)>,
+    veda: Option<VedaPass>,
     text: Option<TextStates>,
 }
 
@@ -353,13 +356,15 @@ pub struct DitOutputs {
     pub video: Vec<f32>,
     /// Velocity in the layout of the audio input.
     pub audio: Vec<f32>,
-    /// Mean fraction of key blocks Sol-Attn routed exactly, over the blocks, when it ran.
+    /// The mean fraction of key blocks Sol-Attn routed exactly, or of the video tile pairs Veda
+    /// kept, over the blocks, when either ran.
     pub routed_fraction: Option<f64>,
     /// This rank's rows, when the step was shared out. The velocity above is then empty.
     pub part: Option<VelocityRows>,
 }
 
 /// Block-sparse attention for the blocks of one call.
+#[derive(Clone, Copy)]
 enum SparsePass<'a> {
     Sol {
         workspace: &'a SparseWorkspace,
@@ -370,6 +375,12 @@ enum SparsePass<'a> {
     Vsa {
         workspace: &'a VsaWorkspace,
         kept: usize,
+    },
+    /// Veda with its predictor, in block `layer`.
+    Veda {
+        pass: &'a VedaPass,
+        weights: &'a VedaWeights,
+        layer: usize,
     },
 }
 
@@ -392,6 +403,8 @@ pub struct CudaDit {
     nvfp4_scales: HashMap<String, Nvfp4Scale>,
     adaln_table: Tensor,
     inverse_frequencies: Vec<f32>,
+    /// Veda's predictor, which `--attention veda` needs.
+    veda: Option<VedaWeights>,
     buffers: RefCell<ForwardBuffers>,
 }
 
@@ -524,6 +537,7 @@ impl CudaDit {
             nvfp4_scales: HashMap::new(),
             adaln_table: host_tensor(file, &format!("{prefix}adaln_t_table"))?,
             inverse_frequencies: host_tensor(file, &format!("{prefix}rope.inv_freq"))?.data,
+            veda: None,
             buffers: RefCell::default(),
         })
     }
@@ -562,6 +576,7 @@ impl CudaDit {
             nvfp4_scales,
             adaln_table: self.adaln_table.clone(),
             inverse_frequencies: self.inverse_frequencies.clone(),
+            veda: self.veda.as_ref().map(VedaWeights::copied).transpose()?,
             buffers: RefCell::default(),
         })
     }
@@ -573,6 +588,28 @@ impl CudaDit {
 
     pub fn set_attention_precision(&mut self, precision: AttentionPrecision) {
         self.attention_precision = precision;
+    }
+
+    /// Takes Veda's predictor, which picks the tiles of `--attention veda`.
+    pub fn set_veda_predictor(&mut self, predictor: &VedaPredictor) -> Result<(), Error> {
+        let config = &self.config;
+        if predictor.layers != config.layers
+            || predictor.heads != config.heads
+            || predictor.head_dim != config.head_dim
+        {
+            return Err(Error::Model(format!(
+                "the Veda predictor scores {} blocks of {} heads of {}, and the DiT has {} of {} of {}",
+                predictor.layers,
+                predictor.heads,
+                predictor.head_dim,
+                config.layers,
+                config.heads,
+                config.head_dim
+            )));
+        }
+        self.buffers.borrow_mut().veda = None;
+        self.veda = Some(VedaWeights::new(predictor)?);
+        Ok(())
     }
 
     /// How much neighbouring query tiles shared in the last VSA call, or `None` when no call has
@@ -1385,6 +1422,7 @@ impl CudaDit {
                 Some(PreparedAttention::Sparse(workspace))
             }
             (Some(SparsePass::Vsa { workspace, .. }), _) => Some(PreparedAttention::Vsa(workspace)),
+            (Some(SparsePass::Veda { .. }), _) => None,
             (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
             (None, None) => None,
         };
@@ -1467,6 +1505,11 @@ impl CudaDit {
                     vsa_workspace,
                     ready,
                 )?,
+                Some(SparsePass::Veda { .. }) => {
+                    return Err(Error::Model(
+                        "a shared-out step does not run Veda".to_owned(),
+                    ));
+                }
             }
         }
         // The attention is on the stream too, and the peers are about to read what it wrote.
@@ -1715,6 +1758,7 @@ impl CudaDit {
                 Some(PreparedAttention::Sparse(workspace))
             }
             (Some(SparsePass::Vsa { workspace, .. }), _) => Some(PreparedAttention::Vsa(workspace)),
+            (Some(SparsePass::Veda { .. }), _) => None,
             (None, Some(quantized)) => Some(PreparedAttention::DenseQuantized(quantized)),
             (None, None) => None,
         };
@@ -1916,6 +1960,19 @@ impl CudaDit {
                                 kept,
                                 vsa_workspace,
                                 inputs,
+                            )?,
+                            SparsePass::Veda {
+                                pass,
+                                weights,
+                                layer,
+                            } => pass.attend_pointers(
+                                weights,
+                                qkv.cast(),
+                                qkv.add(inner).cast(),
+                                qkv.add(2 * inner).cast(),
+                                workspace.attention.pointer(),
+                                &layout,
+                                layer,
                             )?,
                         }
                     }
@@ -2364,9 +2421,31 @@ impl CudaDit {
         let method = sparse
             .filter(|settings| tokens >= settings.min_tokens)
             .map(|settings| settings.method);
-        if matches!(method, Some(SparseMethod::Veda { .. })) {
-            return Err(Error::Model("Veda runs on Metal so far".to_owned()));
-        }
+        let veda_sparsity = match method {
+            Some(SparseMethod::Veda {
+                sparsity,
+                reference_sparsity,
+            }) => {
+                if context.is_some() {
+                    return Err(Error::Model(
+                        "a shared-out step does not run Veda".to_owned(),
+                    ));
+                }
+                if self.attention_precision != AttentionPrecision::Bf16 {
+                    return Err(Error::Model("Veda on CUDA attends in BF16".to_owned()));
+                }
+                Some((sparsity, reference_sparsity))
+            }
+            _ => None,
+        };
+        let veda_weights = match veda_sparsity {
+            Some(_) => Some(self.veda.as_ref().ok_or_else(|| {
+                Error::Model(
+                    "Veda attention needs a predictor, which the DiT does not have".to_owned(),
+                )
+            })?),
+            None => None,
+        };
         let sparse_tau = match method {
             Some(SparseMethod::Sol { tau }) => Some(tau),
             _ => None,
@@ -2384,6 +2463,7 @@ impl CudaDit {
             workspace: cached_workspace,
             sparse: cached_sparse,
             vsa: cached_vsa,
+            veda: cached_veda,
             text: cached_text,
         } = &mut *buffers;
         let shape = WorkspaceShape {
@@ -2476,6 +2556,26 @@ impl CudaDit {
                 ));
             }
             None => *cached_vsa = None,
+        }
+        match (veda_weights, veda_sparsity) {
+            (Some(weights), Some((sparsity, reference_sparsity))) => {
+                if !cached_veda
+                    .as_ref()
+                    .is_some_and(|pass| pass.serves(&layout, sparsity, reference_sparsity))
+                {
+                    *cached_veda = None;
+                    *cached_veda = Some(VedaPass::new(
+                        weights,
+                        &layout,
+                        sparsity,
+                        reference_sparsity,
+                    )?);
+                }
+                if let Some(pass) = cached_veda.as_ref() {
+                    pass.reset()?;
+                }
+            }
+            _ => *cached_veda = None,
         }
         // The blocks kept back on the device take what the buffers above leave.
         self.stream
@@ -2608,6 +2708,16 @@ impl CudaDit {
         };
 
         let sparse_pass = match (sparse_tau, vsa_sparsity) {
+            _ if veda_weights.is_some() => {
+                cached_veda
+                    .as_ref()
+                    .zip(veda_weights)
+                    .map(|(pass, weights)| SparsePass::Veda {
+                        pass,
+                        weights,
+                        layer: 0,
+                    })
+            }
             (Some(tau), _) => cached_sparse
                 .as_ref()
                 .map(|(_, workspace)| SparsePass::Sol {
@@ -2652,7 +2762,16 @@ impl CudaDit {
                 Some(&angles),
                 Some((modulation, &block_rows)),
                 pending,
-                sparse_pass.as_ref(),
+                sparse_pass
+                    .map(|pass| match pass {
+                        SparsePass::Veda { pass, weights, .. } => SparsePass::Veda {
+                            pass,
+                            weights,
+                            layer,
+                        },
+                        other => other,
+                    })
+                    .as_ref(),
                 context.as_deref_mut().map(|context| (context, tokens)),
             )?;
             pass.leave(refiner + layer)?;
@@ -2748,8 +2867,11 @@ impl CudaDit {
                 .into_iter()
                 .map(|value| -value)
                 .collect(),
-            routed_fraction: matches!(sparse_pass, Some(SparsePass::Sol { .. }))
-                .then(|| routed / config.layers as f64),
+            routed_fraction: match &sparse_pass {
+                Some(SparsePass::Veda { pass, .. }) => pass.kept_fraction()?,
+                Some(SparsePass::Sol { .. }) => Some(routed / config.layers as f64),
+                _ => None,
+            },
             part: None,
         })
     }

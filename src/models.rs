@@ -63,6 +63,20 @@ pub fn load_dit(
         )?;
         println!("applied {patch} to {layers} layers and tensors");
     }
+    if options.get("attention") == Some(&"veda") {
+        use mmh3_core::dit::veda::{VEDA_PREDICTOR_FILE, VedaPredictor};
+
+        if precision != mmh3_cuda::attention::AttentionPrecision::Bf16 {
+            return Err("--attention veda on CUDA attends in bf16".into());
+        }
+        let path = option_path(options, "veda-predictor", VEDA_PREDICTOR_FILE)?;
+        let predictor = VedaPredictor::open(Path::new(&path))?;
+        dit.set_veda_predictor(&predictor)?;
+        println!(
+            "loaded the Veda predictor {path}, trained to keep {} of the video tiles",
+            predictor.keep_ratio
+        );
+    }
     if let Some(lora) = model_file(options, "lora", &["loras"])? {
         let started = Instant::now();
         let strength = option_float(options, "lora-strength", 1.0)?;
@@ -244,9 +258,6 @@ pub fn sparse_attention(
             }))
         }
         "veda" => {
-            if cfg!(feature = "cuda") {
-                return Err("--attention veda runs on Metal so far".into());
-            }
             let fraction = |name: &str| -> Result<f64, Box<dyn Error>> {
                 let value = match options.get(name) {
                     Some(value) => value
