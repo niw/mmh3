@@ -202,14 +202,16 @@ pub fn save_algorithm_cache() {
     }
 }
 
-/// Block-sparse attention settings from `--attention sol|vsa`, `--sparse-tau`, `--sparse-start`
-/// and `--vsa-sparsity`, or None for dense attention. Without `--attention`, DiTs with VSA gates
+/// Block-sparse attention settings from `--attention sol|vsa|veda`, `--sparse-tau`,
+/// `--sparse-start`, `--vsa-sparsity`, `--veda-sparsity` and `--veda-reference-sparsity`, or None
+/// for dense attention. Without `--attention`, DiTs with VSA gates
 /// (`vsa_gates`) use VSA and others dense attention.
 pub fn sparse_attention(
     options: &HashMap<&str, &str>,
     vsa_gates: bool,
 ) -> Result<Option<mmh3_core::dit::sparse::SparseAttention>, Box<dyn Error>> {
     use mmh3_core::dit::sparse::{SparseAttention, SparseMethod};
+    use mmh3_core::dit::veda::VEDA_SPARSITY;
     use mmh3_core::dit::vsa::FASTH3_SPARSITY;
 
     let default = if vsa_gates { "vsa" } else { "dense" };
@@ -241,7 +243,31 @@ pub fn sparse_attention(
                 ..SparseAttention::vsa(sparsity)
             }))
         }
-        other => Err(format!("--attention must be dense, sol or vsa, not {other}").into()),
+        "veda" => {
+            if cfg!(feature = "cuda") {
+                return Err("--attention veda runs on Metal so far".into());
+            }
+            let fraction = |name: &str| -> Result<f64, Box<dyn Error>> {
+                let value = match options.get(name) {
+                    Some(value) => value
+                        .parse::<f64>()
+                        .map_err(|_| format!("--{name} must be a number"))?,
+                    None => VEDA_SPARSITY,
+                };
+                if !(0.0..1.0).contains(&value) {
+                    return Err(format!("--{name} must be at least 0 and below 1").into());
+                }
+                Ok(value)
+            };
+            Ok(Some(SparseAttention {
+                start_fraction: option_float(options, "sparse-start", 0.0)?,
+                ..SparseAttention::veda(
+                    fraction("veda-sparsity")?,
+                    fraction("veda-reference-sparsity")?,
+                )
+            }))
+        }
+        other => Err(format!("--attention must be dense, sol, vsa or veda, not {other}").into()),
     }
 }
 

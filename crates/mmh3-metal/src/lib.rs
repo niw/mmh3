@@ -14,6 +14,7 @@ pub mod sparse;
 mod streaming;
 pub mod text_encoder;
 pub mod vae;
+pub mod veda;
 pub mod video_encoder;
 pub mod vision;
 

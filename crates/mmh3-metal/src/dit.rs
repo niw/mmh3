@@ -7,6 +7,7 @@ use crate::{
     shard::ShardContext,
     sparse::SparsePass,
     streaming::{Pass, Stream, fits},
+    veda::{VedaPass, VedaWeights},
 };
 use mmh3_core::{
     dit::{
@@ -16,6 +17,7 @@ use mmh3_core::{
         layout::{PackedLayout, SegmentKind},
         sparse::{SparseMethod, SparseSinks},
         timestep::StepTimesteps,
+        veda::VedaPredictor,
         vsa::VsaPlan,
     },
     safetensors::SafeTensors,
@@ -41,6 +43,16 @@ pub struct MetalDit {
     inv_freq: Vec<f32>,
     /// The blocks read on the way, when some are.
     stream: Option<RefCell<Stream>>,
+    /// Veda's predictor, which `--attention veda` needs.
+    veda: Option<VedaWeights>,
+}
+
+/// The block-sparse attention of one block.
+#[derive(Clone, Copy)]
+enum BlockSparse<'a> {
+    Pass(&'a SparsePass),
+    /// Veda, with the block's index.
+    Veda(&'a VedaPass<'a>, usize),
 }
 
 /// Refined prompt states retained on the GPU for an entire sampling run.
@@ -75,6 +87,8 @@ pub struct DitOutput {
     pub blocks: Vec<(usize, Vec<f32>)>,
     pub video: Vec<f32>,
     pub audio: Vec<f32>,
+    /// The mean fraction of key blocks Sol-Attn routed exactly, or of the video tile pairs Veda
+    /// kept, over the blocks, when either ran.
     pub routed_fraction: Option<f64>,
 }
 
@@ -156,7 +170,29 @@ impl MetalDit {
             time_table,
             inv_freq,
             stream: stream.map(RefCell::new),
+            veda: None,
         })
+    }
+
+    /// Takes Veda's predictor, which picks the tiles of `--attention veda`.
+    pub fn set_veda_predictor(&mut self, predictor: &VedaPredictor) -> Result<()> {
+        let c = &self.config;
+        if predictor.layers != c.layers
+            || predictor.heads != c.heads
+            || predictor.head_dim != c.head_dim
+        {
+            return Err(Error::new(format!(
+                "the Veda predictor scores {} blocks of {} heads of {}, and the DiT has {} of {} of {}",
+                predictor.layers,
+                predictor.heads,
+                predictor.head_dim,
+                c.layers,
+                c.heads,
+                c.head_dim
+            )));
+        }
+        self.veda = Some(VedaWeights::new(self.device(), predictor)?);
+        Ok(())
     }
 
     /// The unit a tensor belongs to.
@@ -261,7 +297,7 @@ impl MetalDit {
         project: &dyn Fn(&str) -> Result<Array>,
         prefix: &str,
         angles: Option<&Array>,
-        sparse: Option<&SparsePass>,
+        sparse: Option<BlockSparse>,
     ) -> Result<Array> {
         let c = &self.config;
         let qkv = project(&format!("{prefix}.attn.qkv_proj"))?;
@@ -284,13 +320,14 @@ impl MetalDit {
                 && c.head_dim == 128,
         )?;
         let attended = match sparse {
-            Some(sparse) => {
+            Some(BlockSparse::Pass(sparse)) => {
                 let gate = format!("{prefix}.attn.to_gate_compress");
                 let gate = (sparse.is_vsa() && self.weights.contains(&format!("{gate}.weight")))
                     .then(|| project(&gate))
                     .transpose()?;
                 sparse.attend(&inputs, gate.as_ref())?
             }
+            Some(BlockSparse::Veda(veda, layer)) => veda.attend(&inputs, layer)?,
             None => inputs.attend()?,
         };
         self.weights
@@ -752,6 +789,31 @@ impl MetalDit {
             )?),
             _ => None,
         };
+        let veda = match method {
+            Some(SparseMethod::Veda {
+                sparsity,
+                reference_sparsity,
+            }) => {
+                let weights = self.veda.as_ref().ok_or_else(|| {
+                    Error::new(
+                        "Veda attention needs a predictor, which the DiT does not have".into(),
+                    )
+                })?;
+                Some(VedaPass::new(
+                    weights,
+                    &layout,
+                    sparsity,
+                    reference_sparsity,
+                )?)
+            }
+            _ => None,
+        };
+        let block_sparse = |layer: usize| {
+            sparse
+                .as_ref()
+                .map(BlockSparse::Pass)
+                .or(veda.as_ref().map(|veda| BlockSparse::Veda(veda, layer)))
+        };
         let video_rows = layout.segment(SegmentKind::Video);
         // The rows this rank carries. Without a shard that is every row, and nothing below knows
         // the difference.
@@ -913,7 +975,7 @@ impl MetalDit {
                     &|name| w.linear_prepacked(&packed, normed.as_ref(), name),
                     &p,
                     Some(&angles),
-                    sparse.as_ref(),
+                    block_sparse(layer),
                 )?;
                 let (updated, normed, packed) = hidden.add_norm_pack(
                     Some((&attended, &m, 2)),
@@ -942,7 +1004,7 @@ impl MetalDit {
                         &|name| w.linear(&norm, name),
                         &p,
                         Some(&angles),
-                        sparse.as_ref(),
+                        block_sparse(layer),
                     )?,
                 };
                 hidden = hidden.add_gated(&attended, &m, &rows, 2)?;
@@ -1027,11 +1089,14 @@ impl MetalDit {
             blocks,
             video,
             audio,
-            routed_fraction: sparse
-                .as_ref()
-                .map(SparsePass::routed_fraction)
-                .transpose()?
-                .flatten(),
+            routed_fraction: match &veda {
+                Some(veda) => veda.kept_fraction()?,
+                None => sparse
+                    .as_ref()
+                    .map(SparsePass::routed_fraction)
+                    .transpose()?
+                    .flatten(),
+            },
         })
     }
 }

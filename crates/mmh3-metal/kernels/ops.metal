@@ -1352,6 +1352,243 @@ kernel void attention_sparse_128(
     }
 }
 
+// Veda (see mmh3-core's dit/veda.rs) attends with each group of a layer's heads that share a tile
+// shape over a copy of their rows in the shape's tile order, where every tile is consecutive and
+// cut into two tiles of at most 64 for the attention of steps 4 above.
+//
+// 1. veda_gather: a group's rows in tile order, and after the attention veda_scatter its output
+//    back in the packed order.
+// 2. veda_pool: per head and video tile, the mean, the maximum and the minimum of the queries and
+//    of the keys.
+// 3. veda_project: the predictor's view of a tile, pooled · P + mean, with P the FP8 projection of
+//    the layer and head times its scale, rounded to BF16 as the predictor runs it.
+// 4. veda_select: per head and query tile of 128, the scores against every video tile, and the
+//    tiles of 64 it attends as routes for attention_sparse_128 or mpp_sparse_attention_128, the
+//    same for the two halves of the tile.
+constant constexpr uint VEDA_POOLED = 3 * SPARSE_HEAD;
+// Video tiles one threadgroup of veda_project projects, sharing the reads of P.
+constant constexpr uint VEDA_PROJECT_TILES = 8;
+
+// Words of a (row, head) of the input, from row p[4] + order[row] and head group[member], into
+// row p[5] + row and member `member` of the output.
+// p: rows, heads, members, words, input row offset, output row offset.
+kernel void veda_gather(device const uint *x [[buffer(0)]], device uint *y [[buffer(1)]],
+                        device const uint *order [[buffer(2)]],
+                        device const uint *group [[buffer(3)]], constant uint *p [[buffer(4)]],
+                        uint i [[thread_position_in_grid]]) {
+    const uint rows = p[0], heads = p[1], members = p[2], words = p[3];
+    if (i >= rows * members * words)
+        return;
+    const uint word = i % words, member = i / words % members, row = i / (words * members);
+    y[((p[5] + row) * members + member) * words + word] =
+        x[((p[4] + order[row]) * heads + group[member]) * words + word];
+}
+
+// The inverse of veda_gather for the attention's FP32 output of heads of 128.
+// p: rows, heads, members.
+kernel void veda_scatter(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
+                         device const uint *order [[buffer(2)]],
+                         device const uint *group [[buffer(3)]], constant uint *p [[buffer(4)]],
+                         uint i [[thread_position_in_grid]]) {
+    const uint rows = p[0], heads = p[1], members = p[2];
+    if (i >= rows * members * SPARSE_HEAD)
+        return;
+    const uint d = i % SPARSE_HEAD, member = i / SPARSE_HEAD % members;
+    const uint row = i / (SPARSE_HEAD * members);
+    y[(order[row] * heads + group[member]) * SPARSE_HEAD + d] = x[i];
+}
+
+// Two heads a threadgroup, a thread a dimension. An empty tile pools to zeros.
+// p: video tiles, members, whether the inputs are FP16.
+kernel void veda_pool(device const uchar *q [[buffer(0)]], device const uchar *k [[buffer(1)]],
+                      device const uint *starts [[buffer(2)]],
+                      device const uint *lengths [[buffer(3)]],
+                      device float *pooled_q [[buffer(4)]], device float *pooled_k [[buffer(5)]],
+                      constant uint *p [[buffer(6)]], uint g [[threadgroup_position_in_grid]],
+                      uint tid [[thread_index_in_threadgroup]]) {
+    const uint tiles = p[0], heads = p[1];
+    const uint tile = g % tiles, head = g / tiles * 2 + tid / SPARSE_HEAD;
+    const uint d = tid % SPARSE_HEAD;
+    if (head >= heads)
+        return;
+    const uint start = starts[tile], rows = lengths[tile];
+    float query_sum = 0, query_max = -INFINITY, query_min = INFINITY;
+    float key_sum = 0, key_max = -INFINITY, key_min = INFINITY;
+    for (uint r = 0; r < rows; ++r) {
+        const uint i = ((start + r) * heads + head) * SPARSE_HEAD + d;
+        const float query = load_value(q, i, p[2]), key = load_value(k, i, p[2]);
+        query_sum += query;
+        query_max = max(query_max, query);
+        query_min = min(query_min, query);
+        key_sum += key;
+        key_max = max(key_max, key);
+        key_min = min(key_min, key);
+    }
+    const uint o = (head * tiles + tile) * VEDA_POOLED + d;
+    const bool empty = rows == 0;
+    pooled_q[o] = empty ? 0 : query_sum / rows;
+    pooled_q[o + SPARSE_HEAD] = empty ? 0 : query_max;
+    pooled_q[o + 2 * SPARSE_HEAD] = empty ? 0 : query_min;
+    pooled_k[o] = empty ? 0 : key_sum / rows;
+    pooled_k[o + SPARSE_HEAD] = empty ? 0 : key_max;
+    pooled_k[o + 2 * SPARSE_HEAD] = empty ? 0 : key_min;
+}
+
+float fp8_e4m3(uchar bits) {
+    const int exponent = (bits >> 3) & 0xF;
+    const float mantissa = float(bits & 7) * 0.125f;
+    const float value = exponent == 0 ? mantissa * 0.015625f : ldexp(1.0f + mantissa, exponent - 7);
+    return (bits & 0x80) ? -value : value;
+}
+
+// Rounds to nearest BF16, ties to even.
+float round_bf16(float value) {
+    const uint bits = as_type<uint>(value);
+    return as_type<float>((bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000u);
+}
+
+// A threadgroup VEDA_PROJECT_TILES tiles of one head, a thread a dimension of half of them.
+// `weights` holds every layer's P, [layers, heads, 384, 128], and `scales` their [layers, heads].
+// p: video tiles, members, layer, heads.
+kernel void veda_project(device const float *pooled [[buffer(0)]],
+                         device const uchar *weights [[buffer(1)]],
+                         device const float *scales [[buffer(2)]],
+                         device const uint *group [[buffer(3)]], device float *out [[buffer(4)]],
+                         constant uint *p [[buffer(5)]], uint g [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]]) {
+    constexpr uint HALF = VEDA_PROJECT_TILES / 2;
+    threadgroup float tiles[VEDA_PROJECT_TILES * VEDA_POOLED];
+    const uint count = p[0], blocks = (count + VEDA_PROJECT_TILES - 1) / VEDA_PROJECT_TILES;
+    const uint member = g / blocks, first = g % blocks * VEDA_PROJECT_TILES;
+    const uint head = p[2] * p[3] + group[member];
+    for (uint i = tid; i < VEDA_PROJECT_TILES * VEDA_POOLED; i += 256) {
+        const uint tile = first + i / VEDA_POOLED;
+        tiles[i] =
+            tile < count ? pooled[(member * count + tile) * VEDA_POOLED + i % VEDA_POOLED] : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint d = tid % SPARSE_HEAD, half_index = tid / SPARSE_HEAD;
+    threadgroup const float *mine = tiles + half_index * HALF * VEDA_POOLED;
+    device const uchar *column = weights + head * VEDA_POOLED * SPARSE_HEAD + d;
+    const float scale = scales[head];
+    float sums[HALF] = {};
+    for (uint row = 0; row < VEDA_POOLED; ++row) {
+        const float weight = round_bf16(fp8_e4m3(column[row * SPARSE_HEAD]) * scale);
+        for (uint t = 0; t < HALF; ++t)
+            sums[t] += mine[t * VEDA_POOLED + row] * weight;
+    }
+    for (uint t = 0; t < HALF; ++t) {
+        const uint tile = first + half_index * HALF + t;
+        if (tile < count)
+            out[(member * count + tile) * SPARSE_HEAD + d] = sums[t] + mine[t * VEDA_POOLED + d];
+    }
+}
+
+// Rows of tile `tile` of 64 in Veda's tiles of 128.
+uint veda_rows(device const uint *lengths, uint tile) {
+    const uint length = lengths[tile / 2];
+    return tile % 2 == 0 ? min(length, 64u) : (length > 64 ? length - 64 : 0);
+}
+
+// A threadgroup a query tile of 128 of one head. A video query tile keeps, of each column block,
+// the allowed number of tiles of the highest scores, its own tile first and ties going to the
+// lower tile, and never an empty tile; then every global tile. A global query tile keeps all.
+// `allowed` holds each video query tile's count for the reference block and the generated block,
+// and `kept` gathers how many video tiles the query tiles kept.
+// p: tiles, video tiles, reference tiles, scale.
+kernel void
+veda_select(device const float *queries [[buffer(0)]], device const float *keys [[buffer(1)]],
+            device const uint *lengths [[buffer(2)]], device const uint *allowed [[buffer(3)]],
+            device ushort *routes [[buffer(4)]], device uint *counts [[buffer(5)]],
+            device atomic_uint *kept [[buffer(6)]], constant uint *p [[buffer(7)]],
+            uint g [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]],
+            uint simd [[simdgroup_index_in_threadgroup]], uint lane [[thread_index_in_simdgroup]]) {
+    threadgroup float scores[SPARSE_MAX_TILES];
+    threadgroup bool chosen[SPARSE_MAX_TILES];
+    threadgroup float pooled[SPARSE_HEAD], scratch[8];
+    const uint tiles = p[0], video = p[1], reference = p[2];
+    const float scale = as_type<float>(p[3]);
+    const uint query = g % tiles, head = g / tiles, small = 2 * tiles;
+    const uint row = head * small + 2 * query;
+    const bool global = query >= video;
+
+    if (!global) {
+        if (tid < SPARSE_HEAD)
+            pooled[tid] = queries[(head * video + query) * SPARSE_HEAD + tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        pooled_scores(pooled, keys + head * video * SPARSE_HEAD, video, scale, scores, simd, lane);
+        for (uint t = tid; t < video; t += 256)
+            chosen[t] = false;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint block = reference == 0 ? 1 : 0; block < 2; ++block) {
+            const uint start = block == 0 ? 0 : reference, end = block == 0 ? reference : video;
+            // The kept-th largest candidate score, a bit at a time from the top, as vsa_select
+            // finds it.
+            float candidates = 0;
+            for (uint t = start + tid; t < end; t += 256)
+                candidates += t == query || lengths[t] > 0;
+            const uint total = uint(group_reduce<false>(candidates, scratch, simd, lane));
+            const uint count = min(allowed[query * 2 + block], total);
+            uint threshold = 0, ties = count;
+            for (int bit = 31; bit >= 0 && count > 0; --bit) {
+                const uint high = bit == 31 ? 0u : ~0u << (bit + 1);
+                float ones = 0;
+                for (uint t = start + tid; t < end; t += 256) {
+                    if (t != query && lengths[t] == 0)
+                        continue;
+                    const uint bits = ordered_bits(t == query ? INFINITY : scores[t]);
+                    ones += (bits & high) == threshold && (bits >> bit) & 1u;
+                }
+                const uint above = uint(group_reduce<false>(ones, scratch, simd, lane));
+                if (above >= ties)
+                    threshold |= 1u << bit;
+                else
+                    ties -= above;
+            }
+            if (simd == 0 && count > 0) {
+                uint seen = 0;
+                for (uint first = start; first < end; first += 32) {
+                    const uint t = first + lane;
+                    const bool candidate = t < end && (t == query || lengths[t] > 0);
+                    const uint bits =
+                        candidate ? ordered_bits(t == query ? INFINITY : scores[t]) : 0;
+                    const uint tie = candidate && bits == threshold;
+                    const uint rank = seen + simd_prefix_exclusive_sum(tie);
+                    seen += simd_sum(tie);
+                    if (candidate && (bits > threshold || (tie && rank < ties)))
+                        chosen[t] = true;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (simd == 0) {
+        device ushort *route = routes + row * small, *twin = route + small;
+        uint count = 0, video_count = 0;
+        for (uint first = 0; first < small; first += 32) {
+            const uint t = first + lane, tile = t / 2;
+            const bool live = t < small && veda_rows(lengths, t) > 0;
+            const uint flag = live && (global || tile >= video || chosen[tile]);
+            const uint before = simd_prefix_exclusive_sum(flag);
+            if (flag) {
+                route[count + before] = ushort(t);
+                twin[count + before] = ushort(t);
+            }
+            count += simd_sum(flag);
+            if (!global)
+                video_count +=
+                    simd_sum(uint(t < small && t % 2 == 0 && tile < video && chosen[tile]));
+        }
+        if (lane == 0) {
+            counts[row] = count;
+            counts[row + 1] = count;
+            if (!global)
+                atomic_fetch_add_explicit(kept, video_count, memory_order_relaxed);
+        }
+    }
+}
+
 // Kernels of the video VAE's encoder, whose activations are FP16 [sequences, frames, height,
 // width, channels]: a sequence is one tile of one clip, and the group norms' statistics are those
 // of one frame of one sequence.

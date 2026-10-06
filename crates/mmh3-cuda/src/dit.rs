@@ -2364,6 +2364,9 @@ impl CudaDit {
         let method = sparse
             .filter(|settings| tokens >= settings.min_tokens)
             .map(|settings| settings.method);
+        if matches!(method, Some(SparseMethod::Veda { .. })) {
+            return Err(Error::Model("Veda runs on Metal so far".to_owned()));
+        }
         let sparse_tau = match method {
             Some(SparseMethod::Sol { tau }) => Some(tau),
             _ => None,

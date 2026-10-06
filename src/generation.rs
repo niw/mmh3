@@ -18,6 +18,7 @@ use crate::video::{ReferenceClip, block_seconds};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::video::{block_frames, load_clip};
 use mmh3_core::dit::sampler::{Sampler, Schedule};
+use mmh3_core::dit::sparse::SparseMethod;
 use mmh3_core::generation::GenerationShape;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
@@ -62,6 +63,9 @@ pub const OPTIONS: &[&str] = &[
     "sparse-tau",
     "sparse-start",
     "vsa-sparsity",
+    "veda-predictor",
+    "veda-sparsity",
+    "veda-reference-sparsity",
     "vram-budget",
     "devices",
 ];
@@ -962,7 +966,12 @@ pub fn sample(
             );
         }
         let routing = routed.map_or(String::new(), |fraction| {
-            format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
+            match step_sparse.map(|s| s.method) {
+                Some(SparseMethod::Veda { .. }) => {
+                    format!(", Veda kept {:.1}% of the video tiles", 100.0 * fraction)
+                }
+                _ => format!(", Sol-Attn routed {:.1}%", 100.0 * fraction),
+            }
         });
         println!(
             "step {}/{steps} at sigma {:.4} in {:.1} s{routing}",
@@ -1340,7 +1349,6 @@ fn shard_target(
     use crate::worker::{digest, session_conditions, session_payload};
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
-    use mmh3_core::dit::sparse::SparseMethod;
     use mmh3_core::shard::Shard;
     use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
 

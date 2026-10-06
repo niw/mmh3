@@ -3,6 +3,7 @@ use crate::{
     cli::option_float,
     models::{model_file, option_path},
 };
+use mmh3_core::dit::veda::{VEDA_PREDICTOR_FILE, VedaPredictor};
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_metal::{AttentionPrecision, LinearPrecision, dit::MetalDit};
 use std::{collections::HashMap, error::Error, path::Path};
@@ -112,6 +113,15 @@ pub fn load_dit(
     if let Some(patch) = model_file(options, "patch", &["patches", "loras"])? {
         let count = dit.add_lora(&SafeTensors::open(Path::new(&patch))?, 1.0)?;
         println!("applied {patch} to {count} layers and tensors");
+    }
+    if options.get("attention") == Some(&"veda") {
+        let path = option_path(options, "veda-predictor", VEDA_PREDICTOR_FILE)?;
+        let predictor = VedaPredictor::open(Path::new(&path))?;
+        dit.set_veda_predictor(&predictor)?;
+        println!(
+            "loaded the Veda predictor {path}, trained to keep {} of the video tiles",
+            predictor.keep_ratio
+        );
     }
     if let Some(path) = model_file(options, "lora", &["loras"])? {
         let count = dit.add_lora(
