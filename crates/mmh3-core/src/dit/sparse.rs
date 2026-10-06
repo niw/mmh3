@@ -20,6 +20,12 @@ pub enum SparseMethod {
     Sol { tau: f32 },
     /// VSA (see `dit::vsa`), dropping this fraction of the video tiles.
     Vsa { sparsity: f64 },
+    /// Veda (see `dit::veda`), dropping these fractions of the generated video's tiles and of the
+    /// keyframes' and references' tiles. A predictor the DiT holds picks the tiles.
+    Veda {
+        sparsity: f64,
+        reference_sparsity: f64,
+    },
 }
 
 /// When and how sparsely the DiT uses block-sparse attention. The Sol-Attn defaults follow
@@ -48,6 +54,18 @@ impl SparseAttention {
     pub fn vsa(sparsity: f64) -> Self {
         SparseAttention {
             method: SparseMethod::Vsa { sparsity },
+            start_fraction: 0.0,
+            min_tokens: 0,
+        }
+    }
+
+    /// Veda on every step and sequence length, as its predictor was trained.
+    pub fn veda(sparsity: f64, reference_sparsity: f64) -> Self {
+        SparseAttention {
+            method: SparseMethod::Veda {
+                sparsity,
+                reference_sparsity,
+            },
             start_fraction: 0.0,
             min_tokens: 0,
         }

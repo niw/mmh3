@@ -8,4 +8,5 @@ pub mod layout;
 pub mod sampler;
 pub mod sparse;
 pub mod timestep;
+pub mod veda;
 pub mod vsa;

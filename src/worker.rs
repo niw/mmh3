@@ -4183,6 +4183,7 @@ pub fn sparse_settings(
     let (method, tau, vsa_sparsity) = match sparse.method {
         SparseMethod::Sol { tau } => (worker::SparseSettings::SOL, tau, 0.0),
         SparseMethod::Vsa { sparsity } => (worker::SparseSettings::VSA, 0.0, sparsity),
+        SparseMethod::Veda { .. } => unreachable!("a run with Veda shares no steps"),
     };
     worker::SparseSettings {
         method,

@@ -1340,6 +1340,7 @@ fn shard_target(
     use crate::worker::{digest, session_conditions, session_payload};
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::layout::PackedLayout;
+    use mmh3_core::dit::sparse::SparseMethod;
     use mmh3_core::shard::Shard;
     use mmh3_core::worker::{CAPABILITY_DIT_SHARD, Checkpoint, OpenSession};
 
@@ -1348,6 +1349,10 @@ fn shard_target(
     // units of its own takes a rank as well.
     if settings.workers_for(CAPABILITY_DIT_SHARD).is_empty() {
         // Nobody may be asked for a step, so every one of them runs here.
+        return None;
+    }
+    if sparse.is_some_and(|sparse| matches!(sparse.method, SparseMethod::Veda { .. })) {
+        eprintln!("note: Veda runs every step on this machine, since workers do not run it yet");
         return None;
     }
     let file = if references.is_empty() {
