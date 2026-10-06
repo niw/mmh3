@@ -73,14 +73,20 @@ through ffmpeg on a GPU or in a container without NVENC.
 - `--seed N` (default 0): Seed of the initial noise.
 - `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
   Turbo LoRA wants 6 and 3.
-- `--attention dense|sol|vsa` (default `vsa` with VSA gates, `dense` otherwise): Sol-Attn switches
-  to block-sparse attention. VSA is the sparse attention FastH3 was trained with.
+- `--attention dense|sol|vsa|veda` (default `vsa` with VSA gates, `dense` otherwise): Sol-Attn
+  switches to block-sparse attention. VSA is the sparse attention FastH3 was trained with.
+  [Veda](veda.md) is a block-sparse attention whose tiles a predictor picks.
 - `--attention-precision bf16|int8-fp8` (default `bf16`): INT8 QK / FP8 PV in the DiT, with FP32
   softmax and accumulation. Changes generated details.
 - `--sparse-tau X` (default 1.3): Sol-Attn's routing threshold. Higher is sparser.
 - `--sparse-start X` (default 0.2 for Sol-Attn, 0 for VSA): Fraction of the steps that stay dense
   before the sparse attention starts.
 - `--vsa-sparsity X` (default 0.9): Fraction of the video tiles VSA leaves out for each query tile.
+- `--veda-predictor FILE` (default `veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors`
+  in the models directory): Veda's predictor.
+- `--veda-sparsity X`, `--veda-reference-sparsity X` (default 0.9 each): Fractions of the generated
+  video's tiles and of the keyframes' and references' tiles Veda leaves out for each query tile.
+  `--veda-reference-sparsity 0` attends to every keyframe and reference token.
 - `--patch FILE` (default none): A patch for the DiT, such as the FastH3 patch, applied before a
   LoRA.
 - `--lora FILE`, `--lora-strength X` (default none, 1.0): A ComfyUI LoRA for the DiT.

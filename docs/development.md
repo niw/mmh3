@@ -5,6 +5,7 @@
 - INT8 ConvRot linear layers (activations rotated by a Hadamard transform and quantized per row) on
   a dedicated INT8 GEMM, FlashAttention-2 style attention, and an FP32 residual stream.
 - Sol-Attn, a training-free block-sparse attention (arXiv:2607.24027), for the long video sequences.
+- Veda, a block-sparse attention whose tiles a distilled predictor picks (arXiv:2605.30325).
 - FastVideo's
   [FastH3](https://huggingface.co/FastVideo/FastVideo-FastH3-4-step-Preview-v1-VSA-DataFree) 4-step
   model with its video sparse attention (VSA), as a patch on the base DiT.

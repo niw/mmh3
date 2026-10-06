@@ -7,7 +7,7 @@ usage() {
   cat <<EOF
 usage: $0 [--video-vae int8|fp16] [--ref2va | --no-ref2va] [--fasth3 | --no-fasth3]
        [--lightx2v-turbo | --no-lightx2v-turbo] [--taomate | --no-taomate] [--pdmd | --no-pdmd]
-       [--dmad | --no-dmad] [--models DIR]
+       [--dmad | --no-dmad] [--veda | --no-veda] [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf), or with curl
 when hf is not installed. curl sends HF_TOKEN when it is set. By default it downloads the ones make
@@ -31,6 +31,9 @@ VSA-DataFree patch.
   --no-pdmd            No PDMD LoRA (default).
   --dmad               The 4-step DMAD LoRA from yniw/MiniMax-H3-mmh3, into loras.
   --no-dmad            No DMAD LoRA (default).
+  --veda               Veda's sparse attention predictor from
+                       Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview, into veda.
+  --no-veda            No Veda predictor (default).
   --models DIR         The models directory (default: models in the repository).
 EOF
 }
@@ -47,6 +50,7 @@ turbo=0
 taomate=0
 pdmd=0
 dmad=0
+veda=0
 models=$(cd "$(dirname "$0")/.." && pwd)/models
 
 while [[ $# -gt 0 ]]; do
@@ -68,6 +72,8 @@ while [[ $# -gt 0 ]]; do
     --no-pdmd) pdmd=0 ;;
     --dmad) dmad=1 ;;
     --no-dmad) dmad=0 ;;
+    --veda) veda=1 ;;
+    --no-veda) veda=0 ;;
     --models)
       [[ $# -ge 2 ]] || fail "--models needs a directory"
       models=$2
@@ -159,4 +165,8 @@ if [[ $ref2va == 1 ]]; then
 fi
 if [[ ${#turbo_files[@]} -gt 0 ]]; then
   download lightx2v/Minimax-h3-Turbo "$models/loras" "${turbo_files[@]}"
+fi
+if [[ $veda == 1 ]]; then
+  download Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview "$models/veda" \
+    minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors
 fi

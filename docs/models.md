@@ -27,8 +27,11 @@ lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the [TaoMate-H3](taomate.m
 also downloads the [PDMD](pdmd.md) LoRA,
 `loras/minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, `--dmad`
 also downloads the [DMAD](dmad.md) LoRA,
-`loras/minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3, and
-`--models DIR` downloads into another directory. `make download-models LORA=pdmd`, `LORA=dmad`,
+`loras/minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3,
+`--veda` also downloads the predictor of [Veda](veda.md)'s sparse attention,
+`veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors` from
+Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview, and `--models DIR` downloads into another
+directory. `make download-models LORA=pdmd`, `LORA=dmad`,
 `LORA=turbo` or `LORA=taomate` passes `--pdmd`, `--dmad`, `--lightx2v-turbo` or `--taomate` to the
 script.
 

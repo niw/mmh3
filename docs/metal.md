@@ -99,7 +99,7 @@ memory. The text encoder and the video VAE attend in FP16. The scores are a smal
 so it gains little. It is this machine's setting: workers asked for a step take their own default.
 
 Text prompts, precomputed `--context` tensors, adapter LoRAs, patches such as
-[FastH3](fasth3.md)'s, and Sol-Attn and VSA sparse attention are supported, and so are
+[FastH3](fasth3.md)'s, and Sol-Attn, VSA and Veda sparse attention are supported, and so are
 [first and last frames](fl2va.md) and [reference pictures, sounds and clips](ref2va.md)
 (`--first-frame`, `--last-frame`, `--reference`, `--reference-audio`, `--reference-video`). Their
 video VAE encoder runs its convolutions in FP16 on the matrix units, so they need macOS 26, and
@@ -110,12 +110,13 @@ The Metal CLI supports `generate`, `latent`, `device` and checkpoint inspection.
 
 ## Sparse attention
 
-`--attention sol` and `--attention vsa` run as on CUDA, with the options in [Usage](usage.md), over
-the DiT's heads of 128. The routing runs in FP32 and the attention over the routed tiles in the
-precision of `--attention-precision`, FP16 on the matrix units or FP32. A share of a step handed out
-by a [distributed](distributed.md) run still attends densely.
+`--attention sol`, `--attention vsa` and `--attention veda` ([Veda](veda.md)) run as on CUDA, with
+the options in [Usage](usage.md), over the DiT's heads of 128. The routing runs in FP32 and the
+attention over the routed tiles in the precision of `--attention-precision`, FP16 on the matrix
+units or FP32. A share of a step handed out by a [distributed](distributed.md) run still attends
+densely.
 
-Both attend over a fraction of the tiles, so a step at a large size takes much less time than with
+They attend over a fraction of the tiles, so a step at a large size takes much less time than with
 dense attention. From the same context and noise, a step's video latent stays close to CUDA's BF16
 one with Sol-Attn, whose routing follows a threshold. With VSA it moves as far as CUDA's own moves
 when its attention changes to INT8/FP8: VSA keeps a tenth of the video tiles by their pooled scores,
