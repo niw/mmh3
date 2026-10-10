@@ -233,13 +233,15 @@ constexpr int CONV_BLOCKS_PER_SM = 2;
 constexpr int CONV_SLAB_STAGES = 2;
 constexpr int CONV_SHARED_BYTES = CONV_SLAB_STAGES * CONV_SLAB_BYTES + 2 * CONV_WEIGHT_BYTES;
 
-template <int TAPS, bool NORMALIZE>
+// With ZERO_PADDING the taps are centered and read zeros past every edge of the input, in time
+// and in space, as a Conv3d with padding one does.
+template <int TAPS, bool NORMALIZE, bool ZERO_PADDING>
 __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
     conv3d_kernel(const __half *__restrict__ input, int frames, int height, int width, int channels,
                   const __half *__restrict__ weight, int columns, const __half *__restrict__ bias,
                   int outputs, int accumulate, const float *__restrict__ statistics,
-                  const __half *__restrict__ norm_weight, const __half *__restrict__ norm_bias,
-                  __half *__restrict__ output) {
+                  int shared_statistics, const __half *__restrict__ norm_weight,
+                  const __half *__restrict__ norm_bias, __half *__restrict__ output) {
     extern __shared__ __align__(128) uint8_t shared_memory[];
     const uint32_t slabs_base = shared_address(shared_memory);
     const uint32_t weights = slabs_base + CONV_SLAB_STAGES * CONV_SLAB_BYTES;
@@ -271,16 +273,22 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
         line = index / CONV_ROW_CHUNKS;
         const int pixel = line % CONV_PATCH_PIXELS;
         const int ky = line / CONV_PATCH_PIXELS;
-        source_frame = frame + slab % TAPS - (TAPS - 1);
+        source_frame = frame + slab % TAPS - (ZERO_PADDING ? TAPS / 2 : TAPS - 1);
         const int source_row = first_row + ky - 1;
         const int source_pixel = first_pixel + pixel - 1;
-        const bool valid = source_frame >= 0 && source_row <= height && source_pixel <= width;
-        source = input +
-                 (valid ? (static_cast<size_t>(source_frame) * pixels +
-                           reflect(source_row, height) * width + reflect(source_pixel, width)) *
-                              channels
-                        : 0) +
-                 slab / TAPS * CONV_CHUNK + sub * 8;
+        size_t position = 0;
+        bool valid = false;
+        if constexpr (ZERO_PADDING) {
+            valid = source_frame >= 0 && source_frame < frames && source_row >= 0 &&
+                    source_row < height && source_pixel >= 0 && source_pixel < width;
+            position = static_cast<size_t>(source_frame) * pixels +
+                       static_cast<size_t>(source_row) * width + source_pixel;
+        } else {
+            valid = source_frame >= 0 && source_row <= height && source_pixel <= width;
+            position = static_cast<size_t>(source_frame) * pixels +
+                       reflect(source_row, height) * width + reflect(source_pixel, width);
+        }
+        source = input + (valid ? position * channels : 0) + slab / TAPS * CONV_CHUNK + sub * 8;
         return valid;
     };
     auto load_slab_slice = [&](int slab, int slice) {
@@ -306,7 +314,8 @@ __global__ void __launch_bounds__(CONV_THREADS, CONV_BLOCKS_PER_SM)
                 continue;
             }
             const int channel = slab / TAPS * CONV_CHUNK + sub * 8;
-            const float *frame_statistics = statistics + source_frame * GROUPS * 2;
+            const float *frame_statistics =
+                statistics + (shared_statistics != 0 ? 0 : source_frame * GROUPS * 2);
             const uint4 scale = *reinterpret_cast<const uint4 *>(norm_weight + channel);
             const uint4 shift = *reinterpret_cast<const uint4 *>(norm_bias + channel);
             const __half *scales = reinterpret_cast<const __half *>(&scale);
@@ -490,16 +499,20 @@ extern "C" int mmh3_video_encoder_tile_input(const float *canvas, int canvas_fra
 // A 3 x 3 x `taps` convolution at stride one, with reflect padding in space and zeros before the
 // clip: output[t, y, x, o] = bias[o] + sum over the taps and channels, added onto the output when
 // `accumulate` is set. The weight holds `columns` per output, the taps ordered (kt, ky, kx,
-// channel). `channels` must be a multiple of 32 and `taps` one or three.
+// channel). `channels` must be a multiple of 32 and `taps` one or three. With `zero_padding`, three
+// taps are centered and every edge reads zeros instead. With `statistics`, the input is
+// SiLU(GroupNorm(input)) with the statistics of each frame, or of the whole input when
+// `shared_statistics` is set.
 extern "C" int mmh3_video_encoder_conv3d(const __half *input, int frames, int height, int width,
-                                         int channels, int taps, const __half *weight, int columns,
-                                         const __half *bias, int outputs, int accumulate,
-                                         const float *statistics, const __half *norm_weight,
+                                         int channels, int taps, int zero_padding,
+                                         const __half *weight, int columns, const __half *bias,
+                                         int outputs, int accumulate, const float *statistics,
+                                         int shared_statistics, const __half *norm_weight,
                                          const __half *norm_bias, __half *output,
                                          cudaStream_t stream) {
     if (channels % CONV_CHUNK != 0 || columns < taps * 9 * channels || (taps != 1 && taps != 3) ||
         height < 2 || width < 2 || frames <= 0 || outputs <= 0 ||
-        (statistics != nullptr && channels % GROUPS != 0)) {
+        (statistics != nullptr && channels % GROUPS != 0) || (zero_padding != 0 && taps != 3)) {
         return static_cast<int>(cudaErrorInvalidValue);
     }
     const int output_blocks = (outputs + CONV_BLOCK_N - 1) / CONV_BLOCK_N;
@@ -510,18 +523,24 @@ extern "C" int mmh3_video_encoder_conv3d(const __half *input, int frames, int he
                              CONV_SHARED_BYTES);
         kernel<<<grid, CONV_THREADS, CONV_SHARED_BYTES, stream>>>(
             input, frames, height, width, channels, weight, columns, bias, outputs, accumulate,
-            statistics, norm_weight, norm_bias, output);
+            statistics, shared_statistics, norm_weight, norm_bias, output);
     };
-    if (statistics != nullptr) {
-        if (taps == 3) {
-            launch(conv3d_kernel<3, true>);
+    if (zero_padding != 0) {
+        if (statistics != nullptr) {
+            launch(conv3d_kernel<3, true, true>);
         } else {
-            launch(conv3d_kernel<1, true>);
+            launch(conv3d_kernel<3, false, true>);
+        }
+    } else if (statistics != nullptr) {
+        if (taps == 3) {
+            launch(conv3d_kernel<3, true, false>);
+        } else {
+            launch(conv3d_kernel<1, true, false>);
         }
     } else if (taps == 3) {
-        launch(conv3d_kernel<3, false>);
+        launch(conv3d_kernel<3, false, false>);
     } else {
-        launch(conv3d_kernel<1, false>);
+        launch(conv3d_kernel<1, false, false>);
     }
     return static_cast<int>(cudaGetLastError());
 }
