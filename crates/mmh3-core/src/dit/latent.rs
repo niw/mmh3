@@ -85,6 +85,44 @@ pub fn unpack_audio(rows: &[f32], shape: &[usize]) -> Vec<f32> {
     latent
 }
 
+/// Video latent `[channels, frames, height, width]` resized bilinearly to `height × width` in every
+/// frame, with pixel centers aligned as `align_corners=False` aligns them.
+pub fn resize_video(latent: &Tensor, height: usize, width: usize) -> Tensor {
+    let (channels, frames, source_height, source_width) = (
+        latent.shape[0],
+        latent.shape[1],
+        latent.shape[2],
+        latent.shape[3],
+    );
+    // For one output coordinate, the two source coordinates it lies between and the weight of the
+    // second one.
+    let taps = |size: usize, source_size: usize| -> Vec<(usize, usize, f32)> {
+        let scale = source_size as f32 / size as f32;
+        (0..size)
+            .map(|index| {
+                let position = ((index as f32 + 0.5) * scale - 0.5).max(0.0);
+                let low = (position as usize).min(source_size - 1);
+                let high = (low + 1).min(source_size - 1);
+                (low, high, position - low as f32)
+            })
+            .collect()
+    };
+    let (rows, columns) = (taps(height, source_height), taps(width, source_width));
+    let mut data = Vec::with_capacity(channels * frames * height * width);
+    for plane in latent.data.chunks_exact(source_height * source_width) {
+        for &(top, bottom, down) in &rows {
+            for &(left, right, across) in &columns {
+                let upper = plane[top * source_width + left] * (1.0 - across)
+                    + plane[top * source_width + right] * across;
+                let lower = plane[bottom * source_width + left] * (1.0 - across)
+                    + plane[bottom * source_width + right] * across;
+                data.push(upper * (1.0 - down) + lower * down);
+            }
+        }
+    }
+    Tensor::new(vec![channels, frames, height, width], data)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +140,13 @@ mod tests {
         let rows = pack_audio(&audio);
         assert_eq!(&rows[..4], &[0.0, 6.0, 12.0, 18.0]);
         assert_eq!(unpack_audio(&rows, &audio.shape), audio.data);
+    }
+
+    #[test]
+    fn doubles_a_frame_bilinearly() {
+        let video = Tensor::new(vec![1, 1, 1, 2], vec![0.0, 4.0]);
+        let resized = resize_video(&video, 2, 4);
+        assert_eq!(resized.shape, vec![1, 1, 2, 4]);
+        assert_eq!(resized.data, vec![0.0, 1.0, 3.0, 4.0, 0.0, 1.0, 3.0, 4.0]);
     }
 }

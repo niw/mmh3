@@ -18,8 +18,8 @@ use crate::video::{ReferenceClip, block_seconds};
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use crate::video::{block_frames, load_clip};
 use mmh3_core::dit::sampler::{Sampler, Schedule};
-use mmh3_core::dit::sparse::SparseMethod;
-use mmh3_core::generation::GenerationShape;
+use mmh3_core::dit::sparse::{SparseAttention, SparseMethod};
+use mmh3_core::generation::{CANVAS_MULTIPLE, GenerationShape};
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use std::collections::HashMap;
@@ -43,6 +43,7 @@ pub const OPTIONS: &[&str] = &[
     "steps",
     "schedule",
     "sampler",
+    "draft-steps",
     "seed",
     "shift-video",
     "shift-audio",
@@ -203,6 +204,9 @@ pub struct Settings {
     pub clips: Vec<ReferenceClip>,
     pub schedule: Schedule,
     pub sampler: Sampler,
+    /// The first steps, run on a canvas of half the width and height before the predicted clean
+    /// latent is enlarged and noised again to the next sigma.
+    pub draft_steps: usize,
     pub steps: usize,
     pub seed: u64,
     pub shift_video: f32,
@@ -511,12 +515,34 @@ impl Settings {
             steps: schedule.steps(),
             schedule,
             sampler,
+            draft_steps: option_number(options, "draft-steps", 0)?,
             seed: option_number(options, "seed", 0)? as u64,
             shift_video,
             shift_audio,
             workers: Vec::new(),
             token,
         };
+        if settings.draft_steps > 0 {
+            if settings.draft_steps >= settings.steps {
+                return Err("--draft-steps must leave at least one step at full size".into());
+            }
+            if !(width / 2).is_multiple_of(CANVAS_MULTIPLE)
+                || !(height / 2).is_multiple_of(CANVAS_MULTIPLE)
+            {
+                return Err(format!(
+                    "--draft-steps needs a width and height of multiples of {}",
+                    2 * CANVAS_MULTIPLE
+                )
+                .into());
+            }
+            if !(settings.keyframes.is_empty()
+                && settings.references.is_empty()
+                && settings.sounds.is_empty()
+                && settings.clips.is_empty())
+            {
+                return Err("--draft-steps cannot be combined with keyframes or references".into());
+            }
+        }
         let checked = before_lending(&settings)?;
         settings.workers = machines
             .into_iter()
@@ -806,7 +832,15 @@ pub fn sample(
     // NOTE: the video noise is drawn before the audio noise, the order of the official pipeline.
     let shape = &settings.shape;
     let mut noise = NormalSampler::new(settings.seed);
-    let (video_shape, audio_shape) = (shape.video_latent_shape(), shape.audio_latent_shape());
+    let (full_video_shape, audio_shape) = (shape.video_latent_shape(), shape.audio_latent_shape());
+    let video_shape = if settings.draft_steps > 0 {
+        let mut draft = full_video_shape.clone();
+        draft[2] /= 2;
+        draft[3] /= 2;
+        draft
+    } else {
+        full_video_shape.clone()
+    };
     let mut video = Tensor::new(
         video_shape.clone(),
         noise.samples(video_shape.iter().product()),
@@ -828,162 +862,212 @@ pub fn sample(
     let sparse = sparse_attention(options, gated)?;
     let schedule = &settings.schedule;
     prepare_after_prompt(&mut prepared_workers, &encoding_slots, options, dit_file);
-    // A machine that can take a share of every step, and a run whose shape one can be cut out of.
-    let mut target = shard_target(
-        settings,
-        options,
-        &config,
-        sparse.as_ref(),
-        &context,
-        &context_modalities,
-        &video,
-        &audio,
-        &keyframes,
-        &references,
-        prepared_workers,
-    );
-    let mut sharing = match &mut target {
-        Some(target) => {
-            match crate::worker::Coordinator::open(
-                &mut target.workers,
-                &target.open,
-                &target.payload,
-            ) {
-                Ok(coordinator) => Some(Sharing::With(Box::new(coordinator))),
-                Err(error) => {
-                    eprintln!("warning: opening a shared run: {error}");
-                    None
-                }
-            }
-        }
-        None => None,
+    // A run with draft steps opens one session for them and another for the steps at full size,
+    // since a session holds one shape. The connections to the workers carry over between them.
+    let phases = if settings.draft_steps > 0 {
+        vec![0..settings.draft_steps, settings.draft_steps..steps]
+    } else {
+        vec![0..steps]
     };
-    // A run that meant to hand every step out and could not takes the steps itself, which is the
-    // fallback everything else a worker does already has. It pays the load it had skipped.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    if dit.is_none() && !matches!(sharing, Some(Sharing::With(_))) {
-        dit = Some(load_dit(options, "dit", dit_file)?);
-    }
-    // Nothing may load a DiT past this point: a run that was going to has done it by now.
-    #[cfg(any(feature = "cuda", feature = "metal"))]
-    #[allow(unused_variables)]
-    let dit = dit;
-    #[cfg(feature = "metal")]
-    let prepared = match &dit {
-        Some(dit) => Some(dit.prepare_text(&context)?),
-        None => None,
-    };
-    for step in 0..steps {
-        let started = Instant::now();
-        let inputs = DitInputs {
-            video: video.clone(),
-            audio: audio.clone(),
-            context: context.clone(),
-            context_modalities: context_modalities.clone(),
-            keyframes: keyframes.clone(),
-            references: references.clone(),
-            sigma: schedule.video[step],
-            shift_video: settings.shift_video,
-            shift_audio: settings.shift_audio,
+    let mut workers = prepared_workers;
+    for phase in phases {
+        // Draft steps fall short of the length below which Sol-Attn stays dense, which keeps a
+        // small canvas exact. Their layout is redrawn at full size, so they go sparse anyway.
+        let sparse = match sparse {
+            Some(sparse) if phase.end <= settings.draft_steps => Some(SparseAttention {
+                min_tokens: 0,
+                ..sparse
+            }),
+            sparse => sparse,
         };
-        let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
-        // The velocity of this step and, where a whole one ran here, what Sol-Attn routed.
-        let (velocity, routed): (mmh3_core::shard::Velocity, Option<f64>) = match &mut sharing {
-            // Every rank runs the same step over its own rows, and the exchanges inside the blocks
-            // keep the attention whole. A rank that fails takes the run with it: there is no
-            // halfway through a step to fall back from.
-            Some(Sharing::With(coordinator)) => {
-                let velocity = crate::worker::step_shard(
-                    coordinator,
-                    &config,
-                    &inputs,
-                    step_sparse.as_ref(),
-                    step,
-                )?;
-                (velocity, None)
-            }
-            // A run that shares a step with nobody takes the whole one, which on Metal goes
-            // through the text this run refined once rather than through the DiT directly.
-            None => {
-                #[cfg(not(any(feature = "cuda", feature = "metal")))]
-                {
-                    return Err(
-                        "this build runs no step of its own: name a worker with --worker".into(),
-                    );
-                }
-                #[cfg(any(feature = "cuda", feature = "metal"))]
-                {
-                    #[cfg(feature = "cuda")]
-                    let outputs = {
-                        let dit = dit
-                            .as_ref()
-                            .ok_or("a step to take here and no DiT to take it")?;
-                        dit.forward(&inputs, &[], step_sparse.as_ref())?
-                    };
-                    #[cfg(feature = "metal")]
-                    let outputs = {
-                        let prepared = prepared
-                            .as_ref()
-                            .ok_or("a step to take here and no DiT to take it")?;
-                        prepared.forward(&inputs, &[], step_sparse.as_ref())?
-                    };
-                    (whole_velocity(&outputs), outputs.routed_fraction)
-                }
-            }
-        };
-        // NOTE: the fresh noise of the re-noise rule continues the stream of the initial noise,
-        // video before audio. The last step lands on the clean latent, which the Euler step reaches
-        // too, so it draws no noise.
-        if settings.sampler == Sampler::Renoise && step + 1 < steps {
-            let fresh = noise.samples(video.data.len());
-            renoise_step(
-                &mut video.data,
-                &velocity.video,
-                &fresh,
-                schedule.video[step],
-                schedule.video[step + 1],
-            );
-            let fresh = noise.samples(audio.data.len());
-            renoise_step(
-                &mut audio.data,
-                &velocity.audio,
-                &fresh,
-                schedule.audio[step],
-                schedule.audio[step + 1],
-            );
-        } else {
-            euler_step(
-                &mut video.data,
-                &velocity.video,
-                schedule.video[step],
-                schedule.video[step + 1],
-            );
-            euler_step(
-                &mut audio.data,
-                &velocity.audio,
-                schedule.audio[step],
-                schedule.audio[step + 1],
-            );
-        }
-        let routing = routed.map_or(String::new(), |fraction| {
-            match step_sparse.map(|s| s.method) {
-                Some(SparseMethod::Veda { .. }) => {
-                    format!(", Veda kept {:.1}% of the video tiles", 100.0 * fraction)
-                }
-                _ => format!(", Sol-Attn routed {:.1}%", 100.0 * fraction),
-            }
-        });
-        println!(
-            "step {}/{steps} at sigma {:.4} in {:.1} s{routing}",
-            step + 1,
-            schedule.video[step],
-            started.elapsed().as_secs_f64()
+        // A machine that can take a share of every step, and a run whose shape one can be cut out
+        // of.
+        let mut target = shard_target(
+            settings,
+            options,
+            &config,
+            sparse.as_ref(),
+            &context,
+            &context_modalities,
+            &video,
+            &audio,
+            &keyframes,
+            &references,
+            std::mem::take(&mut workers),
         );
-        reached(Progress {
-            step: step + 1,
-            steps,
-            seconds: started.elapsed().as_secs_f64(),
-        });
+        let mut sharing = match &mut target {
+            Some(target) => {
+                match crate::worker::Coordinator::open(
+                    &mut target.workers,
+                    &target.open,
+                    &target.payload,
+                ) {
+                    Ok(coordinator) => Some(Sharing::With(Box::new(coordinator))),
+                    Err(error) => {
+                        eprintln!("warning: opening a shared run: {error}");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        // A run that meant to hand every step out and could not takes the steps itself, which is
+        // the fallback everything else a worker does already has. It pays the load it had skipped.
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        if dit.is_none() && !matches!(sharing, Some(Sharing::With(_))) {
+            dit = Some(load_dit(options, "dit", dit_file)?);
+        }
+        #[cfg(feature = "metal")]
+        let prepared = match &dit {
+            Some(dit) => Some(dit.prepare_text(&context)?),
+            None => None,
+        };
+        for step in phase {
+            let started = Instant::now();
+            let inputs = DitInputs {
+                video: video.clone(),
+                audio: audio.clone(),
+                context: context.clone(),
+                context_modalities: context_modalities.clone(),
+                keyframes: keyframes.clone(),
+                references: references.clone(),
+                sigma: schedule.video[step],
+                shift_video: settings.shift_video,
+                shift_audio: settings.shift_audio,
+            };
+            let step_sparse = sparse.filter(|settings| settings.applies_to_step(step, steps));
+            // The velocity of this step and, where a whole one ran here, what Sol-Attn routed.
+            let (velocity, routed): (mmh3_core::shard::Velocity, Option<f64>) = match &mut sharing {
+                // Every rank runs the same step over its own rows, and the exchanges inside the
+                // blocks keep the attention whole. A rank that fails takes the run with it: there
+                // is no halfway through a step to fall back from.
+                Some(Sharing::With(coordinator)) => {
+                    let velocity = crate::worker::step_shard(
+                        coordinator,
+                        &config,
+                        &inputs,
+                        step_sparse.as_ref(),
+                        step,
+                    )?;
+                    (velocity, None)
+                }
+                // A run that shares a step with nobody takes the whole one, which on Metal goes
+                // through the text this run refined once rather than through the DiT directly.
+                None => {
+                    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+                    {
+                        return Err(
+                            "this build runs no step of its own: name a worker with --worker"
+                                .into(),
+                        );
+                    }
+                    #[cfg(any(feature = "cuda", feature = "metal"))]
+                    {
+                        #[cfg(feature = "cuda")]
+                        let outputs = {
+                            let dit = dit
+                                .as_ref()
+                                .ok_or("a step to take here and no DiT to take it")?;
+                            dit.forward(&inputs, &[], step_sparse.as_ref())?
+                        };
+                        #[cfg(feature = "metal")]
+                        let outputs = {
+                            let prepared = prepared
+                                .as_ref()
+                                .ok_or("a step to take here and no DiT to take it")?;
+                            prepared.forward(&inputs, &[], step_sparse.as_ref())?
+                        };
+                        (whole_velocity(&outputs), outputs.routed_fraction)
+                    }
+                }
+            };
+            // NOTE: the fresh noise of the re-noise rule continues the stream of the initial noise,
+            // video before audio. The last step lands on the clean latent, which the Euler step
+            // reaches too, so it draws no noise.
+            if step + 1 == settings.draft_steps {
+                // The clean latent the draft predicts, enlarged to the full canvas and noised to
+                // the next sigma, starts the steps at full size.
+                let (sigma, sigma_next) = (schedule.video[step], schedule.video[step + 1]);
+                for (value, &slope) in video.data.iter_mut().zip(&velocity.video) {
+                    *value -= sigma * slope;
+                }
+                video = mmh3_core::dit::latent::resize_video(
+                    &video,
+                    full_video_shape[2],
+                    full_video_shape[3],
+                );
+                let fresh = noise.samples(video.data.len());
+                for (value, fresh) in video.data.iter_mut().zip(fresh) {
+                    *value = (1.0 - sigma_next) * *value + sigma_next * fresh;
+                }
+                let (sigma, sigma_next) = (schedule.audio[step], schedule.audio[step + 1]);
+                if settings.sampler == Sampler::Renoise {
+                    let fresh = noise.samples(audio.data.len());
+                    renoise_step(&mut audio.data, &velocity.audio, &fresh, sigma, sigma_next);
+                } else {
+                    euler_step(&mut audio.data, &velocity.audio, sigma, sigma_next);
+                }
+            } else if settings.sampler == Sampler::Renoise && step + 1 < steps {
+                let fresh = noise.samples(video.data.len());
+                renoise_step(
+                    &mut video.data,
+                    &velocity.video,
+                    &fresh,
+                    schedule.video[step],
+                    schedule.video[step + 1],
+                );
+                let fresh = noise.samples(audio.data.len());
+                renoise_step(
+                    &mut audio.data,
+                    &velocity.audio,
+                    &fresh,
+                    schedule.audio[step],
+                    schedule.audio[step + 1],
+                );
+            } else {
+                euler_step(
+                    &mut video.data,
+                    &velocity.video,
+                    schedule.video[step],
+                    schedule.video[step + 1],
+                );
+                euler_step(
+                    &mut audio.data,
+                    &velocity.audio,
+                    schedule.audio[step],
+                    schedule.audio[step + 1],
+                );
+            }
+            let routing = routed.map_or(String::new(), |fraction| {
+                match step_sparse.map(|s| s.method) {
+                    Some(SparseMethod::Veda { .. }) => {
+                        format!(", Veda kept {:.1}% of the video tiles", 100.0 * fraction)
+                    }
+                    _ => format!(", Sol-Attn routed {:.1}%", 100.0 * fraction),
+                }
+            });
+            let draft = if step < settings.draft_steps {
+                " (draft)"
+            } else {
+                ""
+            };
+            println!(
+                "step {}/{steps}{draft} at sigma {:.4} in {:.1} s{routing}",
+                step + 1,
+                schedule.video[step],
+                started.elapsed().as_secs_f64()
+            );
+            reached(Progress {
+                step: step + 1,
+                steps,
+                seconds: started.elapsed().as_secs_f64(),
+            });
+        }
+        // The session closes before its connections go on to the next phase's.
+        drop(sharing);
+        if let Some(target) = target {
+            workers = target.workers;
+        }
     }
     #[cfg(feature = "cuda")]
     save_algorithm_cache();
