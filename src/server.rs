@@ -71,8 +71,11 @@ const FILE_OPTIONS: &[&str] = &[
 ];
 /// The options of a generation whose value names a file in the server's models directory, with
 /// the directories it is looked for in, in order.
-const MODEL_FILE_OPTIONS: &[(&str, &[&str])] =
-    &[("patch", &["patches", "loras"]), ("lora", &["loras"])];
+const MODEL_FILE_OPTIONS: &[(&str, &[&str])] = &[
+    ("patch", &["patches", "loras"]),
+    ("lora", &["loras"]),
+    ("latent-upscaler", &["latent_upscale_models"]),
+];
 
 /// The container every generation of a server is written in.
 #[derive(Clone, Copy, PartialEq, Eq)]

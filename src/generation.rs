@@ -44,6 +44,7 @@ pub const OPTIONS: &[&str] = &[
     "schedule",
     "sampler",
     "draft-steps",
+    "latent-upscaler",
     "seed",
     "shift-video",
     "shift-audio",
@@ -522,6 +523,12 @@ impl Settings {
             workers: Vec::new(),
             token,
         };
+        if options.contains_key("latent-upscaler") {
+            if settings.draft_steps == 0 {
+                return Err("--latent-upscaler enlarges the draft of --draft-steps".into());
+            }
+            crate::models::model_file(options, "latent-upscaler", &["latent_upscale_models"])?;
+        }
         if settings.draft_steps > 0 {
             if settings.draft_steps >= settings.steps {
                 return Err("--draft-steps must leave at least one step at full size".into());
@@ -984,6 +991,8 @@ pub fn sample(
             // NOTE: the fresh noise of the re-noise rule continues the stream of the initial noise,
             // video before audio. The last step lands on the clean latent, which the Euler step
             // reaches too, so it draws no noise.
+            // The enlargement after the last draft step says its own time, so the step leaves it out.
+            let mut enlarging = 0.0;
             if step + 1 == settings.draft_steps {
                 // The clean latent the draft predicts, enlarged to the full canvas and noised to
                 // the next sigma, starts the steps at full size.
@@ -991,11 +1000,9 @@ pub fn sample(
                 for (value, &slope) in video.data.iter_mut().zip(&velocity.video) {
                     *value -= sigma * slope;
                 }
-                video = mmh3_core::dit::latent::resize_video(
-                    &video,
-                    full_video_shape[2],
-                    full_video_shape[3],
-                );
+                let enlarged = Instant::now();
+                video = enlarge_draft(options, &video, full_video_shape[2], full_video_shape[3])?;
+                enlarging = enlarged.elapsed().as_secs_f64();
                 let fresh = noise.samples(video.data.len());
                 for (value, fresh) in video.data.iter_mut().zip(fresh) {
                     *value = (1.0 - sigma_next) * *value + sigma_next * fresh;
@@ -1051,16 +1058,16 @@ pub fn sample(
             } else {
                 ""
             };
+            let seconds = started.elapsed().as_secs_f64() - enlarging;
             println!(
-                "step {}/{steps}{draft} at sigma {:.4} in {:.1} s{routing}",
+                "step {}/{steps}{draft} at sigma {:.4} in {seconds:.1} s{routing}",
                 step + 1,
                 schedule.video[step],
-                started.elapsed().as_secs_f64()
             );
             reached(Progress {
                 step: step + 1,
                 steps,
-                seconds: started.elapsed().as_secs_f64(),
+                seconds,
             });
         }
         // The session closes before its connections go on to the next phase's.
@@ -1072,6 +1079,43 @@ pub fn sample(
     #[cfg(feature = "cuda")]
     save_algorithm_cache();
     Ok((video, audio))
+}
+
+/// The clean latent of the last draft step at `height × width`: through the latent upscaler of
+/// `--latent-upscaler`, and bilinearly without one.
+fn enlarge_draft(
+    options: &HashMap<&str, &str>,
+    latent: &Tensor,
+    height: usize,
+    width: usize,
+) -> Result<Tensor, Box<dyn Error>> {
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::latent_upscaler::CudaLatentUpscaler as LatentUpscaler;
+    #[cfg(feature = "metal")]
+    use mmh3_metal::latent_upscaler::MetalLatentUpscaler as LatentUpscaler;
+
+    #[cfg(any(feature = "cuda", feature = "metal"))]
+    if let Some(path) =
+        crate::models::model_file(options, "latent-upscaler", &["latent_upscale_models"])?
+    {
+        if !LatentUpscaler::supported() {
+            return Err("this GPU cannot run the latent upscaler".into());
+        }
+        let path = Path::new(&path);
+        let started = std::time::Instant::now();
+        let enlarged = LatentUpscaler::load(&SafeTensors::open(path)?)?.upscale(latent)?;
+        println!(
+            "enlarged the draft with the latent upscaler in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
+        return Ok(enlarged);
+    }
+    #[cfg(not(any(feature = "cuda", feature = "metal")))]
+    if options.contains_key("latent-upscaler") {
+        return Err("this build runs no latent upscaler".into());
+    }
+    println!("enlarged the draft bilinearly");
+    Ok(mmh3_core::dit::latent::resize_video(latent, height, width))
 }
 
 /// Asks the first worker that holds the text encoder, or returns `None` so the caller encodes here.
