@@ -7,6 +7,7 @@ pub mod audio_encoder;
 pub mod audio_vae;
 pub mod bench;
 pub mod dit;
+pub mod latent_upscaler;
 mod model;
 pub mod ops;
 pub mod shard;

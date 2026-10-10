@@ -3,6 +3,7 @@ pub mod direct_file;
 pub mod dit;
 pub mod generation;
 pub mod json;
+pub mod latent_upscaler;
 pub mod mapped_file;
 pub mod media;
 pub mod numeric;
