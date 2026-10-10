@@ -119,7 +119,13 @@ NVIDIA driver at run time. No FFmpeg implementation is included.
 Model weights.
 mmh3 loads checkpoints that users download themselves, each under its own license:
 MiniMax H3 by MiniMax as repackaged for ComfyUI by Comfy-Org, the text encoder
-derived from Qwen3-VL, and optional LoRAs such as lightx2v's MiniMax-H3 Turbo LoRA.
+derived from Qwen3-VL, optional LoRAs such as lightx2v's MiniMax-H3 Turbo LoRA, and
+LBH-123-AI's latent upscaler (Apache License, Version 2.0).
+
+LBH-123-AI's Minimax H3 latent upscaler (MIT License for its ComfyUI nodes).
+The latent upscalers in `crates/mmh3-cuda`, `crates/mmh3-metal` and `crates/mmh3-core` follow
+the layout of its network and the latent statistics its weights were trained against, which
+the weights need, and contain none of its code.
 
 ComfyUI (GPL-3.0).
 mmh3 was checked against ComfyUI's MiniMax H3 implementation and contains none

@@ -8,6 +8,7 @@ pub mod audio_vae;
 pub mod bench;
 pub mod dit;
 pub mod gemm;
+pub mod latent_upscaler;
 pub mod loader;
 pub mod model;
 pub mod nvfp4;

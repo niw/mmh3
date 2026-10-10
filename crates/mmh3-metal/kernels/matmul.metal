@@ -773,8 +773,9 @@ INT8_PRODUCT(mpp_int8_inside, true)
 // the loads need no checks.
 //
 // p: rows, outputs, channels, input frames, height and width, output frames, height and width,
-// kernel, temporal taps, stride, temporal stride, and whether to add `residual`, which is
-// [rows, outputs] like the output.
+// kernel, temporal taps, stride, temporal stride, whether to add `residual`, which is [rows,
+// outputs] like the output, and whether to pad with zeros: three centered taps that read zeros
+// past every edge of the input, in time and in space, as a Conv3d with padding one does.
 [[kernel, max_total_threads_per_threadgroup(256)]] void
 mpp_video_convolution(device const half *x [[buffer(0)]], device const half *w [[buffer(1)]],
                       device const float *bias [[buffer(2)]],
@@ -787,7 +788,7 @@ mpp_video_convolution(device const half *x [[buffer(0)]], device const half *w [
     const int input_frames = p[3], input_height = p[4], input_width = p[5];
     const int output_frames = p[6], output_height = p[7], output_width = p[8];
     const int size = p[9], taps = p[10], stride = p[11], time_stride = p[12];
-    const bool add_residual = p[13];
+    const bool add_residual = p[13], zero_padding = p[14];
     const int K = taps * size * size * C, pad = size == 3 && stride == 1 ? 1 : 0;
     const int tiles = (N + PRODUCT_TILE - 1) / PRODUCT_TILE;
     const int row = int(g) / tiles * PRODUCT_TILE + int(simd / GROUP_COLUMNS) * PRODUCT_GROUP_ROWS;
@@ -804,7 +805,8 @@ mpp_video_convolution(device const half *x [[buffer(0)]], device const half *w [
             const int r = min(row + m * FRAGMENT + at.y + i * 8, M - 1);
             const int sequence_frame = r / plane, pixel = r % plane;
             first_frame[m][i] = sequence_frame / output_frames * input_frames;
-            frame[m][i] = sequence_frame % output_frames * time_stride - (taps - 1);
+            frame[m][i] =
+                sequence_frame % output_frames * time_stride - (zero_padding ? taps / 2 : taps - 1);
             pixel_y[m][i] = pixel / output_width * stride - pad;
             pixel_x[m][i] = pixel % output_width * stride - pad;
         }
@@ -836,12 +838,21 @@ mpp_video_convolution(device const half *x [[buffer(0)]], device const half *w [
             _Pragma("clang loop unroll(full)") for (short i = 0; i < 2; ++i) {
                 const int t = frame[m][i] + kt;
                 int sy = pixel_y[m][i] + ky, sx = pixel_x[m][i] + kx;
-                sy = sy < 0 ? -sy : (sy >= input_height ? 2 * input_height - 2 - sy : sy);
-                sx = sx < 0 ? -sx : (sx >= input_width ? 2 * input_width - 2 - sx : sx);
-                inside[m][i] = t >= 0;
+                if (zero_padding) {
+                    inside[m][i] = t >= 0 && t < input_frames && sy >= 0 && sy < input_height &&
+                                   sx >= 0 && sx < input_width;
+                    sy = clamp(sy, 0, input_height - 1);
+                    sx = clamp(sx, 0, input_width - 1);
+                } else {
+                    sy = sy < 0 ? -sy : (sy >= input_height ? 2 * input_height - 2 - sy : sy);
+                    sx = sx < 0 ? -sx : (sx >= input_width ? 2 * input_width - 2 - sx : sx);
+                    inside[m][i] = t >= 0;
+                }
                 source[m][i] =
                     x +
-                    ((size_t(first_frame[m][i] + max(t, 0)) * input_height + sy) * input_width +
+                    ((size_t(first_frame[m][i] + clamp(t, 0, input_frames - 1)) * input_height +
+                      sy) *
+                         input_width +
                      sx) *
                         C +
                     at.x;

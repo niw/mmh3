@@ -1721,3 +1721,55 @@ kernel void video_encoder_norm_silu(device const half *x [[buffer(0)]],
         (float(x[i]) - statistics[group * 2]) * statistics[group * 2 + 1] * w[channel] + b[channel];
     y[i] = half(value / (1 + exp(-value)));
 }
+
+// A depthwise convolution of the latent upscaler along time, FP16 [frames, pixels, channels]:
+// y[t, p, c] = b[c] + sum over k of w[c, k] · x[t + k − kernel / 2, p, c], with zeros past either
+// end of the clip.
+//
+// p: values, pixels of a frame, channels, frames, kernel.
+kernel void latent_upscaler_temporal(device const half *x [[buffer(0)]],
+                                     device const float *w [[buffer(1)]],
+                                     device const float *b [[buffer(2)]],
+                                     device half *y [[buffer(3)]], constant uint *p [[buffer(4)]],
+                                     uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint channels = p[2], frame_values = p[1] * channels, kernel_taps = p[4];
+    const uint channel = i % channels;
+    const int frame = int(i / frame_values), frames = int(p[3]);
+    float sum = b[channel];
+    for (uint tap = 0; tap < kernel_taps; ++tap) {
+        const int source = frame + int(tap) - int(kernel_taps / 2);
+        if (source >= 0 && source < frames)
+            sum = fma(w[channel * kernel_taps + tap],
+                      float(x[size_t(source) * frame_values + i % frame_values]), sum);
+    }
+    y[i] = half(sum);
+}
+
+// A bilinear resize of every frame of FP16 [frames, height, width, channels], with the pixel
+// centers aligned as align_corners=False aligns them.
+//
+// p: values, height, width, channels, output height, output width.
+kernel void latent_upscaler_resize(device const half *x [[buffer(0)]], device half *y [[buffer(1)]],
+                                   constant uint *p [[buffer(2)]],
+                                   uint i [[thread_position_in_grid]]) {
+    if (i >= p[0])
+        return;
+    const uint height = p[1], width = p[2], channels = p[3], output_height = p[4],
+               output_width = p[5];
+    const uint channel = i % channels, pixel = i / channels;
+    const uint column = pixel % output_width, row = pixel / output_width % output_height;
+    const uint frame = pixel / (output_width * output_height);
+    const float sy = max((float(row) + 0.5f) * float(height) / float(output_height) - 0.5f, 0.0f);
+    const float sx = max((float(column) + 0.5f) * float(width) / float(output_width) - 0.5f, 0.0f);
+    const uint top = min(uint(sy), height - 1), bottom = min(top + 1, height - 1);
+    const uint left = min(uint(sx), width - 1), right = min(left + 1, width - 1);
+    const float down = sy - float(top), across = sx - float(left);
+    device const half *plane = x + size_t(frame) * height * width * channels + channel;
+    const float upper = float(plane[(top * width + left) * channels]) * (1 - across) +
+                        float(plane[(top * width + right) * channels]) * across;
+    const float lower = float(plane[(bottom * width + left) * channels]) * (1 - across) +
+                        float(plane[(bottom * width + right) * channels]) * across;
+    y[i] = half(upper * (1 - down) + lower * down);
+}

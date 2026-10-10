@@ -734,6 +734,7 @@ impl MetalVideoEncoder {
                 stride as u32,
                 time_stride as u32,
                 u32::from(residual.is_some()),
+                0,
             ],
             rows.div_ceil(PRODUCT_TILE) * convolution.outputs.div_ceil(PRODUCT_TILE),
             true,

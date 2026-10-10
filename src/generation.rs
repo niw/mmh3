@@ -44,6 +44,7 @@ pub const OPTIONS: &[&str] = &[
     "schedule",
     "sampler",
     "draft-steps",
+    "latent-upscaler",
     "seed",
     "shift-video",
     "shift-audio",
@@ -991,11 +992,7 @@ pub fn sample(
                 for (value, &slope) in video.data.iter_mut().zip(&velocity.video) {
                     *value -= sigma * slope;
                 }
-                video = mmh3_core::dit::latent::resize_video(
-                    &video,
-                    full_video_shape[2],
-                    full_video_shape[3],
-                );
+                video = enlarge_draft(options, &video, full_video_shape[2], full_video_shape[3])?;
                 let fresh = noise.samples(video.data.len());
                 for (value, fresh) in video.data.iter_mut().zip(fresh) {
                     *value = (1.0 - sigma_next) * *value + sigma_next * fresh;
@@ -1072,6 +1069,44 @@ pub fn sample(
     #[cfg(feature = "cuda")]
     save_algorithm_cache();
     Ok((video, audio))
+}
+
+/// The clean latent of the last draft step at `height × width`: through the latent upscaler when
+/// its weights are there, and bilinearly otherwise.
+fn enlarge_draft(
+    options: &HashMap<&str, &str>,
+    latent: &Tensor,
+    height: usize,
+    width: usize,
+) -> Result<Tensor, Box<dyn Error>> {
+    use mmh3_core::latent_upscaler::FILE;
+
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::latent_upscaler::CudaLatentUpscaler as LatentUpscaler;
+    #[cfg(feature = "metal")]
+    use mmh3_metal::latent_upscaler::MetalLatentUpscaler as LatentUpscaler;
+
+    let path = crate::models::option_path(options, "latent-upscaler", FILE).ok();
+    match &path {
+        #[cfg(any(feature = "cuda", feature = "metal"))]
+        Some(path) if Path::new(path).exists() && LatentUpscaler::supported() => {
+            let started = std::time::Instant::now();
+            let upscaler = LatentUpscaler::load(&SafeTensors::open(Path::new(path))?)?;
+            let loaded = started.elapsed().as_secs_f64();
+            let enlarged = upscaler.upscale(latent)?;
+            println!(
+                "enlarged the draft with the latent upscaler in {:.1} s, {loaded:.1} s of it loading",
+                started.elapsed().as_secs_f64()
+            );
+            return Ok(enlarged);
+        }
+        Some(path) if options.contains_key("latent-upscaler") && !Path::new(path).exists() => {
+            return Err(format!("--latent-upscaler {path}: no such file").into());
+        }
+        _ => {}
+    }
+    println!("enlarged the draft bilinearly, with no latent upscaler to enlarge it");
+    Ok(mmh3_core::dit::latent::resize_video(latent, height, width))
 }
 
 /// Asks the first worker that holds the text encoder, or returns `None` so the caller encodes here.

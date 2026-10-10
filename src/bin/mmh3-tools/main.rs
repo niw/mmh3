@@ -41,7 +41,7 @@ const USAGE: &str = "usage:
                     [--reference FILE]... [--reference-audio FILE]... [--reference-video FILE]...
                     [--steps N | --schedule taomate] [--sampler euler|renoise] [--draft-steps N] [--seed N]
                     [--shift-video X] [--shift-audio X] [--dit FILE] [--text-encoder FILE] [--video-vae FILE]
-                    [--audio-vae FILE] [--patch FILE] [--lora FILE]
+                    [--audio-vae FILE] [--latent-upscaler FILE] [--patch FILE] [--lora FILE]
                     [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa]
                     [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X]
                     [--sparse-start X] [--vsa-sparsity X]

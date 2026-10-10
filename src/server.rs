@@ -39,7 +39,8 @@ const WATCH: Duration = Duration::from_millis(250);
 
 const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] \
                      [--idle-unload SECONDS] [--models DIR] [--dit FILE] [--text-encoder FILE] \
-                     [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...] \
+                     [--video-vae FILE] [--audio-vae FILE] [--latent-upscaler FILE] \
+                     [--devices CARD,CARD...] \
                      [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]] \
                      [--token FILE] [--vram-budget GB] [--consistent] [--ffmpeg ARGS...]";
 /// The options that are the server's own rather than a generation's.
@@ -53,6 +54,7 @@ const MACHINE_OPTIONS: &[&str] = &[
     "text-encoder",
     "video-vae",
     "audio-vae",
+    "latent-upscaler",
     "devices",
     "vram-budget",
     "worker",

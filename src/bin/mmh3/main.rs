@@ -3,7 +3,8 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--idle-unload SECONDS] [--models DIR]
-              [--dit FILE] [--text-encoder FILE] [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...]
+              [--dit FILE] [--text-encoder FILE] [--video-vae FILE] [--audio-vae FILE] [--latent-upscaler FILE]
+              [--devices CARD,CARD...]
               [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
               [--token FILE] [--vram-budget GB] [--consistent] [--ffmpeg ARGS...]
   mmh3 worker [--listen ADDR] [--models DIR] [--token FILE] [--devices CARD,CARD...] [--vram-budget GB]
@@ -12,7 +13,7 @@ const USAGE: &str = "usage:
                 [--width N] [--height N] [--frames N] [--first-frame FILE] [--last-frame FILE] [--reference FILE]...
                 [--reference-audio FILE]... [--reference-video FILE]...
                 [--steps N | --schedule taomate] [--sampler euler|renoise] [--draft-steps N] [--seed N] [--shift-video X] [--shift-audio X]
-                [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE]
+                [--dit FILE] [--video-vae FILE] [--audio-vae FILE] [--text-encoder FILE] [--latent-upscaler FILE]
                 [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge] [--attention dense|sol|vsa] [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--sparse-tau X] [--sparse-start X] [--vsa-sparsity X]
                 [--devices CARD,CARD...] [--worker HOST[:PORT] [--worker-units UNITS]]...
                 [--local-worker [--worker-units UNITS]] [--token FILE] [--consistent] [--vram-budget GB]
