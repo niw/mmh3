@@ -26,6 +26,7 @@ Generating in fewer steps:
 
 Going faster, and looking underneath:
 
+- [Draft steps](draft-steps.md): the first steps on a half-size canvas.
 - [Veda](veda.md): a block-sparse attention whose tiles a predictor picks.
 - [NVFP4 linear layers](nvfp4.md): a faster, coarser precision for the DiT.
 - [Performance and accuracy](performance.md): times, and the checks against ComfyUI.

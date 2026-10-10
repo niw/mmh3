@@ -70,6 +70,9 @@ through ffmpeg on a GPU or in a container without NVENC.
   official pipeline's Euler step. `renoise` takes the clean latent the step predicts and noises it
   again to the next sigma with fresh noise from the seed, the rule DMD-style students such as
   [DMAD](dmad.md) are trained with.
+- `--draft-steps N` (default 0): Runs the first N steps on a canvas of half the width and height,
+  and the rest at full size. With a 4-step model, about 2 is the limit. See
+  [Draft steps](draft-steps.md).
 - `--seed N` (default 0): Seed of the initial noise.
 - `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
   Turbo LoRA wants 6 and 3.
