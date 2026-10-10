@@ -29,6 +29,10 @@ pub type VideoDecoder = mmh3_metal::vae::MetalVideoDecoder;
 pub type AudioDecoder = mmh3_cuda::audio_vae::CudaAudioDecoder;
 #[cfg(feature = "metal")]
 pub type AudioDecoder = mmh3_metal::audio_vae::MetalAudioDecoder;
+#[cfg(feature = "cuda")]
+pub type LatentUpscaler = mmh3_cuda::latent_upscaler::CudaLatentUpscaler;
+#[cfg(feature = "metal")]
+pub type LatentUpscaler = mmh3_metal::latent_upscaler::MetalLatentUpscaler;
 /// The DiT a rank runs its share of a step on.
 #[cfg(feature = "cuda")]
 pub type Dit = mmh3_cuda::dit::CudaDit;
@@ -84,6 +88,7 @@ enum Kind {
     TextEncoder,
     VideoDecoder,
     AudioDecoder,
+    LatentUpscaler,
     Dit,
     /// The blocks a DiT kept on the device, which it reads on the way until it keeps some again.
     #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
@@ -97,6 +102,7 @@ impl Kind {
             Kind::TextEncoder => "the text encoder",
             Kind::VideoDecoder => "the video VAE",
             Kind::AudioDecoder => "the audio VAE",
+            Kind::LatentUpscaler => "the latent upscaler",
             Kind::Dit => "the DiT",
             Kind::DitBlocks => "the DiT's blocks",
         }
@@ -108,6 +114,7 @@ impl Kind {
             Kind::TextEncoder => "text_encoder",
             Kind::VideoDecoder => "video_vae",
             Kind::AudioDecoder => "audio_vae",
+            Kind::LatentUpscaler => "latent_upscaler",
             Kind::Dit | Kind::DitBlocks => "dit",
         }
     }
@@ -120,6 +127,7 @@ pub struct Models {
     text_encoder: Slot<u64, TextEncoder>,
     video_decoder: Slot<VideoDecoderKey, VideoDecoder>,
     audio_decoder: Slot<u64, AudioDecoder>,
+    latent_upscaler: Slot<u64, LatentUpscaler>,
     dit: Slot<DitKey, Dit>,
     /// Counts the uses, so that the least recent one is the smallest.
     tick: u64,
@@ -136,6 +144,7 @@ impl Models {
             text_encoder: Slot::new(),
             video_decoder: Slot::new(),
             audio_decoder: Slot::new(),
+            latent_upscaler: Slot::new(),
             dit: Slot::new(),
             tick: 0,
             touched: None,
@@ -208,6 +217,22 @@ impl Models {
         Ok(&self.audio_decoder.kept.as_ref().expect("just loaded").1)
     }
 
+    /// The latent upscaler of `path`, loaded unless the kept one came from the same checkpoint.
+    pub fn latent_upscaler(
+        &mut self,
+        path: &Path,
+        key: u64,
+    ) -> Result<&LatentUpscaler, Box<dyn Error>> {
+        if self.latent_upscaler.kept.as_ref().map(|(kept, _)| *kept) != Some(key) {
+            self.latent_upscaler.kept = None;
+            let file = SafeTensors::open(path)?;
+            let upscaler = self.read(|| load(path, || LatentUpscaler::load(&file)))?;
+            self.latent_upscaler.kept = Some((key, upscaler));
+        }
+        self.latent_upscaler.used = self.touch();
+        Ok(&self.latent_upscaler.kept.as_ref().expect("just loaded").1)
+    }
+
     /// Reads a model. When the device has no memory left, lets go of the model used least and
     /// tries again, until there is nothing left to let go of and the read fails as it would have
     /// on a machine that was holding nothing.
@@ -277,6 +302,7 @@ impl Models {
             (self.text_encoder.kept.is_some(), Kind::TextEncoder),
             (self.video_decoder.kept.is_some(), Kind::VideoDecoder),
             (self.audio_decoder.kept.is_some(), Kind::AudioDecoder),
+            (self.latent_upscaler.kept.is_some(), Kind::LatentUpscaler),
             (self.dit.kept.is_some(), Kind::Dit),
         ]
         .into_iter()
@@ -374,6 +400,7 @@ impl Models {
             (self.text_encoder.releasable(), Kind::TextEncoder),
             (self.video_decoder.releasable(), Kind::VideoDecoder),
             (self.audio_decoder.releasable(), Kind::AudioDecoder),
+            (self.latent_upscaler.releasable(), Kind::LatentUpscaler),
             (self.dit.releasable(), Kind::Dit),
         ]
         .into_iter()
@@ -396,6 +423,7 @@ impl Models {
             Kind::TextEncoder => self.text_encoder.kept = None,
             Kind::VideoDecoder => self.video_decoder.kept = None,
             Kind::AudioDecoder => self.audio_decoder.kept = None,
+            Kind::LatentUpscaler => self.latent_upscaler.kept = None,
             Kind::Dit => self.dit.kept = None,
         }
         Some(kind)

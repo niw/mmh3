@@ -1103,7 +1103,15 @@ fn enlarge_draft(
         }
         let path = Path::new(&path);
         let started = std::time::Instant::now();
-        let enlarged = LatentUpscaler::load(&SafeTensors::open(path)?)?.upscale(latent)?;
+        // A process that keeps its models keeps the upscaler with them, in the table of the device
+        // this run computes on.
+        let enlarged = if KEEPS_MODELS.load(std::sync::atomic::Ordering::Relaxed) {
+            let key = crate::worker::digest(&SafeTensors::open(path)?);
+            crate::resident::Table::new(crate::resident::current_device())
+                .with_room(|models| Ok(models.latent_upscaler(path, key)?.upscale(latent)?))?
+        } else {
+            LatentUpscaler::load(&SafeTensors::open(path)?)?.upscale(latent)?
+        };
         println!(
             "enlarged the draft with the latent upscaler in {:.1} s",
             started.elapsed().as_secs_f64()
