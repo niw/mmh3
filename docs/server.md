@@ -21,11 +21,11 @@ as ffmpeg's arguments, as it does for a generation. See [Output](output.md).
 target/release/mmh3 server --ffmpeg
 ```
 
-The rest of the server's line is what `mmh3 generate` takes about the machine: `--models`,
-`--dit`, `--text-encoder`, `--video-vae`, `--audio-vae`, `--devices`, `--worker`,
-`--worker-units`, `--local-worker`, `--token`, `--vram-budget` and `--consistent`. Every
-generation is told them, and a request may not give them. What to generate is a request's, and the
-server refuses it on its own line.
+The rest of the server's line is what `mmh3 generate` takes about the machine: `--models`, `--dit`,
+`--text-encoder`, `--video-vae`, `--audio-vae`, `--latent-upscaler`, `--devices`, `--worker`,
+`--worker-units`, `--local-worker`, `--token`, `--vram-budget` and `--consistent`. Every generation
+is told them, and a request may not give them. What to generate is a request's, and the server
+refuses it on its own line.
 
 There is no authentication. A machine that should answer anybody but itself wants something in
 front of this that decides who may ask, which is why the default is loopback.

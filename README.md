@@ -55,7 +55,7 @@ Each generated a 1344×768, 124-frame video, 5.2 seconds at 24 fps.
 
 With [draft steps](docs/draft-steps.md), the first steps run on a canvas of half the width and
 height, which settles the layout and the motion in a quarter of the tokens. With the first two of
-the Turbo LoRA's four steps as draft steps, a generation took 59.5 s rather than 83.2 s.
+the Turbo LoRA's four steps as draft steps, a generation took 61.5 s rather than 83.2 s.
 
 ### Metal on macOS
 
