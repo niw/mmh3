@@ -128,9 +128,8 @@ run does. So `--vram-budget GB` and `--idle-unload SECONDS` mean here what they 
 [Distributed generation](distributed.md). `--consistent` given to the server holds for every
 generation it runs.
 
-On a DGX Spark the models take about 6.4 s to read, and that is what the first generation pays and
-the ones after it do not, whatever they generate. Three generations of the same request against a
-server just started:
+On a DGX Spark, reading the models is what the first generation pays and the ones after it do not,
+whatever they generate. Three generations of the same request against a server just started:
 
 | Request | First | Then |
 | --- | ---: | ---: |
@@ -138,8 +137,14 @@ server just started:
 | 1344×768, four steps, [FastH3](fasth3.md) | 88.3 s | 77.0 s, 80.5 s |
 
 So it is the short generation that gains most: reading the models is more than half of the first
-one and less than a tenth of the second, where the four steps take 58 s and the video VAE 19 to
-22 s however the models arrived.
+one and less than a tenth of the second. The rest of the second takes as long however the models
+arrived:
+
+| Stage of the 1344×768 FastH3 generation | Time |
+| --- | ---: |
+| Reading the models, the first time only | 6.4 s |
+| The four steps | 58 s |
+| The video VAE | 19 to 22 s |
 
 ## Every request
 

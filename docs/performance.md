@@ -19,15 +19,19 @@ tokens (38,710 tokens in all):
 | Text encoder load and encode | 3.4 s | |
 | DiT load | 2.9 s | |
 
-A complete run with the [Turbo LoRA](lightx2v-turbo.md) settings, the garden red panda
-prompt (75 text tokens) and seed 42 took **86.29 s for MP4** and **90.88 s for WebM**, including
-model loading and native encoding. Both runs produced 1344×768, 124-frame clips with stereo audio,
-and both files were verified by decoding the entire video and audio streams. These are individual
-runs, not averages.
+Complete runs with the [Turbo LoRA](lightx2v-turbo.md) settings at 1344×768 and 124 frames,
+including model loading, took:
 
-With the Tokyo rain prompt and seed 1, the same settings took 86.76 s without the final video and
-audio encoding, 98.98 s with the first step dense, and 116.20 s with BF16 attention and the first
-step dense.
+| Prompt | Seed | Run | Time |
+| --- | ---: | --- | ---: |
+| Garden red panda, 75 text tokens | 42 | MP4 | 86.29 s |
+| Garden red panda, 75 text tokens | 42 | WebM | 90.88 s |
+| Tokyo rain | 1 | without the final video and audio encoding | 86.76 s |
+| Tokyo rain | 1 | the first step dense | 98.98 s |
+| Tokyo rain | 1 | BF16 attention, the first step dense | 116.20 s |
+
+The MP4 and WebM files were verified by decoding the entire video and audio streams. These are
+individual runs, not averages.
 
 ## Accuracy
 

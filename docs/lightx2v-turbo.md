@@ -26,7 +26,14 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 `make download-models LORA=turbo` and `make generate LORA=turbo` run these settings too.
 
 INT8/FP8 attention changes image details and needs about 0.76 GiB more memory. `--sparse-start 0`
-can also change the composition. `--sparse-start 0.2` keeps the first step dense and took 98.98 s.
+can also change the composition. `--sparse-start 0.2` keeps the first step dense, which is slower,
+as [Performance and accuracy](performance.md) shows.
 So far these settings have been compared visually on one prompt and seed only.
 
-[Performance and accuracy](performance.md) gives the times of these settings on a DGX Spark.
+With these settings, a complete generation takes:
+
+| Machine | Clip | Each step | Whole generation |
+| --- | --- | ---: | ---: |
+| DGX Spark | 1344×768, 124 frames | 14 s | 81 s |
+
+[Performance and accuracy](performance.md) gives the time of each stage.

@@ -45,8 +45,12 @@ attention, a step after the first took:
 | [lightx2v Turbo LoRA](lightx2v-turbo.md) with Sol-Attn | 14.1 to 14.2 s | 10.7 s |
 | [TaoMate-H3](taomate.md) with Sol-Attn | 13.9 to 14.0 s | 10.4 to 10.5 s |
 
-A complete FastH3 run, including model loading and encoding, took 72.0 s with NVFP4 and 84.7 s with
-INT8. Its first step took 12.0 s with the saved cuBLASLt candidates.
+A complete FastH3 run took:
+
+| | INT8 | NVFP4 |
+| --- | ---: | ---: |
+| The first step, with the saved cuBLASLt candidates | | 12.0 s |
+| The whole run, including model loading and encoding | 84.7 s | 72.0 s |
 
 ## Accuracy
 

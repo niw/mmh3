@@ -124,11 +124,15 @@ so a small difference in the scores keeps a different tenth.
 
 ## Approximate speed
 
-`make generate`, a 672×384, 73-frame FastH3 clip in four steps, takes about 153 seconds on an Apple
-M4 Max with 128 GB, at about 27 seconds a step, and about 67 seconds on an M6 with 24 GB, at about
-12 seconds a step, even though the M6 keeps only 24 of the DiT's 52 blocks on the device. A clip of
-the same size in the two steps of the [PDMD](pdmd.md) LoRA takes about 45 seconds on the M6, and in
-the four steps of the [DMAD](dmad.md) LoRA about 76 seconds. All are with warm model files and
-include loading, generation and MP4 output. Loading uncached models takes longer, and larger clips
-require more time and memory.
+A 672×384, 73-frame clip, with warm model files and including loading, generation and MP4 output,
+takes about:
+
+| Mac | Model | Each step | Whole generation |
+| --- | --- | ---: | ---: |
+| M4 Max | [FastH3](fasth3.md), `make generate` | 27 s | 153 s |
+| M6 | [FastH3](fasth3.md), `make generate` | 12 s | 67 s |
+| M6 | [PDMD](pdmd.md), 2 steps | | 45 s |
+| M6 | [DMAD](dmad.md), 4 steps | | 76 s |
+
+Loading uncached models takes longer, and larger clips require more time and memory.
 These figures are a starting point for this configuration, not a comparison across GPUs.

@@ -203,9 +203,14 @@ costing the Spark 0.2 s a step, which is what handing out a step and putting it 
 Neither of those last two numbers can be read from one machine. 2.2 s beside 2.0 s is what says the
 coordination costs 0.2 s. On its own it says only that a step took 2.2 s.
 
-The Mac also stops reading 45 GB it never needed: 20 GB of DiT, which a machine that runs no block
-does not want, and 25 GB of text encoder, which the Spark already held. That is a larger change than
-the clock shows, since the wall time of the same run moved only from 53 s to 51 s.
+The Mac also does not read 45 GB it never needs: 20 GB of DiT, which a machine that runs no block
+does not want, and 25 GB of text encoder, which the Spark already holds. That matters more than the
+clock shows:
+
+| The Mac handing every step to the Spark | Whole run |
+| --- | ---: |
+| reading the DiT and the text encoder as well | 53 s |
+| reading neither | 51 s |
 
 Between two DGX Sparks at 200 GbE, splitting a 768p step takes about a third off a run. A worker
 that only encodes the prompt and decodes chunks saves 9% of the same run.

@@ -27,12 +27,16 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 
 `make download-models LORA=dmad` and `make generate LORA=dmad` run these settings too.
 
-At 1344×768 with Sol-Attn and INT8/FP8 attention, the four steps take 14.1, 13.6, 13.7 and 13.8 s
-on a DGX Spark, and the whole generation 80 s. `--sampler euler` runs them in the same time, with a
-different video for the same seed.
-
 On [Metal](metal.md), which has no INT8/FP8 attention, leave out `--attention-precision int8-fp8`.
-On an M6 with 24 GB, a 672×384, 73-frame clip takes about 76 s, about 13.5 s a step.
+
+With these settings, a complete generation takes:
+
+| Machine | Clip | Each step | Whole generation |
+| --- | --- | ---: | ---: |
+| DGX Spark | 1344×768, 124 frames | 14.1, 13.6, 13.7, 13.8 s | 80 s |
+| M6 | 672×384, 73 frames | 13.5 s | 76 s |
+
+`--sampler euler` runs the steps in the same time, with a different video for the same seed.
 
 ## How the LoRA is built
 

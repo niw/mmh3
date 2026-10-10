@@ -25,9 +25,18 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 `make generate` runs these settings. `--patch` takes a path, or a file name in `patches` or `loras`
 of the models directory. mmh3 selects VSA for DiTs with VSA gates, which the patch adds.
 `--vsa-sparsity X` (default 0.9) is the fraction of the video tiles that VSA leaves out for each
-query tile, and `--attention-precision int8-fp8` runs the attention with INT8 QK and FP8 PV. With
-these settings, a complete MP4 generation at 1344×768 on a DGX Spark takes about 80 seconds,
-including model loading and encoding.
+query tile, and `--attention-precision int8-fp8` runs the attention with INT8 QK and FP8 PV.
+
+With these settings, a complete MP4 generation, including model loading and encoding, takes:
+
+| Machine | Clip | Each step | Whole generation |
+| --- | --- | ---: | ---: |
+| DGX Spark | 1344×768, 124 frames | 14 s | 80 s |
+| M4 Max | 672×384, 73 frames | 27 s | 153 s |
+| M6 | 672×384, 73 frames | 12 s | 67 s |
+
+On [Metal](metal.md), which has no INT8/FP8 attention, the Macs run without
+`--attention-precision int8-fp8`.
 
 INT8/FP8 attention changes image details compared with `--attention-precision bf16`.
 

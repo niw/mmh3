@@ -126,29 +126,42 @@ unless `--width` and `--height` say otherwise, as the references do not set it. 
 
 ## Speed and accuracy
 
-The kitten and street example above at 1344×768 and 124 frames on a DGX Spark, with the Turbo LoRA
-in eight steps: 177.9 s in all, steps 17.7 s. Without the LoRA in 20 steps, the first four of them
-dense, 424.8 s. The two pictures add about 4,500 rows to the sequence with their vision blocks.
-Encoding the prompt with the pictures takes 7.8 s and the pictures 2.2 s.
+A generation took:
 
-A sound is far cheaper than a picture: it brings no vision tokens, and a two-second one adds 160
-rows, two per latent frame at 40 frames per second, against about 2,300 rows for a 768p picture.
-Encoding it takes 0.2 s, and a run with one 448×256 reference picture and a two-second sound at
-1344×768 and 124 frames takes 14.4 s per step, the same as without the sound.
+| Machine | Clip | References | Settings | Each step | Whole generation |
+| --- | --- | --- | --- | ---: | ---: |
+| DGX Spark | 1344×768, 124 frames | the kitten and the street above | Turbo LoRA, 8 steps | 17.7 s | 177.9 s |
+| DGX Spark | 1344×768, 124 frames | the kitten and the street above | 20 steps, the first 4 dense | | 424.8 s |
+| DGX Spark | 1344×768, 124 frames | a 448×256 picture | | 14.4 s | |
+| DGX Spark | 1344×768, 124 frames | a 448×256 picture and a two-second sound | | 14.4 s | |
+| DGX Spark | 1344×768, 124 frames | a 22-frame 448×256 clip | Turbo LoRA, 8 steps | 15.1 s | about 150 s |
+| M6 | 448×256, 73 frames | a 448×256 picture, a 39-frame 448×256 clip with its soundtrack and a two-second sound | Turbo LoRA, 8 steps | 10 s | 101 s |
 
-A clip costs what its own size and length ask for. A 22-frame clip of 448×256 encodes in 0.5 s and
-adds 784 video rows, 74 audio rows and one vision block, and a 1344×768 video of 124 frames still
-runs at 15.1 s per step with it, about two and a half minutes for the eight steps. The same 22
-frames at 1344×768 take 9.3 s to encode instead and bring about 37,000 rows, as many as the target
-itself, and 124 frames of 1344×768 take 37 s, so a long reference at full size is expensive on
-both counts.
+Encoding the references took:
 
-On an M6 with 24 GB, a 448×256 video of 73 frames from a 448×256 picture, a 39-frame 448×256 clip
-with its soundtrack and a two-second sound, with the Turbo LoRA in eight steps, takes 101 s in all,
-steps 10 s with 23 of the DiT's 52 blocks kept on the device. Encoding the prompt takes 5.7 s, the
-picture 0.3 s, the clip 3.8 s and each sound 0.2 s. The clip's last group of seventeen frames
-goes through the encoder with only the five frames its two kept latent frames read, which the
-causal encoder makes exact.
+| Machine | What | Time |
+| --- | --- | ---: |
+| DGX Spark | the prompt with the kitten and the street | 7.8 s |
+| DGX Spark | the kitten and the street | 2.2 s |
+| DGX Spark | a two-second sound | 0.2 s |
+| DGX Spark | a 22-frame 448×256 clip | 0.5 s |
+| DGX Spark | a 22-frame 1344×768 clip | 9.3 s |
+| DGX Spark | a 124-frame 1344×768 clip | 37 s |
+| M6 | the prompt with a picture, a clip and a sound | 5.7 s |
+| M6 | a 448×256 picture | 0.3 s |
+| M6 | a 39-frame 448×256 clip | 3.8 s |
+| M6 | a two-second sound | 0.2 s |
+
+The two pictures add about 4,500 rows to the sequence with their vision blocks. A sound is far
+cheaper than a picture: it brings no vision tokens, and a two-second one adds 160 rows, two per
+latent frame at 40 frames per second, against about 2,300 rows for a 768p picture.
+
+A clip costs what its own size and length ask for. A 22-frame clip of 448×256 adds 784 video rows,
+74 audio rows and one vision block. The same 22 frames at 1344×768 bring about 37,000 rows, as many
+as the target itself, so a long reference at full size is expensive both to encode and to attend.
+
+A clip's last group of seventeen frames goes through the encoder with only the five frames its two
+kept latent frames read, which the causal encoder makes exact.
 
 Against ComfyUI in FP32 at 448×256 with two reference pictures, one of them 128×256, the DiT's
 velocity is within 1.1e-2 for video and 1.9e-2 for audio, as close as with keyframes. With one

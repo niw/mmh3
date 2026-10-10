@@ -48,17 +48,24 @@ Pillow's Lanczos filter, as the official pipeline fits them.
 
 ## Speed and accuracy
 
-Tokyo rain at 1344×768 with the FastH3 patch and INT8/FP8 attention on a DGX Spark, a first and a
-last frame: 111.1 s in all, steps 19.1 s. With `--linear-precision nvfp4` 99.3 s, steps 15.5 s. The
-pictures add about 4,100 rows to the sequence, which VSA attends from every video tile, so a step
-takes about 5 s longer than without pictures. Encoding the prompt with the pictures takes 6.7 s
-and the keyframes 2.1 s.
+With a first and a last frame and the FastH3 patch in four steps, the Tokyo rain prompt took:
 
-On an M6 with 24 GB, a first and a last frame at 448×256 and 73 frames with the FastH3 patch in
-four steps take 48 s in all, steps 7 to 10 s with 28 of the DiT's 52 blocks kept on the device.
-Encoding the prompt with the pictures takes 6.2 s and the keyframes 0.3 s. At 1344×768 the two
-pictures take the prompt 7.5 s, since the vision tower runs in FP16 on the matrix units, 0.6 s a
-picture.
+| Machine | Clip | Settings | Each step | Whole generation |
+| --- | --- | --- | ---: | ---: |
+| DGX Spark | 1344×768 | INT8/FP8 attention | 19.1 s | 111.1 s |
+| DGX Spark | 1344×768 | INT8/FP8 attention, `--linear-precision nvfp4` | 15.5 s | 99.3 s |
+| M6 | 448×256, 73 frames | | 7 to 10 s | 48 s |
+
+The pictures add about 4,100 rows to the sequence, which VSA attends from every video tile, so a
+step takes about 5 s longer than without pictures. Encoding them took:
+
+| Machine | Clip | The prompt with the pictures | The keyframes |
+| --- | --- | ---: | ---: |
+| DGX Spark | 1344×768 | 6.7 s | 2.1 s |
+| M6 | 448×256 | 6.2 s | 0.3 s |
+| M6 | 1344×768 | 7.5 s | |
+
+On the M6, the vision tower runs in FP16 on the matrix units, about 0.6 s a picture at 1344×768.
 
 Against ComfyUI in FP32 at 448×256 with a first and a last frame, the DiT's velocity is within
 9.1e-3 for video and 2.3e-2 for audio, and the keyframe latents within 1.3e-3. The vision tower

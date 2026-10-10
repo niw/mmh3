@@ -26,8 +26,12 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 
 `make download-models LORA=taomate` and `make generate LORA=taomate` run these settings too.
 
-At 1344×768 with Sol-Attn and INT8/FP8 attention, the three steps take 14.3, 13.8 and 13.9 s on a
-DGX Spark, against 13.8, 13.5 and 13.5 s for the DiT without a LoRA.
+With these settings, a complete generation takes:
+
+| Machine | Clip | Each step | Whole generation |
+| --- | --- | ---: | ---: |
+| DGX Spark | 1344×768, 124 frames | 14.3, 13.8, 13.9 s | 66 s |
+| DGX Spark, DiT without a LoRA | 1344×768, 124 frames | 13.8, 13.5, 13.5 s | |
 
 Keep `--lora-mode adapter`, the default. Most of TaoMate's updates are smaller than the INT8 step
 of their weights, so `--lora-mode merge` loses them, with visibly worse detail.

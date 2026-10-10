@@ -26,11 +26,15 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 
 `make download-models LORA=pdmd` and `make generate LORA=pdmd` run these settings too.
 
-At 1344×768 with Sol-Attn and INT8/FP8 attention, the two steps take 14.1 and 13.7 s on a DGX Spark,
-against 13.5 and 13.3 s for the DiT without a LoRA.
-
 On [Metal](metal.md), which has no INT8/FP8 attention, leave out `--attention-precision int8-fp8`.
-On an M6 with 24 GB, a 672×384, 73-frame clip takes about 45 s.
+
+With these settings, a complete generation takes:
+
+| Machine | Clip | Each step | Whole generation |
+| --- | --- | ---: | ---: |
+| DGX Spark | 1344×768, 124 frames | 14.1, 13.7 s | 52 s |
+| DGX Spark, DiT without a LoRA | 1344×768, 124 frames | 13.5, 13.3 s | |
+| M6 | 672×384, 73 frames | | 45 s |
 
 ## How the LoRA is built
 
