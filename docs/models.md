@@ -30,10 +30,12 @@ also downloads the [DMAD](dmad.md) LoRA,
 `loras/minimax_h3_dmad_4step_full_critic_rank128_bf16.safetensors` from yniw/MiniMax-H3-mmh3,
 `--veda` also downloads the predictor of [Veda](veda.md)'s sparse attention,
 `veda/minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors` from
-Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview, and `--models DIR` downloads into another
-directory. `make download-models LORA=pdmd`, `LORA=dmad`,
-`LORA=turbo` or `LORA=taomate` passes `--pdmd`, `--dmad`, `--lightx2v-turbo` or `--taomate` to the
-script.
+Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview, `--latent-upscaler` also downloads the
+latent upscaler of [draft steps](draft-steps.md),
+`latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors` from
+LBH-123-AI/Minimax_h3_latent_Upscaler, and `--models DIR` downloads into another directory.
+`make download-models LORA=pdmd`, `LORA=dmad`, `LORA=turbo` or `LORA=taomate` passes `--pdmd`,
+`--dmad`, `--lightx2v-turbo` or `--taomate` to the script.
 
 Patches, such as the FastH3 patch, go into `patches` of the models directory. `--patch` and `--lora`
 take a path, or a file name that mmh3 looks up in `patches` and then `loras` of the models directory

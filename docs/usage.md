@@ -73,6 +73,10 @@ through ffmpeg on a GPU or in a container without NVENC.
 - `--draft-steps N` (default 0): Runs the first N steps on a canvas of half the width and height,
   and the rest at full size. With a 4-step model, about 2 is the limit. See
   [Draft steps](draft-steps.md).
+- `--latent-upscaler FILE` (default none): The latent upscaler that enlarges the draft of
+  `--draft-steps`, a path or a file name in `latent_upscale_models` of the models directory, such as
+  `minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors`. Without it, the draft is enlarged
+  bilinearly.
 - `--seed N` (default 0): Seed of the initial noise.
 - `--shift-video X`, `--shift-audio X` (default 12, 3): Sigma shifts of the two schedules. The 768p
   Turbo LoRA wants 6 and 3.

@@ -21,22 +21,22 @@ as ffmpeg's arguments, as it does for a generation. See [Output](output.md).
 target/release/mmh3 server --ffmpeg
 ```
 
-The rest of the server's line is what `mmh3 generate` takes about the machine: `--models`,
-`--dit`, `--text-encoder`, `--video-vae`, `--audio-vae`, `--devices`, `--worker`,
-`--worker-units`, `--local-worker`, `--token`, `--vram-budget` and `--consistent`. Every
-generation is told them, and a request may not give them. What to generate is a request's, and the
-server refuses it on its own line.
+The rest of the server's line is what `mmh3 generate` takes about the machine: `--models`, `--dit`,
+`--text-encoder`, `--video-vae`, `--audio-vae`, `--devices`, `--worker`, `--worker-units`,
+`--local-worker`, `--token`, `--vram-budget` and `--consistent`. Every generation is told them, and
+a request may not give them. What to generate is a request's, and the server refuses it on its own
+line.
 
 There is no authentication. A machine that should answer anybody but itself wants something in
 front of this that decides who may ask, which is why the default is loopback.
 
 ## Asking for a generation
 
-A form field is the option of the same name, so what `mmh3 generate` takes on the command line
-about what to generate this takes as a field. A field that carries a file is written beside the
-generation and stands for the path it was written to. `first-frame`, `last-frame`, the
-references, `prompt-file` and `context` take only such a file. `lora` and `patch` take the name of
-a file in the models directory, looked for where `mmh3 generate` looks for it.
+A form field is the option of the same name, so what `mmh3 generate` takes on the command line about
+what to generate this takes as a field. A field that carries a file is written beside the generation
+and stands for the path it was written to. `first-frame`, `last-frame`, the references,
+`prompt-file` and `context` take only such a file. `lora`, `patch` and `latent-upscaler` take the
+name of a file in the models directory, looked for where `mmh3 generate` looks for it.
 
 ```sh
 curl -X POST http://localhost:8833/v1/generations \
@@ -119,14 +119,15 @@ curl http://localhost:8833/v1/status
 not a machine holding nothing. `memory` is what the GPUs have between them, and `models` is what
 any of them holds.
 
-The models are held by a worker in the server's own process, which is the same worker
-`mmh3 worker` runs and holds its models the same way. A generation is a leader and reads no model
-itself, so without one there would be nothing to keep: the server lends its cards through that
-worker even when a run could have taken every step on one card by itself. A server told to use
-machines of its own with `--worker` lends none of its cards unless `--local-worker` says so, as a
-run does. So `--vram-budget GB` and `--idle-unload SECONDS` mean here what they mean there. See
-[Distributed generation](distributed.md). `--consistent` given to the server holds for every
-generation it runs.
+The models are held by a worker in the server's own process, which is the same worker `mmh3 worker`
+runs and holds its models the same way. A generation is a leader and reads no model itself, so
+without one there would be nothing to keep: the server lends its cards through that worker even when
+a run could have taken every step on one card by itself. The exception is the latent upscaler of
+[draft steps](draft-steps.md), which goes into the same tables on the card the generation computes
+on and stays there with the others. A server told to use machines of its own with `--worker` lends
+none of its cards unless `--local-worker` says so, as a run does. So `--vram-budget GB` and
+`--idle-unload SECONDS` mean here what they mean there. See [Distributed
+generation](distributed.md). `--consistent` given to the server holds for every generation it runs.
 
 On a DGX Spark, reading the models is what the first generation pays and the ones after it do not,
 whatever they generate. Three generations of the same request against a server just started:
