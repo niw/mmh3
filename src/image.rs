@@ -24,6 +24,7 @@ pub const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <image.png> [--models DIR]
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
+             [--save-context <text.safetensors>]
              [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
              [--renoise-sigma X] [--steps N] [--shift X] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
@@ -50,7 +51,9 @@ sigmas below X. The draft may then take every step.
 --steps samples in N steps on the uniform grid shifted by --shift, 12 by default, rather than on the six sigmas the
 checkpoint was distilled for, as a few-step LoRA such as PDMD's wants. A step then projects through the output heads
 of the distilled sigmas it spans, weighted by how much of it each one covers. --patch and --lora apply as they do to
-mmh3 generate.";
+mmh3 generate.
+--save-context also writes the text encoder's states of the prompt, which --context takes in place of the prompt
+and its encoder on the next run.";
 
 /// The DiT of MiniMax H3 Image inside the models directory.
 pub const IMAGE_DIT_FILE: &str =
@@ -226,6 +229,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "text-encoder",
             "vae",
             "save-latent",
+            "save-context",
             "attention-precision",
             "linear-precision",
             "vram-budget",
@@ -341,46 +345,81 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         )),
         false => Held::Alone,
     };
+    if options.contains_key("save-context") && !references.is_empty() {
+        return Err("--save-context saves a prompt without references".into());
+    }
     let (context, context_modalities) = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
             let started = Instant::now();
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
-            let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
-                if references.is_empty() {
-                    let mut ids = Tokenizer::h3().encode(&prompt);
-                    ids.truncate(MAX_PROMPT_TOKENS);
-                    return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
+            let mut ids = Tokenizer::h3().encode(&prompt);
+            ids.truncate(MAX_PROMPT_TOKENS);
+            let key = crate::resident::ContextKey {
+                encoder: crate::worker::digest(&SafeTensors::open(Path::new(&path))?),
+                ids: ids.clone(),
+                references: references.iter().map(reference_digest).collect(),
+            };
+            let (context, modalities) = match held.context(&key) {
+                Some(kept) => {
+                    println!(
+                        "found the {} prompt tokens with {} pictures encoded",
+                        kept.0.shape[0],
+                        references.len()
+                    );
+                    kept
                 }
-                // The tower is gone before the prompt encodes.
-                let embeddings = {
-                    #[allow(unused_mut)]
-                    let mut vision = VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+                None => {
+                    // A server's states are kept under the encoder, the prompt and the
+                    // references, so its tower runs at the default precision, as its kept
+                    // encoder does, rather than at whatever the request asked.
                     #[cfg(feature = "metal")]
-                    vision.set_precision(
-                        crate::metal::default_linear_precision(),
-                        crate::metal::attention_precision(&options)?,
-                    )?;
-                    references
-                        .iter()
-                        .map(|reference| vision.encode(&reference.vision.to_tensor()))
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let grids: Vec<VisionGrid> = references
-                    .iter()
-                    .map(|reference| {
-                        VisionGrid::for_picture(reference.vision.height, reference.vision.width)
-                    })
-                    .collect();
-                let prompt = picture_prompt(&Tokenizer::h3(), &prompt, &grids, MAX_PROMPT_TOKENS);
-                let context = encoder.encode_prompt(&prompt, &embeddings, &[])?.context;
-                Ok((context, prompt.modalities))
-            })?;
-            println!(
-                "encoded {} prompt tokens with {} pictures in {:.1} s",
-                context.shape[0],
-                references.len(),
-                started.elapsed().as_secs_f64()
-            );
+                    let vision_precision = match &held {
+                        Held::Alone => crate::metal::attention_precision(&options)?,
+                        Held::Kept(_) => crate::metal::default_attention_precision(),
+                    };
+                    let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
+                        if references.is_empty() {
+                            return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
+                        }
+                        // The tower is gone before the prompt encodes.
+                        let embeddings = {
+                            #[allow(unused_mut)]
+                            let mut vision =
+                                VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+                            #[cfg(feature = "metal")]
+                            vision.set_precision(
+                                crate::metal::default_linear_precision(),
+                                vision_precision,
+                            )?;
+                            references
+                                .iter()
+                                .map(|reference| vision.encode(&reference.vision.to_tensor()))
+                                .collect::<Result<Vec<_>, _>>()?
+                        };
+                        let grids: Vec<VisionGrid> = references
+                            .iter()
+                            .map(|reference| {
+                                VisionGrid::for_picture(
+                                    reference.vision.height,
+                                    reference.vision.width,
+                                )
+                            })
+                            .collect();
+                        let prompt =
+                            picture_prompt(&Tokenizer::h3(), &prompt, &grids, MAX_PROMPT_TOKENS);
+                        let context = encoder.encode_prompt(&prompt, &embeddings, &[])?.context;
+                        Ok((context, prompt.modalities))
+                    })?;
+                    println!(
+                        "encoded {} prompt tokens with {} pictures in {:.1} s",
+                        context.shape[0],
+                        references.len(),
+                        started.elapsed().as_secs_f64()
+                    );
+                    held.keep_context(key, &context, &modalities);
+                    (context, modalities)
+                }
+            };
             (context, modalities)
         }
         (None, Some(path)) => {
@@ -402,6 +441,18 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     if draft_steps > 0 && !references.is_empty() {
         return Err("--draft-steps cannot be combined with references".into());
+    }
+    if let Some(path) = options.get("save-context") {
+        let mut metadata = Vec::new();
+        if let Some(prompt) = options.get("prompt") {
+            metadata.push(("prompt", *prompt));
+        }
+        mmh3_core::safetensors::write_f32(
+            Path::new(path),
+            &[("context", &context.shape, &context.data)],
+            &metadata,
+        )?;
+        println!("wrote the context {:?} to {path}", context.shape);
     }
     let references = encode_references(&options, seed, &references)?;
 
@@ -598,6 +649,32 @@ impl Held {
                 let key = crate::worker::digest(&file);
                 table.with_room(|models| work(models.text_encoder(Path::new(path), key)?))
             }
+        }
+    }
+
+    /// The encoded prompt a server kept from an earlier picture of the same prompt and references
+    /// through the same encoder, which spares it the encoder's load and the encode.
+    fn context(
+        &mut self,
+        key: &crate::resident::ContextKey,
+    ) -> Option<(Tensor, Vec<mmh3_core::dit::timestep::Modality>)> {
+        match self {
+            Held::Alone => None,
+            Held::Kept(table) => table.borrow().context(key),
+        }
+    }
+
+    /// Keeps an encoded prompt for the pictures after this one, where the models are kept.
+    fn keep_context(
+        &mut self,
+        key: crate::resident::ContextKey,
+        context: &Tensor,
+        modalities: &[mmh3_core::dit::timestep::Modality],
+    ) {
+        if let Held::Kept(table) = self {
+            table
+                .borrow()
+                .keep_context(key, context.clone(), modalities.to_vec());
         }
     }
 
@@ -1024,6 +1101,19 @@ fn encode_references(
         started.elapsed().as_secs_f64()
     );
     Ok(latents)
+}
+
+/// What tells one reference from another in a kept prompt: the pixels of both copies the
+/// encoders read.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn reference_digest(reference: &EditReference) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    for picture in [&reference.encoded, &reference.vision] {
+        (picture.width, picture.height, &picture.pixels).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The top left of a latent `[channels, 1, height, width]` in whole 2 × 2 patches.

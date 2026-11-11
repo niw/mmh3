@@ -10,7 +10,9 @@
 //! the only one that gets to use it. Two devices hold their models apart and take their turns
 //! apart, which is what lets a machine compute on both at once.
 
+use mmh3_core::dit::timestep::Modality;
 use mmh3_core::safetensors::SafeTensors;
+use mmh3_core::tensor::Tensor;
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
@@ -60,6 +62,16 @@ pub type AdapterKey = (u64, u32, u8);
 pub struct DitKey {
     pub checkpoint: u64,
     pub adapters: Vec<AdapterKey>,
+}
+
+/// What an encoded prompt was made from: the text encoder, by its checkpoint's digest, the token
+/// ids it read and the reference pictures it saw, by their digests. Two of these equal means the
+/// same states, so a server with them kept need not read the encoder again.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextKey {
+    pub encoder: u64,
+    pub ids: Vec<u32>,
+    pub references: Vec<u64>,
 }
 
 /// One model, and when it was last used.
@@ -129,6 +141,9 @@ pub struct Models {
     audio_decoder: Slot<u64, AudioDecoder>,
     latent_upscaler: Slot<u64, LatentUpscaler>,
     dit: Slot<DitKey, Dit>,
+    /// The last prompt encoded, with the DiT's modality of each token, which is on the host and
+    /// stays however the device fills: it is the one thing here that costs no memory to speak of.
+    context: Option<(ContextKey, Tensor, Vec<Modality>)>,
     /// Counts the uses, so that the least recent one is the smallest.
     tick: u64,
     /// When a model was last asked for, for letting go of them all after a quiet while.
@@ -146,6 +161,7 @@ impl Models {
             audio_decoder: Slot::new(),
             latent_upscaler: Slot::new(),
             dit: Slot::new(),
+            context: None,
             tick: 0,
             touched: None,
             lent: 0,
@@ -171,6 +187,19 @@ impl Models {
         }
         self.text_encoder.used = self.touch();
         Ok(&self.text_encoder.kept.as_ref().expect("just loaded").1)
+    }
+
+    /// The encoded prompt kept under `key`, when the last one was.
+    pub fn context(&self, key: &ContextKey) -> Option<(Tensor, Vec<Modality>)> {
+        self.context
+            .as_ref()
+            .filter(|(kept, _, _)| kept == key)
+            .map(|(_, context, modalities)| (context.clone(), modalities.clone()))
+    }
+
+    /// Keeps an encoded prompt in place of the last one.
+    pub fn keep_context(&mut self, key: ContextKey, context: Tensor, modalities: Vec<Modality>) {
+        self.context = Some((key, context, modalities));
     }
 
     /// The video decoder of `path` for the tile geometry `key` names.

@@ -102,6 +102,12 @@ only the other DiT and VAE. The server takes the DiT and the picture VAE from th
 or from `--image-dit FILE` and `--image-vae FILE`, which are a picture's `--dit` and `--vae`. A kept
 DiT runs INT8 linear layers, so a request does not give `linear-precision`.
 
+The server also keeps the text encoder's states of the last prompt it encoded for a picture, so a
+picture of the same prompt and references through the same encoder skips the encoder's load and
+the encode, which on an M5 Max is about 6 s at 87 tokens and more at longer prompts. The kept
+encoder and the vision tower that reads the references run at the default attention precision,
+whatever `attention-precision` a request gives its DiT, so the states are the same for any request.
+
 On a DGX Spark, two 1024×1024 pictures against a server just started took 16.2 s and then 9.5 s.
 Two 4096×4096 pictures with the [faster settings](image.md#faster) took 34.0 s and then 26.1 s:
 
