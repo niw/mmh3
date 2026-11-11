@@ -382,3 +382,143 @@ fn adapter_lora_matches_a_cpu_weight_update() {
     assert!(video_change(&original.video, &actual.video) > 1e-4);
     assert!(dit.add_lora(&lora, strength).is_err());
 }
+
+/// MiniMax H3 Image's DiT: the fixture without its audio layers and with an output head per step,
+/// stacked as ComfyUI's PDD bank, the first head whole and the others as offsets from it. A step
+/// follows the CPU reference of the fixture whose output layer is the head of the step's sigma,
+/// on a picture with no audio frames, and with a reference picture to edit.
+#[test]
+fn follows_the_cpu_reference_with_a_head_per_step_and_no_audio() {
+    use mmh3_core::{dit::config::DitConfig, safetensors::write_f32};
+    use std::collections::HashMap;
+
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let tensors: HashMap<_, _> = file
+        .tensors()
+        .iter()
+        .filter_map(|info| {
+            info.name
+                .strip_prefix("weight.")
+                .map(|name| (name.to_owned(), Tensor::load(&file, info).unwrap()))
+        })
+        .collect();
+    let video = unbatched(tensor(&file, "input.video"));
+    let picture = Tensor::new(
+        vec![video.shape[0], 1, video.shape[2], video.shape[3]],
+        frames(&video, 0, 1).data,
+    );
+
+    // The heads after the first are offsets from it.
+    let sigmas = [1.0f32, 0.6, 0.3];
+    let heads: Vec<HashMap<&str, Vec<f32>>> = (0..sigmas.len())
+        .map(|head| {
+            ["weight", "bias"]
+                .into_iter()
+                .map(|suffix| {
+                    let base = &tensors[&format!("final_layer.video_out.{suffix}")].data;
+                    let offset = |i: usize| (i as f32 * 0.41 + head as f32).sin() * 0.05;
+                    let values = match head {
+                        0 => base.clone(),
+                        _ => (0..base.len()).map(offset).collect(),
+                    };
+                    (suffix, values)
+                })
+                .collect()
+        })
+        .collect();
+    let mut stacked: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+    for (name, tensor) in &tensors {
+        if name.starts_with("audio_patch_proj.") || name.starts_with("final_layer.audio_out.") {
+            continue;
+        }
+        let Some(suffix) = name.strip_prefix("final_layer.video_out.") else {
+            stacked.push((name.clone(), tensor.shape.clone(), tensor.data.clone()));
+            continue;
+        };
+        let mut shape = tensor.shape.clone();
+        shape[0] *= sigmas.len();
+        let values = heads.iter().flat_map(|head| head[suffix].clone()).collect();
+        stacked.push((name.clone(), shape, values));
+    }
+    let path = std::env::temp_dir().join(format!(
+        "mmh3-metal-image-dit-{}.safetensors",
+        std::process::id()
+    ));
+    let entries: Vec<(&str, &[usize], &[f32])> = stacked
+        .iter()
+        .map(|(name, shape, values)| (name.as_str(), shape.as_slice(), values.as_slice()))
+        .collect();
+    write_f32(
+        &path,
+        &entries,
+        &[(
+            "config",
+            r#"{"transformer": {"pdd_steps": 3, "pdd_sigmas": [1.0, 0.6, 0.3, 0.0]}}"#,
+        )],
+    )
+    .unwrap();
+    // The weights are read from the file's path, so it goes once they are.
+    let dit = MetalDit::load(&SafeTensors::open(&path).unwrap(), "");
+    std::fs::remove_file(&path).unwrap();
+    let dit = dit.unwrap();
+    assert!(!dit.config().has_audio());
+    assert_eq!(dit.config().step_sigmas, sigmas);
+
+    // The last step edits a picture on a grid of its own, from the input's values.
+    let channels = picture.shape[0];
+    let reference = mmh3_core::dit::inputs::Reference::Picture(Tensor::new(
+        vec![channels, 1, 2, 8],
+        video.data[..channels * 2 * 8].to_vec(),
+    ));
+    for (head, &sigma) in sigmas.iter().enumerate() {
+        let inputs = DitInputs {
+            video: picture.clone(),
+            audio: Tensor::new(vec![0, 2, 0], Vec::new()),
+            context: unbatched(tensor(&file, "input.context")),
+            context_modalities: Vec::new(),
+            keyframes: Vec::new(),
+            references: match head + 1 == sigmas.len() {
+                true => vec![reference.clone()],
+                false => Vec::new(),
+            },
+            sigma: sigma - 0.01,
+            shift_video: 1.0,
+            shift_audio: 1.0,
+        };
+        let outputs = dit.forward(&inputs, &[], None).unwrap();
+        assert!(outputs.audio.is_empty());
+
+        let mut reference = tensors.clone();
+        for suffix in ["weight", "bias"] {
+            let output = reference
+                .get_mut(&format!("final_layer.video_out.{suffix}"))
+                .unwrap();
+            if head > 0 {
+                for (value, offset) in output.data.iter_mut().zip(&heads[head][suffix]) {
+                    *value += offset;
+                }
+            }
+        }
+        let config =
+            DitConfig::from_shapes(|name| reference.get(name).map(|t| t.shape.clone())).unwrap();
+        let expected =
+            mmh3_cpu::dit::forward(&mmh3_cpu::dit::DitWeights::new(reference), &config, &inputs);
+        assert_close(&format!("head {head}"), &outputs.video, &expected.video);
+    }
+
+    // A DiT without audio layers takes no audio frames.
+    let mut inputs = DitInputs {
+        video: picture,
+        audio: unbatched(tensor(&file, "input.audio")),
+        context: unbatched(tensor(&file, "input.context")),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references: Vec::new(),
+        sigma: 0.5,
+        shift_video: 1.0,
+        shift_audio: 1.0,
+    };
+    assert!(dit.forward(&inputs, &[], None).is_err());
+    inputs.audio = Tensor::new(vec![0, 2, 0], Vec::new());
+    assert!(dit.forward(&inputs, &[], None).is_ok());
+}

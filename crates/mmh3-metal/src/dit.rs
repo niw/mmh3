@@ -130,7 +130,7 @@ impl MetalDit {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
             };
-            if name.ends_with(".comfy_quant") {
+            if name.ends_with(".comfy_quant") || name.ends_with(".comfy_attention.config") {
                 continue;
             }
             if let Some(unit) = Self::unit_index(&config, name) {
@@ -161,13 +161,12 @@ impl MetalDit {
         Self::from_weights(weights, config, Some(stream))
     }
 
-    fn from_weights(weights: Weights, config: DitConfig, stream: Option<Stream>) -> Result<Self> {
-        if !config.step_sigmas.is_empty() || !config.has_audio() {
-            return Err(Error::new(
-                "Metal runs DiTs with audio layers and a single output head, not MiniMax H3 Image's"
-                    .into(),
-            ));
-        }
+    fn from_weights(
+        mut weights: Weights,
+        config: DitConfig,
+        stream: Option<Stream>,
+    ) -> Result<Self> {
+        Self::split_output_heads(&config, &mut weights)?;
         let time_table = weights.host("adaln_t_table")?;
         let inv_freq = weights.host("rope.inv_freq")?.data;
         Ok(Self {
@@ -178,6 +177,54 @@ impl MetalDit {
             stream: stream.map(RefCell::new),
             veda: None,
         })
+    }
+
+    /// Splits a `final_layer.video_out` that stacks one head per sampling step into
+    /// `final_layer.video_out.{head}`, the layer a step at that head's sigma projects through, in
+    /// FP32. The stack is ComfyUI's PDD head bank: the first head whole and every later one as its
+    /// offset from the first.
+    fn split_output_heads(config: &DitConfig, weights: &mut Weights) -> Result<()> {
+        let heads = config.step_sigmas.len();
+        if heads < 2 {
+            return Ok(());
+        }
+        for suffix in ["weight", "bias"] {
+            let name = format!("final_layer.video_out.{suffix}");
+            if !weights.contains(&name) {
+                continue;
+            }
+            let stacked = weights.host(&name)?;
+            weights.remove(&name);
+            let each = stacked.data.len() / heads;
+            let mut shape = stacked.shape.clone();
+            shape[0] /= heads;
+            let first = &stacked.data[..each];
+            for head in 0..heads {
+                let rows = &stacked.data[head * each..(head + 1) * each];
+                let values: Vec<f32> = match head {
+                    0 => rows.to_vec(),
+                    _ => rows
+                        .iter()
+                        .zip(first)
+                        .map(|(offset, base)| base + offset)
+                        .collect(),
+                };
+                weights.insert_f32(
+                    &format!("final_layer.video_out.{head}.{suffix}"),
+                    shape.clone(),
+                    &values,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The video output layer of a step at `sigma`.
+    fn video_output(&self, sigma: f32) -> String {
+        match self.config.step_sigmas.is_empty() {
+            true => "final_layer.video_out".to_owned(),
+            false => format!("final_layer.video_out.{}", self.config.output_head(sigma)),
+        }
     }
 
     /// Takes Veda's predictor, which picks the tiles of `--attention veda`.
@@ -750,7 +797,8 @@ impl MetalDit {
             || inputs.audio.shape.len() != 3
             || inputs.audio.shape[0] != c.audio_channels
             || inputs.audio.shape[1] != 2
-            || inputs.audio.shape[2] == 0
+            // A DiT without audio layers takes no audio frames, and one with them some.
+            || (inputs.audio.shape[2] == 0) == c.has_audio()
             || !inputs.sigma.is_finite()
             || !(0.0..=1.0).contains(&inputs.sigma)
         {
@@ -872,6 +920,10 @@ impl MetalDit {
         let mut parts = Vec::new();
 
         for segment in &layout.segments {
+            // The audio rows of a DiT without audio layers.
+            if segment.is_empty() {
+                continue;
+            }
             let (latent, video) = match segment.kind {
                 SegmentKind::Text => {
                     parts.push(text.clone());
@@ -1064,7 +1116,7 @@ impl MetalDit {
             w.linear(&x.modulate(&m, &rows, 0, 1)?, name)?.to_f32()
         };
 
-        let mut video = project(SegmentKind::Video, "final_layer.video_out")?;
+        let mut video = project(SegmentKind::Video, &self.video_output(inputs.sigma))?;
         if let Some(plan) = &plan {
             video = plan.restore_video(&video, c.video_patch_features());
         }

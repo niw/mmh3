@@ -161,6 +161,12 @@ impl Weights {
                 continue;
             }
 
+            // ComfyUI's choice of attention kernel, which MiniMax H3 Image's DiT carries in each
+            // block, is no weight.
+            if name.ends_with(".comfy_attention.config") {
+                continue;
+            }
+
             dtype_code(info.dtype)?;
             if info.element_count() == 0 {
                 return Err(Error::new(format!("empty weight {name}")));
@@ -828,6 +834,31 @@ impl Weights {
         };
         self.tensors.insert(name.to_owned(), weight);
         Ok(())
+    }
+
+    /// Adds `values` as an FP32 tensor of `shape`, or replaces the one of that name.
+    pub(crate) fn insert_f32(
+        &mut self,
+        name: &str,
+        shape: Vec<usize>,
+        values: &[f32],
+    ) -> Result<()> {
+        let rows = if shape.len() >= 2 { shape[0] } else { 1 };
+        let array = Array::from_f32(&self.device, rows, values.len() / rows, values)?;
+        self.tensors.insert(
+            name.to_owned(),
+            Weight {
+                buffer: array.buffer,
+                shape,
+                dtype: DType::F32,
+            },
+        );
+        Ok(())
+    }
+
+    /// Lets go of a tensor kept on the device.
+    pub(crate) fn remove(&mut self, name: &str) {
+        self.tensors.remove(name);
     }
 
     /// `replace` for a tensor of a unit read on the way, which reads the new one from then on.
