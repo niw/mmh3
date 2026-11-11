@@ -326,10 +326,6 @@ impl Weights {
         Ok(())
     }
 
-    pub fn embedding(&self, name: &str, ids: &[u32]) -> Result<Array> {
-        self.embedding_of(&self.weight(name)?, ids)
-    }
-
     /// The rows `ids` of an embedding table.
     pub(crate) fn embedding_of(&self, w: &Weight, ids: &[u32]) -> Result<Array> {
         if w.shape.len() != 2 || ids.is_empty() || ids.iter().any(|&i| i as usize >= w.shape[0]) {

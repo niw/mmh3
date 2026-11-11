@@ -1,8 +1,8 @@
 //! Qwen3-VL language tower for prompts of text and of the pictures the vision tower embeds. The
 //! output precedes the final model norm.
 //!
-//! The layers are units, which a Mac without the room for all of them reads on the way. Such an
-//! encoder also leaves its embedding table on the disk and reads the rows of the prompt from there.
+//! The layers are units, which a Mac without the room for all of them reads on the way. The
+//! embedding table stays on the disk, and an encoder reads the rows of the prompt from there.
 use crate::{
     Error, Result,
     model::{Weight, Weights},
@@ -17,8 +17,8 @@ use mmh3_core::{
     vision::VisionPrompt,
 };
 use std::cell::RefCell;
+use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::PathBuf;
 
 const PREFIX: &str = "model.";
 const EMBEDDING: &str = "embed_tokens.weight";
@@ -33,8 +33,8 @@ pub struct MetalTextEncoder {
     kv_heads: usize,
     /// The layers read on the way, when some are.
     stream: Option<RefCell<Stream>>,
-    /// The checkpoint, the offset and the type of an embedding table left on the disk.
-    embedding: Option<(PathBuf, u64, DType)>,
+    /// The checkpoint, the offset and the type of the embedding table.
+    embedding: (File, u64, DType),
 }
 
 pub struct TextEncoding {
@@ -51,14 +51,31 @@ fn layer_of(name: &str) -> Option<usize> {
         .ok()
 }
 
+/// The checkpoint, the offset and the type of the embedding table, whose rows a prompt reads.
+fn embedding(file: &SafeTensors) -> Result<(File, u64, DType)> {
+    let embedding = file
+        .get(&format!("{PREFIX}{EMBEDDING}"))
+        .ok_or_else(|| Error::new(format!("missing tensor {PREFIX}{EMBEDDING}")))?;
+    Ok((
+        File::open(file.path())?,
+        file.file_offset(embedding),
+        embedding.dtype,
+    ))
+}
+
 impl MetalTextEncoder {
-    /// Loads the whole encoder, or fails as out of memory when it does not fit in the GPU's share,
-    /// which Metal would fill past by paging rather than refuse.
+    /// Loads the whole encoder but its embedding table, or fails as out of memory when it does not
+    /// fit in the GPU's share, which Metal would fill past by paging rather than refuse.
     pub fn load(file: &SafeTensors) -> Result<Self> {
+        let embedding = embedding(file)?;
         let bytes = file
             .tensors()
             .iter()
-            .filter(|info| info.name.starts_with(PREFIX))
+            .filter(|info| {
+                info.name
+                    .strip_prefix(PREFIX)
+                    .is_some_and(|name| name != EMBEDDING)
+            })
             .map(|info| info.byte_count())
             .sum();
         if !fits(bytes)? {
@@ -66,7 +83,8 @@ impl MetalTextEncoder {
                 "the text encoder's {bytes} bytes do not fit in the GPU's share of memory"
             )));
         }
-        Self::from_weights(Weights::load(file, PREFIX)?, None, None)
+        let weights = Weights::load_leaving(file, PREFIX, |_| true, |name| name == EMBEDDING)?;
+        Self::from_weights(weights, None, embedding)
     }
 
     /// `load`, or, without the room for the whole encoder, an encoder that reads its layers on the
@@ -108,14 +126,7 @@ impl MetalTextEncoder {
                 Arrangement::Contiguous,
             );
         }
-        let embedding = file
-            .get(&format!("{PREFIX}{EMBEDDING}"))
-            .ok_or_else(|| Error::new(format!("missing tensor {PREFIX}{EMBEDDING}")))?;
-        let embedding = (
-            file.path().to_owned(),
-            file.file_offset(embedding),
-            embedding.dtype,
-        );
+        let embedding = embedding(file)?;
         let weights = Weights::load_leaving(
             file,
             PREFIX,
@@ -124,7 +135,7 @@ impl MetalTextEncoder {
         )?;
         let order = give_up_order(units.len());
         let stream = Stream::new("text encoder layers", files, units, order);
-        Self::from_weights(weights, Some(stream), Some(embedding))
+        Self::from_weights(weights, Some(stream), embedding)
     }
 
     /// Reads every layer on the way, keeping none back, for an encoder that encodes one prompt.
@@ -139,7 +150,7 @@ impl MetalTextEncoder {
     fn from_weights(
         weights: Weights,
         stream: Option<Stream>,
-        embedding: Option<(PathBuf, u64, DType)>,
+        embedding: (File, u64, DType),
     ) -> Result<Self> {
         let hidden = weights.shape(EMBEDDING)?[1];
         let heads = weights.shape("layers.0.self_attn.q_proj.weight")?[0] / HEAD_DIM;
@@ -165,11 +176,8 @@ impl MetalTextEncoder {
     /// The prompt's rows of the embedding table.
     fn embed(&self, ids: &[u32]) -> Result<Array> {
         let w = &self.weights;
-        let Some((path, offset, dtype)) = &self.embedding else {
-            return w.embedding(EMBEDDING, ids);
-        };
+        let (file, offset, dtype) = &self.embedding;
         let row_bytes = self.hidden * dtype.size_in_bytes();
-        let file = std::fs::File::open(path)?;
         let mut rows = vec![0; ids.len() * row_bytes];
         for (&id, row) in ids.iter().zip(rows.chunks_exact_mut(row_bytes)) {
             file.read_exact_at(row, offset + (id as usize * row_bytes) as u64)?;
