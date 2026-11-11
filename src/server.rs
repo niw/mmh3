@@ -66,6 +66,11 @@ const IMAGE_OPTIONS: &[&str] = &[
     "min-generation-area",
     "seed",
     "attention-precision",
+    "attention",
+    "sparse-tau",
+    "sparse-start",
+    "draft-steps",
+    "latent-upscaler",
 ];
 /// The options of a picture whose value is a file, which a request uploads.
 const IMAGE_FILE_OPTIONS: &[&str] = &["prompt-file", "reference"];
@@ -795,10 +800,15 @@ fn image_field_kind(name: &str) -> Result<FieldKind, String> {
     if !IMAGE_OPTIONS.contains(&name) {
         return Err(format!("{name} is not an option of a picture"));
     }
-    match IMAGE_FILE_OPTIONS.contains(&name) {
-        true => Ok(FieldKind::File),
-        false => Ok(FieldKind::Text),
+    if IMAGE_FILE_OPTIONS.contains(&name) {
+        return Ok(FieldKind::File);
     }
+    Ok(MODEL_FILE_OPTIONS
+        .iter()
+        .find(|(option, _)| *option == name)
+        .map_or(FieldKind::Text, |(_, directories)| {
+            FieldKind::ModelFile(directories)
+        }))
 }
 
 /// The path of the file a request's `option` names, the first of `directories` in the models
@@ -923,6 +933,14 @@ mod tests {
     fn a_request_for_a_picture_gives_what_to_generate() {
         assert!(matches!(image_field_kind("prompt"), Ok(FieldKind::Text)));
         assert!(matches!(image_field_kind("reference"), Ok(FieldKind::File)));
+        assert!(matches!(
+            image_field_kind("draft-steps"),
+            Ok(FieldKind::Text)
+        ));
+        assert!(matches!(
+            image_field_kind("latent-upscaler"),
+            Ok(FieldKind::ModelFile(["latent_upscale_models"]))
+        ));
         for name in [
             "dit",
             "vae",
@@ -931,6 +949,7 @@ mod tests {
             "save-latent",
             "linear-precision",
             "steps",
+            "lora",
         ] {
             assert!(image_field_kind(name).is_err(), "{name}");
         }

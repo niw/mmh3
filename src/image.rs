@@ -25,6 +25,7 @@ pub const USAGE: &str = "usage:
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
              [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--vram-budget GB] [--consistent]
+             [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
 
 image generates a picture with MiniMax H3 Image from a prompt, used as given. The model expects a detailed English
 description of the whole picture. Checkpoints default to their ComfyUI names inside a models directory laid out like
@@ -37,7 +38,10 @@ such as 4096x4096 or 5472x3072. A picture smaller than --min-generation-area pix
 is generated on a larger canvas of the same aspect ratio and resized to the requested size with Lanczos.
 --reference takes a PNG or JPEG picture to edit, which the prompt refers to as <Picture 1>, <Picture 2> and so on,
 in the order of the options, up to 16. The size of the result is still --width and --height.
---save-latent also writes the final latent, which tools/models/video_vae_int8.py calibrates an INT8 picture VAE on.";
+--save-latent also writes the final latent, which tools/models/video_vae_int8.py calibrates an INT8 picture VAE on.
+--attention sol runs Sol-Attn, a training-free block-sparse attention, as mmh3 generate does.
+--draft-steps runs the first N steps on a canvas of half the width and height, which must then be multiples of 64,
+and enlarges the latent they predict with the latent upscaler of --latent-upscaler, or bilinearly without one.";
 
 /// The DiT of MiniMax H3 Image inside the models directory.
 pub const IMAGE_DIT_FILE: &str =
@@ -177,6 +181,11 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "attention-precision",
             "linear-precision",
             "vram-budget",
+            "attention",
+            "sparse-tau",
+            "sparse-start",
+            "draft-steps",
+            "latent-upscaler",
         ],
         &["consistent"],
         USAGE,
@@ -207,6 +216,20 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("--min-generation-area must be from 1024 to 16777216".into());
     }
     let (canvas_width, canvas_height) = canvas_size(width, height, min_area);
+    let draft_steps = option_number(&options, "draft-steps", 0)?;
+    if draft_steps > 0
+        && (canvas_width % (2 * CANVAS_MULTIPLE) != 0 || canvas_height % (2 * CANVAS_MULTIPLE) != 0)
+    {
+        return Err(format!(
+            "--draft-steps needs a canvas of multiples of {}, not {canvas_width}×{canvas_height}",
+            2 * CANVAS_MULTIPLE
+        )
+        .into());
+    }
+    if draft_steps == 0 && options.contains_key("latent-upscaler") {
+        return Err("--latent-upscaler enlarges the draft of --draft-steps".into());
+    }
+    let sparse = crate::models::sparse_attention(&options, false)?;
 
     let prompt = match (options.get("prompt"), options.get("prompt-file")) {
         (Some(prompt), None) => Some((*prompt).to_owned()),
@@ -283,6 +306,9 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
         _ => return Err("pass a prompt or --context, not both".into()),
     };
+    if draft_steps > 0 && !references.is_empty() {
+        return Err("--draft-steps cannot be combined with references".into());
+    }
     let references = encode_references(&options, seed, &references)?;
 
     let (dit, dit_key) = held.dit(&options)?;
@@ -295,23 +321,46 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         );
     }
     let sigmas = step_schedule(&config.step_sigmas);
-    let latent_shape = vec![
-        VIDEO_LATENT_CHANNELS,
-        1,
-        canvas_height / SPATIAL_RATIO,
-        canvas_width / SPATIAL_RATIO,
-    ];
+    let steps = sigmas.len() - 1;
+    if draft_steps >= steps {
+        return Err(format!(
+            "--draft-steps must leave at least one of the {steps} steps at full size"
+        )
+        .into());
+    }
+    let (latent_height, latent_width) =
+        (canvas_height / SPATIAL_RATIO, canvas_width / SPATIAL_RATIO);
+    let latent_shape = match draft_steps {
+        0 => vec![VIDEO_LATENT_CHANNELS, 1, latent_height, latent_width],
+        _ => vec![
+            VIDEO_LATENT_CHANNELS,
+            1,
+            latent_height / 2,
+            latent_width / 2,
+        ],
+    };
+    let mut noise = NormalSampler::new(seed);
     let mut latent = Tensor::new(
         latent_shape.clone(),
-        NormalSampler::new(seed).samples(latent_shape.iter().product()),
+        noise.samples(latent_shape.iter().product()),
     );
     let silence = Tensor::new(vec![0, 2, 0], Vec::new());
     println!(
-        "sampling {canvas_width}×{canvas_height} in {} steps",
-        sigmas.len() - 1
+        "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
-    for step in 0..sigmas.len() - 1 {
+    for step in 0..steps {
         let started = Instant::now();
+        // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout is
+        // redrawn at full size, so they go sparse anyway.
+        let step_sparse = sparse
+            .map(|sparse| match step < draft_steps {
+                true => mmh3_core::dit::sparse::SparseAttention {
+                    min_tokens: 0,
+                    ..sparse
+                },
+                false => sparse,
+            })
+            .filter(|sparse| sparse.applies_to_step(step, steps));
         let inputs = DitInputs {
             video: latent.clone(),
             audio: silence.clone(),
@@ -325,27 +374,43 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         };
         // A kept model may be holding the room a step needs, and a step can run again.
         let outputs = loop {
-            match dit.forward(&inputs, &[], None) {
+            match dit.forward(&inputs, &[], step_sparse.as_ref()) {
                 Err(error) if error.is_out_of_memory() && held.let_go_of_one() => continue,
                 outputs => break outputs?,
             }
         };
-        euler_step(
-            &mut latent.data,
-            &outputs.video,
-            sigmas[step],
-            sigmas[step + 1],
-        );
-        let seconds = started.elapsed().as_secs_f64();
+        let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
+        // The enlargement after the last draft step says its own time, so the step leaves it out.
+        let mut enlarging = 0.0;
+        if step + 1 == draft_steps {
+            // The clean latent the draft predicts, enlarged to the full canvas and noised to the
+            // next sigma with fresh noise of the seed, starts the steps at full size.
+            for (value, &slope) in latent.data.iter_mut().zip(&outputs.video) {
+                *value -= sigma * slope;
+            }
+            let enlarged = Instant::now();
+            latent =
+                crate::generation::enlarge_draft(&options, &latent, latent_height, latent_width)?;
+            enlarging = enlarged.elapsed().as_secs_f64();
+            let fresh = noise.samples(latent.data.len());
+            for (value, fresh) in latent.data.iter_mut().zip(fresh) {
+                *value = (1.0 - sigma_next) * *value + sigma_next * fresh;
+            }
+        } else {
+            euler_step(&mut latent.data, &outputs.video, sigma, sigma_next);
+        }
+        let routing = outputs.routed_fraction.map_or(String::new(), |fraction| {
+            format!(", Sol-Attn routed {:.1}%", 100.0 * fraction)
+        });
+        let draft = if step < draft_steps { " (draft)" } else { "" };
+        let seconds = started.elapsed().as_secs_f64() - enlarging;
         println!(
-            "step {}/{} at sigma {:.4} in {seconds:.1} s",
+            "step {}/{steps}{draft} at sigma {sigma:.4} in {seconds:.1} s{routing}",
             step + 1,
-            sigmas.len() - 1,
-            sigmas[step],
         );
         crate::generation::reached(crate::generation::Progress {
             step: step + 1,
-            steps: sigmas.len() - 1,
+            steps,
             seconds,
         });
     }

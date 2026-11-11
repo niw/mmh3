@@ -1089,7 +1089,7 @@ pub fn sample(
 
 /// The clean latent of the last draft step at `height × width`: through the latent upscaler of
 /// `--latent-upscaler`, and bilinearly without one.
-fn enlarge_draft(
+pub fn enlarge_draft(
     options: &HashMap<&str, &str>,
     latent: &Tensor,
     height: usize,
