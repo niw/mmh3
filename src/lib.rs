@@ -12,6 +12,7 @@ pub mod pictures;
 
 pub mod generate;
 pub mod generation;
+pub mod image;
 #[cfg(feature = "metal")]
 pub mod metal;
 pub mod models;

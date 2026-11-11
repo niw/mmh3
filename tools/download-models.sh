@@ -8,7 +8,7 @@ usage() {
 usage: $0 [--video-vae int8|fp16] [--ref2va | --no-ref2va] [--fasth3 | --no-fasth3]
        [--lightx2v-turbo | --no-lightx2v-turbo] [--taomate | --no-taomate] [--pdmd | --no-pdmd]
        [--dmad | --no-dmad] [--veda | --no-veda] [--latent-upscaler | --no-latent-upscaler]
-       [--models DIR]
+       [--image | --no-image] [--models DIR]
 
 Downloads the checkpoints mmh3 loads from Hugging Face with the Hugging Face CLI (hf), or with curl
 when hf is not installed. curl sends HF_TOKEN when it is set. By default it downloads the ones make
@@ -38,6 +38,9 @@ VSA-DataFree patch.
   --latent-upscaler    LBH-123-AI's latent upscaler for draft steps from
                        LBH-123-AI/Minimax_h3_latent_Upscaler, into latent_upscale_models.
   --no-latent-upscaler No latent upscaler (default).
+  --image              MiniMax H3 Image's INT8 ConvRot DiT and FP16 picture VAE from
+                       Comfy-Org/MiniMax-H3-Image, for mmh3 image. It shares the text encoder.
+  --no-image           No MiniMax H3 Image (default).
   --models DIR         The models directory (default: models in the repository).
 EOF
 }
@@ -56,6 +59,7 @@ pdmd=0
 dmad=0
 veda=0
 latent_upscaler=0
+image=0
 models=$(cd "$(dirname "$0")/.." && pwd)/models
 
 while [[ $# -gt 0 ]]; do
@@ -81,6 +85,8 @@ while [[ $# -gt 0 ]]; do
     --no-veda) veda=0 ;;
     --latent-upscaler) latent_upscaler=1 ;;
     --no-latent-upscaler) latent_upscaler=0 ;;
+    --image) image=1 ;;
+    --no-image) image=0 ;;
     --models)
       [[ $# -ge 2 ]] || fail "--models needs a directory"
       models=$2
@@ -144,6 +150,11 @@ if [[ $ref2va == 1 ]]; then
   files+=(diffusion_models/minimax_h3_ref2va_pruned_int8_convrot.safetensors)
 fi
 download Comfy-Org/MiniMax-H3 "$models" "${files[@]}"
+if [[ $image == 1 ]]; then
+  download Comfy-Org/MiniMax-H3-Image "$models" \
+    diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors \
+    vae/minimax_h3_image_vae_fp16.safetensors
+fi
 mmh3_files=()
 if [[ $video_vae == int8 ]]; then
   mmh3_files+=(vae/minimax_h3_video_vae_int8_convrot.safetensors)

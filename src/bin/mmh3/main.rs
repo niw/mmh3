@@ -2,6 +2,7 @@ use std::error::Error;
 use std::process::ExitCode;
 
 const USAGE: &str = "usage:
+  mmh3 image (--prompt TEXT | --prompt-file FILE) --out <image.png> [OPTIONS...], listed by mmh3 image --help
   mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--idle-unload SECONDS] [--models DIR]
               [--dit FILE] [--text-encoder FILE] [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...]
               [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
@@ -71,6 +72,7 @@ fn main() -> ExitCode {
     let arguments: Vec<String> = std::env::args().skip(1).collect();
     let result: Result<(), Box<dyn Error>> = match arguments.first().map(String::as_str) {
         Some("generate") => mmh3::generate::run(&arguments[1..], USAGE),
+        Some("image") => mmh3::image::run(&arguments[1..]),
         #[cfg(any(feature = "cuda", feature = "metal"))]
         Some("worker") => mmh3::worker::serve(&arguments[1..]),
         #[cfg(feature = "server")]
