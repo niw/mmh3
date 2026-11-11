@@ -23,7 +23,7 @@ use {
 pub const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <image.png> [--models DIR]
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
-             [--dit FILE] [--text-encoder FILE] [--vae FILE]
+             [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
              [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--vram-budget GB] [--consistent]
 
 image generates a picture with MiniMax H3 Image from a prompt, used as given. The model expects a detailed English
@@ -36,7 +36,8 @@ ComfyUI's models folder and the Comfy-Org/MiniMax-H3-Image repository, given by 
 such as 4096x4096 or 5472x3072. A picture smaller than --min-generation-area pixels, 4194304 (2048x2048) by default,
 is generated on a larger canvas of the same aspect ratio and resized to the requested size with Lanczos.
 --reference takes a PNG or JPEG picture to edit, which the prompt refers to as <Picture 1>, <Picture 2> and so on,
-in the order of the options, up to 16. The size of the result is still --width and --height.";
+in the order of the options, up to 16. The size of the result is still --width and --height.
+--save-latent also writes the final latent, which tools/models/video_vae_int8.py calibrates an INT8 picture VAE on.";
 
 /// The DiT of MiniMax H3 Image inside the models directory.
 pub const IMAGE_DIT_FILE: &str =
@@ -172,6 +173,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "dit",
             "text-encoder",
             "vae",
+            "save-latent",
             "attention-precision",
             "linear-precision",
             "vram-budget",
@@ -349,6 +351,22 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     held.keep_dit(dit, dit_key);
     crate::models::save_algorithm_cache();
+    if let Some(path) = options.get("save-latent") {
+        let values = [width.to_string(), height.to_string(), seed.to_string()];
+        let mut metadata: Vec<(&str, &str)> = ["width", "height", "seed"]
+            .into_iter()
+            .zip(values.iter().map(String::as_str))
+            .collect();
+        if let Some(prompt) = options.get("prompt") {
+            metadata.push(("prompt", prompt));
+        }
+        mmh3_core::safetensors::write_f32(
+            Path::new(path),
+            &[("video", &latent.shape, &latent.data)],
+            &metadata,
+        )?;
+        println!("wrote the latent {:?} to {path}", latent.shape);
+    }
 
     let started = Instant::now();
     let path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
