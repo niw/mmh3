@@ -32,6 +32,17 @@ pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dy
         .into());
     }
 
+    validate_linear_precision(options)
+}
+
+/// Reject the precisions this machine cannot run for a command that runs every step itself, and
+/// so has no worker to hand them to.
+pub fn validate_precisions(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
+    attention_precision(options)?;
+    validate_linear_precision(options)
+}
+
+fn validate_linear_precision(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
     if let Some(value) = options.get("linear-precision")
         && !["fp32", "fp16", "int8", "mps-fp16"].contains(value)
     {
@@ -155,6 +166,22 @@ mod tests {
             assert!(
                 validate_step_options(&options).is_err(),
                 "--{option} {value} must be refused by the machine that runs the step"
+            );
+        }
+    }
+
+    /// A command with no worker refuses a precision without sending its user to one.
+    #[test]
+    fn a_run_without_workers_refuses_without_pointing_at_one() {
+        for (option, value) in [
+            ("attention-precision", "bf16"),
+            ("linear-precision", "nvfp4"),
+        ] {
+            let options = options(&[(option, value)]);
+            let error = validate_precisions(&options).unwrap_err().to_string();
+            assert!(
+                !error.contains("--worker"),
+                "--{option} {value} is refused with {error:?}"
             );
         }
     }
