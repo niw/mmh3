@@ -10,7 +10,7 @@
 use mmh3_core::generation::CANVAS_MULTIPLE;
 use mmh3_core::picture::Picture;
 use std::error::Error;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 use {
     crate::cli::{option_number, option_values, parse_options},
     crate::models::{TEXT_ENCODER_FILE, option_path},
@@ -24,7 +24,7 @@ pub const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <image.png> [--models DIR]
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
-             [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--vram-budget GB] [--consistent]
+             [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
 
 image generates a picture with MiniMax H3 Image from a prompt, used as given. The model expects a detailed English
@@ -39,6 +39,8 @@ is generated on a larger canvas of the same aspect ratio and resized to the requ
 --reference takes a PNG or JPEG picture to edit, which the prompt refers to as <Picture 1>, <Picture 2> and so on,
 in the order of the options, up to 16. The size of the result is still --width and --height.
 --save-latent also writes the final latent, which tools/models/video_vae_int8.py calibrates an INT8 picture VAE on.
+--attention-precision takes bf16 or int8-fp8 on CUDA and fp32, fp16 or int8-fp16 on Metal, and --linear-precision
+int8 or nvfp4 on CUDA and fp32, fp16, int8 or mps-fp16 on Metal.
 --attention sol runs Sol-Attn, a training-free block-sparse attention, as mmh3 generate does.
 --draft-steps runs the first N steps on a canvas of half the width and height, which must then be multiples of 64,
 and enlarges the latent they predict with the latent upscaler of --latent-upscaler, or bilinearly without one.";
@@ -49,14 +51,14 @@ pub const IMAGE_DIT_FILE: &str =
 /// The picture VAE of MiniMax H3 Image inside the models directory.
 pub const IMAGE_VAE_FILE: &str = "vae/minimax_h3_image_vae_fp16.safetensors";
 /// Prompt tokens the reference keeps.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_PROMPT_TOKENS: usize = 4096;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const DEFAULT_SIDE: usize = 2048;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const DEFAULT_MIN_GENERATION_AREA: usize = 2048 * 2048;
 /// The most reference pictures an edit takes.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_REFERENCES: usize = 16;
 /// Bounds of a reference's short edge for the VAE's encoder and for the vision tower.
 const REFERENCE_SHORT_EDGE: (usize, usize) = (1024, 2048);
@@ -65,9 +67,9 @@ const VISION_SHORT_EDGE: usize = 1024;
 const VISION_MIN_PIXELS: usize = 65_536;
 const VISION_MAX_PIXELS: usize = 16_777_216;
 /// Noise streams of the references, apart from the seed's noise of the generated picture.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const REFERENCE_POSTERIOR_STREAM: u64 = 0x5265_6650_6f73_7465;
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 const REFERENCE_NOISE_STREAM: u64 = 0x5265_664e_6f69_7365;
 
 /// The canvas a `width × height` picture is generated on: scaled up at the same aspect ratio to at
@@ -150,7 +152,7 @@ pub fn step_schedule(step_sigmas: &[f32]) -> Vec<f32> {
         .collect()
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
     use mmh3_core::dit::sampler::euler_step;
@@ -159,7 +161,10 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::tokenizer::Tokenizer;
     use mmh3_core::vae::SPATIAL_RATIO;
     use mmh3_core::vision::{VisionGrid, picture_prompt};
-    use mmh3_cuda::vision::CudaVisionEncoder;
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::vision::CudaVisionEncoder as VisionEncoder;
+    #[cfg(feature = "metal")]
+    use mmh3_metal::vision::MetalVisionEncoder as VisionEncoder;
 
     let options = parse_options(
         arguments,
@@ -190,13 +195,23 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         &["consistent"],
         USAGE,
     )?;
+    #[cfg(feature = "cuda")]
     mmh3_cuda::check_device()?;
     crate::resident::take_budget(&options)?;
-    mmh3_cuda::algorithms::set_consistent(options.contains_key("consistent"));
-    if options.get("linear-precision").copied() == Some("nvfp4") {
-        mmh3_cuda::nvfp4::check_supported()?;
+    #[cfg(feature = "cuda")]
+    {
+        mmh3_cuda::algorithms::set_consistent(options.contains_key("consistent"));
+        if options.get("linear-precision").copied() == Some("nvfp4") {
+            mmh3_cuda::nvfp4::check_supported()?;
+        }
+        crate::models::load_algorithm_cache();
     }
-    crate::models::load_algorithm_cache();
+    // A wrong precision is refused before anything is read.
+    #[cfg(feature = "metal")]
+    {
+        crate::metal::attention_precision(&options)?;
+        crate::metal::linear_precision(&options)?;
+    }
 
     let out = Path::new(options.get("out").ok_or(USAGE)?);
     if !out
@@ -257,7 +272,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         (Some(prompt), None) => {
             let started = Instant::now();
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
-            let (context, modalities) = held.text_encoder(&path, |encoder| {
+            let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
                 if references.is_empty() {
                     let mut ids = Tokenizer::h3().encode(&prompt);
                     ids.truncate(MAX_PROMPT_TOKENS);
@@ -265,7 +280,13 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 }
                 // The tower is gone before the prompt encodes.
                 let embeddings = {
-                    let vision = CudaVisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+                    #[allow(unused_mut)]
+                    let mut vision = VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+                    #[cfg(feature = "metal")]
+                    vision.set_precision(
+                        crate::metal::default_linear_precision(),
+                        crate::metal::attention_precision(&options)?,
+                    )?;
                     references
                         .iter()
                         .map(|reference| vision.encode(&reference.vision.to_tensor()))
@@ -348,6 +369,9 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!(
         "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
+    // Metal refines the prompt once for every step.
+    #[cfg(feature = "metal")]
+    let prepared = dit.prepare_text(&context)?;
     for step in 0..steps {
         let started = Instant::now();
         // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout is
@@ -374,7 +398,11 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         };
         // A kept model may be holding the room a step needs, and a step can run again.
         let outputs = loop {
-            match dit.forward(&inputs, &[], step_sparse.as_ref()) {
+            #[cfg(feature = "cuda")]
+            let outputs = dit.forward(&inputs, &[], step_sparse.as_ref());
+            #[cfg(feature = "metal")]
+            let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref());
+            match outputs {
                 Err(error) if error.is_out_of_memory() && held.let_go_of_one() => continue,
                 outputs => break outputs?,
             }
@@ -414,7 +442,10 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             seconds,
         });
     }
+    #[cfg(feature = "metal")]
+    drop(prepared);
     held.keep_dit(dit, dit_key);
+    #[cfg(feature = "cuda")]
     crate::models::save_algorithm_cache();
     if let Some(path) = options.get("save-latent") {
         let values = [width.to_string(), height.to_string(), seed.to_string()];
@@ -435,7 +466,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let started = Instant::now();
     let path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
-    let pixels = held.decode(&path, &latent)?;
+    let pixels = held.decode(&path, &options, &latent)?;
     println!(
         "decoded the picture with {path} in {:.1} s",
         started.elapsed().as_secs_f64()
@@ -449,25 +480,38 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 /// does, or kept in this process's table for the runs after it, as a server does. The table is
 /// the one the worker of a server keeps its models in, so a picture and a video share the text
 /// encoder they both read.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 enum Held {
     Alone,
     Kept(crate::resident::Table),
 }
 
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 impl Held {
     /// Runs `work` with the text encoder of `path`.
     fn text_encoder<T>(
         &mut self,
         path: &str,
-        mut work: impl FnMut(&mmh3_cuda::text_encoder::CudaTextEncoder) -> Result<T, Box<dyn Error>>,
+        #[allow(unused_variables)] options: &std::collections::HashMap<&str, &str>,
+        mut work: impl FnMut(&crate::resident::TextEncoder) -> Result<T, Box<dyn Error>>,
     ) -> Result<T, Box<dyn Error>> {
         let file = SafeTensors::open(Path::new(path))?;
         match self {
-            Held::Alone => work(&mmh3_cuda::text_encoder::CudaTextEncoder::load_fitting(
-                &file,
-            )?),
+            Held::Alone => {
+                #[allow(unused_mut)]
+                let mut encoder = crate::resident::TextEncoder::load_fitting(&file)?;
+                // One prompt reads every layer once, so a Mac that streams the encoder keeps none
+                // of its layers back.
+                #[cfg(feature = "metal")]
+                {
+                    encoder.set_precision(
+                        crate::metal::default_linear_precision(),
+                        crate::metal::attention_precision(options)?,
+                    )?;
+                    encoder.read_once();
+                }
+                work(&encoder)
+            }
             Held::Kept(table) => {
                 let key = crate::worker::digest(&file);
                 table.with_room(|models| work(models.text_encoder(Path::new(path), key)?))
@@ -476,13 +520,13 @@ impl Held {
     }
 
     /// The DiT of `--dit` or the models directory, with the key it goes back into the table under
-    /// when it is kept. A kept DiT runs INT8 linear layers, since NVFP4 ones would stay in it for
-    /// the runs after this one.
+    /// when it is kept. A kept DiT runs INT8 linear layers on CUDA, since NVFP4 ones would stay in
+    /// it for the runs after this one.
     fn dit(
         &mut self,
         options: &std::collections::HashMap<&str, &str>,
-    ) -> Result<(mmh3_cuda::dit::CudaDit, Option<crate::resident::DitKey>), Box<dyn Error>> {
-        use mmh3_cuda::dit::CudaDit;
+    ) -> Result<(crate::resident::Dit, Option<crate::resident::DitKey>), Box<dyn Error>> {
+        use crate::resident::Dit;
 
         let table = match self {
             Held::Alone => {
@@ -491,6 +535,7 @@ impl Held {
             }
             Held::Kept(table) => table,
         };
+        #[cfg(feature = "cuda")]
         if options
             .get("linear-precision")
             .is_some_and(|precision| *precision != "int8")
@@ -509,20 +554,24 @@ impl Held {
             other => {
                 drop(other);
                 let started = Instant::now();
-                let dit = models.read_fitting(
-                    || CudaDit::load(&file, ""),
-                    || CudaDit::load_fitting(&file, ""),
-                )?;
+                let dit = models
+                    .read_fitting(|| Dit::load(&file, ""), || Dit::load_fitting(&file, ""))?;
                 println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
                 dit
             }
         };
+        #[cfg(feature = "cuda")]
         dit.set_attention_precision(attention_precision(options)?);
+        #[cfg(feature = "metal")]
+        {
+            dit.set_linear_precision(crate::metal::linear_precision(options)?)?;
+            dit.set_attention_precision(crate::metal::attention_precision(options)?)?;
+        }
         Ok((dit, Some(key)))
     }
 
     /// Puts a kept DiT back into the table, and lets go of one read for this run alone.
-    fn keep_dit(&mut self, dit: mmh3_cuda::dit::CudaDit, key: Option<crate::resident::DitKey>) {
+    fn keep_dit(&mut self, dit: crate::resident::Dit, key: Option<crate::resident::DitKey>) {
         if let (Held::Kept(table), Some(key)) = (self, key) {
             table.borrow().keep_dit(key, dit);
         }
@@ -538,15 +587,26 @@ impl Held {
     }
 
     /// Decodes a latent with the picture VAE of `path` into pixels `[3, 1, height, width]`.
-    fn decode(&mut self, path: &str, latent: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+    fn decode(
+        &mut self,
+        path: &str,
+        #[allow(unused_variables)] options: &std::collections::HashMap<&str, &str>,
+        latent: &Tensor,
+    ) -> Result<Tensor, Box<dyn Error>> {
+        use crate::resident::VideoDecoder;
         use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
-        use mmh3_cuda::vae::CudaVideoDecoder;
 
         let file = SafeTensors::open(Path::new(path))?;
         match self {
             Held::Alone => {
-                let decoder =
-                    CudaVideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
+                #[allow(unused_mut)]
+                let mut decoder =
+                    VideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
+                #[cfg(feature = "metal")]
+                decoder.set_precision(
+                    crate::metal::default_linear_precision(),
+                    crate::metal::attention_precision(options)?,
+                )?;
                 Ok(decoder.decode(latent, false)?.pixels)
             }
             Held::Kept(table) => {
@@ -585,7 +645,7 @@ fn attention_precision(
 /// The references as the DiT sees them: a sample of each one's posterior from the picture VAE's
 /// encoder, rounded to FP16, cropped at the top left to whole patches and held just short of clean
 /// with noise mixed in at the conditions' timestep.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn encode_references(
     options: &std::collections::HashMap<&str, &str>,
     seed: u64,
@@ -595,14 +655,17 @@ fn encode_references(
     use mmh3_core::dit::timestep::VIDEO_CONDITION_TIMESTEP;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
-    use mmh3_cuda::video_encoder::{CudaVideoEncoder, Temporal};
+    #[cfg(feature = "cuda")]
+    use mmh3_cuda::video_encoder::{CudaVideoEncoder as VideoEncoder, Temporal};
+    #[cfg(feature = "metal")]
+    use mmh3_metal::video_encoder::{MetalVideoEncoder as VideoEncoder, Temporal};
 
     if references.is_empty() {
         return Ok(Vec::new());
     }
     let started = Instant::now();
     let path = option_path(options, "vae", IMAGE_VAE_FILE)?;
-    let encoder = CudaVideoEncoder::load(
+    let encoder = VideoEncoder::load(
         &SafeTensors::open(Path::new(&path))?,
         Temporal::Frame,
         DEFAULT_TILE_SIZE,
@@ -634,7 +697,7 @@ fn encode_references(
 }
 
 /// The top left of a latent `[channels, 1, height, width]` in whole 2 × 2 patches.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn whole_patches(latent: &Tensor) -> Tensor {
     let (channels, height, width) = (latent.shape[0], latent.shape[2], latent.shape[3]);
     let (kept_height, kept_width) = (height / 2 * 2, width / 2 * 2);
@@ -648,15 +711,15 @@ fn whole_patches(latent: &Tensor) -> Tensor {
     Tensor::new(vec![channels, 1, kept_height, kept_width], data)
 }
 
-#[cfg(not(feature = "cuda"))]
+#[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub fn run(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    Err("image runs on CUDA only for now".into())
+    Err("image needs a build with CUDA or Metal".into())
 }
 
 /// Writes pixels `[3, 1, height, width]` in [0, 1] as an 8-bit RGB PNG of `width × height`,
 /// resized with Lanczos when the canvas differs. The values are truncated to 8 bits, as the
 /// reference pipeline quantizes them, before any resize.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "metal"))]
 fn write_png(
     pixels: &Tensor,
     width: usize,

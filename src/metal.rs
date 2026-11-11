@@ -87,6 +87,24 @@ pub fn attention_precision(
     })
 }
 
+/// `--linear-precision`, INT8 on the matrix units by default and FP16 through MPS on a Mac without
+/// them.
+pub fn linear_precision(options: &HashMap<&str, &str>) -> Result<LinearPrecision, Box<dyn Error>> {
+    Ok(match options.get("linear-precision").copied() {
+        Some("fp32") => LinearPrecision::Fp32,
+        Some("fp16") => LinearPrecision::Fp16,
+        Some("int8") => LinearPrecision::Int8,
+        Some("mps-fp16") => LinearPrecision::MpsFp16,
+        Some(value) => {
+            return Err(format!(
+                "Metal supports --linear-precision fp32, fp16, int8 or mps-fp16, not {value}"
+            )
+            .into());
+        }
+        None => default_linear_precision(),
+    })
+}
+
 pub fn load_dit(
     options: &HashMap<&str, &str>,
     name: &str,
@@ -96,13 +114,7 @@ pub fn load_dit(
     let path = option_path(options, name, default_file)?;
     let started = std::time::Instant::now();
     let mut dit = MetalDit::load_fitting(&SafeTensors::open(Path::new(&path))?, "")?;
-    let precision = match options.get("linear-precision").copied() {
-        Some("fp16") => LinearPrecision::Fp16,
-        Some("int8") => LinearPrecision::Int8,
-        Some("mps-fp16") => LinearPrecision::MpsFp16,
-        Some(_) => LinearPrecision::Fp32,
-        None => default_linear_precision(),
-    };
+    let precision = linear_precision(options)?;
 
     dit.set_linear_precision(precision)?;
     let attention = attention_precision(options)?;
