@@ -4,7 +4,7 @@
 of about 16 megapixels from text. Its DiT is MiniMax H3's without the audio layers, distilled to six
 steps with no guidance, it reads the MiniMax H3 text encoder unchanged, and it decodes with a picture
 VAE of its own. `mmh3 image` generates pictures from text and edits reference pictures on
-[CUDA](cuda.md). Metal is not supported yet.
+[CUDA](cuda.md) and [Metal](metal.md).
 
 ## Download
 
@@ -43,8 +43,10 @@ prompt expander before generating.
   [Edit](#edit).
 - `--seed N` (default 0): The seed of the initial noise.
 - `--attention-precision bf16|int8-fp8` (default bf16): INT8/FP8 attention, as in
-  [Performance and accuracy](performance.md).
-- `--linear-precision int8|nvfp4` (default int8): [NVFP4 linear layers](nvfp4.md).
+  [Performance and accuracy](performance.md). On Metal, `fp32|fp16|int8-fp16` as in
+  [Metal](metal.md#options-and-current-limits).
+- `--linear-precision int8|nvfp4` (default int8): [NVFP4 linear layers](nvfp4.md). On Metal,
+  `fp32|fp16|int8|mps-fp16` as in [Metal](metal.md#options-and-current-limits).
 - `--draft-steps N` (default 0): Runs the first N steps on a canvas of half the width and height,
   as in [Faster](#faster). The canvas must then be a multiple of 64 on each side, and an edit
   takes none.
@@ -133,6 +135,27 @@ default, so its draft steps run on a 1024×1024 canvas, too short for Sol-Attn. 
 decodes a 4096×4096 picture in 2.9 s. The whole generation includes loading the text encoder, the
 DiT and the VAE from warm files. At 4096×4096 INT8/FP8 attention changes fine details of the
 picture and keeps its composition. NVFP4 also mutes colors and coarsens textures.
+
+On an M6 with 24 GB, with the same prompt and seed, INT8 linear layers and attention on the matrix
+units, FP16 unless INT8/FP16:
+
+| Picture | Draft steps | Attention | Each step at full size | Whole generation |
+| --- | ---: | --- | ---: | ---: |
+| 1024×1024 | 0 | FP16 | 7.1 s | 57 s |
+| 1024×1024 | 2 | INT8/FP16 | 7.0 s | 52 s |
+| 4096×4096 | 0 | FP16 | 49 s | 337 s |
+| 4096×4096 | 2 | FP16 | 49 s | 255 s |
+| 4096×4096 | 0 | Sol-Attn, INT8/FP16 | 26 s | 237 s |
+| 4096×4096 | 2 | Sol-Attn, INT8/FP16 | 26 s | 165 s |
+
+The last 4096×4096 row is the [faster settings](#faster) with `--attention-precision int8-fp16`,
+Metal's INT8 attention. The 1024×1024 picture is generated on a 2048×2048 canvas, as on CUDA, so a
+2048×2048 picture takes as long and its draft steps are too short for Sol-Attn. A draft step at
+4096×4096 takes about 7 s, the latent upscaler 5 s with its loading, and the picture VAE decodes a
+4096×4096 picture in 35 s. The 21 GB DiT does not fit in the GPU's share of 24 GB, so the Mac keeps
+as many of its blocks as fit beside the step, 31 of the 52 at 2048×2048 and 11 at 4096×4096, and
+reads the others from the disk as they run. Editing needs macOS 26, since the picture VAE's encoder
+runs on the matrix units, as for the [references](ref2va.md) of a video.
 
 ## Accuracy
 

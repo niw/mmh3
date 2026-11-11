@@ -30,7 +30,7 @@ make generate
 `make download-models` downloads the models into `models`, and `make generate` writes a video with
 audio from a sample prompt to `out.mp4`. See [Usage](docs/usage.md) for the other settings.
 
-On CUDA, these commands download MiniMax H3 Image and write a picture to `out.png`. See
+These commands download MiniMax H3 Image and write a picture to `out.png`. See
 [Image](docs/image.md) for its settings and for editing pictures.
 
 ```sh
@@ -112,6 +112,18 @@ MiniMax H3 Image generates in six steps, and the times per step are those of a s
 A [server](docs/server.md) that keeps the models loaded takes 26 s with the faster settings.
 [Image](docs/image.md) has the times of other settings.
 
+### Pictures on Metal
+
+On an M6 with 24 GB, a 4096×4096 picture took:
+
+| Settings | Time per step | Time |
+| --- | ---: | ---: |
+| [Faster settings](docs/image.md#faster): 2 draft steps, Sol-Attn and INT8/FP16 attention | 26 s | 165 s |
+| Defaults, FP16 attention | 49 s | 337 s |
+
+The DiT's blocks that do not fit are read from the disk as they run.
+[Image](docs/image.md) has the times of other settings.
+
 ## Status
 
 ### Videos
@@ -126,7 +138,7 @@ A [server](docs/server.md) that keeps the models loaded takes 26 s with the fast
 
 - Pictures of about 16 megapixels from text, and edits of up to 16 reference pictures
   ([Image](docs/image.md)), work with `mmh3 image` on CUDA and have been checked against diffusers'
-  pipeline. Metal does not run them yet.
+  pipeline. They work on Metal too, where editing needs macOS 26.
 
 ### Machines
 
