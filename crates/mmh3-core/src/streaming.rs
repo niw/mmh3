@@ -18,8 +18,13 @@ use std::path::{Path, PathBuf};
 /// Tensors of a unit start at multiples of this, which every kernel's vector loads accept.
 pub const UNIT_ALIGNMENT: usize = 256;
 
-/// Bytes a reader holds between the file and the unit.
+/// Bytes a reader holds between the file and the unit, for a file that takes only aligned reads.
 const STAGING_BYTES: usize = 64 << 20;
+/// Threads that read a unit into place. One thread leaves most of the bandwidth of the page cache,
+/// and of an SSD that serves several reads at once, unused.
+const READ_THREADS: usize = 8;
+/// The most bytes one read into place asks for, so that the threads share a large tensor.
+const READ_BYTES: usize = 16 << 20;
 /// Pieces closer than this are read in one pass rather than seeking over the gap.
 const MERGE_GAP: u64 = 4 << 20;
 
@@ -223,10 +228,13 @@ impl Drop for AlignedBuffer {
 unsafe impl Send for AlignedBuffer {}
 
 /// Reads units from their checkpoints with direct reads, so that a unit read at every step leaves
-/// nothing in the page cache.
+/// nothing in the page cache. Where the files take reads at any offset, several threads read each
+/// tensor straight into its place; a file that takes only aligned reads goes through a staging
+/// buffer.
 pub struct UnitReader {
     files: Vec<DirectFile>,
-    staging: AlignedBuffer,
+    /// Allocated only when some file takes only aligned reads.
+    staging: Option<AlignedBuffer>,
 }
 
 /// One piece of one tensor of the unit being read.
@@ -241,14 +249,16 @@ struct Wanted {
 
 impl UnitReader {
     pub fn new(files: &Files) -> io::Result<Self> {
-        Ok(UnitReader {
-            files: files
-                .paths
-                .iter()
-                .map(|path| DirectFile::open(path))
-                .collect::<io::Result<_>>()?,
-            staging: AlignedBuffer::new(STAGING_BYTES),
-        })
+        let files: Vec<DirectFile> = files
+            .paths
+            .iter()
+            .map(|path| DirectFile::open(path))
+            .collect::<io::Result<_>>()?;
+        let staging = files
+            .iter()
+            .any(DirectFile::is_direct)
+            .then(|| AlignedBuffer::new(STAGING_BYTES));
+        Ok(UnitReader { files, staging })
     }
 
     /// Reads `unit` into `destination`, laid out as the unit says. The files are those the reader
@@ -259,16 +269,122 @@ impl UnitReader {
             "{}: the destination is smaller than the unit",
             unit.name
         );
+        for tensor in &unit.tensors {
+            if tensor
+                .pieces
+                .iter()
+                .any(|piece| piece.file >= self.files.len())
+            {
+                return Err(io::Error::other(format!(
+                    "{}: a piece from a file the reader does not have",
+                    tensor.name
+                )));
+            }
+        }
+        match self.staging.as_mut() {
+            Some(staging) => Self::read_staged(&self.files, staging, unit, destination),
+            None => Self::read_in_place(&self.files, unit, destination, READ_BYTES),
+        }
+    }
+
+    /// Reads each run of bytes that lies end to end in both a file and the unit straight into
+    /// `destination`, with several threads, in reads of at most `read_bytes`.
+    fn read_in_place(
+        files: &[DirectFile],
+        unit: &Unit,
+        destination: &mut [u8],
+        read_bytes: usize,
+    ) -> io::Result<()> {
+        // (file, offset in the file, offset in the unit, bytes), joined where they continue.
+        let mut runs: Vec<(usize, u64, usize, usize)> = Vec::new();
+        for tensor in &unit.tensors {
+            let mut position = 0;
+            for piece in &tensor.pieces {
+                let mut at = 0;
+                while at < piece.bytes {
+                    let (placed, run) = tensor.place(position + at);
+                    let length = run.min(piece.bytes - at);
+                    let offset = piece.offset + at as u64;
+                    let target = tensor.offset + placed;
+                    match runs.last_mut() {
+                        Some(last)
+                            if last.0 == piece.file
+                                && last.1 + last.3 as u64 == offset
+                                && last.2 + last.3 == target =>
+                        {
+                            last.3 += length;
+                        }
+                        _ => runs.push((piece.file, offset, target, length)),
+                    }
+                    at += length;
+                }
+                position += piece.bytes;
+            }
+        }
+
+        // The runs never overlap in the unit, so each takes its own part of the destination.
+        runs.sort_by_key(|run| run.2);
+        let mut reads = Vec::new();
+        let mut rest = destination;
+        let mut start = 0;
+        for (file, offset, target, bytes) in runs {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(target - start);
+            let (place, tail) = tail.split_at_mut(bytes);
+            rest = tail;
+            start = target + bytes;
+            for (index, chunk) in place.chunks_mut(read_bytes).enumerate() {
+                reads.push((file, offset + (index * read_bytes) as u64, chunk));
+            }
+        }
+        // Taken from the end, so the files are read from their starts.
+        reads.sort_by_key(|read| std::cmp::Reverse((read.0, read.1)));
+
+        let threads = std::thread::available_parallelism()
+            .map_or(1, |threads| threads.get())
+            .min(READ_THREADS)
+            .min(reads.len());
+        let reads = std::sync::Mutex::new(reads);
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| -> io::Result<()> {
+                        loop {
+                            let Some((file, offset, place)) = reads.lock().unwrap().pop() else {
+                                return Ok(());
+                            };
+                            let result = match files[file].read_at(offset, place) {
+                                Ok(read) if read == place.len() => Ok(()),
+                                Ok(_) => Err(io::Error::new(
+                                    io::ErrorKind::UnexpectedEof,
+                                    "the checkpoint is shorter than its header says",
+                                )),
+                                Err(error) => Err(error),
+                            };
+                            if result.is_err() {
+                                reads.lock().unwrap().clear();
+                                return result;
+                            }
+                        }
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .try_for_each(|worker| worker.join().expect("a reader thread panicked"))
+        })
+    }
+
+    /// Reads aligned ranges covering the pieces into `staging` and copies the pieces from there.
+    fn read_staged(
+        files: &[DirectFile],
+        staging: &mut AlignedBuffer,
+        unit: &Unit,
+        destination: &mut [u8],
+    ) -> io::Result<()> {
         let mut wanted = Vec::new();
         for (index, tensor) in unit.tensors.iter().enumerate() {
             let mut position = 0;
             for piece in &tensor.pieces {
-                if piece.file >= self.files.len() {
-                    return Err(io::Error::other(format!(
-                        "{}: a piece from a file the reader does not have",
-                        tensor.name
-                    )));
-                }
                 wanted.push(Wanted {
                     file: piece.file,
                     offset: piece.offset,
@@ -302,9 +418,9 @@ impl UnitReader {
         for (file, range_start, range_end, data_end, covered) in ranges {
             let mut position = range_start;
             while position < range_end {
-                let length = ((range_end - position) as usize).min(STAGING_BYTES);
-                let staging = &mut self.staging.as_mut_slice()[..length];
-                let read = self.files[file].read_at(position, staging)?;
+                let length = ((range_end - position) as usize).min(staging.bytes);
+                let staging = &mut staging.as_mut_slice()[..length];
+                let read = files[file].read_at(position, staging)?;
                 let chunk_end = position + read as u64;
                 // Only the aligned tail past the end of the file may come back short.
                 if chunk_end < data_end.min(position + length as u64) {
@@ -449,6 +565,85 @@ mod tests {
         let row = |index: u8| (index * 4..index * 4 + 4).collect::<Vec<u8>>();
         let expected: Vec<u8> = [0, 1, 4, 5, 2, 3, 6, 7].into_iter().flat_map(row).collect();
         assert_eq!(&destination[1536..1568], &expected[..]);
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn reads_the_same_bytes_in_place_and_staged() {
+        let path = std::env::temp_dir().join(format!("mmh3-streaming-ways-{}", std::process::id()));
+        let bytes = |count: usize, seed: usize| -> Vec<u8> {
+            (0..count)
+                .map(|index| (index * seed + index / 256) as u8)
+                .collect()
+        };
+        // Tensors that cross many reads and staging chunks, with a tensor the unit leaves out
+        // between them, and rows of 48 bytes whose halves interleave three rows at a time.
+        let (first, skipped, second, rows) = (
+            bytes(20000, 31),
+            bytes(5000, 7),
+            bytes(7001, 13),
+            bytes(66 * 48, 5),
+        );
+        write_checkpoint(
+            &path,
+            &[
+                ("first", &first),
+                ("skipped", &skipped),
+                ("second", &second),
+                ("rows", &rows),
+            ],
+        );
+        let file = SafeTensors::open(&path).unwrap();
+        let mut files = Files::default();
+        let mut unit = Unit::new("layer");
+        let piece = |files: &mut Files, name: &str| files.piece(&file, file.get(name).unwrap());
+        let pieces = vec![piece(&mut files, "second"), piece(&mut files, "first")];
+        unit.insert(
+            "joined",
+            DType::U8,
+            vec![27001],
+            pieces,
+            Arrangement::Contiguous,
+        );
+        let pieces = vec![piece(&mut files, "rows")];
+        unit.insert(
+            "rows",
+            DType::U8,
+            vec![66, 48],
+            pieces,
+            Arrangement::InterleavedHalves {
+                row_bytes: 48,
+                group: 3,
+            },
+        );
+
+        let mut expected = vec![0u8; unit.bytes()];
+        expected[..7001].copy_from_slice(&second);
+        expected[7001..27001].copy_from_slice(&first);
+        let offset = unit.get("rows").unwrap().offset;
+        let row = |index: usize| &rows[index * 48..index * 48 + 48];
+        let order = (0..11).flat_map(|group| {
+            let first_half = group * 3..group * 3 + 3;
+            first_half.clone().chain(first_half.map(|row| row + 33))
+        });
+        for (placed, index) in order.enumerate() {
+            expected[offset + placed * 48..offset + placed * 48 + 48].copy_from_slice(row(index));
+        }
+
+        let reader = UnitReader::new(&files).unwrap();
+        // Reads in place need a file that takes reads at any offset, which a direct one may not.
+        let buffered = [DirectFile::open_buffered(&path).unwrap()];
+        for read_bytes in [READ_BYTES, 1000] {
+            let mut destination = vec![0u8; unit.bytes()];
+            UnitReader::read_in_place(&buffered, &unit, &mut destination, read_bytes).unwrap();
+            assert!(destination == expected, "in place, reads of {read_bytes}");
+        }
+        for staging_bytes in [STAGING_BYTES, DIRECT_ALIGNMENT] {
+            let mut destination = vec![0u8; unit.bytes()];
+            let mut staging = AlignedBuffer::new(staging_bytes);
+            UnitReader::read_staged(&reader.files, &mut staging, &unit, &mut destination).unwrap();
+            assert!(destination == expected, "staged through {staging_bytes}");
+        }
         std::fs::remove_file(&path).unwrap();
     }
 

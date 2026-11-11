@@ -56,6 +56,12 @@ impl DirectFile {
                 return Ok(DirectFile { file, direct: true });
             }
         }
+        Self::open_buffered(path)
+    }
+
+    /// Opens `path` for buffered reads at any offset, which still leave the page cache as
+    /// [`DirectFile::open`]'s do where the platform lets them.
+    pub fn open_buffered(path: &Path) -> io::Result<Self> {
         let file = OpenOptions::new().read(true).open(path)?;
         // SAFETY: plain advice on an open descriptor. A file system that refuses it is read
         // through the cache.
