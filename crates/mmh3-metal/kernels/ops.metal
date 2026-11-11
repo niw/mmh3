@@ -471,15 +471,16 @@ kernel void audio_geglu(device const float *gate [[buffer(0)]],
     y[i] = 0.5f * x * (1 + tanh(inner)) * value[i];
 }
 
+// A token decodes into p[4] frames: 4 for the video VAE and 1 for MiniMax H3 Image's picture VAE.
 kernel void video_unpatch(device const float *x [[buffer(0)]], device float *y [[buffer(1)]],
                           constant uint *p [[buffer(2)]], uint i [[thread_position_in_grid]]) {
     if (i >= p[0])
         return;
-    uint w = p[3], h = p[2], f = p[1];
+    uint w = p[3], h = p[2], f = p[1], patch_frames = p[4];
     uint col = i % w, row = i / w % h, t = i / (w * h) % f, c = i / (w * h * f);
-    uint token = ((t / 4) * (h / 16) + row / 16) * (w / 16) + col / 16;
-    uint feature = c * 1024 + t % 4 * 256 + row % 16 * 16 + col % 16;
-    y[i] = x[token * 3072 + feature];
+    uint token = ((t / patch_frames) * (h / 16) + row / 16) * (w / 16) + col / 16;
+    uint feature = (c * patch_frames + t % patch_frames) * 256 + row % 16 * 16 + col % 16;
+    y[i] = x[token * 3 * patch_frames * 256 + feature];
 }
 
 // Write only the region owned by this tile. Neighbors are the original, unblended

@@ -1,4 +1,5 @@
-//! Video VAE decoding, unpatchification and spatial/temporal blending on Metal.
+//! Decoding with the ViT of the video VAE or of MiniMax H3 Image's picture VAE, unpatchification
+//! and spatial/temporal blending on Metal.
 use crate::{
     AttentionPrecision, Device, Error, LinearPrecision, Result,
     model::Weights,
@@ -8,7 +9,10 @@ use mmh3_core::{
     media::Yuv420,
     safetensors::SafeTensors,
     tensor::Tensor,
-    vae::{TemporalPlan, TileAxis, rope_angles, split_tiles},
+    vae::{
+        PICTURE_LATENTS_MEAN, PICTURE_LATENTS_STD, SPATIAL_RATIO, TEMPORAL_RATIO, TemporalPlan,
+        TileAxis, picture_rope_angles, rope_angles, split_tiles,
+    },
 };
 use std::cell::OnceCell;
 
@@ -37,6 +41,9 @@ pub struct MetalVideoDecoder {
     dim: usize,
     layers: usize,
     registers: usize,
+    /// Frames each latent token decodes into: `TEMPORAL_RATIO` for the video VAE, and 1 for
+    /// MiniMax H3 Image's picture VAE, whose rotary embedding also has no time axis.
+    patch_frames: usize,
     latents_mean: Vec<f32>,
     latents_std: Vec<f32>,
     tile_size: usize,
@@ -179,12 +186,20 @@ impl MetalVideoDecoder {
                     .is_some()
             })
             .count();
-        let latents_mean = host("latents_mean")?;
-        let latents_std = host("latents_std")?;
+        let projected = dimension("decoder.proj_out.weight", 0)?;
+        let patch_frames = projected / (3 * SPATIAL_RATIO * SPATIAL_RATIO);
+        // Comfy-Org's file of the picture VAE lacks the latent statistics of the release.
+        let statistics = |name: &str, picture: &[f32]| match info(name) {
+            Err(_) if patch_frames == 1 => Ok(picture.to_vec()),
+            _ => host(name),
+        };
+        let latents_mean = statistics("latents_mean", &PICTURE_LATENTS_MEAN)?;
+        let latents_std = statistics("latents_std", &PICTURE_LATENTS_STD)?;
         if dim == 0
             || !dim.is_multiple_of(64)
             || layers == 0
-            || dimension("decoder.proj_out.weight", 0)? != 3072
+            || ![1, TEMPORAL_RATIO].contains(&patch_frames)
+            || projected != 3 * patch_frames * SPATIAL_RATIO * SPATIAL_RATIO
             || latents_mean.len() < channels
             || latents_std.len() < channels
         {
@@ -200,6 +215,7 @@ impl MetalVideoDecoder {
             dim,
             layers,
             registers,
+            patch_frames,
             latents_mean,
             latents_std,
             precision: Default::default(),
@@ -246,6 +262,12 @@ impl MetalVideoDecoder {
         Ok(())
     }
 
+    /// Whether this is MiniMax H3 Image's picture decoder, which decodes one latent frame into one
+    /// picture.
+    fn is_picture(&self) -> bool {
+        self.patch_frames == 1
+    }
+
     fn tile(
         &self,
         latent_rows: &[f32],
@@ -266,12 +288,11 @@ impl MetalVideoDecoder {
         )?;
         let tokens = x.rows;
         let heads = self.dim / 64;
-        let angles = Array::from_f32(
-            &w.device,
-            tokens,
-            24,
-            &rope_angles(frames, height, width, self.registers + 1, 8, 100.0),
-        )?;
+        let angles = match self.is_picture() {
+            true => picture_rope_angles(height, width, self.registers + 1, 8, 100.0),
+            false => rope_angles(frames, height, width, self.registers + 1, 8, 100.0),
+        };
+        let angles = Array::from_f32(&w.device, tokens, angles.len() / tokens, &angles)?;
         let ones = Array::from_f32(&w.device, 1, 64, &[1.0; 64])?;
         // Each head's query, key and value lie side by side, and the query and key norms have no
         // weights of their own.
@@ -362,15 +383,22 @@ impl MetalVideoDecoder {
             }
         }
 
+        let features = 3 * self.patch_frames * SPATIAL_RATIO * SPATIAL_RATIO;
         let projected = w
             .linear(&w.norm(&x, "decoder.norm_out", 1e-5)?, "decoder.proj_out")?
-            .slice(0, patches, 0, 3072)?;
-        let (f, h, wp) = (frames * 4, height * 16, width * 16);
+            .slice(0, patches, 0, features)?;
+        let (f, h, wp) = (frames * self.patch_frames, height * 16, width * 16);
         let pixels = Array::empty(&w.device, 3, f * h * wp)?;
         w.device.run(
             "video_unpatch",
             &[&projected.buffer, &pixels.buffer],
-            &[pixels.len() as u32, f as u32, h as u32, wp as u32],
+            &[
+                pixels.len() as u32,
+                f as u32,
+                h as u32,
+                wp as u32,
+                self.patch_frames as u32,
+            ],
             pixels.len(),
             false,
         )?;
@@ -522,7 +550,10 @@ impl MetalVideoDecoder {
             ));
         };
 
-        if channels != self.channels || [latent_frames, lh, lw].contains(&0) {
+        if channels != self.channels
+            || [latent_frames, lh, lw].contains(&0)
+            || (self.is_picture() && latent_frames != 1)
+        {
             return Err(Error::new("invalid video latent dimensions".into()));
         }
 
@@ -551,7 +582,7 @@ impl MetalVideoDecoder {
             tw,
             chunks,
             cf,
-            canvas_frames: cf * 4,
+            canvas_frames: cf * self.patch_frames,
             output_frames,
         })
     }
@@ -754,8 +785,9 @@ impl MetalVideoDecoder {
                         width,
                     })
                 };
+            // A single latent frame keeps the last frame it decodes into.
             if latent_frames == 1 {
-                write(3, 1, false, 0)?;
+                write(canvas_frames - 1, 1, false, 0)?;
             } else {
                 write(3, 17, chunk > 0, position)?;
                 position += 17;
