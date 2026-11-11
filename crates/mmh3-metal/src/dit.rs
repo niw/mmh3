@@ -2,7 +2,7 @@
 //! token layouts.
 use crate::{
     AttentionPrecision, Device, Error, Result,
-    model::Weights,
+    model::{Weights, is_comfy_attention_hint},
     ops::{Array, PackedRows, RowMap, attends_in_half},
     shard::ShardContext,
     sparse::SparsePass,
@@ -130,7 +130,7 @@ impl MetalDit {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
             };
-            if name.ends_with(".comfy_quant") {
+            if name.ends_with(".comfy_quant") || is_comfy_attention_hint(name) {
                 continue;
             }
             if let Some(unit) = Self::unit_index(&config, name) {

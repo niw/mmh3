@@ -160,6 +160,9 @@ impl Weights {
 
                 continue;
             }
+            if is_comfy_attention_hint(name) {
+                continue;
+            }
 
             dtype_code(info.dtype)?;
             if info.element_count() == 0 {
@@ -944,6 +947,11 @@ impl Weights {
         self.adapters.extend(adapters);
         Ok(count)
     }
+}
+
+/// ComfyUI's hint for its own attention, a U8 note beside a block's weights rather than a weight.
+pub(crate) fn is_comfy_attention_hint(name: &str) -> bool {
+    name.ends_with(".comfy_attention.config")
 }
 
 /// `keep`, ranges of `source`'s rows of `row_bytes` each, copied out end to end. The rows of one
