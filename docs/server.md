@@ -2,7 +2,7 @@
 
 `mmh3 server` takes a generation over HTTP and keeps its models loaded between the generations it
 runs, so a machine asked for one video after another reads the checkpoints once. It also generates
-pictures with [Image](image.md) on CUDA, see [Asking for a picture](#asking-for-a-picture).
+pictures with [Image](image.md), see [Asking for a picture](#asking-for-a-picture).
 
 ```sh
 export MMH3_MODELS=$PWD/models

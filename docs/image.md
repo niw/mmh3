@@ -4,7 +4,7 @@
 of about 16 megapixels from text. Its DiT is MiniMax H3's without the audio layers, distilled to six
 steps with no guidance, it reads the MiniMax H3 text encoder unchanged, and it decodes with a picture
 VAE of its own. `mmh3 image` generates pictures from text and edits reference pictures on
-[CUDA](cuda.md). Metal is not supported yet.
+[CUDA](cuda.md) and on [Metal](metal.md).
 
 ## Download
 
@@ -43,13 +43,16 @@ prompt expander before generating.
   [Edit](#edit).
 - `--seed N` (default 0): The seed of the initial noise.
 - `--attention-precision bf16|int8-fp8` (default bf16): INT8/FP8 attention, as in
-  [Performance and accuracy](performance.md).
-- `--linear-precision int8|nvfp4` (default int8): [NVFP4 linear layers](nvfp4.md).
+  [Performance and accuracy](performance.md). On Metal, `fp16`, `int8-fp16` or `fp32`, as in
+  [Metal](metal.md).
+- `--linear-precision int8|nvfp4` (default int8): [NVFP4 linear layers](nvfp4.md). On Metal,
+  `int8`, `fp16`, `mps-fp16` or `fp32`, as in [Metal](metal.md).
 - `--draft-steps N` (default 0): Runs the first N steps on a canvas of half the width and height,
   as in [Faster](#faster). The canvas must then be a multiple of 64 on each side, and an edit
   takes none.
 - `--latent-upscaler FILE`: Enlarges the draft with
-  [the latent upscaler](draft-steps.md#latent-upscaler) rather than bilinearly.
+  [the latent upscaler](draft-steps.md#latent-upscaler) rather than bilinearly. On Metal, it runs
+  on the matrix units, so it needs macOS 26.
 - `--attention dense|sol` (default dense), `--sparse-tau X`, `--sparse-start X`: Sol-Attn, as in
   [Usage](usage.md), from the third step by default.
 - `--dit FILE`, `--text-encoder FILE`, `--vae FILE`, `--models DIR`: Checkpoints, as in
@@ -84,6 +87,8 @@ target/release/mmh3 image --out panda.png --width 4096 --height 4096 \
   same seed gives another composition than without draft steps.
 - The four steps at full size run Sol-Attn, which attends to about 17% of the picture.
 - `--linear-precision nvfp4` takes it down to about 30 s, with muted colors and coarser textures.
+- On Metal, leave out `--attention-precision int8-fp8`, which Metal does not take. The draft steps
+  and Sol-Attn run there as in [Speed](#speed).
 
 Sol-Attn costs the most accuracy. Compared on a shop sign, a portrait and a station hall, it
 rewrote the prices on a chalkboard, added stray lettering and painted a second clock, while faces
@@ -94,7 +99,8 @@ at most. For a picture with text, leave `--attention sol` out, which takes about
 ## Edit
 
 With `--reference`, the prompt edits up to 16 pictures, which it refers to as `<Picture 1>`,
-`<Picture 2>` and so on, in the order of the options:
+`<Picture 2>` and so on, in the order of the options. On Metal, the picture VAE's encoder runs on
+the matrix units, so edits need macOS 26:
 
 ```sh
 target/release/mmh3 image --out night.png --width 4096 --height 4096 \
@@ -134,6 +140,23 @@ decodes a 4096×4096 picture in 2.9 s. The whole generation includes loading the
 DiT and the VAE from warm files. At 4096×4096 INT8/FP8 attention changes fine details of the
 picture and keeps its composition. NVFP4 also mutes colors and coarsens textures.
 
+On an M5 Max with 128 GB, with the same prompt and seed:
+
+| Picture | Draft steps | Attention | Linear layers | Each step at full size | Whole generation |
+| --- | ---: | --- | --- | ---: | ---: |
+| 2048×2048 | 0 | FP16 | INT8 | 4.3 s | 38 s |
+| 2048×2048 | 2 | FP16 | INT8 | 4.4 s | 30 s |
+| 4096×4096 | 0 | FP16 | INT8 | 24 s | 165 s |
+| 4096×4096 | 0 | Sol-Attn, FP16 | INT8 | 18 s | 153 s |
+| 4096×4096 | 2 | FP16 | INT8 | 27 s | 140 s |
+| 4096×4096 | 2 | Sol-Attn, FP16 | INT8 | 14 s | 89 s |
+
+The draft was enlarged bilinearly, and a draft step at 4096×4096 took about 3.5 s. A 2048×2048
+canvas is too short for Sol-Attn, which stays dense there. Metal decodes the
+picture's tiles one at a time, where CUDA decodes them together, in 5 s at 2048×2048 and 18 s at
+4096×4096. macOS can hold the GPU of a Mac well below its top clock under load, and the same run
+took from about two thirds to one and a half times these times as the clock changed.
+
 ## Accuracy
 
 `tools/golden/h3_image_reference.py` writes golden data from MiniMaxAI's release through diffusers,
@@ -148,6 +171,9 @@ with the BF16 DiT and the FP32 picture VAE, and `mmh3-tools check` compares mmh3
 The FP16 picture VAE decodes the final latent of the golden data 72 dB PSNR from the reference's
 FP32 decode, and its encoder gives the posterior means of the two references within 4.6e-3 of the
 reference's FP32 encoder.
+
+`mmh3-tools check` runs on CUDA. On Metal, the tests check the decode of the picture VAE against
+diffusers on a small random model, and the DiT's output heads against single heads summed by hand.
 
 ## License
 

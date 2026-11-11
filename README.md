@@ -30,7 +30,7 @@ make generate
 `make download-models` downloads the models into `models`, and `make generate` writes a video with
 audio from a sample prompt to `out.mp4`. See [Usage](docs/usage.md) for the other settings.
 
-On CUDA, these commands download MiniMax H3 Image and write a picture to `out.png`. See
+These commands download MiniMax H3 Image and write a picture to `out.png`. See
 [Image](docs/image.md) for its settings and for editing pictures.
 
 ```sh
@@ -112,6 +112,19 @@ MiniMax H3 Image generates in six steps, and the times per step are those of a s
 A [server](docs/server.md) that keeps the models loaded takes 26 s with the faster settings.
 [Image](docs/image.md) has the times of other settings.
 
+### Pictures on Metal on macOS
+
+The DiT runs on the GPU's matrix units with INT8 products and FP16 attention, as for videos. On an
+M5 Max with 128 GB, a picture took:
+
+| Picture | Settings | Time per step | Time |
+| --- | --- | ---: | ---: |
+| 4096×4096 | 2 [draft steps](docs/draft-steps.md) enlarged bilinearly, and Sol-Attn | 14 s | 89 s |
+| 4096×4096 | Defaults | 24 s | 165 s |
+| 2048×2048 | Defaults | 4.3 s | 38 s |
+
+The times per step are those of a step at full size.
+
 ## Status
 
 ### Videos
@@ -125,8 +138,8 @@ A [server](docs/server.md) that keeps the models loaded takes 26 s with the fast
 ### Pictures
 
 - Pictures of about 16 megapixels from text, and edits of up to 16 reference pictures
-  ([Image](docs/image.md)), work with `mmh3 image` on CUDA and have been checked against diffusers'
-  pipeline. Metal does not run them yet.
+  ([Image](docs/image.md)), work with `mmh3 image` on CUDA and Metal, and have been checked against
+  diffusers' pipeline on CUDA.
 
 ### Machines
 
