@@ -5,15 +5,15 @@
 
 #include "convrot.cuh"
 
-// Kernels of the video VAE's ViT decoder. The residual stream is FP32, linear layers run in FP16
-// like the reference, and the decoded pixels are blended and finalized in FP32.
+// Kernels of the ViT decoders of the video VAE and of MiniMax H3 Image's picture VAE. The residual
+// stream is FP32, linear layers run in FP16 like the reference, and the decoded pixels are blended
+// and finalized in FP32.
 
 namespace {
 
 constexpr int ROW_THREADS = 256;
 constexpr int VAE_HEAD_DIM = 64;
 constexpr int PATCH = 16;
-constexpr int PATCH_FRAMES = 4;
 
 __device__ __forceinline__ float block_sum(float value, float *scratch) {
     for (int offset = 16; offset > 0; offset /= 2) {
@@ -204,6 +204,8 @@ struct TileGrid {
     int tile_width;
     int latent_frames;
     int tile_tokens;
+    // Frames a token decodes into: 4 for the video decoder and 1 for the picture decoder.
+    int patch_frames;
 };
 
 // Raw decoder output of one tile at (channel, frame, row, column) of its pixels.
@@ -211,12 +213,13 @@ __device__ __forceinline__ float tile_pixel(const __half *projected, const TileG
                                             int channel, int frame, int row, int column) {
     const int latent_height = grid.tile_height / PATCH;
     const int latent_width = grid.tile_width / PATCH;
+    const int patch_frames = grid.patch_frames;
     const int token =
-        ((frame / PATCH_FRAMES) * latent_height + row / PATCH) * latent_width + column / PATCH;
+        ((frame / patch_frames) * latent_height + row / PATCH) * latent_width + column / PATCH;
     const int feature =
-        ((channel * PATCH_FRAMES + frame % PATCH_FRAMES) * PATCH + row % PATCH) * PATCH +
+        ((channel * patch_frames + frame % patch_frames) * PATCH + row % PATCH) * PATCH +
         column % PATCH;
-    const int features = 3 * PATCH_FRAMES * PATCH * PATCH;
+    const int features = 3 * patch_frames * PATCH * PATCH;
     return __half2float(
         projected[(static_cast<size_t>(tile) * grid.tile_tokens + token) * features + feature]);
 }
@@ -226,7 +229,7 @@ __device__ __forceinline__ float tile_pixel(const __half *projected, const TileG
 // then with the raw tile to the left, across their overlaps, the same order as the reference.
 __global__ void unpatchify_blend_kernel(const __half *__restrict__ projected, TileGrid grid,
                                         float *__restrict__ canvas, int height, int width) {
-    const int frames = grid.latent_frames * PATCH_FRAMES;
+    const int frames = grid.latent_frames * grid.patch_frames;
     const size_t count = static_cast<size_t>(3) * frames * height * width;
     const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
     for (size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x; index < count;
@@ -469,11 +472,11 @@ extern "C" int mmh3_vae_unpatchify_blend(const __half *projected, const int *sta
                                          const int *starts_x, const int *overlaps_y,
                                          const int *overlaps_x, int tiles_y, int tiles_x,
                                          int tile_height, int tile_width, int latent_frames,
-                                         int tile_tokens, float *canvas, int height, int width,
-                                         cudaStream_t stream) {
-    TileGrid grid = {starts_y, starts_x,    overlaps_y, overlaps_x,    tiles_y,
-                     tiles_x,  tile_height, tile_width, latent_frames, tile_tokens};
-    const size_t count = static_cast<size_t>(3) * latent_frames * PATCH_FRAMES * height * width;
+                                         int tile_tokens, int patch_frames, float *canvas,
+                                         int height, int width, cudaStream_t stream) {
+    TileGrid grid = {starts_y,    starts_x,   overlaps_y,    overlaps_x,  tiles_y,     tiles_x,
+                     tile_height, tile_width, latent_frames, tile_tokens, patch_frames};
+    const size_t count = static_cast<size_t>(3) * latent_frames * patch_frames * height * width;
     unpatchify_blend_kernel<<<grid_for(count), ROW_THREADS, 0, stream>>>(projected, grid, canvas,
                                                                          height, width);
     return static_cast<int>(cudaGetLastError());

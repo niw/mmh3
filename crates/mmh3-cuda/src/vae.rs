@@ -19,7 +19,8 @@ use mmh3_core::safetensors::{DType, SafeTensors};
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vae::{
     CHUNK_FRAMES, CHUNK_OVERLAP_TOKENS, CHUNK_TOKENS, FRAME_OVERLAP, FRAME_PRE_PADDING,
-    SPATIAL_RATIO, TEMPORAL_RATIO, TemporalPlan, TileAxis, rope_angles, split_tiles,
+    PICTURE_LATENTS_MEAN, PICTURE_LATENTS_STD, SPATIAL_RATIO, TEMPORAL_RATIO, TemporalPlan,
+    TileAxis, picture_rope_angles, rope_angles, split_tiles,
 };
 use std::cell::OnceCell;
 use std::ffi::{c_int, c_void};
@@ -115,6 +116,7 @@ unsafe extern "C" {
         tile_width: c_int,
         latent_frames: c_int,
         tile_tokens: c_int,
+        patch_frames: c_int,
         canvas: *mut c_void,
         height: c_int,
         width: c_int,
@@ -156,7 +158,6 @@ const ROPE_BASE: f32 = 100.0;
 const ROPE_FREQUENCIES: usize = 8;
 const OUTPUT_CHANNELS: usize = 3;
 /// Features of one decoded patch: 3 channels × 4 frames × 16 × 16 pixels.
-const PATCH_FEATURES: usize = OUTPUT_CHANNELS * TEMPORAL_RATIO * SPATIAL_RATIO * SPATIAL_RATIO;
 const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const PIXEL_STD: [f32; 3] = [0.229, 0.224, 0.225];
 
@@ -168,6 +169,24 @@ pub struct VideoDecoderConfig {
     pub layers: usize,
     pub ffn: usize,
     pub registers: usize,
+    /// Frames each latent token decodes into: `TEMPORAL_RATIO` for the video VAE, and 1 for
+    /// MiniMax H3 Image's picture VAE, whose rotary embedding also has no time axis.
+    pub patch_frames: usize,
+}
+
+impl VideoDecoderConfig {
+    fn patch_features(&self) -> usize {
+        OUTPUT_CHANNELS * self.patch_frames * SPATIAL_RATIO * SPATIAL_RATIO
+    }
+
+    fn is_picture(&self) -> bool {
+        self.patch_frames == 1
+    }
+
+    /// Rotated pairs of a head: the frequencies of each rotary axis.
+    fn rope_pairs(&self) -> usize {
+        ROPE_FREQUENCIES * if self.is_picture() { 2 } else { 3 }
+    }
 }
 
 /// Decoded pixels and, when requested, the raw decoder output of the first tile.
@@ -218,7 +237,7 @@ impl Workspace {
                 1
             })?,
             activated: DeviceBuffer::new(tokens * config.ffn * 2)?,
-            projected: DeviceBuffer::new(tokens * PATCH_FEATURES * 2)?,
+            projected: DeviceBuffer::new(tokens * config.patch_features() * 2)?,
             quantized: DeviceBuffer::new(quantized_rows * dim.max(config.ffn))?,
             scales: DeviceBuffer::new(quantized_rows * 4)?,
         })
@@ -524,6 +543,7 @@ impl CudaVideoDecoder {
                 .ok_or_else(|| Error::Model(format!("missing tensor {prefix}{name}")))
         };
         let embedder = shape("decoder.x_embedder.weight")?;
+        let projected = shape("decoder.proj_out.weight")?[0];
         let config = VideoDecoderConfig {
             latent_channels: embedder[1],
             dim: embedder[0],
@@ -538,9 +558,11 @@ impl CudaVideoDecoder {
                 .count(),
             ffn: shape("decoder.transformer_blocks.0.ff.w2.weight")?[1],
             registers: shape("decoder.register_tokens")?[1],
+            patch_frames: projected / (OUTPUT_CHANNELS * SPATIAL_RATIO * SPATIAL_RATIO),
         };
         if !config.dim.is_multiple_of(HEAD_DIM)
-            || shape("decoder.proj_out.weight")?[0] != PATCH_FEATURES
+            || ![1, TEMPORAL_RATIO].contains(&config.patch_frames)
+            || projected != config.patch_features()
         {
             return Err(Error::Model(format!(
                 "unsupported video decoder {config:?}"
@@ -569,9 +591,13 @@ impl CudaVideoDecoder {
         let dense_ffn = (0..config.layers)
             .any(|layer| !int8(&format!("transformer_blocks.{layer}.ff.w1.weight")));
 
+        let statistics = |name: &str, picture: &[f32]| match file.get(&format!("{prefix}{name}")) {
+            None if config.is_picture() => Ok(picture.to_vec()),
+            _ => host_tensor(file, &format!("{prefix}{name}")).map(|tensor| tensor.data),
+        };
         Ok(CudaVideoDecoder {
-            latents_mean: host_tensor(file, &format!("{prefix}latents_mean"))?.data,
-            latents_std: host_tensor(file, &format!("{prefix}latents_std"))?.data,
+            latents_mean: statistics("latents_mean", &PICTURE_LATENTS_MEAN)?,
+            latents_std: statistics("latents_std", &PICTURE_LATENTS_STD)?,
             config,
             quantized,
             dense_ffn,
@@ -972,7 +998,7 @@ impl CudaVideoDecoder {
                 check(mmh3_vae_key_norm_rope(
                     qkv.cast(),
                     angles.pointer(),
-                    (3 * ROPE_FREQUENCIES) as c_int,
+                    config.rope_pairs() as c_int,
                     tile_tokens as c_int,
                     tokens as c_int,
                     config.heads as c_int,
@@ -992,7 +1018,7 @@ impl CudaVideoDecoder {
                     &layout,
                     1.0 / (HEAD_DIM as f32).sqrt(),
                     angles.pointer(),
-                    3 * ROPE_FREQUENCIES,
+                    config.rope_pairs(),
                     NORM_EPSILON,
                 )?;
             }
@@ -1125,28 +1151,26 @@ impl CudaVideoDecoder {
     ) -> Result<Tensor, Error> {
         let (tile_height, tile_width) = (grid.latent_height(), grid.latent_width());
         let patches = frames * tile_height * tile_width;
-        let mut bytes = vec![0u8; patches * PATCH_FEATURES * 2];
+        let (patch_frames, features) = (self.config.patch_frames, self.config.patch_features());
+        let mut bytes = vec![0u8; patches * features * 2];
         workspace.projected.copy_range_to_host(0, &mut bytes)?;
-        let (pixel_frames, pixel_height, pixel_width) = (
-            frames * TEMPORAL_RATIO,
-            grid.rows.length,
-            grid.columns.length,
-        );
+        let (pixel_frames, pixel_height, pixel_width) =
+            (frames * patch_frames, grid.rows.length, grid.columns.length);
         let mut data = vec![0.0f32; OUTPUT_CHANNELS * pixel_frames * pixel_height * pixel_width];
         for (index, &pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
-            let (token, feature) = (index / PATCH_FEATURES, index % PATCH_FEATURES);
+            let (token, feature) = (index / features, index % features);
             let (frame, y, x) = (
                 token / (tile_height * tile_width),
                 token / tile_width % tile_height,
                 token % tile_width,
             );
-            let channel = feature / (TEMPORAL_RATIO * SPATIAL_RATIO * SPATIAL_RATIO);
-            let sub_frame = feature / (SPATIAL_RATIO * SPATIAL_RATIO) % TEMPORAL_RATIO;
+            let channel = feature / (patch_frames * SPATIAL_RATIO * SPATIAL_RATIO);
+            let sub_frame = feature / (SPATIAL_RATIO * SPATIAL_RATIO) % patch_frames;
             let (sub_y, sub_x) = (
                 feature / SPATIAL_RATIO % SPATIAL_RATIO,
                 feature % SPATIAL_RATIO,
             );
-            let target_frame = frame * TEMPORAL_RATIO + sub_frame;
+            let target_frame = frame * patch_frames + sub_frame;
             let target = ((channel * pixel_frames + target_frame) * pixel_height
                 + y * SPATIAL_RATIO
                 + sub_y)
@@ -1177,7 +1201,7 @@ impl CudaVideoDecoder {
         };
         Ok(DecodePlan {
             chunks,
-            canvas_frames: chunk_frames * TEMPORAL_RATIO,
+            canvas_frames: chunk_frames * self.config.patch_frames,
             height,
             width,
             tiles: grid.count(),
@@ -1267,7 +1291,10 @@ impl CudaVideoDecoder {
                 latent.shape
             )));
         };
-        if channels != self.config.latent_channels || frames == 0 {
+        if channels != self.config.latent_channels
+            || frames == 0
+            || (self.config.is_picture() && frames != 1)
+        {
             return Err(Error::Model(format!(
                 "latent shape {:?} does not match the decoder",
                 latent.shape
@@ -1309,7 +1336,7 @@ impl CudaVideoDecoder {
                 plan.frames,
             )
         };
-        let canvas_frames = chunk_frames * TEMPORAL_RATIO;
+        let canvas_frames = chunk_frames * config.patch_frames;
         let patches = chunk_frames * grid.latent_height() * grid.latent_width();
         let tile_tokens = patches + config.registers + 1;
         let tokens = tiles * tile_tokens;
@@ -1357,16 +1384,26 @@ impl CudaVideoDecoder {
         );
         if decode.work.is_none() {
             let config = &self.config;
-            decode.work = Some((
-                Workspace::new(config, decode.tokens, self.quantized, self.dense_ffn)?,
-                DeviceBuffer::from_f32(&rope_angles(
+            let angles = match config.is_picture() {
+                true => picture_rope_angles(
+                    decode.grid.latent_height(),
+                    decode.grid.latent_width(),
+                    config.registers + 1,
+                    ROPE_FREQUENCIES,
+                    ROPE_BASE,
+                ),
+                false => rope_angles(
                     decode.chunk_frames,
                     decode.grid.latent_height(),
                     decode.grid.latent_width(),
                     config.registers + 1,
                     ROPE_FREQUENCIES,
                     ROPE_BASE,
-                ))?,
+                ),
+            };
+            decode.work = Some((
+                Workspace::new(config, decode.tokens, self.quantized, self.dense_ffn)?,
+                DeviceBuffer::from_f32(&angles)?,
             ));
         }
         let (workspace, angles) = decode.work.as_mut().expect("just made");
@@ -1398,6 +1435,7 @@ impl CudaVideoDecoder {
                 decode.grid.columns.length as c_int,
                 decode.chunk_frames as c_int,
                 decode.tile_tokens as c_int,
+                self.config.patch_frames as c_int,
                 decode.canvas.pointer(),
                 decode.height as c_int,
                 decode.width as c_int,
