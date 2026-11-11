@@ -226,55 +226,62 @@ pub enum PromptReference {
     },
 }
 
+/// Appends text tokens, which take consecutive positions on all three axes.
+fn push_text(prompt: &mut VisionPrompt, next: &mut usize, ids: &[u32], modality: Modality) {
+    for &id in ids {
+        prompt.ids.push(id);
+        prompt.modalities.push(modality);
+        prompt.positions.push([*next; 3]);
+        *next += 1;
+    }
+}
+
+/// Appends `<|vision_start|>`, a picture's vision embeddings and `<|vision_end|>`. The
+/// embeddings share the time position of their first one and spread over its rows and columns,
+/// after which the text continues past the picture's largest position.
+fn push_block(prompt: &mut VisionPrompt, next: &mut usize, grid: &VisionGrid) {
+    push_text(prompt, next, &[VISION_START], Modality::Video);
+    prompt.picture_starts.push(prompt.ids.len());
+    let (rows, columns) = (grid.height / MERGE, grid.width / MERGE);
+    for row in 0..rows {
+        for column in 0..columns {
+            prompt.ids.push(IMAGE_PAD);
+            prompt.modalities.push(Modality::Video);
+            prompt.positions.push([*next, *next + row, *next + column]);
+        }
+    }
+    *next += rows.max(columns);
+    push_text(prompt, next, &[VISION_END], Modality::Video);
+}
+
+fn empty_prompt() -> VisionPrompt {
+    VisionPrompt {
+        ids: Vec::new(),
+        picture_starts: Vec::new(),
+        modalities: Vec::new(),
+        positions: Vec::new(),
+    }
+}
+
 /// H3's presentation of a prompt with references, without a chat template: for each picture
 /// `"<Picture i>: "`, `<|vision_start|>`, its vision embeddings and `<|vision_end|>`, for each
 /// sound `"<Audio j>: "`, and for each clip `"<Video k>: "` and then a `"<T.T seconds>"` label and
-/// a vision block per pair of its frames. Every kind is numbered from one within its own kind. Text tokens take consecutive positions on all three axes, and a picture's embeddings
-/// share the time position of their first one and spread over its rows and columns, after which
-/// the text continues past the picture's largest position.
+/// a vision block per pair of its frames. Every kind is numbered from one within its own kind.
 pub fn vision_prompt(
     tokenizer: &Tokenizer,
     prompt: &str,
     references: &[PromptReference],
 ) -> VisionPrompt {
-    fn push_text(prompt: &mut VisionPrompt, next: &mut usize, ids: &[u32], modality: Modality) {
-        for &id in ids {
-            prompt.ids.push(id);
-            prompt.modalities.push(modality);
-            prompt.positions.push([*next; 3]);
-            *next += 1;
-        }
-    }
-
-    let mut result = VisionPrompt {
-        ids: Vec::new(),
-        picture_starts: Vec::new(),
-        modalities: Vec::new(),
-        positions: Vec::new(),
-    };
+    let mut result = empty_prompt();
     let mut next = 0;
     let (mut pictures, mut sounds, mut clips) = (0, 0, 0);
-    let block = |result: &mut VisionPrompt, next: &mut usize, grid: &VisionGrid| {
-        push_text(result, next, &[VISION_START], Modality::Video);
-        result.picture_starts.push(result.ids.len());
-        let (rows, columns) = (grid.height / MERGE, grid.width / MERGE);
-        for row in 0..rows {
-            for column in 0..columns {
-                result.ids.push(IMAGE_PAD);
-                result.modalities.push(Modality::Video);
-                result.positions.push([*next, *next + row, *next + column]);
-            }
-        }
-        *next += rows.max(columns);
-        push_text(result, next, &[VISION_END], Modality::Video);
-    };
     for reference in references {
         match reference {
             PromptReference::Picture(grid) => {
                 pictures += 1;
                 let label = tokenizer.encode(&format!("<Picture {pictures}>: "));
                 push_text(&mut result, &mut next, &label, Modality::Text);
-                block(&mut result, &mut next, grid);
+                push_block(&mut result, &mut next, grid);
             }
             PromptReference::Sound => {
                 sounds += 1;
@@ -288,7 +295,7 @@ pub fn vision_prompt(
                 for seconds in timestamps {
                     let label = tokenizer.encode(&format!("<{seconds:.1} seconds>"));
                     push_text(&mut result, &mut next, &label, Modality::Text);
-                    block(&mut result, &mut next, grid);
+                    push_block(&mut result, &mut next, grid);
                 }
             }
         }
@@ -299,6 +306,31 @@ pub fn vision_prompt(
         &tokenizer.encode(prompt),
         Modality::Text,
     );
+    result
+}
+
+/// MiniMax H3 Image's presentation of an edit: for each picture `"Picture i: "`, without the
+/// angle brackets the prompt refers to it with, and its vision block, then the prompt. The
+/// prompt and every label keep at most `max_tokens` tokens.
+pub fn picture_prompt(
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    grids: &[VisionGrid],
+    max_tokens: usize,
+) -> VisionPrompt {
+    let mut result = empty_prompt();
+    let mut next = 0;
+    let encode = |text: &str| {
+        let mut ids = tokenizer.encode(text);
+        ids.truncate(max_tokens);
+        ids
+    };
+    for (index, grid) in grids.iter().enumerate() {
+        let label = encode(&format!("Picture {}: ", index + 1));
+        push_text(&mut result, &mut next, &label, Modality::Text);
+        push_block(&mut result, &mut next, grid);
+    }
+    push_text(&mut result, &mut next, &encode(prompt), Modality::Text);
     result
 }
 
@@ -408,6 +440,29 @@ mod tests {
         assert_eq!(between, tokenizer.encode("<1.2 seconds>").len() + 1);
         let last = prompt.picture_starts[2] + grid.tokens() + 1;
         assert_eq!(&prompt.ids[last..], &tokenizer.encode("Rain.")[..]);
+    }
+
+    #[test]
+    fn labels_pictures_without_brackets() {
+        let tokenizer = Tokenizer::h3();
+        let grid = VisionGrid {
+            height: 4,
+            width: 6,
+        };
+        let prompt = picture_prompt(&tokenizer, "Make it night.", &[grid, grid], 4096);
+        let label = tokenizer.encode("Picture 1: ");
+        assert_eq!(&prompt.ids[..label.len()], &label[..]);
+        assert_eq!(prompt.ids[label.len()], VISION_START);
+        assert_eq!(prompt.picture_starts[0], label.len() + 1);
+        let second = tokenizer.encode("Picture 2: ");
+        let after = prompt.picture_starts[0] + grid.tokens() + 1;
+        assert_eq!(&prompt.ids[after..after + second.len()], &second[..]);
+        let end = prompt.picture_starts[1] + grid.tokens() + 1;
+        assert_eq!(&prompt.ids[end..], &tokenizer.encode("Make it night.")[..]);
+        assert_eq!(prompt.modalities[label.len()], Modality::Video);
+        assert_eq!(*prompt.modalities.last().unwrap(), Modality::Text);
+        let short = picture_prompt(&tokenizer, "Make it night.", &[], 2);
+        assert_eq!(short.ids, tokenizer.encode("Make it night.")[..2].to_vec());
     }
 
     #[test]

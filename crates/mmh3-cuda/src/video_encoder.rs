@@ -16,8 +16,8 @@ use mmh3_core::numeric::f32_to_f16;
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vae::{
-    CHUNK_TOKENS, CLIP_LENGTH, SPATIAL_RATIO, TEMPORAL_RATIO, TOKEN_DROP, blend_encoded_tiles,
-    split_tiles,
+    CHUNK_TOKENS, CLIP_LENGTH, PICTURE_LATENTS_MEAN, PICTURE_LATENTS_STD, SPATIAL_RATIO,
+    TEMPORAL_RATIO, TOKEN_DROP, blend_encoded_tiles, split_tiles,
 };
 use std::cell::RefCell;
 use std::ffi::{c_int, c_void};
@@ -157,6 +157,18 @@ fn load(file: &SafeTensors, name: &str) -> Result<Tensor, Error> {
         .get(name)
         .ok_or_else(|| Error::Model(format!("missing tensor {name}")))?;
     Tensor::load(file, info).map_err(Error::Model)
+}
+
+/// The latent statistics `name` of a VAE checkpoint. MiniMax H3 Image's picture VAE, whose decoder
+/// turns a token into one frame, may come without them, and then has `picture`.
+fn latent_statistics(file: &SafeTensors, name: &str, picture: &[f32]) -> Result<Vec<f32>, Error> {
+    let picture_decoder = file
+        .get("decoder.proj_out.weight")
+        .is_some_and(|info| info.shape[0] == 3 * SPATIAL_RATIO * SPATIAL_RATIO);
+    match file.get(name) {
+        None if picture_decoder => Ok(picture.to_vec()),
+        _ => Ok(load(file, name)?.data),
+    }
 }
 
 /// What an encoder keeps of the temporal kernels, which decides what it can encode.
@@ -446,8 +458,8 @@ impl CudaVideoEncoder {
             output_norm: GroupNorm::load(file, "encoder.norm_out")?,
             output: Convolution::load(file, "encoder.conv_out", taps)?,
             quant: Convolution::load(file, "quant_conv", taps)?,
-            latents_mean: load(file, "latents_mean")?.data,
-            latents_std: load(file, "latents_std")?.data,
+            latents_mean: latent_statistics(file, "latents_mean", &PICTURE_LATENTS_MEAN)?,
+            latents_std: latent_statistics(file, "latents_std", &PICTURE_LATENTS_STD)?,
             temporal,
             tile_size,
             tile_overlap_min,

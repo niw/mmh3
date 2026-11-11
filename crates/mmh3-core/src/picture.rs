@@ -62,6 +62,58 @@ pub fn reference_size(
     (snap(width), snap(height))
 }
 
+/// The size MiniMax H3 Image gives a reference of `width × height` for one of its consumers: the
+/// picture as it is when its short edge lies within `[min_short_edge, max_short_edge]`, and
+/// otherwise scaled at its aspect ratio so that the short edge lands on the nearer bound, with both
+/// sides rounded to a multiple of `multiple`.
+pub fn bound_short_edge(
+    width: usize,
+    height: usize,
+    min_short_edge: usize,
+    max_short_edge: usize,
+    multiple: usize,
+) -> (usize, usize) {
+    let short_edge = width.min(height);
+    if (min_short_edge..=max_short_edge).contains(&short_edge) {
+        return (width, height);
+    }
+    let target = if short_edge < min_short_edge {
+        min_short_edge
+    } else {
+        max_short_edge
+    };
+    let scale = target as f64 / short_edge as f64;
+    let snap = |side: usize| {
+        let multiples = (side as f64 * scale / multiple as f64).round_ties_even() as usize;
+        multiples.max(1) * multiple
+    };
+    (snap(width), snap(height))
+}
+
+/// The size the Qwen2-VL image processor resizes a picture of `width × height` to: both sides
+/// rounded to multiples of `factor`, and scaled to keep the area within `[min_pixels, max_pixels]`.
+pub fn vision_size(
+    width: usize,
+    height: usize,
+    factor: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    let (width_f, height_f, factor_f) = (width as f64, height as f64, factor as f64);
+    let round = |side: f64| ((side / factor_f).round_ties_even() as usize) * factor;
+    let (mut new_width, mut new_height) = (round(width_f), round(height_f));
+    if new_width * new_height > max_pixels {
+        let beta = (width_f * height_f / max_pixels as f64).sqrt();
+        let floor = |side: f64| ((side / beta / factor_f).floor() as usize * factor).max(factor);
+        (new_width, new_height) = (floor(width_f), floor(height_f));
+    } else if new_width * new_height < min_pixels {
+        let beta = (min_pixels as f64 / (width_f * height_f)).sqrt();
+        let ceil = |side: f64| (side * beta / factor_f).ceil() as usize * factor;
+        (new_width, new_height) = (ceil(width_f), ceil(height_f));
+    }
+    (new_width, new_height)
+}
+
 fn sinc(x: f64) -> f64 {
     if x == 0.0 {
         return 1.0;
@@ -195,6 +247,24 @@ impl Picture {
         }
     }
 
+    /// The top left `width × height` of the picture.
+    pub fn crop(&self, width: usize, height: usize) -> Picture {
+        assert!(
+            width <= self.width && height <= self.height,
+            "a crop inside the picture"
+        );
+        let mut pixels = Vec::with_capacity(width * height * 3);
+        for row in 0..height {
+            let start = row * self.width * 3;
+            pixels.extend_from_slice(&self.pixels[start..start + width * 3]);
+        }
+        Picture {
+            width,
+            height,
+            pixels,
+        }
+    }
+
     /// `[height, width, 3]` in [0, 1].
     pub fn to_tensor(&self) -> Tensor {
         Tensor::new(
@@ -220,6 +290,32 @@ mod tests {
         assert_eq!(canvas_for(4000, 3000), (1024, 768));
         // Wider than 1344 × 768 shrinks to its area.
         assert_eq!(canvas_for(2400, 1000), (1568, 640));
+    }
+
+    #[test]
+    fn bounds_the_short_edge_of_references() {
+        assert_eq!(bound_short_edge(1500, 1100, 1024, 2048, 32), (1500, 1100));
+        assert_eq!(bound_short_edge(800, 600, 1024, 2048, 32), (1376, 1024));
+        assert_eq!(bound_short_edge(6000, 4000, 1024, 2048, 32), (3072, 2048));
+        assert_eq!(bound_short_edge(1500, 1100, 1024, 1024, 32), (1408, 1024));
+    }
+
+    #[test]
+    fn sizes_pictures_like_the_qwen_processor() {
+        assert_eq!(vision_size(1408, 1024, 32, 65536, 16777216), (1408, 1024));
+        assert_eq!(vision_size(1500, 1024, 32, 65536, 16777216), (1504, 1024));
+        assert_eq!(vision_size(100, 100, 32, 65536, 16777216), (256, 256));
+        assert_eq!(vision_size(8192, 4096, 32, 65536, 16777216), (5792, 2880));
+    }
+
+    #[test]
+    fn crops_the_top_left() {
+        let picture = Picture {
+            width: 3,
+            height: 2,
+            pixels: (0..18).collect(),
+        };
+        assert_eq!(picture.crop(2, 1).pixels, vec![0, 1, 2, 3, 4, 5]);
     }
 
     #[test]
