@@ -232,12 +232,15 @@ prompt and seed, INT8 linear layers and FP16 attention:
 | 4096×4096 | 2 | Sol-Attn, FP16 | 14 s | 89 s |
 
 The draft was enlarged bilinearly, and a draft step at 4096×4096 took about 3.5 s. These runs, like
-the M6's above, decoded the picture's tiles one at a time, in 5 s at 2048×2048 and 18 s at
-4096×4096; Metal now decodes them together, as CUDA does. The GPU of this MacBook Pro runs at its
-top clock of about 1.4 GHz only for the first second or two of a load and then at about 700 to
-800 MHz, held there by the power and cooling of the 14-inch case whatever the adapter, so the same
-run took from about two thirds to one and a half times these times as the clock moved. A 16-inch
-MacBook Pro or a Mac Studio with the same chip should be faster.
+the M6's above, decoded the picture's tiles one at a time with FP32 products, in 5 s at 2048×2048
+and 18 s at 4096×4096. The picture VAE now decodes several tiles at once, as CUDA does, and at these
+precisions its linear layers take its FP16 weights on the matrix units, with FP16 inputs, which
+takes about 0.22 of that time at the same clock; its pictures are within one level everywhere of
+those of FP32 products (68.5 dB PSNR at 4096×4096). The GPU of this MacBook Pro runs at its top
+clock of about 1.4 GHz only for the first second or two of a load and then at about 700 to 800 MHz,
+held there by the power and cooling of the 14-inch case whatever the adapter, so the same run took
+from about two thirds to one and a half times these times as the clock moved. A 16-inch MacBook Pro
+or a Mac Studio with the same chip should be faster.
 
 ## Accuracy
 

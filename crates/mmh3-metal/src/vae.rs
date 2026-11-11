@@ -52,7 +52,8 @@ pub struct MetalVideoDecoder {
     latents_std: Vec<f32>,
     tile_size: usize,
     overlap: usize,
-    /// The precisions of the transformer's INT8 layers and attention, FP32 unless set.
+    /// The precisions of the transformer's INT8 layers, a picture VAE's FP16 ones and the
+    /// attention, FP32 unless set.
     precision: (LinearPrecision, AttentionPrecision),
 }
 
@@ -252,8 +253,9 @@ impl MetalVideoDecoder {
         Ok(self.weights.get_or_init(|| weights))
     }
 
-    /// Select the precisions of the transformer's INT8 layers and of its attention, whether the
-    /// weights are on the device yet or not.
+    /// Select the precisions of the transformer's INT8 layers, of a picture VAE's FP16 ones, which
+    /// take FP16 inputs at `Fp16` and `Int8`, and of its attention, whether the weights are on the
+    /// device yet or not.
     pub fn set_precision(
         &mut self,
         linear: LinearPrecision,
@@ -306,6 +308,21 @@ impl MetalVideoDecoder {
         };
         let angles = Array::from_f32(&w.device, tokens, angles.len() / tokens, &angles)?;
         let ones = Array::from_f32(&w.device, 1, 64, &[1.0; 64])?;
+        // The FP16 and INT8 precisions put the products on the matrix units, where a picture VAE's
+        // FP16 weights go as they are, with FP16 inputs and FP32 sums; the residual and the norms
+        // stay FP32. A video VAE's FP16 file keeps the FP32 products its decode was checked with.
+        let fp16 = self.is_picture()
+            && matches!(
+                w.linear_precision,
+                LinearPrecision::Fp16 | LinearPrecision::Int8
+            );
+        let linear = |x: &Array, name: &str| -> Result<Array> {
+            if fp16 && w.is_half(name) {
+                w.linear_fp16(x, name)
+            } else {
+                w.linear(x, name)
+            }
+        };
         // Each head's query, key and value lie side by side, and the query and key norms have no
         // weights of their own.
         let attend = |qkv: &Array, p: &str| -> Result<Array> {
@@ -321,7 +338,7 @@ impl MetalVideoDecoder {
                     false,
                 )?
                 .attend()?;
-            w.linear(
+            linear(
                 &attended.reshape(tokens * tiles, self.dim)?,
                 &format!("{p}.attn.to_out"),
             )
@@ -381,7 +398,7 @@ impl MetalVideoDecoder {
         } else {
             for i in 0..self.layers {
                 let p = format!("decoder.transformer_blocks.{i}");
-                let qkv = w.linear(
+                let qkv = linear(
                     &w.norm(&x, &format!("{p}.norm1"), 1e-5)?,
                     &format!("{p}.attn.to_qkv"),
                 )?;
@@ -391,17 +408,22 @@ impl MetalVideoDecoder {
                 let (w1, w2) = (format!("{p}.ff.w1"), format!("{p}.ff.w2"));
                 let delta = if w.is_int8(&w1) {
                     w.linear(&w.linear_swiglu(&normed, &w1)?, &w2)?
+                } else if fp16 && w.is_half(&w2) {
+                    linear(&linear(&normed, &w1)?.swiglu()?, &w2)?
                 } else {
-                    w.linear_gated(&w.linear(&normed, &w1)?, &w2)?
+                    w.linear_gated(&linear(&normed, &w1)?, &w2)?
                 };
                 x = x.add_scaled(&delta, &w.vector(&format!("{p}.scale2"))?)?;
             }
         }
 
         let features = 3 * self.patch_frames * SPATIAL_RATIO * SPATIAL_RATIO;
-        let projected = w
-            .linear(&w.norm(&x, "decoder.norm_out", 1e-5)?, "decoder.proj_out")?
-            .slice(0, patches * tiles, 0, features)?;
+        let projected = linear(&w.norm(&x, "decoder.norm_out", 1e-5)?, "decoder.proj_out")?.slice(
+            0,
+            patches * tiles,
+            0,
+            features,
+        )?;
         let (f, h, wp) = (frames * self.patch_frames, height * 16, width * 16);
         let pixels = Array::empty(&w.device, tiles * 3, f * h * wp)?;
         w.device.run(
