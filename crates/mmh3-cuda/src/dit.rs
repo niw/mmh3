@@ -94,6 +94,7 @@ unsafe extern "C" {
         time_embedding: *const c_void,
         weight: *const c_void,
         bias: *const c_void,
+        bias_bf16: c_int,
         output: *mut c_void,
         steps: c_int,
         rank: c_int,
@@ -499,6 +500,7 @@ impl CudaDit {
             }
         }
         uploader.run()?;
+        Self::split_output_heads(&config, file, prefix, &mut tensors)?;
         if whole {
             for layer in 0..config.layers {
                 let fc1 = format!("blocks.{layer}.mlp.fc1");
@@ -540,6 +542,60 @@ impl CudaDit {
             veda: None,
             buffers: RefCell::default(),
         })
+    }
+
+    /// Splits a `final_layer.video_out` that stacks one head per sampling step into
+    /// `final_layer.video_out.{head}`, the layer a step at that head's sigma projects through, in
+    /// FP32. The stack is ComfyUI's PDD head bank: the first head whole and every later one as its
+    /// offset from the first.
+    fn split_output_heads(
+        config: &DitConfig,
+        file: &SafeTensors,
+        prefix: &str,
+        tensors: &mut DeviceTensors,
+    ) -> Result<(), Error> {
+        let heads = config.step_sigmas.len();
+        if heads < 2 {
+            return Ok(());
+        }
+        for suffix in ["weight", "bias"] {
+            let name = format!("final_layer.video_out.{suffix}");
+            if file.get(&format!("{prefix}{name}")).is_none() {
+                continue;
+            }
+            tensors.remove(&name);
+            let stacked = host_tensor(file, &format!("{prefix}{name}"))?;
+            let each = stacked.data.len() / heads;
+            let mut shape = stacked.shape.clone();
+            shape[0] /= heads;
+            let first = &stacked.data[..each];
+            for head in 0..heads {
+                let rows = &stacked.data[head * each..(head + 1) * each];
+                let values: Vec<f32> = match head {
+                    0 => rows.to_vec(),
+                    _ => rows
+                        .iter()
+                        .zip(first)
+                        .map(|(offset, base)| base + offset)
+                        .collect(),
+                };
+                tensors.insert_buffer(
+                    &format!("final_layer.video_out.{head}.{suffix}"),
+                    DeviceBuffer::from_f32(&values)?,
+                    DType::F32,
+                    shape.clone(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The video output layer of a step at `sigma`.
+    fn video_output(&self, sigma: f32) -> String {
+        match self.config.step_sigmas.is_empty() {
+            true => "final_layer.video_out".to_owned(),
+            false => format!("final_layer.video_out.{}", self.config.output_head(sigma)),
+        }
     }
 
     /// A copy of this DiT on the device this thread computes on, from the device it was read onto,
@@ -1230,12 +1286,24 @@ impl CudaDit {
                 "{name}: AdaLN weights must be F16 in pruned checkpoints"
             )));
         }
-        // SAFETY: output holds `steps × outputs` values and the weight is `[outputs, rank]`.
+        let bias = tensors.get(&format!("{name}.bias"))?;
+        let bias_bf16 = match bias.dtype {
+            DType::F16 => false,
+            DType::BF16 => true,
+            other => {
+                return Err(Error::Model(format!(
+                    "{name}: AdaLN bias must be F16 or BF16, not {other}"
+                )));
+            }
+        };
+        // SAFETY: output holds `steps × outputs` values, the weight is `[outputs, rank]` and the
+        // bias `[outputs]` of its dtype.
         check(unsafe {
             mmh3_modulation(
                 time_embedding.pointer(),
                 weight.buffer.pointer(),
-                self.pointer(&format!("{name}.bias"))?,
+                bias.buffer.pointer(),
+                c_int::from(bias_bf16),
                 output.pointer(),
                 steps as c_int,
                 weight.shape[1] as c_int,
@@ -2835,7 +2903,7 @@ impl CudaDit {
         };
         let mut video_velocity = project(
             video,
-            "final_layer.video_out",
+            &self.video_output(inputs.sigma),
             config.video_patch_features(),
         )?;
         let audio_velocity = project(audio, "final_layer.audio_out", config.audio_channels)?;

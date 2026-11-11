@@ -162,6 +162,12 @@ impl MetalDit {
     }
 
     fn from_weights(weights: Weights, config: DitConfig, stream: Option<Stream>) -> Result<Self> {
+        if !config.step_sigmas.is_empty() || !config.has_audio() {
+            return Err(Error::new(
+                "Metal runs DiTs with audio layers and a single output head, not MiniMax H3 Image's"
+                    .into(),
+            ));
+        }
         let time_table = weights.host("adaln_t_table")?;
         let inv_freq = weights.host("rope.inv_freq")?.data;
         Ok(Self {

@@ -579,16 +579,20 @@ __global__ void __launch_bounds__(ROW_THREADS) add_norm_quantize_nvfp4_kernel(
 }
 
 // output[step, o] = Σ_r time_embedding[step, r] · weight[o, r] + bias[o], with FP16 weights.
+// The bias is FP16, or BF16 with `bias_bf16`, as MiniMax H3 Image's pruned checkpoints keep it.
 __global__ void modulation_kernel(const float *__restrict__ time_embedding,
-                                  const __half *__restrict__ weight,
-                                  const __half *__restrict__ bias, float *__restrict__ output,
-                                  int steps, int rank, int outputs) {
+                                  const __half *__restrict__ weight, const void *__restrict__ bias,
+                                  bool bias_bf16, float *__restrict__ output, int steps, int rank,
+                                  int outputs) {
     const int column = blockIdx.x * blockDim.x + threadIdx.x;
     if (column >= outputs) {
         return;
     }
+    const float offset = bias_bf16
+                             ? __bfloat162float(static_cast<const __nv_bfloat16 *>(bias)[column])
+                             : __half2float(static_cast<const __half *>(bias)[column]);
     for (int step = 0; step < steps; step++) {
-        float value = __half2float(bias[column]);
+        float value = offset;
         for (int index = 0; index < rank; index++) {
             value += time_embedding[step * rank + index] *
                      __half2float(weight[static_cast<size_t>(column) * rank + index]);
@@ -898,11 +902,11 @@ extern "C" int mmh3_add_norm_quantize_nvfp4(
     return static_cast<int>(cudaGetLastError());
 }
 
-extern "C" int mmh3_modulation(const float *time_embedding, const __half *weight,
-                               const __half *bias, float *output, int steps, int rank, int outputs,
+extern "C" int mmh3_modulation(const float *time_embedding, const __half *weight, const void *bias,
+                               int bias_bf16, float *output, int steps, int rank, int outputs,
                                cudaStream_t stream) {
     modulation_kernel<<<(outputs + ROW_THREADS - 1) / ROW_THREADS, ROW_THREADS, 0, stream>>>(
-        time_embedding, weight, bias, output, steps, rank, outputs);
+        time_embedding, weight, bias, bias_bf16 != 0, output, steps, rank, outputs);
     return static_cast<int>(cudaGetLastError());
 }
 
