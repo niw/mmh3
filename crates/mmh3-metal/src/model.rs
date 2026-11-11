@@ -94,6 +94,92 @@ impl Adapter {
     }
 }
 
+/// Layers of one input whose weights are read as one layer `name`, with the outputs of `parts` in
+/// order: one product and one packing of the input in place of one each a part. Per-output INT8
+/// scales concatenate the same way, so the product's values are the parts' own.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Concatenated {
+    pub name: String,
+    pub parts: Vec<String>,
+}
+
+/// One tensor of a concatenated layer: its name, the parts' tensors it is made of and its shape.
+pub(crate) type ConcatenatedTensor<'a> = (String, Vec<&'a TensorInfo>, Vec<usize>);
+
+impl Concatenated {
+    /// The tensors of the one layer, each with the parts' tensors it is made of, in order, and its
+    /// shape: one for each tensor the parts have, such as the weights, the scales when the parts
+    /// are INT8 and the biases when they have them. Parts that do not have the same tensors are an
+    /// error, so that none of theirs is left behind.
+    pub(crate) fn tensors<'a>(
+        &self,
+        file: &'a SafeTensors,
+        prefix: &str,
+    ) -> Result<Vec<ConcatenatedTensor<'a>>> {
+        let infos = |suffix: &str| -> Result<Vec<&'a TensorInfo>> {
+            self.parts
+                .iter()
+                .map(|part| {
+                    let name = format!("{prefix}{part}.{suffix}");
+                    file.get(&name)
+                        .ok_or_else(|| Error::new(format!("missing tensor {name}")))
+                })
+                .collect()
+        };
+        // The ConvRot metadata is checked for each part where the weights are read, and is no
+        // tensor of the layer.
+        let suffixes = |part: &str| -> Vec<&'a str> {
+            let stem = format!("{prefix}{part}.");
+            let mut suffixes: Vec<&'a str> = file
+                .tensors()
+                .iter()
+                .filter_map(|info| info.name.strip_prefix(stem.as_str()))
+                .filter(|suffix| *suffix != "comfy_quant")
+                .collect();
+            suffixes.sort_unstable();
+            suffixes
+        };
+        let suffixes_of_first = suffixes(&self.parts[0]);
+        if !suffixes_of_first.contains(&"weight") {
+            return Err(Error::new(format!(
+                "missing tensor {prefix}{}.weight",
+                self.parts[0]
+            )));
+        }
+        if let Some(part) = self.parts[1..]
+            .iter()
+            .find(|part| suffixes(part) != suffixes_of_first)
+        {
+            return Err(Error::new(format!(
+                "{}: {part} does not have the tensors {} has",
+                self.name, self.parts[0]
+            )));
+        }
+        suffixes_of_first
+            .into_iter()
+            .map(|suffix| {
+                let name = format!("{}.{suffix}", self.name);
+                let infos = infos(suffix)?;
+                // End to end: the first axis is the parts' summed, the rest are shared, and so is
+                // the type.
+                let first = infos[0];
+                if infos.iter().any(|info| {
+                    info.dtype != first.dtype
+                        || info.shape.is_empty()
+                        || info.shape[1..] != first.shape[1..]
+                }) {
+                    return Err(Error::new(format!(
+                        "{name}: its parts do not share their type and input width"
+                    )));
+                }
+                let mut shape = first.shape.clone();
+                shape[0] = infos.iter().map(|info| info.shape[0]).sum();
+                Ok((name, infos, shape))
+            })
+            .collect()
+    }
+}
+
 pub(crate) struct Weights {
     pub device: Device,
     pub linear_precision: LinearPrecision,
@@ -128,9 +214,25 @@ impl Weights {
         keep: impl Fn(&str) -> bool,
         leave: impl Fn(&str) -> bool,
     ) -> Result<Self> {
+        Self::load_concatenating(file, prefix, keep, leave, &[])
+    }
+
+    /// `load_leaving`, with the layers of each of `concatenated` read as one layer whose outputs
+    /// are theirs in order, which `keep` and `leave` are asked about by the one name.
+    pub(crate) fn load_concatenating(
+        file: &SafeTensors,
+        prefix: &str,
+        keep: impl Fn(&str) -> bool,
+        leave: impl Fn(&str) -> bool,
+        concatenated: &[Concatenated],
+    ) -> Result<Self> {
         let device = Device::shared()?;
         let mut tensors = HashMap::new();
         let mut absent = HashMap::new();
+        let parts: HashMap<&str, &Concatenated> = concatenated
+            .iter()
+            .flat_map(|layer| layer.parts.iter().map(move |part| (part.as_str(), layer)))
+            .collect();
         // The tensors kept are read from the disk in one pass into one region, which the GPU reads
         // where they land: faster than faulting in the mapped file, and the page cache does not
         // hold the checkpoint a second time.
@@ -172,6 +274,14 @@ impl Weights {
                 return Err(Error::new(format!("empty weight {name}")));
             }
 
+            // A part of a concatenated layer is read with the layer, below.
+            if name
+                .rsplit_once('.')
+                .is_some_and(|(layer, _)| parts.contains_key(layer))
+            {
+                continue;
+            }
+
             if leave(name) {
                 absent.insert(name.to_owned(), (info.dtype, info.shape.clone()));
                 continue;
@@ -184,6 +294,24 @@ impl Weights {
                 vec![files.piece(file, info)],
                 Arrangement::Contiguous,
             );
+        }
+        for layer in concatenated {
+            for (name, infos, shape) in layer.tensors(file, prefix)? {
+                if !keep(&name) {
+                    continue;
+                }
+                if leave(&name) {
+                    absent.insert(name, (infos[0].dtype, shape));
+                    continue;
+                }
+                kept.insert(
+                    &name,
+                    infos[0].dtype,
+                    shape,
+                    infos.iter().map(|info| files.piece(file, info)).collect(),
+                    Arrangement::Contiguous,
+                );
+            }
         }
         if !kept.tensors().is_empty() {
             let mut region = Region::new(kept.bytes())?;
@@ -212,12 +340,21 @@ impl Weights {
                     .map(|(name, (dtype, shape))| (name.as_str(), (*dtype, shape.as_slice()))),
             )
             .collect();
+        // A concatenated layer's metadata is its parts'.
+        let quantized = |layer: &str| -> bool {
+            let has_metadata =
+                |layer: &str| file.get(&format!("{prefix}{layer}.comfy_quant")).is_some();
+            match concatenated.iter().find(|whole| whole.name == layer) {
+                Some(whole) => whole.parts.iter().all(|part| has_metadata(part)),
+                None => has_metadata(layer),
+            }
+        };
         for (name, &(dtype, shape)) in &described {
             if dtype == DType::I8 {
                 let layer = name
                     .strip_suffix(".weight")
                     .ok_or_else(|| Error::new(format!("unexpected INT8 tensor {name}")))?;
-                if file.get(&format!("{prefix}{layer}.comfy_quant")).is_none()
+                if !quantized(layer)
                     || shape.len() != 2
                     || !shape[1].is_multiple_of(256)
                     || described
@@ -999,6 +1136,39 @@ fn gather_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_concatenated_layer_takes_every_tensor_of_its_parts() {
+        let path = std::env::temp_dir().join(format!("mmh3-concatenated-{}", std::process::id()));
+        let weight = [0.0; 6];
+        let bias = [0.0; 2];
+        mmh3_core::safetensors::write_f32(
+            &path,
+            &[
+                ("model.a.weight", &[2, 3], &weight),
+                ("model.a.bias", &[2], &bias),
+                ("model.b.weight", &[2, 3], &weight),
+                ("model.b.bias", &[2], &bias),
+                ("model.c.weight", &[2, 3], &weight),
+            ],
+            &[],
+        )
+        .unwrap();
+        let file = SafeTensors::open(&path).unwrap();
+        let layer = |parts: &[&str]| Concatenated {
+            name: "ab".into(),
+            parts: parts.iter().map(|&part| part.into()).collect(),
+        };
+
+        let tensors = layer(&["a", "b"]).tensors(&file, "model.").unwrap();
+        let shapes: Vec<(&str, &[usize])> = tensors
+            .iter()
+            .map(|(name, _, shape)| (name.as_str(), shape.as_slice()))
+            .collect();
+        assert_eq!(shapes, [("ab.bias", &[4][..]), ("ab.weight", &[4, 3][..])]);
+        assert!(layer(&["a", "c"]).tensors(&file, "model.").is_err());
+        std::fs::remove_file(&path).unwrap();
+    }
 
     #[test]
     fn int8_convrot_matches_explicit_regular_hadamard_product() {
