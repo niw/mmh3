@@ -52,7 +52,8 @@ fn check_shard(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
     Err("this build has no CUDA backend".into())
 }
 
-/// One file of a golden directory written by tools/golden/h3_reference.py.
+/// One file of a golden directory written by tools/golden/h3_reference.py or
+/// tools/golden/h3_image_reference.py.
 struct GoldenFile(SafeTensors);
 
 impl GoldenFile {
@@ -85,6 +86,18 @@ impl GoldenFile {
         let mut tensor = self.tensor(name)?;
         tensor.shape.remove(0);
         Ok(tensor)
+    }
+
+    /// The audio latent `name` without its batch dimension, or no audio at all in the golden data
+    /// of MiniMax H3 Image, which has none.
+    fn audio(&self, name: &str) -> Result<mmh3_core::tensor::Tensor, Box<dyn Error>> {
+        match self.0.get(name) {
+            Some(_) => self.unbatched(name),
+            None if self.0.get("noise.audio").is_none() => {
+                Ok(mmh3_core::tensor::Tensor::new(vec![0, 2, 0], Vec::new()))
+            }
+            None => Err(format!("golden data lacks {name}").into()),
+        }
     }
 
     fn has_metadata(&self, key: &str) -> bool {
@@ -284,7 +297,7 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .collect();
     let inputs = DitInputs {
         video: dit_file.unbatched(&format!("step{step}.input.video"))?,
-        audio: dit_file.unbatched(&format!("step{step}.input.audio"))?,
+        audio: dit_file.audio(&format!("step{step}.input.audio"))?,
         context: text_file.tensor("context")?,
         context_modalities: text_file.context_modalities()?,
         keyframes: dit_file.keyframes()?,
@@ -426,11 +439,13 @@ fn check_dit(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         &outputs.video,
         &negated(&format!("step{step}.velocity.video"))?,
     );
-    report(
-        "audio",
-        &outputs.audio,
-        &negated(&format!("step{step}.velocity.audio"))?,
-    );
+    if !inputs.audio.data.is_empty() {
+        report(
+            "audio",
+            &outputs.audio,
+            &negated(&format!("step{step}.velocity.audio"))?,
+        );
+    }
     Ok(())
 }
 
@@ -759,14 +774,27 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         dit_file.metadata("shift_video")?.parse()?,
         dit_file.metadata("shift_audio")?.parse()?,
     );
-    let schedule = Schedule::uniform(
-        dit_file.metadata("steps")?.parse()?,
-        shift_video,
-        shift_audio,
-    );
-
     let mut video = dit_file.unbatched("noise.video")?;
-    let mut audio = dit_file.unbatched("noise.audio")?;
+    let mut audio = dit_file.audio("noise.audio")?;
+    // A picture's DiT samples on the sigmas it was distilled for, which the golden data lists.
+    let schedule = if audio.data.is_empty() {
+        let sigmas: Vec<f32> = json::parse(&dit_file.metadata("sigmas_video")?)?
+            .as_array()
+            .ok_or("bad sigmas_video")?
+            .iter()
+            .filter_map(|value| value.as_f64().map(|value| value as f32))
+            .collect();
+        Schedule {
+            video: sigmas.clone(),
+            audio: sigmas,
+        }
+    } else {
+        Schedule::uniform(
+            dit_file.metadata("steps")?.parse()?,
+            shift_video,
+            shift_audio,
+        )
+    };
     let context = text_file.tensor("context")?;
     let context_modalities = text_file.context_modalities()?;
     let keyframes = dit_file.keyframes()?;
@@ -809,10 +837,13 @@ fn check_sample(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             &video.data,
             &dit_file.tensor(&format!("step{step}.latent.video"))?.data,
         );
-        let (audio_cosine, audio_relative, _, _) = compare(
-            &audio.data,
-            &dit_file.tensor(&format!("step{step}.latent.audio"))?.data,
-        );
+        let (audio_cosine, audio_relative, _, _) = match audio.data.is_empty() {
+            true => (f64::NAN, f64::NAN, 0.0, 0.0),
+            false => compare(
+                &audio.data,
+                &dit_file.tensor(&format!("step{step}.latent.audio"))?.data,
+            ),
+        };
         println!(
             "{step:<6} {:>8.4} {video_cosine:>11.7} {video_relative:>11.3e} {audio_cosine:>11.7} {audio_relative:>11.3e} {:>7.1}",
             schedule.video[step],
