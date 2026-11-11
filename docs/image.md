@@ -140,7 +140,8 @@ decodes a 4096×4096 picture in 2.9 s. The whole generation includes loading the
 DiT and the VAE from warm files. At 4096×4096 INT8/FP8 attention changes fine details of the
 picture and keeps its composition. NVFP4 also mutes colors and coarsens textures.
 
-On an M5 Max with 128 GB, with the same prompt and seed:
+On a 14-inch MacBook Pro with an M5 Max and 128 GB, in High Power Mode on AC power, with the same
+prompt and seed:
 
 | Picture | Draft steps | Attention | Linear layers | Each step at full size | Whole generation |
 | --- | ---: | --- | --- | ---: | ---: |
@@ -154,8 +155,11 @@ On an M5 Max with 128 GB, with the same prompt and seed:
 The draft was enlarged bilinearly, and a draft step at 4096×4096 took about 3.5 s. A 2048×2048
 canvas is too short for Sol-Attn, which stays dense there. Metal decodes the
 picture's tiles one at a time, where CUDA decodes them together, in 5 s at 2048×2048 and 18 s at
-4096×4096. macOS can hold the GPU of a Mac well below its top clock under load, and the same run
-took from about two thirds to one and a half times these times as the clock changed.
+4096×4096. The GPU of this MacBook Pro runs at its top clock of about 1.4 GHz only for the first
+second or two of a load and then at about 700 to 800 MHz, held there by the power and cooling of the
+14-inch case whatever the adapter, so the same run took from about two thirds to one and a half
+times these times as the clock moved. A 16-inch MacBook Pro or a Mac Studio with the same chip
+should be faster.
 
 ## Accuracy
 

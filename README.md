@@ -114,8 +114,8 @@ A [server](docs/server.md) that keeps the models loaded takes 26 s with the fast
 
 ### Pictures on Metal on macOS
 
-The DiT runs on the GPU's matrix units with INT8 products and FP16 attention, as for videos. On an
-M5 Max with 128 GB, a picture took:
+The DiT runs on the GPU's matrix units with INT8 products and FP16 attention, as for videos. On a
+14-inch MacBook Pro with an M5 Max and 128 GB, in High Power Mode on AC power, a picture took:
 
 | Picture | Settings | Time per step | Time |
 | --- | --- | ---: | ---: |
@@ -123,7 +123,8 @@ M5 Max with 128 GB, a picture took:
 | 4096×4096 | Defaults | 24 s | 165 s |
 | 2048×2048 | Defaults | 4.3 s | 38 s |
 
-The times per step are those of a step at full size.
+The times per step are those of a step at full size. The GPU's clock moved these times by two
+thirds to one and a half times, as [Image](docs/image.md#speed) says.
 
 ## Status
 
