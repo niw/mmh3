@@ -86,6 +86,11 @@ pub fn keep_models() {
     KEEPS_MODELS.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Whether this process keeps its models between runs.
+pub fn keeps_models() -> bool {
+    KEEPS_MODELS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// A machine this run may borrow, and what it may be asked for.
 pub struct Machine {
     pub address: String,
@@ -155,7 +160,8 @@ pub fn progress() -> Option<Progress> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn reached(progress: Progress) {
+/// Says what the run here has reached.
+pub fn reached(progress: Progress) {
     *PROGRESS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(progress);

@@ -3,7 +3,7 @@ use std::process::ExitCode;
 
 const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE) --out <image.png> [OPTIONS...], listed by mmh3 image --help
-  mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--idle-unload SECONDS] [--models DIR]
+  mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] [--idle-unload SECONDS] [--image-dit FILE] [--image-vae FILE] [--models DIR]
               [--dit FILE] [--text-encoder FILE] [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...]
               [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]]
               [--token FILE] [--vram-budget GB] [--consistent] [--ffmpeg ARGS...]
@@ -64,7 +64,8 @@ would. A worker lets go of the model it has used least whenever an allocation fi
 --idle-unload SECONDS lets a worker go of every model it holds after that long with nothing to do, so that a
 machine nobody is generating on is a machine with its memory back. Without it a worker holds what it loaded.
 server takes the options of generate about this machine and its workers, and each request the ones about what to
-generate as form fields.
+generate as form fields. POST /v1/images takes a picture the same way, with the options of mmh3 image, and
+--image-dit and --image-vae are its --dit and --vae.
 A machine that cannot be reached, or that holds no checkpoint for what it was asked, is passed over. One that
 answered and then failed ends the run.";
 

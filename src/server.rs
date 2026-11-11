@@ -1,4 +1,5 @@
-//! `mmh3 server`, which takes a generation over HTTP and hands back the video it wrote.
+//! `mmh3 server`, which takes a generation over HTTP and hands back the video or the picture it
+//! wrote.
 //!
 //! A form field stands for the option of the same name, so what a request asks for is turned into
 //! the arguments the command would have had and handed to the same generation. There is one
@@ -38,12 +39,36 @@ const FILE_BYTES: u64 = 4 << 30;
 const WATCH: Duration = Duration::from_millis(250);
 
 const USAGE: &str = "usage: mmh3 server [--listen ADDR] [--jobs DIR] [--format mp4|webm] \
-                     [--idle-unload SECONDS] [--models DIR] [--dit FILE] [--text-encoder FILE] \
+                     [--idle-unload SECONDS] [--image-dit FILE] [--image-vae FILE] \
+                     [--models DIR] [--dit FILE] [--text-encoder FILE] \
                      [--video-vae FILE] [--audio-vae FILE] [--devices CARD,CARD...] \
                      [--worker HOST[:PORT] [--worker-units UNITS]]... [--local-worker [--worker-units UNITS]] \
                      [--token FILE] [--vram-budget GB] [--consistent] [--ffmpeg ARGS...]";
-/// The options that are the server's own rather than a generation's.
-const SERVER_OPTIONS: &[&str] = &["listen", "jobs", "format", "idle-unload"];
+/// The options that are the server's own rather than a generation's. `--image-dit` and
+/// `--image-vae` are a picture's `--dit` and `--vae`.
+const SERVER_OPTIONS: &[&str] = &[
+    "listen",
+    "jobs",
+    "format",
+    "idle-unload",
+    "image-dit",
+    "image-vae",
+];
+/// The machine options a picture is told too, which are the ones `mmh3 image` takes.
+const IMAGE_MACHINE_OPTIONS: &[&str] = &["models", "text-encoder", "vram-budget"];
+/// What a request for a picture may give: the options of `mmh3 image` about what to generate.
+const IMAGE_OPTIONS: &[&str] = &[
+    "prompt",
+    "prompt-file",
+    "reference",
+    "width",
+    "height",
+    "min-generation-area",
+    "seed",
+    "attention-precision",
+];
+/// The options of a picture whose value is a file, which a request uploads.
+const IMAGE_FILE_OPTIONS: &[&str] = &["prompt-file", "reference"];
 /// The options of a generation that say what this machine has and which machines compute, which
 /// the server is given and a request may not give. `--local-worker` and `--consistent`, which a
 /// form cannot give either, are the others.
@@ -100,6 +125,13 @@ impl Container {
     }
 }
 
+/// What a generation writes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Output {
+    Video,
+    Picture,
+}
+
 /// What a generation the server was asked for is doing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Stage {
@@ -125,10 +157,11 @@ struct Job {
     state: Stage,
     /// What the generation was told, in the form the command would have been told it.
     arguments: Vec<String>,
-    /// Where this job's uploads and its video live.
+    /// Where this job's uploads and what it wrote live.
     directory: PathBuf,
-    /// Where this job's video was written.
-    video: PathBuf,
+    output: Output,
+    /// Where this job's video or picture was written.
+    written: PathBuf,
     /// Why it failed, for a client that asks after it did.
     failure: Option<String>,
     queued: SystemTime,
@@ -162,6 +195,9 @@ struct Server {
     /// What every generation is told before what its own request said: the machine options the
     /// server was given.
     defaults: Vec<String>,
+    /// The same for a picture: the machine options `mmh3 image` takes, with `--image-dit` and
+    /// `--image-vae` as its `--dit` and `--vae`.
+    image_defaults: Vec<String>,
     /// Where a request's `lora` and `patch` are looked for.
     models: Option<PathBuf>,
     /// What every generation hands ffmpeg to write its video, after everything else it is told, or
@@ -224,23 +260,36 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         }
     }
 
-    // Everything but --listen, --jobs, --format and --idle-unload is about this machine, and every
-    // generation is told it.
+    // Everything but the server's own options is about this machine, and every generation is
+    // told it. A picture is told what `mmh3 image` takes of it.
     let mut defaults = Vec::new();
+    let mut image_defaults = Vec::new();
     let mut remaining = arguments.iter();
     while let Some(name) = remaining.next() {
         // An option that stands alone carries nothing after it to pair with.
         if crate::generation::FLAGS.contains(&&name[2..]) {
             defaults.push(name.clone());
+            if name == "--consistent" {
+                image_defaults.push(name.clone());
+            }
             continue;
         }
         let Some(value) = remaining.next() else { break };
-        if !matches!(
-            name.as_str(),
-            "--listen" | "--jobs" | "--format" | "--idle-unload"
-        ) {
-            defaults.push(name.clone());
-            defaults.push(value.clone());
+        let option = &name[2..];
+        match option {
+            "image-dit" | "image-vae" => {
+                image_defaults.push(name.replacen("image-", "", 1));
+                image_defaults.push(value.clone());
+            }
+            _ if SERVER_OPTIONS.contains(&option) => {}
+            _ => {
+                defaults.push(name.clone());
+                defaults.push(value.clone());
+                if IMAGE_MACHINE_OPTIONS.contains(&option) {
+                    image_defaults.push(name.clone());
+                    image_defaults.push(value.clone());
+                }
+            }
         }
     }
     crate::generation::Settings::check_machines(&options, &defaults)?;
@@ -268,6 +317,7 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         jobs: Mutex::new(HashMap::new()),
         queue,
         defaults,
+        image_defaults,
         models: crate::models::models_directory(&options),
         ffmpeg: ffmpeg.map(<[String]>::to_vec),
         container,
@@ -287,10 +337,12 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
     let application = Router::new()
         .route("/v1/generations", post(create).get(list))
+        .route("/v1/images", post(create_image))
         .route("/v1/status", get(status))
         .route("/v1/generations/{id}", get(describe).delete(forget))
         .route("/v1/generations/{id}/events", get(events))
         .route("/v1/generations/{id}/video", get(video))
+        .route("/v1/generations/{id}/image", get(image))
         .with_state(server);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -306,18 +358,21 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// Runs one job to its end, whichever end that is.
 fn generate(server: &Server, id: &str) {
-    let arguments = {
+    let (arguments, output) = {
         let mut jobs = server.jobs.lock().expect("the jobs");
         let Some(job) = jobs.get_mut(id) else {
             return;
         };
         job.state = Stage::Running;
         job.started = Some(Instant::now());
-        job.arguments.clone()
+        (job.arguments.clone(), job.output)
     };
     println!("generation {id} begins");
     crate::generation::starting();
-    let generated = crate::generate::run(&arguments, USAGE);
+    let generated = match output {
+        Output::Video => crate::generate::run(&arguments, USAGE),
+        Output::Picture => crate::image::run(&arguments),
+    };
     let mut jobs = server.jobs.lock().expect("the jobs");
     let Some(job) = jobs.get_mut(id) else {
         return;
@@ -326,7 +381,7 @@ fn generate(server: &Server, id: &str) {
     match generated {
         Ok(()) => {
             job.state = Stage::Done;
-            println!("generation {id} wrote {}", job.video.display());
+            println!("generation {id} wrote {}", job.written.display());
         }
         Err(error) => {
             job.state = Stage::Failed;
@@ -352,7 +407,9 @@ async fn create(
     arguments.push("--out".to_owned());
     arguments.push(video.to_string_lossy().into_owned());
 
-    if let Err(failure) = read_fields(&server, &mut form, &directory, &mut arguments).await {
+    if let Err(failure) =
+        read_fields(&server, &mut form, &directory, &mut arguments, field_kind).await
+    {
         // A refused request leaves nothing behind, not even the files it sent before the field
         // that was refused.
         let _ = tokio::fs::remove_dir_all(&directory).await;
@@ -364,11 +421,53 @@ async fn create(
         arguments.extend(ffmpeg.iter().cloned());
     }
 
+    queue_job(&server, id, Output::Video, arguments, directory, video)
+}
+
+/// Takes a picture with MiniMax H3 Image, the way `create` takes a video: the form's fields are
+/// the options of `mmh3 image` about what to generate, and the answer is the job. The picture is
+/// a PNG.
+async fn create_image(
+    State(server): State<Arc<Server>>,
+    mut form: Multipart,
+) -> Result<Response, Failure> {
+    let id = next_id();
+    let directory = server.directory.join(&id);
+    tokio::fs::create_dir_all(&directory).await?;
+    let picture = directory.join("image.png");
+    let mut arguments = server.image_defaults.clone();
+    arguments.push("--out".to_owned());
+    arguments.push(picture.to_string_lossy().into_owned());
+    if let Err(failure) = read_fields(
+        &server,
+        &mut form,
+        &directory,
+        &mut arguments,
+        image_field_kind,
+    )
+    .await
+    {
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+        return Err(failure);
+    }
+    queue_job(&server, id, Output::Picture, arguments, directory, picture)
+}
+
+/// Queues a job and answers with it.
+fn queue_job(
+    server: &Server,
+    id: String,
+    output: Output,
+    arguments: Vec<String>,
+    directory: PathBuf,
+    written: PathBuf,
+) -> Result<Response, Failure> {
     let job = Job {
         state: Stage::Queued,
         arguments,
         directory,
-        video,
+        output,
+        written,
         failure: None,
         queued: SystemTime::now(),
         started: None,
@@ -391,18 +490,20 @@ async fn create(
         .into_response())
 }
 
-/// Adds the fields of a request's form to `arguments`, writing its files into `directory`.
+/// Adds the fields of a request's form to `arguments`, writing its files into `directory`. `kinds`
+/// says what each field takes, or why a request may not give it.
 async fn read_fields(
     server: &Server,
     form: &mut Multipart,
     directory: &std::path::Path,
     arguments: &mut Vec<String>,
+    kinds: fn(&str) -> Result<FieldKind, String>,
 ) -> Result<(), Failure> {
     while let Some(mut field) = form.next_field().await.map_err(Failure::form)? {
         let Some(name) = field.name().map(str::to_owned) else {
             return Err(Failure::asked("a form field with no name"));
         };
-        let kind = field_kind(&name).map_err(|message| Failure::asked(&message))?;
+        let kind = kinds(&name).map_err(|message| Failure::asked(&message))?;
         let value = match (kind, field.file_name().map(str::to_owned)) {
             // A file stands for the path it is written to, which is this job's own directory.
             (FieldKind::File, Some(filename)) => {
@@ -616,14 +717,42 @@ async fn video(
     State(server): State<Arc<Server>>,
     Path(id): Path<String>,
 ) -> Result<Response, Failure> {
-    let (state, path) = {
+    let content_type = server.container.content_type();
+    written(&server, &id, Output::Video, content_type).await
+}
+
+/// The picture a generation wrote, once it has written one.
+async fn image(
+    State(server): State<Arc<Server>>,
+    Path(id): Path<String>,
+) -> Result<Response, Failure> {
+    written(&server, &id, Output::Picture, "image/png").await
+}
+
+/// What generation `id` wrote, when it is `output` and it has written it.
+async fn written(
+    server: &Server,
+    id: &str,
+    output: Output,
+    content_type: &'static str,
+) -> Result<Response, Failure> {
+    let (state, path, wrote) = {
         let jobs = server.jobs.lock().expect("the jobs");
-        let job = jobs.get(&id).ok_or_else(Failure::unknown)?;
-        (job.state, job.video.clone())
+        let job = jobs.get(id).ok_or_else(Failure::unknown)?;
+        (job.state, job.written.clone(), job.output)
     };
+    if wrote != output {
+        return Err(Failure(
+            StatusCode::NOT_FOUND,
+            match wrote {
+                Output::Video => "that generation writes a video".to_owned(),
+                Output::Picture => "that generation writes a picture".to_owned(),
+            },
+        ));
+    }
     match state {
         Stage::Done => Ok((
-            [(header::CONTENT_TYPE, server.container.content_type())],
+            [(header::CONTENT_TYPE, content_type)],
             tokio::fs::read(&path).await?,
         )
             .into_response()),
@@ -659,6 +788,17 @@ fn field_kind(name: &str) -> Result<FieldKind, String> {
         .map_or(FieldKind::Text, |(_, directories)| {
             FieldKind::ModelFile(directories)
         }))
+}
+
+/// What kind of value the field `name` of a request for a picture takes, or why it may not give it.
+fn image_field_kind(name: &str) -> Result<FieldKind, String> {
+    if !IMAGE_OPTIONS.contains(&name) {
+        return Err(format!("{name} is not an option of a picture"));
+    }
+    match IMAGE_FILE_OPTIONS.contains(&name) {
+        true => Ok(FieldKind::File),
+        false => Ok(FieldKind::Text),
+    }
 }
 
 /// The path of the file a request's `option` names, the first of `directories` in the models
@@ -738,7 +878,7 @@ impl Failure {
     fn waiting() -> Self {
         Failure(
             StatusCode::CONFLICT,
-            "that generation has not written a video yet".to_owned(),
+            "that generation has not written anything yet".to_owned(),
         )
     }
 
@@ -776,6 +916,23 @@ mod tests {
             .chain(&["out", "local-worker", "listen"])
         {
             assert!(field_kind(name).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_request_for_a_picture_gives_what_to_generate() {
+        assert!(matches!(image_field_kind("prompt"), Ok(FieldKind::Text)));
+        assert!(matches!(image_field_kind("reference"), Ok(FieldKind::File)));
+        for name in [
+            "dit",
+            "vae",
+            "models",
+            "out",
+            "save-latent",
+            "linear-precision",
+            "steps",
+        ] {
+            assert!(image_field_kind(name).is_err(), "{name}");
         }
     }
 

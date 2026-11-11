@@ -152,10 +152,8 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::generation::VIDEO_LATENT_CHANNELS;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tokenizer::Tokenizer;
-    use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN, SPATIAL_RATIO};
+    use mmh3_core::vae::SPATIAL_RATIO;
     use mmh3_core::vision::{VisionGrid, picture_prompt};
-    use mmh3_cuda::text_encoder::CudaTextEncoder;
-    use mmh3_cuda::vae::CudaVideoDecoder;
     use mmh3_cuda::vision::CudaVisionEncoder;
 
     let options = parse_options(
@@ -224,20 +222,25 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if references.len() > MAX_REFERENCES {
         return Err(format!("pass at most {MAX_REFERENCES} --reference pictures").into());
     }
+    let mut held = match crate::generation::keeps_models() {
+        true => Held::Kept(crate::resident::Table::new(
+            crate::resident::current_device(),
+        )),
+        false => Held::Alone,
+    };
     let (context, context_modalities) = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
             let started = Instant::now();
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
-            let file = SafeTensors::open(Path::new(&path))?;
-            let encoder = CudaTextEncoder::load_fitting(&file)?;
-            let (context, modalities) = if references.is_empty() {
-                let mut ids = Tokenizer::h3().encode(&prompt);
-                ids.truncate(MAX_PROMPT_TOKENS);
-                (encoder.encode(&ids, &[])?.context, Vec::new())
-            } else {
+            let (context, modalities) = held.text_encoder(&path, |encoder| {
+                if references.is_empty() {
+                    let mut ids = Tokenizer::h3().encode(&prompt);
+                    ids.truncate(MAX_PROMPT_TOKENS);
+                    return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
+                }
                 // The tower is gone before the prompt encodes.
                 let embeddings = {
-                    let vision = CudaVisionEncoder::load(&file)?;
+                    let vision = CudaVisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
                     references
                         .iter()
                         .map(|reference| vision.encode(&reference.vision.to_tensor()))
@@ -251,8 +254,8 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                     .collect();
                 let prompt = picture_prompt(&Tokenizer::h3(), &prompt, &grids, MAX_PROMPT_TOKENS);
                 let context = encoder.encode_prompt(&prompt, &embeddings, &[])?.context;
-                (context, prompt.modalities)
-            };
+                Ok((context, prompt.modalities))
+            })?;
             println!(
                 "encoded {} prompt tokens with {} pictures in {:.1} s",
                 context.shape[0],
@@ -280,7 +283,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let references = encode_references(&options, seed, &references)?;
 
-    let dit = crate::models::load_dit(&options, "dit", IMAGE_DIT_FILE)?;
+    let (dit, dit_key) = held.dit(&options)?;
     let config = dit.config();
     if config.has_audio() || config.step_sigmas.is_empty() {
         return Err(
@@ -318,34 +321,38 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             shift_video: 1.0,
             shift_audio: 1.0,
         };
-        let outputs = dit.forward(&inputs, &[], None)?;
+        // A kept model may be holding the room a step needs, and a step can run again.
+        let outputs = loop {
+            match dit.forward(&inputs, &[], None) {
+                Err(error) if error.is_out_of_memory() && held.let_go_of_one() => continue,
+                outputs => break outputs?,
+            }
+        };
         euler_step(
             &mut latent.data,
             &outputs.video,
             sigmas[step],
             sigmas[step + 1],
         );
+        let seconds = started.elapsed().as_secs_f64();
         println!(
-            "step {}/{} at sigma {:.4} in {:.1} s",
+            "step {}/{} at sigma {:.4} in {seconds:.1} s",
             step + 1,
             sigmas.len() - 1,
             sigmas[step],
-            started.elapsed().as_secs_f64()
         );
+        crate::generation::reached(crate::generation::Progress {
+            step: step + 1,
+            steps: sigmas.len() - 1,
+            seconds,
+        });
     }
-    drop(dit);
+    held.keep_dit(dit, dit_key);
     crate::models::save_algorithm_cache();
 
     let started = Instant::now();
     let path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
-    let decoder = CudaVideoDecoder::load(
-        &SafeTensors::open(Path::new(&path))?,
-        "",
-        DEFAULT_TILE_SIZE,
-        PICTURE_TILE_OVERLAP_MIN,
-    )?;
-    let pixels = decoder.decode(&latent, false)?.pixels;
-    drop(decoder);
+    let pixels = held.decode(&path, &latent)?;
     println!(
         "decoded the picture with {path} in {:.1} s",
         started.elapsed().as_secs_f64()
@@ -353,6 +360,143 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     write_png(&pixels, width, height, out)?;
     println!("wrote {}", out.display());
     Ok(())
+}
+
+/// Where a run takes its models from: read for it alone and let go of when it ends, as a command
+/// does, or kept in this process's table for the runs after it, as a server does. The table is
+/// the one the worker of a server keeps its models in, so a picture and a video share the text
+/// encoder they both read.
+#[cfg(feature = "cuda")]
+enum Held {
+    Alone,
+    Kept(crate::resident::Table),
+}
+
+#[cfg(feature = "cuda")]
+impl Held {
+    /// Runs `work` with the text encoder of `path`.
+    fn text_encoder<T>(
+        &mut self,
+        path: &str,
+        mut work: impl FnMut(&mmh3_cuda::text_encoder::CudaTextEncoder) -> Result<T, Box<dyn Error>>,
+    ) -> Result<T, Box<dyn Error>> {
+        let file = SafeTensors::open(Path::new(path))?;
+        match self {
+            Held::Alone => work(&mmh3_cuda::text_encoder::CudaTextEncoder::load_fitting(
+                &file,
+            )?),
+            Held::Kept(table) => {
+                let key = crate::worker::digest(&file);
+                table.with_room(|models| work(models.text_encoder(Path::new(path), key)?))
+            }
+        }
+    }
+
+    /// The DiT of `--dit` or the models directory, with the key it goes back into the table under
+    /// when it is kept. A kept DiT runs INT8 linear layers, since NVFP4 ones would stay in it for
+    /// the runs after this one.
+    fn dit(
+        &mut self,
+        options: &std::collections::HashMap<&str, &str>,
+    ) -> Result<(mmh3_cuda::dit::CudaDit, Option<crate::resident::DitKey>), Box<dyn Error>> {
+        use mmh3_cuda::dit::CudaDit;
+
+        let table = match self {
+            Held::Alone => {
+                let dit = crate::models::load_dit(options, "dit", IMAGE_DIT_FILE)?;
+                return Ok((dit, None));
+            }
+            Held::Kept(table) => table,
+        };
+        if options
+            .get("linear-precision")
+            .is_some_and(|precision| *precision != "int8")
+        {
+            return Err("a server keeps the DiT with INT8 linear layers".into());
+        }
+        let path = option_path(options, "dit", IMAGE_DIT_FILE)?;
+        let file = SafeTensors::open(Path::new(&path))?;
+        let key = crate::resident::DitKey {
+            checkpoint: crate::worker::digest(&file),
+            adapters: Vec::new(),
+        };
+        let mut models = table.borrow();
+        let mut dit = match models.take_dit() {
+            Some((kept, dit)) if kept == key => dit,
+            other => {
+                drop(other);
+                let started = Instant::now();
+                let dit = models.read_fitting(
+                    || CudaDit::load(&file, ""),
+                    || CudaDit::load_fitting(&file, ""),
+                )?;
+                println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
+                dit
+            }
+        };
+        dit.set_attention_precision(attention_precision(options)?);
+        Ok((dit, Some(key)))
+    }
+
+    /// Puts a kept DiT back into the table, and lets go of one read for this run alone.
+    fn keep_dit(&mut self, dit: mmh3_cuda::dit::CudaDit, key: Option<crate::resident::DitKey>) {
+        if let (Held::Kept(table), Some(key)) = (self, key) {
+            table.borrow().keep_dit(key, dit);
+        }
+    }
+
+    /// Lets go of the kept model used least, for a step that ran out of memory, and says whether
+    /// there was one.
+    fn let_go_of_one(&mut self) -> bool {
+        match self {
+            Held::Alone => false,
+            Held::Kept(table) => table.let_go_of_one(),
+        }
+    }
+
+    /// Decodes a latent with the picture VAE of `path` into pixels `[3, 1, height, width]`.
+    fn decode(&mut self, path: &str, latent: &Tensor) -> Result<Tensor, Box<dyn Error>> {
+        use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
+        use mmh3_cuda::vae::CudaVideoDecoder;
+
+        let file = SafeTensors::open(Path::new(path))?;
+        match self {
+            Held::Alone => {
+                let decoder =
+                    CudaVideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
+                Ok(decoder.decode(latent, false)?.pixels)
+            }
+            Held::Kept(table) => {
+                let key = (
+                    crate::worker::digest(&file),
+                    DEFAULT_TILE_SIZE,
+                    PICTURE_TILE_OVERLAP_MIN,
+                );
+                table.with_room(|models| {
+                    let decoder = models.video_decoder(Path::new(path), key)?;
+                    Ok(decoder.decode(latent, false)?.pixels)
+                })
+            }
+        }
+    }
+}
+
+/// The attention precision of `--attention-precision`, BF16 by default.
+#[cfg(feature = "cuda")]
+fn attention_precision(
+    options: &std::collections::HashMap<&str, &str>,
+) -> Result<mmh3_cuda::attention::AttentionPrecision, Box<dyn Error>> {
+    use mmh3_cuda::attention::AttentionPrecision;
+
+    match options
+        .get("attention-precision")
+        .copied()
+        .unwrap_or("bf16")
+    {
+        "bf16" => Ok(AttentionPrecision::Bf16),
+        "int8-fp8" => Ok(AttentionPrecision::Int8Fp8),
+        other => Err(format!("--attention-precision must be bf16 or int8-fp8, not {other}").into()),
+    }
 }
 
 /// The references as the DiT sees them: a sample of each one's posterior from the picture VAE's
