@@ -99,7 +99,7 @@ only the other DiT and VAE. The server takes the DiT and the picture VAE from th
 or from `--image-dit FILE` and `--image-vae FILE`, which are a picture's `--dit` and `--vae`. A kept
 DiT runs INT8 linear layers, so a request does not give `linear-precision`.
 
-On a DGX Spark, two 1024×1024 pictures against a server just started took 9.0 s and then 2.3 s.
+On a DGX Spark, two 1024×1024 pictures against a server just started took 16.2 s and then 9.5 s.
 
 ## Watching one
 

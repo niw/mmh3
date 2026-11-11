@@ -84,14 +84,15 @@ On a DGX Spark, with the prompt above and seed 1:
 
 | Picture | Attention | Linear layers | Each step | Decode | Whole generation |
 | --- | --- | --- | ---: | ---: | ---: |
-| 1024×1024 | BF16 | INT8 | 0.3 s | 0.7 s | 10 s |
+| 1024×1024 | BF16 | INT8 | 1.4 s | 1.0 s | 18 s |
 | 4096×4096 | BF16 | INT8 | 8.8 s | 2.9 s | 63 s |
 | 4096×4096 | INT8/FP8 | INT8 | 7.3 s | 2.9 s | 54 s |
 | 4096×4096 | INT8/FP8 | NVFP4 | 6.2 s | 2.9 s | 47 s |
 
-The whole generation includes loading the text encoder, the DiT and the VAE from warm files. At
-4096×4096 INT8/FP8 attention changes fine details of the picture and keeps its composition. NVFP4
-also mutes colors and coarsens textures.
+The 1024×1024 picture is generated on a 2048×2048 canvas, as `--min-generation-area` sets by
+default. The whole generation includes loading the text encoder, the DiT and the VAE from warm
+files. At 4096×4096 INT8/FP8 attention changes fine details of the picture and keeps its
+composition. NVFP4 also mutes colors and coarsens textures.
 
 ## Accuracy
 
