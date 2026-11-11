@@ -1,7 +1,8 @@
 # Server
 
 `mmh3 server` takes a generation over HTTP and keeps its models loaded between the generations it
-runs, so a machine asked for one video after another reads the checkpoints once.
+runs, so a machine asked for one video after another reads the checkpoints once. It also generates
+pictures with [Image](image.md) on CUDA, see [Asking for a picture](#asking-for-a-picture).
 
 ```sh
 export MMH3_MODELS=$PWD/models
@@ -73,6 +74,32 @@ curl -X POST http://localhost:8833/v1/generations \
 
 A field that is not an option of a generation or that is the machine's is refused by name, and so
 is a file longer than the server takes. See [Usage](usage.md) for what the options mean.
+
+## Asking for a picture
+
+`POST /v1/images` takes a picture to generate with [Image](image.md) the same way. Its fields are the
+options of `mmh3 image` about what to generate: `prompt`, `prompt-file`, `reference`, `width`,
+`height`, `min-generation-area`, `seed` and `attention-precision`. A field that starts with `<`, as
+a prompt that refers to `<Picture 1>` does, goes to curl with `--form-string`, since curl reads
+`-F name=<file` from a file.
+
+```sh
+curl -X POST http://localhost:8833/v1/images \
+  --form-string prompt="<Picture 1> at night, the street lamps lit." \
+  -F reference=@street.jpg -F width=4096 -F height=4096
+```
+
+The answer is a generation like any other, which waits its turn with the videos and is watched the
+same way, and its picture is a PNG at `GET /v1/generations/{id}/image`.
+
+A picture is generated on this machine's card, whatever `--worker` says, and keeps its text encoder,
+DiT and picture VAE in the same tables as the worker of the server. The text encoder is the one
+MiniMax H3 reads, so a picture after a video, or a video after a picture, finds it loaded and reads
+only the other DiT and VAE. The server takes the DiT and the picture VAE from the models directory,
+or from `--image-dit FILE` and `--image-vae FILE`, which are a picture's `--dit` and `--vae`. A kept
+DiT runs INT8 linear layers, so a request does not give `linear-precision`.
+
+On a DGX Spark, two 1024×1024 pictures against a server just started took 9.0 s and then 2.3 s.
 
 ## Watching one
 
@@ -155,7 +182,9 @@ arrived:
 | `GET /v1/generations` | Every generation this server was asked for, the most recent first. |
 | `GET /v1/generations/{id}` | What one is doing, with the step it is on while it runs. |
 | `GET /v1/generations/{id}/events` | The same as it happens, as server-sent events. |
+| `POST /v1/images` | Take a picture, as `multipart/form-data`. Answers 202 and the generation. |
 | `GET /v1/generations/{id}/video` | The video, once there is one. |
+| `GET /v1/generations/{id}/image` | The picture, once there is one. |
 | `DELETE /v1/generations/{id}` | Take one away with whatever it wrote. |
 | `GET /v1/status` | What this machine is doing and what it is holding. |
 

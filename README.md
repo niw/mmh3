@@ -1,15 +1,16 @@
 # mmh3
 
-mmh3 is an inference engine dedicated to
-[MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3), written in Rust with CUDA and Metal
-kernels and running without PyTorch or ComfyUI. The tokenizer, the Qwen3-VL text encoder, the
-diffusion transformer, the sampler and both VAE decoders are written in this repository and tuned
-for MiniMax H3's shapes.
+mmh3 is an inference engine dedicated to the MiniMax H3 family, written in Rust with CUDA and Metal
+kernels and running without PyTorch or ComfyUI. It generates videos with audio with
+[MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) and pictures with
+[MiniMax H3 Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image). The tokenizer, the Qwen3-VL
+text encoder, the diffusion transformer, the samplers and the VAEs are written in this repository
+and tuned for the shapes of these models.
 
-It runs on one machine or [distributed across several](docs/distributed.md) running `mmh3 worker`,
-splitting every diffusion step between them over RDMA where there is a path for it and ordinary
-sockets where there is not. The machine that hands the work out runs none of it, so it needs no GPU
-of its own.
+Videos run on one machine or [distributed across several](docs/distributed.md) running
+`mmh3 worker`, splitting every diffusion step between them over RDMA where there is a path for it
+and ordinary sockets where there is not. The machine that hands the work out runs none of it, so it
+needs no GPU of its own.
 
 The backends are [CUDA](docs/cuda.md) on Linux and Windows (WSL) and [Metal](docs/metal.md) on
 macOS, each with its own kernels. Each page says what that backend needs.
@@ -29,12 +30,21 @@ make generate
 `make download-models` downloads the models into `models`, and `make generate` writes a video with
 audio from a sample prompt to `out.mp4`. See [Usage](docs/usage.md) for the other settings.
 
+On CUDA, these commands download MiniMax H3 Image and write a picture to `out.png`. See
+[Image](docs/image.md) for its settings and for editing pictures.
+
+```sh
+tools/download-models.sh --image
+target/release/mmh3 image --models models --out out.png \
+  --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn."
+```
+
 ## Performance
 
-These are the times of `make generate`, including model loading and encoding, with warm model
-files. [Performance and accuracy](docs/performance.md) has the times of each stage.
+These are the times of a complete generation, including model loading and encoding, with warm
+model files. [Performance and accuracy](docs/performance.md) has the times of each stage.
 
-### CUDA on Linux and Windows (WSL)
+### Videos on CUDA on Linux and Windows (WSL)
 
 `make generate` uses FastVideo's 4-step [FastH3](docs/fasth3.md) as a patch on the base DiT, with
 its video sparse attention, INT8/FP8 attention and the INT8 video VAE, and writes MP4 with NVENC
@@ -57,7 +67,7 @@ With [draft steps](docs/draft-steps.md), the first steps run on a canvas of half
 height, which settles the layout and the motion in a quarter of the tokens. With the first two of
 the Turbo LoRA's four steps as draft steps, a generation took 61.5 s rather than 83.2 s.
 
-### Metal on macOS
+### Videos on Metal on macOS
 
 `make generate` uses the same 4-step [FastH3](docs/fasth3.md) patch with its video sparse
 attention, in a smaller and shorter clip, and writes MP4 with VideoToolbox H.264 and AAC. The DiT,
@@ -76,13 +86,35 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps. On the M6, the
 [PDMD](docs/pdmd.md) LoRA generated a video of the same size in 45 s, and the 4-step
 [DMAD](docs/dmad.md) LoRA in 76 s.
 
+### Pictures on CUDA
+
+On a DGX Spark, a picture took:
+
+| Picture | Attention | Time per step | Time |
+| --- | --- | ---: | ---: |
+| 4096×4096 | BF16 | 8.8 s | 63 s |
+| 4096×4096 | INT8/FP8 | 7.3 s | 54 s |
+
+MiniMax H3 Image generates in six steps, and [Image](docs/image.md) has the times of other settings.
+
 ## Status
+
+### Videos
 
 - Text to video with audio (T2VA) works end to end, one video at a time. Native MP4 and WebM
   generation and complete video/audio decoding have been verified on GB10.
 - Videos from a first frame, a last frame or both ([FL2VA](docs/fl2va.md)) work too.
 - Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
+
+### Pictures
+
+- Pictures of about 16 megapixels from text, and edits of up to 16 reference pictures
+  ([Image](docs/image.md)), work with `mmh3 image` on CUDA and have been checked against diffusers'
+  pipeline. Metal does not run them yet.
+
+### Machines
+
 - NVIDIA GPUs with CUDA. It is developed on a DGX Spark (GB10, `sm_121`) and builds for `sm_120f`,
   so it should also run on RTX PRO 6000 and RTX 50 series GPUs, which have not been tested yet. The
   build also targets Ada (`sm_89`), which runs on an RTX 4090.
@@ -90,13 +122,13 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps. On the M6, the
   audio works with LoRAs, patches such as FastH3's, and Sol-Attn and VSA sparse attention, and a
   Mac with 24 GB runs it by reading the layers that do not fit from the disk. Videos from frames and
   references work on macOS 26. See [Metal](docs/metal.md) for its current limits.
-- [Distributed generation](docs/distributed.md) works on both backends and between them, and from a
-  machine with neither. Shares follow what each machine measures itself to do. Between two DGX
-  Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark rather
-  than taking one itself generates about twenty-five times faster than it does alone.
-- An [HTTP server](docs/server.md) takes a generation as a form and keeps its models loaded
-  between the generations it runs, so the second one against a warm server starts at its first
-  step. It has no authentication of its own and waits on loopback.
+- [Distributed generation](docs/distributed.md) of videos works on both backends and between them,
+  and from a machine with neither. Shares follow what each machine measures itself to do. Between
+  two DGX Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark
+  rather than taking one itself generates about twenty-five times faster than it does alone.
+- An [HTTP server](docs/server.md) takes a video or a picture as a form and keeps its models
+  loaded between the generations it runs, so the second one against a warm server starts at its
+  first step. It has no authentication of its own and waits on loopback.
 
 ## Documentation
 

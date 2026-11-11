@@ -118,9 +118,15 @@ NVIDIA driver at run time. No FFmpeg implementation is included.
 
 Model weights.
 mmh3 loads checkpoints that users download themselves, each under its own license:
-MiniMax H3 by MiniMax as repackaged for ComfyUI by Comfy-Org, the text encoder
-derived from Qwen3-VL, optional LoRAs such as lightx2v's MiniMax-H3 Turbo LoRA, and
-LBH-123-AI's latent upscaler (Apache License, Version 2.0).
+MiniMax H3 and MiniMax H3 Image by MiniMax as repackaged for ComfyUI by Comfy-Org,
+the text encoder derived from Qwen3-VL, optional LoRAs such as lightx2v's MiniMax-H3
+Turbo LoRA, and LBH-123-AI's latent upscaler (Apache License, Version 2.0).
+
+MiniMax H3 Image by MiniMax (MiniMax-H3-Image Community License Agreement).
+The latent statistics of its picture VAE, in `crates/mmh3-core/src/vae.rs` and
+`tools/models/video_vae_int8.py`, come from the `vae/config.json` of
+MiniMaxAI/MiniMax-H3-Image, since Comfy-Org's file does not carry them and the
+weights need them.
 
 LBH-123-AI's Minimax H3 latent upscaler (MIT License for its ComfyUI nodes).
 The latent upscalers in `crates/mmh3-cuda`, `crates/mmh3-metal` and `crates/mmh3-core` follow
@@ -137,7 +143,7 @@ The flash attention and INT8 product kernels in `crates/mmh3-metal/kernels/matmu
 follow the design of MLX's attention and GEMM kernels for the Neural Accelerators,
 and contain none of its code.
 
-Other references consulted: the MiniMax H3 repository and the MiniMax H3
-pipeline of Hugging Face diffusers (Apache License, Version 2.0), and BigVGAN by
-NVIDIA and the alias-free activations of junjun3518/alias-free-torch for the
-audio decoder's architecture.
+Other references consulted: the MiniMax H3 repository, the MiniMax H3 and
+MiniMax H3 Image pipelines of Hugging Face diffusers (Apache License, Version 2.0),
+and BigVGAN by NVIDIA and the alias-free activations of junjun3518/alias-free-torch
+for the audio decoder's architecture.
