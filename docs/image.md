@@ -172,8 +172,9 @@ The FP16 picture VAE decodes the final latent of the golden data 72 dB PSNR from
 FP32 decode, and its encoder gives the posterior means of the two references within 4.6e-3 of the
 reference's FP32 encoder.
 
-`mmh3-tools check` runs on CUDA. On Metal, the tests check the decode of the picture VAE against
-diffusers on a small random model, and the DiT's output heads against single heads summed by hand.
+`mmh3-tools check` runs on CUDA. On Metal, the tests check the decode and the encode of the picture
+VAE against diffusers on small random models, and the DiT's output heads against single heads summed
+by hand.
 
 ## License
 
