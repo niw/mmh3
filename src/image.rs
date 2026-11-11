@@ -70,6 +70,14 @@ const DEFAULT_MIN_GENERATION_AREA: usize = 2048 * 2048;
 /// The shift of the grid of `--steps`, the one PDMD's LoRA was distilled on.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const DEFAULT_SHIFT: f32 = 12.0;
+/// The room the steps and the decode of a picture work in beside the DiT and the VAE, which grows
+/// with the canvas: on an M5 Max the device allocations of a 2048×2048 picture peaked 3.96 GiB
+/// beyond the two checkpoints and those of a 4096×4096 one, the size the model is meant for,
+/// 6.90 GiB beyond, which is 2.97 GiB and 251 bytes a pixel. A GiB is to spare here.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const STEP_ROOM_BASE: usize = 4 << 30;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const STEP_ROOM_PER_PIXEL: usize = 256;
 /// The most reference pictures an edit takes.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_REFERENCES: usize = 16;
@@ -455,6 +463,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         println!("wrote the context {:?} to {path}", context.shape);
     }
     let references = encode_references(&options, seed, &references)?;
+    held.make_room(&options, canvas_width * canvas_height)?;
 
     let (mut dit, dit_key) = held.dit(&options)?;
     let config = dit.config();
@@ -678,6 +687,43 @@ impl Held {
         }
     }
 
+    /// Where the models are kept, lets go of the kept models the picture does not use, and then
+    /// of the text encoder now that the prompt is encoded, until the device has room for the DiT,
+    /// the adapters and the picture VAE it has yet to read and for the work of the steps on
+    /// `pixels` of canvas, so that a Mac without the room for all three keeps the DiT and the VAE
+    /// between pictures and reads the encoder for each prompt, rather than finding out at the
+    /// first step that ran out of memory.
+    fn make_room(
+        &mut self,
+        options: &std::collections::HashMap<&str, &str>,
+        pixels: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let Held::Kept(table) = self else {
+            return Ok(());
+        };
+        let dit = SafeTensors::open(Path::new(&option_path(options, "dit", IMAGE_DIT_FILE)?))?;
+        let vae = SafeTensors::open(Path::new(&option_path(options, "vae", IMAGE_VAE_FILE)?))?;
+        let (dit_key, adapters) = dit_key(&dit, options)?;
+        let vae_key = decoder_key(&vae);
+        let mut models = table.borrow();
+        let mut bytes = STEP_ROOM_BASE + STEP_ROOM_PER_PIXEL * pixels;
+        let applied = match models.dit_key() {
+            Some(kept) if dit_key.builds_on(kept) => kept.adapters.len(),
+            _ => {
+                bytes += file_bytes(&dit);
+                0
+            }
+        };
+        for (path, _) in &adapters[applied..] {
+            bytes += file_bytes(&SafeTensors::open(Path::new(path))?);
+        }
+        if !models.has_picture_decoder(vae_key) {
+            bytes += file_bytes(&vae);
+        }
+        models.make_room(bytes, &dit_key, vae_key);
+        Ok(())
+    }
+
     /// The DiT of `--dit` or the models directory, with the key it goes back into the table under
     /// when it is kept. A kept DiT runs INT8 linear layers on CUDA, since NVFP4 ones would stay in
     /// it for the runs after this one.
@@ -703,23 +749,11 @@ impl Held {
         }
         let path = option_path(options, "dit", IMAGE_DIT_FILE)?;
         let file = SafeTensors::open(Path::new(&path))?;
-        let adapters = wanted_adapters(options)?;
-        let key = crate::resident::DitKey {
-            checkpoint: crate::worker::digest(&file),
-            adapters: adapters
-                .iter()
-                .map(|(_, adapter)| (adapter.digest, adapter.strength.to_bits(), adapter.mode))
-                .collect(),
-        };
+        let (key, adapters) = dit_key(&file, options)?;
         let mut models = table.borrow();
         // Adapters only ever add, so a kept DiT whose adapters begin this run's takes the rest.
         let (mut dit, applied) = match models.take_dit() {
-            Some((kept, dit))
-                if kept.checkpoint == key.checkpoint
-                    && key.adapters.starts_with(&kept.adapters) =>
-            {
-                (dit, kept.adapters.len())
-            }
+            Some((kept, dit)) if key.builds_on(&kept) => (dit, kept.adapters.len()),
             other => {
                 drop(other);
                 let started = Instant::now();
@@ -811,7 +845,7 @@ impl Held {
                     let file = SafeTensors::open(Path::new(&path))?;
                     let key = decoder_key(&file);
                     Table::new(device).with_room(|models| {
-                        models.video_decoder(Path::new(&path), key).map(|_| ())
+                        models.picture_decoder(Path::new(&path), key).map(|_| ())
                     })?;
                     Ok(None)
                 })
@@ -868,7 +902,7 @@ impl Held {
             Held::Kept(table) => {
                 let key = decoder_key(&file);
                 table.with_room(|models| {
-                    let decoder = models.video_decoder(Path::new(path), key)?;
+                    let decoder = models.picture_decoder(Path::new(path), key)?;
                     timing.read += read.elapsed().as_secs_f64();
                     decode_timed(decoder, latent)
                 })?
@@ -913,6 +947,12 @@ impl std::fmt::Display for DecodeTiming {
             self.read, self.waited, self.decoded, self.read_back
         )
     }
+}
+
+/// The bytes of a checkpoint's tensors, which is about what reading it whole takes on the device.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn file_bytes(file: &SafeTensors) -> usize {
+    file.tensors().iter().map(|info| info.byte_count()).sum()
 }
 
 /// What a kept picture VAE is: its checkpoint and the tile geometry a picture decodes in.
@@ -985,12 +1025,34 @@ fn decode_timed(
     }
 }
 
+/// What the DiT of `file` with the adapters `options` asks for is kept under, with those adapters
+/// and the files they come from.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn dit_key(
+    file: &SafeTensors,
+    options: &std::collections::HashMap<&str, &str>,
+) -> Result<(crate::resident::DitKey, Adapters), Box<dyn Error>> {
+    let adapters = wanted_adapters(options)?;
+    let key = crate::resident::DitKey {
+        checkpoint: crate::worker::digest(file),
+        adapters: adapters
+            .iter()
+            .map(|(_, adapter)| (adapter.digest, adapter.strength.to_bits(), adapter.mode))
+            .collect(),
+    };
+    Ok((key, adapters))
+}
+
+/// Adapters with the files they come from, in the order they apply.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+type Adapters = Vec<(String, mmh3_core::worker::Adapter)>;
+
 /// The patch of `--patch` and the LoRA of `--lora` with the files they come from, in the order they
 /// apply, since they do not commute. A patch applies as adapters at full strength.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn wanted_adapters(
     options: &std::collections::HashMap<&str, &str>,
-) -> Result<Vec<(String, mmh3_core::worker::Adapter)>, Box<dyn Error>> {
+) -> Result<Adapters, Box<dyn Error>> {
     use crate::models::model_file;
     use mmh3_core::worker::Adapter;
 

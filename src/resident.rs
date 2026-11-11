@@ -64,6 +64,14 @@ pub struct DitKey {
     pub adapters: Vec<AdapterKey>,
 }
 
+impl DitKey {
+    /// Whether a DiT kept under `kept` becomes this one by taking the rest of its adapters:
+    /// adapters only ever add, so it is the same checkpoint and its adapters begin these.
+    pub fn builds_on(&self, kept: &DitKey) -> bool {
+        self.checkpoint == kept.checkpoint && self.adapters.starts_with(&kept.adapters)
+    }
+}
+
 /// What an encoded prompt was made from: the text encoder, by its checkpoint's digest, the token
 /// ids it read and the reference pictures it saw, by their digests. Two of these equal means the
 /// same states, so a server with them kept need not read the encoder again.
@@ -99,11 +107,11 @@ impl<K, T> Slot<K, T> {
 enum Kind {
     TextEncoder,
     VideoDecoder,
+    PictureDecoder,
     AudioDecoder,
     LatentUpscaler,
     Dit,
     /// The blocks a DiT kept on the device, which it reads on the way until it keeps some again.
-    #[cfg_attr(not(feature = "cuda"), allow(dead_code))]
     DitBlocks,
 }
 
@@ -113,6 +121,7 @@ impl Kind {
         match self {
             Kind::TextEncoder => "the text encoder",
             Kind::VideoDecoder => "the video VAE",
+            Kind::PictureDecoder => "the picture VAE",
             Kind::AudioDecoder => "the audio VAE",
             Kind::LatentUpscaler => "the latent upscaler",
             Kind::Dit => "the DiT",
@@ -125,6 +134,7 @@ impl Kind {
         match self {
             Kind::TextEncoder => "text_encoder",
             Kind::VideoDecoder => "video_vae",
+            Kind::PictureDecoder => "image_vae",
             Kind::AudioDecoder => "audio_vae",
             Kind::LatentUpscaler => "latent_upscaler",
             Kind::Dit | Kind::DitBlocks => "dit",
@@ -138,6 +148,9 @@ pub struct Models {
     device: usize,
     text_encoder: Slot<u64, TextEncoder>,
     video_decoder: Slot<VideoDecoderKey, VideoDecoder>,
+    /// The picture VAE of MiniMax H3 Image, apart from the video VAE so that a picture after a
+    /// video, or a video after a picture, finds its own still here.
+    picture_decoder: Slot<VideoDecoderKey, VideoDecoder>,
     audio_decoder: Slot<u64, AudioDecoder>,
     latent_upscaler: Slot<u64, LatentUpscaler>,
     dit: Slot<DitKey, Dit>,
@@ -158,6 +171,7 @@ impl Models {
             device,
             text_encoder: Slot::new(),
             video_decoder: Slot::new(),
+            picture_decoder: Slot::new(),
             audio_decoder: Slot::new(),
             latent_upscaler: Slot::new(),
             dit: Slot::new(),
@@ -210,24 +224,94 @@ impl Models {
     ) -> Result<&VideoDecoder, Box<dyn Error>> {
         if self.video_decoder.kept.as_ref().map(|(kept, _)| *kept) != Some(key) {
             self.video_decoder.kept = None;
-            let file = SafeTensors::open(path)?;
-            let (_, tile_size, tile_overlap) = key;
-            let decoder = self.read(|| {
-                load(path, || {
-                    #[allow(unused_mut)]
-                    let mut decoder = VideoDecoder::load(&file, "", tile_size, tile_overlap)?;
-                    #[cfg(feature = "metal")]
-                    decoder.set_precision(
-                        crate::metal::default_linear_precision(),
-                        crate::metal::default_attention_precision(),
-                    )?;
-                    Ok::<_, Box<dyn Error>>(decoder)
-                })
-            })?;
+            let decoder = self.read_video_decoder(path, key)?;
             self.video_decoder.kept = Some((key, decoder));
         }
         self.video_decoder.used = self.touch();
         Ok(&self.video_decoder.kept.as_ref().expect("just loaded").1)
+    }
+
+    /// The picture VAE of `path` for the tile geometry `key` names.
+    pub fn picture_decoder(
+        &mut self,
+        path: &Path,
+        key: VideoDecoderKey,
+    ) -> Result<&VideoDecoder, Box<dyn Error>> {
+        if !self.has_picture_decoder(key) {
+            self.picture_decoder.kept = None;
+            let decoder = self.read_video_decoder(path, key)?;
+            self.picture_decoder.kept = Some((key, decoder));
+        }
+        self.picture_decoder.used = self.touch();
+        Ok(&self.picture_decoder.kept.as_ref().expect("just loaded").1)
+    }
+
+    /// Whether the kept picture VAE is the one `key` names.
+    pub fn has_picture_decoder(&self, key: VideoDecoderKey) -> bool {
+        self.picture_decoder.kept.as_ref().map(|(kept, _)| *kept) == Some(key)
+    }
+
+    /// Reads the video or picture VAE of `path` for the tile geometry `key` names.
+    fn read_video_decoder(
+        &mut self,
+        path: &Path,
+        key: VideoDecoderKey,
+    ) -> Result<VideoDecoder, Box<dyn Error>> {
+        let file = SafeTensors::open(path)?;
+        let (_, tile_size, tile_overlap) = key;
+        self.read(|| {
+            load(path, || {
+                #[allow(unused_mut)]
+                let mut decoder = VideoDecoder::load(&file, "", tile_size, tile_overlap)?;
+                #[cfg(feature = "metal")]
+                decoder.set_precision(
+                    crate::metal::default_linear_precision(),
+                    crate::metal::default_attention_precision(),
+                )?;
+                Ok::<_, Box<dyn Error>>(decoder)
+            })
+        })
+    }
+
+    /// Lets go of models, the one used least first, until the device has room for `bytes` more
+    /// beside what it holds, keeping a kept DiT that `dit` builds on and a picture VAE kept under
+    /// `decoder`, and says how many went. A picture asks this once its prompt is encoded, with
+    /// what it has yet to read and the room its steps work in, which is measured. A video's models
+    /// kept from before go first, since they were used before the text encoder, and a DiT that
+    /// `dit` does not build on goes before the encoder too, since the picture's own would push it
+    /// out anyway.
+    /// The encoder goes last: reading it again for the next prompt is cheaper than reading the DiT
+    /// again for this picture's steps, and it is better let go of now than by a step that ran out
+    /// of memory first and had to let go of what it found. The free memory is held to
+    /// `--vram-budget`, so a machine answering for a smaller one lets go as that one would.
+    pub fn make_room(&mut self, bytes: usize, dit: &DitKey, decoder: VideoDecoderKey) -> usize {
+        let mut kept = Vec::new();
+        if self.dit_key().is_some_and(|key| dit.builds_on(key)) {
+            kept.extend([Kind::Dit, Kind::DitBlocks]);
+        }
+        if self.has_picture_decoder(decoder) {
+            kept.push(Kind::PictureDecoder);
+        }
+        let mut released = 0;
+        loop {
+            let Some(free) = free_bytes(self.device) else {
+                return released;
+            };
+            if free >= bytes {
+                return released;
+            }
+            let Some(kind) = self.release_oldest_except(&kept) else {
+                return released;
+            };
+            println!(
+                "device {} has {:.1} GB left and the picture wants {:.1} GB, so let go of {}",
+                self.device,
+                free as f64 / (1u64 << 30) as f64,
+                bytes as f64 / (1u64 << 30) as f64,
+                kind.name()
+            );
+            released += 1;
+        }
     }
 
     /// The audio decoder of `path`, loaded unless the kept one came from the same checkpoint.
@@ -266,9 +350,10 @@ impl Models {
     /// tries again, until there is nothing left to let go of and the read fails as it would have
     /// on a machine that was holding nothing.
     ///
-    /// Nothing is set aside beforehand. What a read and the work after it take cannot be known
+    /// A read sets nothing aside beforehand. What it and the work after it take cannot be known
     /// from the size of a checkpoint, and a machine that guessed would either let go of models it
-    /// had the room for or keep models it did not.
+    /// had the room for or keep models it did not. A picture, whose steps' room was measured,
+    /// asks for it with `make_room` instead.
     pub fn read<T, E: Into<Box<dyn Error>>>(
         &mut self,
         read: impl FnMut() -> Result<T, E>,
@@ -330,6 +415,7 @@ impl Models {
         [
             (self.text_encoder.kept.is_some(), Kind::TextEncoder),
             (self.video_decoder.kept.is_some(), Kind::VideoDecoder),
+            (self.picture_decoder.kept.is_some(), Kind::PictureDecoder),
             (self.audio_decoder.kept.is_some(), Kind::AudioDecoder),
             (self.latent_upscaler.kept.is_some(), Kind::LatentUpscaler),
             (self.dit.kept.is_some(), Kind::Dit),
@@ -428,6 +514,7 @@ impl Models {
         let mut models = [
             (self.text_encoder.releasable(), Kind::TextEncoder),
             (self.video_decoder.releasable(), Kind::VideoDecoder),
+            (self.picture_decoder.releasable(), Kind::PictureDecoder),
             (self.audio_decoder.releasable(), Kind::AudioDecoder),
             (self.latent_upscaler.releasable(), Kind::LatentUpscaler),
             (self.dit.releasable(), Kind::Dit),
@@ -451,6 +538,7 @@ impl Models {
             Kind::DitBlocks => {}
             Kind::TextEncoder => self.text_encoder.kept = None,
             Kind::VideoDecoder => self.video_decoder.kept = None,
+            Kind::PictureDecoder => self.picture_decoder.kept = None,
             Kind::AudioDecoder => self.audio_decoder.kept = None,
             Kind::LatentUpscaler => self.latent_upscaler.kept = None,
             Kind::Dit => self.dit.kept = None,
@@ -496,6 +584,19 @@ pub fn take_budget(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> 
     #[cfg(feature = "metal")]
     mmh3_metal::set_allocation_limit(budget);
     Ok(())
+}
+
+/// What `device` has left for this process, held to `--vram-budget`, or None when it cannot say.
+/// On a Mac it is what the device recommends one process fill less what this one holds, so what
+/// other programs hold is not counted against it.
+fn free_bytes(device: usize) -> Option<usize> {
+    #[cfg(feature = "cuda")]
+    return mmh3_cuda::free_bytes_on(device).ok();
+    #[cfg(feature = "metal")]
+    {
+        let _ = device;
+        mmh3_metal::free_bytes().ok()
+    }
 }
 
 /// Whether an error is the device saying it has no memory left, which a caller holding models it

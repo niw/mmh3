@@ -155,7 +155,7 @@ curl http://localhost:8833/v1/status
   "generating": "6ab1cf3b0000",
   "generations": 7,
   "memory": {"free": 57481990144, "total": 130660909056},
-  "models": ["text_encoder", "video_vae", "audio_vae", "dit"],
+  "models": ["text_encoder", "video_vae", "image_vae", "audio_vae", "dit"],
   "queued": 1
 }
 ```
