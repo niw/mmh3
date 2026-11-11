@@ -79,9 +79,10 @@ is a file longer than the server takes. See [Usage](usage.md) for what the optio
 
 `POST /v1/images` takes a picture to generate with [Image](image.md) the same way. Its fields are the
 options of `mmh3 image` about what to generate: `prompt`, `prompt-file`, `reference`, `width`,
-`height`, `min-generation-area`, `seed` and `attention-precision`. A field that starts with `<`, as
-a prompt that refers to `<Picture 1>` does, goes to curl with `--form-string`, since curl reads
-`-F name=<file` from a file.
+`height`, `min-generation-area`, `seed`, `attention-precision`, `attention`, `sparse-tau`,
+`sparse-start`, `draft-steps` and `latent-upscaler`, which takes the name of a file in the models
+directory as a video's does. A field that starts with `<`, as a prompt that refers to `<Picture 1>`
+does, goes to curl with `--form-string`, since curl reads `-F name=<file` from a file.
 
 ```sh
 curl -X POST http://localhost:8833/v1/images \
@@ -100,6 +101,15 @@ or from `--image-dit FILE` and `--image-vae FILE`, which are a picture's `--dit`
 DiT runs INT8 linear layers, so a request does not give `linear-precision`.
 
 On a DGX Spark, two 1024×1024 pictures against a server just started took 16.2 s and then 9.5 s.
+Two 4096×4096 pictures with the [faster settings](image.md#faster) took 34.0 s and then 26.1 s:
+
+```sh
+curl -X POST http://localhost:8833/v1/images \
+  -F prompt="A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn." \
+  -F width=4096 -F height=4096 -F draft-steps=2 \
+  -F latent-upscaler=minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
+  -F attention=sol -F attention-precision=int8-fp8
+```
 
 ## Watching one
 

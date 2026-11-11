@@ -39,6 +39,18 @@ target/release/mmh3 image --models models --out out.png \
   --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn."
 ```
 
+These settings generate a 4096×4096 picture in about 35 s on a DGX Spark, with
+[draft steps](docs/draft-steps.md) and Sol-Attn, which can change the details and the composition.
+See [Image](docs/image.md#faster) for what they change.
+
+```sh
+tools/download-models.sh --image --latent-upscaler
+target/release/mmh3 image --models models --out out.png --width 4096 --height 4096 \
+  --draft-steps 2 --latent-upscaler minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
+  --attention sol --attention-precision int8-fp8 \
+  --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn."
+```
+
 ## Performance
 
 These are the times of a complete generation, including model loading and encoding, with warm
@@ -88,14 +100,17 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps. On the M6, the
 
 ### Pictures on CUDA
 
-On a DGX Spark, a picture took:
+On a DGX Spark, a 4096×4096 picture took:
 
-| Picture | Attention | Time per step | Time |
-| --- | --- | ---: | ---: |
-| 4096×4096 | BF16 | 8.8 s | 63 s |
-| 4096×4096 | INT8/FP8 | 7.3 s | 54 s |
+| Settings | Time per step | Time |
+| --- | ---: | ---: |
+| [Faster settings](docs/image.md#faster): 2 draft steps, Sol-Attn and INT8/FP8 attention | 4.9 s | 35 s |
+| The same with [NVFP4 linear layers](docs/nvfp4.md) | 3.7 s | 30 s |
+| Defaults, BF16 attention | 8.8 s | 63 s |
 
-MiniMax H3 Image generates in six steps, and [Image](docs/image.md) has the times of other settings.
+MiniMax H3 Image generates in six steps, and the times per step are those of a step at full size.
+A [server](docs/server.md) that keeps the models loaded takes 26 s with the faster settings.
+[Image](docs/image.md) has the times of other settings.
 
 ## Status
 

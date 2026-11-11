@@ -45,6 +45,13 @@ prompt expander before generating.
 - `--attention-precision bf16|int8-fp8` (default bf16): INT8/FP8 attention, as in
   [Performance and accuracy](performance.md).
 - `--linear-precision int8|nvfp4` (default int8): [NVFP4 linear layers](nvfp4.md).
+- `--draft-steps N` (default 0): Runs the first N steps on a canvas of half the width and height,
+  as in [Faster](#faster). The canvas must then be a multiple of 64 on each side, and an edit
+  takes none.
+- `--latent-upscaler FILE`: Enlarges the draft with
+  [the latent upscaler](draft-steps.md#latent-upscaler) rather than bilinearly.
+- `--attention dense|sol` (default dense), `--sparse-tau X`, `--sparse-start X`: Sol-Attn, as in
+  [Usage](usage.md), from the third step by default.
 - `--dit FILE`, `--text-encoder FILE`, `--vae FILE`, `--models DIR`: Checkpoints, as in
   [Models](models.md).
 - `--save-latent FILE`: Also writes the final latent, which the INT8 picture VAE is calibrated
@@ -58,6 +65,31 @@ pipeline does too.
 
 A [server](server.md#asking-for-a-picture) takes the same generations with `POST /v1/images` and
 keeps the models loaded between them.
+
+## Faster
+
+These settings generate a 4096×4096 picture in about 35 s rather than 63 s on a DGX Spark:
+
+```sh
+tools/download-models.sh --image --latent-upscaler
+target/release/mmh3 image --out panda.png --width 4096 --height 4096 \
+  --draft-steps 2 --latent-upscaler minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
+  --attention sol --attention-precision int8-fp8 \
+  --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn, soft golden light filtering through the trees, photorealistic, detailed fur"
+```
+
+- The first two steps run as [draft steps](draft-steps.md) on a 2048×2048 canvas, still within the
+  sizes the model works at, and settle the composition in a quarter of the tokens. The picture
+  VAE's encoder is the video VAE's, so the latent upscaler of MiniMax H3 enlarges the draft. The
+  same seed gives another composition than without draft steps.
+- The four steps at full size run Sol-Attn, which attends to about 17% of the picture.
+- `--linear-precision nvfp4` takes it down to about 30 s, with muted colors and coarser textures.
+
+Sol-Attn costs the most accuracy. Compared on a shop sign, a portrait and a station hall, it
+rewrote the prices on a chalkboard, added stray lettering and painted a second clock, while faces
+and hands stayed as they were. With `--sparse-start 0.5` it starts at the fourth step and kept the
+lettering. Draft steps alone kept large lettering and the composition, and moved small lettering
+at most. For a picture with text, leave `--attention sol` out, which takes about 50 s.
 
 ## Edit
 
@@ -82,17 +114,25 @@ reference goes twice into the generation, as the reference pipeline takes it:
 
 On a DGX Spark, with the prompt above and seed 1:
 
-| Picture | Attention | Linear layers | Each step | Decode | Whole generation |
-| --- | --- | --- | ---: | ---: | ---: |
-| 1024×1024 | BF16 | INT8 | 1.4 s | 1.0 s | 18 s |
-| 4096×4096 | BF16 | INT8 | 8.8 s | 2.9 s | 63 s |
-| 4096×4096 | INT8/FP8 | INT8 | 7.3 s | 2.9 s | 54 s |
-| 4096×4096 | INT8/FP8 | NVFP4 | 6.2 s | 2.9 s | 47 s |
+| Picture | Draft steps | Attention | Linear layers | Each step at full size | Whole generation |
+| --- | ---: | --- | --- | ---: | ---: |
+| 1024×1024 | 0 | BF16 | INT8 | 1.4 s | 18 s |
+| 1024×1024 | 2 | INT8/FP8 | INT8 | 1.3 s | 16 s |
+| 4096×4096 | 0 | BF16 | INT8 | 8.8 s | 63 s |
+| 4096×4096 | 0 | INT8/FP8 | INT8 | 7.3 s | 54 s |
+| 4096×4096 | 0 | INT8/FP8 | NVFP4 | 6.2 s | 47 s |
+| 4096×4096 | 0 | Sol-Attn, BF16 | INT8 | 5.3 s | 49 s |
+| 4096×4096 | 2 | BF16 | INT8 | 8.8 s | 50 s |
+| 4096×4096 | 2 | Sol-Attn, BF16 | INT8 | 5.3 s | 37 s |
+| 4096×4096 | 2 | Sol-Attn, INT8/FP8 | INT8 | 4.9 s | 35 s |
+| 4096×4096 | 2 | Sol-Attn, INT8/FP8 | NVFP4 | 3.7 s | 30 s |
 
 The 1024×1024 picture is generated on a 2048×2048 canvas, as `--min-generation-area` sets by
-default. The whole generation includes loading the text encoder, the DiT and the VAE from warm
-files. At 4096×4096 INT8/FP8 attention changes fine details of the picture and keeps its
-composition. NVFP4 also mutes colors and coarsens textures.
+default, so its draft steps run on a 1024×1024 canvas, too short for Sol-Attn. A draft step at
+4096×4096 takes about 1.5 s and the latent upscaler 2 s with its loading, and the picture VAE
+decodes a 4096×4096 picture in 2.9 s. The whole generation includes loading the text encoder, the
+DiT and the VAE from warm files. At 4096×4096 INT8/FP8 attention changes fine details of the
+picture and keeps its composition. NVFP4 also mutes colors and coarsens textures.
 
 ## Accuracy
 

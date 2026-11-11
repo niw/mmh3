@@ -33,6 +33,8 @@ target/release/mmh3 generate --prompt-file prompt.txt --out out.mp4 \
 The width and the height must be multiples of 64, so that the half-size canvas stays on the
 32-pixel grid. Draft steps do not run with keyframes or references.
 
+`mmh3 image` takes `--draft-steps` and `--latent-upscaler` too, as [Image](image.md#faster) shows.
+
 ## Latent upscaler
 
 [LBH-123-AI's latent upscaler](https://huggingface.co/LBH-123-AI/Minimax_h3_latent_Upscaler) is a 3D
