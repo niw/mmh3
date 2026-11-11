@@ -10,13 +10,16 @@
 # [tool.uv.sources]
 # torch = { index = "pytorch-cu130" }
 # ///
-"""Builds an INT8 ConvRot video VAE from the FP16 one.
+"""Builds an INT8 ConvRot video VAE, or picture VAE, from the FP16 one.
 
 Development tool. It reads the FP16 video VAE in ComfyUI's layout,
 vae/minimax_h3_video_vae_fp16.safetensors of Comfy-Org/MiniMax-H3, and calibration latents,
 and writes the VAE with the linear layers of its decoder blocks in INT8 ConvRot, the format
-that mmh3 and ComfyUI load from vae/minimax_h3_video_vae_int8_convrot.safetensors. It computes
-on a CUDA GPU. Run it with uv, which installs numpy and PyTorch for CUDA 13.0, for example:
+that mmh3 and ComfyUI load from vae/minimax_h3_video_vae_int8_convrot.safetensors. Given the
+FP16 picture VAE of MiniMax H3 Image, vae/minimax_h3_image_vae_fp16.safetensors of
+Comfy-Org/MiniMax-H3-Image, and picture latents, it writes
+vae/minimax_h3_image_vae_int8_convrot.safetensors the same way. It computes on a CUDA GPU. Run
+it with uv, which installs numpy and PyTorch for CUDA 13.0, for example:
 
     uv run tools/models/video_vae_int8.py \\
         --vae /path/to/minimax_h3_video_vae_fp16.safetensors \\
@@ -66,6 +69,60 @@ HEAD_DIM = 64
 ROPE_FREQUENCIES = 8
 ROPE_BASE = 100.0
 NORM_EPSILON = 1e-5
+# The latent statistics of the picture VAE, from the vae/config.json of
+# MiniMaxAI/MiniMax-H3-Image, which Comfy-Org's file does not carry.
+PICTURE_LATENTS_MEAN = [
+    0.858090341091156,
+    -0.9606591463088989,
+    1.0661640167236328,
+    -0.5090325474739075,
+    -0.2727581858634949,
+    -1.3675414323806763,
+    -0.2553254961967468,
+    -0.26907554268836975,
+    -0.5376840829849243,
+    -0.0464097298681736,
+    0.6657370328903198,
+    0.19690127670764923,
+    -0.5460608005523682,
+    -0.4035342037677765,
+    -0.23683024942874908,
+    0.25928452610969543,
+    -0.30133944749832153,
+    0.211341992020607,
+    -1.1206848621368408,
+    0.3581933379173279,
+    -0.04225143790245056,
+    0.2604829967021942,
+    0.22864092886447906,
+    0.7056031823158264,
+]
+PICTURE_LATENTS_STD = [
+    1.2223774194717407,
+    1.2767263650894165,
+    1.6831774711608887,
+    1.7549455165863037,
+    1.5636216402053833,
+    2.194143533706665,
+    0.9653137922286987,
+    1.0569885969161987,
+    0.841948926448822,
+    0.7729952931404114,
+    1.8955937623977661,
+    0.946841835975647,
+    0.7996809482574463,
+    0.44988900423049927,
+    0.7197399735450745,
+    0.6936293244361877,
+    2.961095094680786,
+    2.7694199085235596,
+    3.0496184825897217,
+    2.1088054180145264,
+    3.276226282119751,
+    3.1627357006073,
+    2.2816812992095947,
+    2.6127843856811523,
+]
 QUANTIZATION = json.dumps(
     {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": CONVROT_GROUP}
 ).encode()
@@ -140,9 +197,10 @@ def split_tiles(length):
     return starts, TILE_SIZE
 
 
-def rope_angles(frames, height, width, suffix):
+def rope_angles(frames, height, width, suffix, picture):
     """Rotary angles [tokens, 3 × ROPE_FREQUENCIES] of one tile, like
-    mmh3_core::vae::rope_angles."""
+    mmh3_core::vae::rope_angles, or [tokens, 2 × ROPE_FREQUENCIES] without the time axis of a
+    picture decoder, like mmh3_core::vae::picture_rope_angles."""
     inverse = ROPE_BASE ** (-np.arange(ROPE_FREQUENCIES) / ROPE_FREQUENCIES)
 
     def coordinates(size):
@@ -152,6 +210,8 @@ def rope_angles(frames, height, width, suffix):
         coordinates(frames), coordinates(height), coordinates(width), indexing="ij"
     )
     positions = np.stack([axis.ravel() for axis in grid], axis=1)
+    if picture:
+        positions = positions[:, 1:]
     angles = (2 * np.pi * positions[:, :, None] * inverse).reshape(len(positions), -1)
     angles = np.concatenate([angles, np.zeros((suffix, angles.shape[1]))])
     return torch.from_numpy(angles).float().to(DEVICE)
@@ -174,8 +234,9 @@ def load_latent(path):
 
 
 class Decoder:
-    """The decoder blocks of the video VAE in FP32 on the GPU, whose tensors the tool edits
-    in place."""
+    """The decoder blocks of the video or picture VAE in FP32 on the GPU, whose tensors the
+    tool edits in place. A picture decoder turns a token into one frame and has no time axis in
+    its rotary embedding."""
 
     def __init__(self, vae):
         self.tensors = {
@@ -183,8 +244,15 @@ class Decoder:
             for name in vae.header
             if name.startswith("decoder.") or name.startswith("post_quant_conv.")
         }
-        self.latents_mean = vae.load("latents_mean").reshape(-1)
-        self.latents_std = vae.load("latents_std").reshape(-1)
+        self.picture = (
+            self.tensors["decoder.proj_out.weight"].shape[0] == 3 * SPATIAL_RATIO**2
+        )
+        if "latents_mean" in vae or not self.picture:
+            self.latents_mean = vae.load("latents_mean").reshape(-1)
+            self.latents_std = vae.load("latents_std").reshape(-1)
+        else:
+            self.latents_mean = np.array(PICTURE_LATENTS_MEAN, dtype=np.float32)
+            self.latents_std = np.array(PICTURE_LATENTS_STD, dtype=np.float32)
         self.layers = sum(1 for name in self.tensors if name.endswith(".scale1"))
         self.registers = self.tensors["decoder.register_tokens"][0]
 
@@ -200,13 +268,16 @@ class Decoder:
         columns, tile_width = split_tiles(width * SPATIAL_RATIO)
         tile_height //= SPATIAL_RATIO
         tile_width //= SPATIAL_RATIO
-        # The chunk count of mmh3_core::vae::TemporalPlan.
+        # The chunk count of mmh3_core::vae::TemporalPlan, and a single frame for a picture.
         chunks = max(1, -(-(frames + TOKEN_DROP) // CHUNK_TOKENS) - 1)
+        chunk_frames = CHUNK_LATENT_FRAMES
+        if self.picture:
+            chunks, chunk_frames = 1, 1
         tiles = []
         for chunk in range(chunks):
             frame_indices = [
                 min(chunk * CHUNK_TOKENS + frame, frames - 1)
-                for frame in range(CHUNK_LATENT_FRAMES)
+                for frame in range(chunk_frames)
             ]
             for top in rows:
                 for left in columns:
@@ -217,7 +288,7 @@ class Decoder:
                     tiles.append(
                         (
                             part.reshape(channels, -1).T,
-                            (CHUNK_LATENT_FRAMES, tile_height, tile_width),
+                            (chunk_frames, tile_height, tile_width),
                         )
                     )
         return tiles
@@ -378,7 +449,7 @@ def quantize_block(decoder, layer, states, angles, method, smooth):
 def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
-        "--vae", required=True, help="FP16 video VAE in ComfyUI's layout"
+        "--vae", required=True, help="FP16 video or picture VAE in ComfyUI's layout"
     )
     parser.add_argument(
         "--latents", nargs="+", required=True, help="safetensors files of video latents"
@@ -409,7 +480,7 @@ def main():
     grids = {grid for _, grid in tiles}
     if len(grids) != 1:
         sys.exit(f"calibration tiles of different sizes {grids}")
-    angles = rope_angles(*grids.pop(), decoder.registers.shape[0] + 1)
+    angles = rope_angles(*grids.pop(), decoder.registers.shape[0] + 1, decoder.picture)
     print(f"{len(tiles)} calibration tiles from {len(paths)} latents", flush=True)
 
     rows = torch.from_numpy(np.stack([rows for rows, _ in tiles])).float().to(DEVICE)
