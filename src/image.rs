@@ -464,6 +464,8 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!(
         "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
+    let vae_path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
+    let vae_ahead = held.read_decoder_ahead(&vae_path, &options)?;
     // Metal refines the prompt once for every step.
     #[cfg(feature = "metal")]
     let prepared = held.with_room(|| dit.prepare_text(&inputs.context))?;
@@ -546,10 +548,9 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let started = Instant::now();
-    let path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
-    let pixels = held.decode(&path, &options, &latent)?;
+    let (pixels, timing) = held.decode(&vae_path, &options, &latent, vae_ahead)?;
     println!(
-        "decoded the picture with {path} in {:.1} s",
+        "decoded the picture with {vae_path} in {:.1} s: {timing}",
         started.elapsed().as_secs_f64()
     );
     write_png(&pixels, width, height, out)?;
@@ -705,41 +706,205 @@ impl Held {
         }
     }
 
-    /// Decodes a latent with the picture VAE of `path` into pixels `[3, 1, height, width]`.
+    /// Starts reading the picture VAE of `path` on a thread of its own, so that the read hides
+    /// behind the steps: it uploads the weights between the steps' calls on the device. A run alone
+    /// gets the decoder back through the handle; a server's table keeps it, where the decode finds
+    /// it. A read that fails says so and leaves the decode to read again, having cost the steps
+    /// nothing.
+    fn read_decoder_ahead(
+        &mut self,
+        path: &str,
+        options: &std::collections::HashMap<&str, &str>,
+    ) -> Result<DecoderAhead, Box<dyn Error>> {
+        use crate::resident::Table;
+
+        let device = crate::resident::current_device();
+        let path = path.to_owned();
+        let read: DecoderRead = match self {
+            Held::Alone => {
+                let precision = decoder_precision(options)?;
+                Box::new(move || {
+                    let file = SafeTensors::open(Path::new(&path))?;
+                    Ok(Some(load_decoder(&file, precision)?))
+                })
+            }
+            Held::Kept(table) => {
+                let device = table.device();
+                Box::new(move || {
+                    let file = SafeTensors::open(Path::new(&path))?;
+                    let key = decoder_key(&file);
+                    Table::new(device).with_room(|models| {
+                        models.video_decoder(Path::new(&path), key).map(|_| ())
+                    })?;
+                    Ok(None)
+                })
+            }
+        };
+        let thread = std::thread::Builder::new()
+            .name("picture VAE".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                let decoder = match crate::resident::bind_device(device).and_then(|()| read()) {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        eprintln!("warning: reading the picture VAE during the steps: {error}");
+                        None
+                    }
+                };
+                (decoder, started.elapsed().as_secs_f64())
+            })?;
+        Ok(DecoderAhead { thread })
+    }
+
+    /// Decodes a latent with the picture VAE of `path` into pixels `[3, 1, height, width]`, with
+    /// the decoder `ahead` read during the steps or one read here.
     fn decode(
         &mut self,
         path: &str,
-        #[allow(unused_variables)] options: &std::collections::HashMap<&str, &str>,
+        options: &std::collections::HashMap<&str, &str>,
         latent: &Tensor,
-    ) -> Result<Tensor, Box<dyn Error>> {
-        use crate::resident::VideoDecoder;
-        use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
-
+        ahead: DecoderAhead,
+    ) -> Result<(Tensor, DecodeTiming), Box<dyn Error>> {
+        let waited = Instant::now();
+        let (decoder, mut timing) = match ahead.thread.join() {
+            Ok((decoder, read)) => (
+                decoder,
+                DecodeTiming {
+                    read,
+                    waited: waited.elapsed().as_secs_f64(),
+                    ..DecodeTiming::default()
+                },
+            ),
+            Err(_) => (None, DecodeTiming::default()),
+        };
+        let read = Instant::now();
         let file = SafeTensors::open(Path::new(path))?;
-        match self {
+        let (pixels, decoded, read_back) = match self {
             Held::Alone => {
-                #[allow(unused_mut)]
-                let mut decoder =
-                    VideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
-                #[cfg(feature = "metal")]
-                decoder.set_precision(
-                    crate::metal::default_linear_precision(),
-                    crate::metal::attention_precision(options)?,
-                )?;
-                Ok(decoder.decode(latent, false)?.pixels)
+                let decoder = match decoder {
+                    Some(decoder) => decoder,
+                    None => load_decoder(&file, decoder_precision(options)?)?,
+                };
+                timing.read += read.elapsed().as_secs_f64();
+                decode_timed(&decoder, latent)?
             }
             Held::Kept(table) => {
-                let key = (
-                    crate::worker::digest(&file),
-                    DEFAULT_TILE_SIZE,
-                    PICTURE_TILE_OVERLAP_MIN,
-                );
+                let key = decoder_key(&file);
                 table.with_room(|models| {
                     let decoder = models.video_decoder(Path::new(path), key)?;
-                    Ok(decoder.decode(latent, false)?.pixels)
-                })
+                    timing.read += read.elapsed().as_secs_f64();
+                    decode_timed(decoder, latent)
+                })?
             }
-        }
+        };
+        timing.decoded = decoded;
+        timing.read_back = read_back;
+        Ok((pixels, timing))
+    }
+}
+
+/// The thread reading the picture VAE while the steps run, with the decoder it read for a run
+/// alone and how long it took.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+struct DecoderAhead {
+    thread: std::thread::JoinHandle<(Option<crate::resident::VideoDecoder>, f64)>,
+}
+
+/// The read that thread runs, which gives back the decoder for a run alone.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+type DecoderRead =
+    Box<dyn FnOnce() -> Result<Option<crate::resident::VideoDecoder>, Box<dyn Error>> + Send>;
+
+/// Where the time of a decode went: reading the VAE, which mostly overlaps the steps and only
+/// counts as waited for where it ran past them, the decode on the device and the pixels' way back.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[derive(Default)]
+struct DecodeTiming {
+    read: f64,
+    waited: f64,
+    decoded: f64,
+    read_back: f64,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl std::fmt::Display for DecodeTiming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "VAE read in {:.1} s during the steps and waited for {:.1} s, decoded in {:.1} s, read \
+             back in {:.1} s",
+            self.read, self.waited, self.decoded, self.read_back
+        )
+    }
+}
+
+/// What a kept picture VAE is: its checkpoint and the tile geometry a picture decodes in.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decoder_key(file: &SafeTensors) -> crate::resident::VideoDecoderKey {
+    use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
+
+    (
+        crate::worker::digest(file),
+        DEFAULT_TILE_SIZE,
+        PICTURE_TILE_OVERLAP_MIN,
+    )
+}
+
+/// The precisions a run alone decodes with, which on Metal follow `--attention-precision`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decoder_precision(
+    #[allow(unused_variables)] options: &std::collections::HashMap<&str, &str>,
+) -> Result<DecoderPrecision, Box<dyn Error>> {
+    #[cfg(feature = "metal")]
+    return Ok((
+        crate::metal::default_linear_precision(),
+        crate::metal::attention_precision(options)?,
+    ));
+    #[cfg(feature = "cuda")]
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+type DecoderPrecision = (mmh3_metal::LinearPrecision, mmh3_metal::AttentionPrecision);
+#[cfg(feature = "cuda")]
+type DecoderPrecision = ();
+
+/// The picture VAE of `file` with its weights on the device, for a run alone.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn load_decoder(
+    file: &SafeTensors,
+    #[allow(unused_variables)] precision: DecoderPrecision,
+) -> Result<crate::resident::VideoDecoder, Box<dyn Error>> {
+    use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
+
+    #[allow(unused_mut)]
+    let mut decoder =
+        crate::resident::VideoDecoder::load(file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
+    #[cfg(feature = "metal")]
+    decoder.set_precision(precision.0, precision.1)?;
+    Ok(decoder)
+}
+
+/// Decodes `latent`, with the seconds the device took and the seconds the pixels took to come
+/// back. CUDA's decode brings them back itself, so there the first holds both.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decode_timed(
+    decoder: &crate::resident::VideoDecoder,
+    latent: &Tensor,
+) -> Result<(Tensor, f64, f64), Box<dyn Error>> {
+    let started = Instant::now();
+    #[cfg(feature = "metal")]
+    {
+        let frames = decoder.decode_device(latent)?;
+        mmh3_metal::Device::shared()?.synchronize()?;
+        let decoded = started.elapsed().as_secs_f64();
+        let pixels = frames.to_pixels()?;
+        Ok((pixels, decoded, started.elapsed().as_secs_f64() - decoded))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let pixels = decoder.decode(latent, false)?.pixels;
+        Ok((pixels, started.elapsed().as_secs_f64(), 0.0))
     }
 }
 
