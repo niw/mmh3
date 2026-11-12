@@ -5,6 +5,7 @@
 use mmh3_core::safetensors::SafeTensors;
 use mmh3_core::tensor::Tensor;
 use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
+use mmh3_metal::Device;
 use mmh3_metal::video_encoder::{MetalVideoEncoder, Temporal};
 use std::path::Path;
 
@@ -19,6 +20,16 @@ fn tensor(file: &SafeTensors, name: &str) -> Tensor {
         file.get(name).unwrap_or_else(|| panic!("missing {name}")),
     )
     .unwrap()
+}
+
+/// Whether the GPU has the matrix units that the video encoder needs. A GPU without them, such as
+/// the paravirtual GPU of a virtual machine, skips the test and says so.
+fn has_matrix_units() -> bool {
+    let supported = Device::shared().unwrap().supports_tensor_ops();
+    if !supported {
+        eprintln!("skipped: the video encoder needs the matrix units, which this GPU lacks");
+    }
+    supported
 }
 
 /// Cosine similarity and the largest absolute error against the largest expected magnitude.
@@ -59,6 +70,9 @@ fn compare(label: &str, actual: &Tensor, expected: &Tensor) {
 
 #[test]
 fn matches_diffusers_golden_picture() {
+    if !has_matrix_units() {
+        return;
+    }
     let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
     // Without latent statistics, as in Comfy-Org's file, the encoder takes the release's.
     assert!(file.get("latents_mean").is_none());

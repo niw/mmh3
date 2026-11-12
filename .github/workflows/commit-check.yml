@@ -1,0 +1,102 @@
+name: commit-check
+
+# NOTE: The checks run only when the files they read change, so that a change to the documents
+# does not take one of the few macOS jobs that run at once.
+on:
+  pull_request:
+    paths:
+      - .clang-format
+      - .clang-format-ignore
+      - .github/workflows/commit-check.yml
+      - .swiftformat
+      - Cargo.lock
+      - Cargo.toml
+      - Makefile
+      - crates/**
+      - ruff.toml
+      - src/**
+      - tests/**
+      - tools/**
+      - ty.toml
+      - "!**.md"
+  push:
+    branches:
+      - master
+    paths:
+      - .clang-format
+      - .clang-format-ignore
+      - .github/workflows/commit-check.yml
+      - .swiftformat
+      - Cargo.lock
+      - Cargo.toml
+      - Makefile
+      - crates/**
+      - ruff.toml
+      - src/**
+      - tests/**
+      - tools/**
+      - ty.toml
+      - "!**.md"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # NOTE: The runner has no GPU, so FEATURES leaves out CUDA, and make picks the crates without it.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-
+      - run: make check-format
+      - run: make lint FEATURES=server
+      - run: make check-typing FEATURES=server
+      - run: make test FEATURES=server
+
+  # NOTE: The preview image of Xcode 27 has the Swift 6.4 that .swiftformat takes.
+  macos:
+    runs-on: xcode-27
+    steps:
+      - uses: actions/checkout@v5
+      - run: sudo xcode-select --switch /Applications/Xcode_27.2.app
+      - name: Install Rust
+        id: rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt,clippy
+          rustup default stable
+          echo "version=$(rustc --version | cut -d ' ' -f 2)" >> "$GITHUB_OUTPUT"
+      - uses: astral-sh/setup-uv@v6
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-${{ steps.rust.outputs.version }}-
+      - run: brew install swiftformat ffmpeg
+      - run: make check-format
+      - run: make lint
+      - run: make check-typing
+      - run: make test

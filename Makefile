@@ -14,6 +14,19 @@ SEED = 1
 export PROMPT = A woman in a yellow raincoat opens a clear umbrella on a neon-lit Tokyo street at night. Rain patters on the umbrella, with distant traffic and soft piano music.
 
 comma := ,
+# Without a backend, the checks leave out the CUDA crates, which need the CUDA toolchain on Linux.
+ifneq ($(filter cuda metal,$(subst $(comma), ,$(FEATURES))),)
+CARGO_PACKAGES = --workspace
+endif
+# Options of cargo test, such as --no-run where no GPU is available.
+TEST_OPTIONS =
+RUFF = uvx ruff@0.16.7
+TY = uvx ty@0.0.101
+CLANG_FORMAT = uvx clang-format@23.1.1
+CLANG_FORMAT_FILES = $$(git ls-files '*.cu' '*.cuh' '*.cpp' '*.h' '*.metal')
+SWIFT_FILES = $$(git ls-files '*.swift')
+REQUIRE_CARGO = $(if $(shell command -v cargo),,$(error cargo is not installed. Install Rust))
+REQUIRE_UVX = $(if $(shell command -v uvx),,$(error uvx is not installed. Install uv))
 ifneq ($(filter metal,$(subst $(comma), ,$(FEATURES))),)
 # A smaller and shorter clip on Metal.
 BACKEND_OPTIONS = --width 672 --height 384 --frames 73
@@ -46,7 +59,7 @@ endif
 
 .PHONY: build
 build:
-	$(if $(shell command -v cargo),,$(error cargo is not installed. Install Rust))
+	$(REQUIRE_CARGO)
 	cargo build --release --features "$(FEATURES)" --bin mmh3
 
 # NOTE: the prompt goes through the environment so that quotes in it reach mmh3 as they are.
@@ -70,13 +83,49 @@ download-models:
 # Swift code builds on macOS alone.
 .PHONY: format
 format:
-	$(if $(shell command -v cargo),,$(error cargo is not installed. Install Rust))
-	$(if $(shell command -v uvx),,$(error uvx is not installed. Install uv))
+	$(REQUIRE_CARGO)
+	$(REQUIRE_UVX)
 	cargo fmt --all
-	uvx ruff@0.16.7 format tools
+	$(RUFF) format tools
 	@if command -v swiftformat >/dev/null; then \
-		swiftformat $$(git ls-files '*.swift'); \
+		swiftformat $(SWIFT_FILES); \
 	else \
 		echo "swiftformat is not installed, skipping the Swift code"; \
 	fi
-	uvx clang-format@23.1.1 -i $$(git ls-files '*.cu' '*.cuh' '*.cpp' '*.h' '*.metal')
+	$(CLANG_FORMAT) -i $(CLANG_FORMAT_FILES)
+
+# Checks that the code is formatted as format leaves it, without changing it.
+.PHONY: check-format
+check-format:
+	$(REQUIRE_CARGO)
+	$(REQUIRE_UVX)
+	cargo fmt --all --check
+	$(RUFF) format --check tools
+	@if command -v swiftformat >/dev/null; then \
+		swiftformat --lint $(SWIFT_FILES); \
+	else \
+		echo "swiftformat is not installed, skipping the Swift code"; \
+	fi
+	$(CLANG_FORMAT) --dry-run -Werror $(CLANG_FORMAT_FILES)
+
+# Lints the Rust code with clippy and the Python tools with ruff.
+.PHONY: lint
+lint:
+	$(REQUIRE_CARGO)
+	$(REQUIRE_UVX)
+	cargo clippy $(CARGO_PACKAGES) --features "$(FEATURES)" --all-targets -- -D warnings
+	$(RUFF) check tools
+
+# Type checks the Rust code with cargo check and the Python tools with ty. ty.toml leaves the
+# imports of ComfyUI and other packages unresolved, so ty checks the tools without them.
+.PHONY: check-typing
+check-typing:
+	$(REQUIRE_CARGO)
+	$(REQUIRE_UVX)
+	cargo check $(CARGO_PACKAGES) --features "$(FEATURES)" --all-targets
+	$(TY) check
+
+.PHONY: test
+test:
+	$(REQUIRE_CARGO)
+	cargo test $(CARGO_PACKAGES) --features "$(FEATURES)" $(TEST_OPTIONS)
