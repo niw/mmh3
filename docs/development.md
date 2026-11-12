@@ -96,5 +96,5 @@ The Rust checks and tests take the features of `make build`. Where no CUDA toolc
 on Linux, `FEATURES=server` leaves out the CUDA crates, for example `make lint FEATURES=server`.
 
 GitHub Actions runs these checks and the tests on each pull request and each push to master, on
-Linux without CUDA and on macOS with Metal. The runners have no GPU, so the Metal tests only build
-there.
+Linux without CUDA and on macOS with Metal. The Linux runner has no GPU, so the CUDA tests do not
+run there.

@@ -30,7 +30,6 @@ jobs:
       - run: make check-typing FEATURES=server
       - run: make test FEATURES=server
 
-  # NOTE: The runner has no GPU, so the Metal tests only build.
   macos:
     runs-on: macos-26
     steps:
@@ -43,8 +42,8 @@ jobs:
           components: rustfmt, clippy
       - uses: astral-sh/setup-uv@v6
       - uses: Swatinem/rust-cache@v2
-      - run: brew install swiftformat
+      - run: brew install swiftformat ffmpeg
       - run: make check-format
       - run: make lint
       - run: make check-typing
-      - run: make test TEST_OPTIONS=--no-run
+      - run: make test
