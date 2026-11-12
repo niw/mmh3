@@ -648,7 +648,7 @@ def main():
                 torch.backends.cudnn.allow_tf32 = tf32
                 audio_vae = comfy.sd.VAE(sd=dict(audio_weights), dtype=torch.float32)
 
-                def encode_sound(waveform):
+                def encode_sound(waveform, audio_vae=audio_vae):
                     # The node's helper drives the VAE wrapper, which moves the samples itself.
                     latent, _ = _encode_ref_audio(
                         audio_vae,

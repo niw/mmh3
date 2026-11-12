@@ -62,7 +62,8 @@ def main():
 
     tensors = {}
     with safe_open(arguments.text_encoder, "pt") as file:
-        for name in file.keys():
+        # NOTE: safe_open is not iterable, so it lists its tensors with keys().
+        for name in file.keys():  # noqa: SIM118
             if name.startswith("visual."):
                 tensors[name[len("visual.") :]] = file.get_tensor(name)
     width = tensors["merger.linear_fc2.weight"].shape[0]

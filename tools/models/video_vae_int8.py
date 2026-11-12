@@ -242,7 +242,7 @@ class Decoder:
         self.tensors = {
             name: torch.from_numpy(vae.load(name)).to(DEVICE)
             for name in vae.header
-            if name.startswith("decoder.") or name.startswith("post_quant_conv.")
+            if name.startswith(("decoder.", "post_quant_conv."))
         }
         self.picture = (
             self.tensors["decoder.proj_out.weight"].shape[0] == 3 * SPATIAL_RATIO**2

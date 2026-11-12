@@ -1,0 +1,2 @@
+# The scripts in tools/models import their shared modules by name.
+src = ["tools/models"]
