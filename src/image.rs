@@ -24,6 +24,7 @@ pub const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <image.png> [--models DIR]
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
+             [--save-context <text.safetensors>]
              [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
              [--renoise-sigma X] [--steps N] [--shift X] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
@@ -50,7 +51,9 @@ sigmas below X. The draft may then take every step.
 --steps samples in N steps on the uniform grid shifted by --shift, 12 by default, rather than on the six sigmas the
 checkpoint was distilled for, as a few-step LoRA such as PDMD's wants. A step then projects through the output heads
 of the distilled sigmas it spans, weighted by how much of it each one covers. --patch and --lora apply as they do to
-mmh3 generate.";
+mmh3 generate.
+--save-context also writes the text encoder's states of the prompt, which --context takes in place of the prompt
+and its encoder on the next run.";
 
 /// The DiT of MiniMax H3 Image inside the models directory.
 pub const IMAGE_DIT_FILE: &str =
@@ -67,6 +70,14 @@ const DEFAULT_MIN_GENERATION_AREA: usize = 2048 * 2048;
 /// The shift of the grid of `--steps`, the one PDMD's LoRA was distilled on.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const DEFAULT_SHIFT: f32 = 12.0;
+/// The room the steps and the decode of a picture work in beside the DiT and the VAE, which grows
+/// with the canvas: on an M5 Max the device allocations of a 2048×2048 picture peaked 3.96 GiB
+/// beyond the two checkpoints and those of a 4096×4096 one, the size the model is meant for,
+/// 6.90 GiB beyond, which is 2.97 GiB and 251 bytes a pixel. A GiB is to spare here.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const STEP_ROOM_BASE: usize = 4 << 30;
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const STEP_ROOM_PER_PIXEL: usize = 256;
 /// The most reference pictures an edit takes.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_REFERENCES: usize = 16;
@@ -226,6 +237,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "text-encoder",
             "vae",
             "save-latent",
+            "save-context",
             "attention-precision",
             "linear-precision",
             "vram-budget",
@@ -341,46 +353,81 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         )),
         false => Held::Alone,
     };
+    if options.contains_key("save-context") && !references.is_empty() {
+        return Err("--save-context saves a prompt without references".into());
+    }
     let (context, context_modalities) = match (prompt, options.get("context")) {
         (Some(prompt), None) => {
             let started = Instant::now();
             let path = option_path(&options, "text-encoder", TEXT_ENCODER_FILE)?;
-            let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
-                if references.is_empty() {
-                    let mut ids = Tokenizer::h3().encode(&prompt);
-                    ids.truncate(MAX_PROMPT_TOKENS);
-                    return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
+            let mut ids = Tokenizer::h3().encode(&prompt);
+            ids.truncate(MAX_PROMPT_TOKENS);
+            let key = crate::resident::ContextKey {
+                encoder: crate::worker::digest(&SafeTensors::open(Path::new(&path))?),
+                ids: ids.clone(),
+                references: references.iter().map(reference_digest).collect(),
+            };
+            let (context, modalities) = match held.context(&key) {
+                Some(kept) => {
+                    println!(
+                        "found the {} prompt tokens with {} pictures encoded",
+                        kept.0.shape[0],
+                        references.len()
+                    );
+                    kept
                 }
-                // The tower is gone before the prompt encodes.
-                let embeddings = {
-                    #[allow(unused_mut)]
-                    let mut vision = VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+                None => {
+                    // A server's states are kept under the encoder, the prompt and the
+                    // references, so its tower runs at the default precision, as its kept
+                    // encoder does, rather than at whatever the request asked.
                     #[cfg(feature = "metal")]
-                    vision.set_precision(
-                        crate::metal::default_linear_precision(),
-                        crate::metal::attention_precision(&options)?,
-                    )?;
-                    references
-                        .iter()
-                        .map(|reference| vision.encode(&reference.vision.to_tensor()))
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let grids: Vec<VisionGrid> = references
-                    .iter()
-                    .map(|reference| {
-                        VisionGrid::for_picture(reference.vision.height, reference.vision.width)
-                    })
-                    .collect();
-                let prompt = picture_prompt(&Tokenizer::h3(), &prompt, &grids, MAX_PROMPT_TOKENS);
-                let context = encoder.encode_prompt(&prompt, &embeddings, &[])?.context;
-                Ok((context, prompt.modalities))
-            })?;
-            println!(
-                "encoded {} prompt tokens with {} pictures in {:.1} s",
-                context.shape[0],
-                references.len(),
-                started.elapsed().as_secs_f64()
-            );
+                    let vision_precision = match &held {
+                        Held::Alone => crate::metal::attention_precision(&options)?,
+                        Held::Kept(_) => crate::metal::default_attention_precision(),
+                    };
+                    let (context, modalities) = held.text_encoder(&path, &options, |encoder| {
+                        if references.is_empty() {
+                            return Ok((encoder.encode(&ids, &[])?.context, Vec::new()));
+                        }
+                        // The tower is gone before the prompt encodes.
+                        let embeddings = {
+                            #[allow(unused_mut)]
+                            let mut vision =
+                                VisionEncoder::load(&SafeTensors::open(Path::new(&path))?)?;
+                            #[cfg(feature = "metal")]
+                            vision.set_precision(
+                                crate::metal::default_linear_precision(),
+                                vision_precision,
+                            )?;
+                            references
+                                .iter()
+                                .map(|reference| vision.encode(&reference.vision.to_tensor()))
+                                .collect::<Result<Vec<_>, _>>()?
+                        };
+                        let grids: Vec<VisionGrid> = references
+                            .iter()
+                            .map(|reference| {
+                                VisionGrid::for_picture(
+                                    reference.vision.height,
+                                    reference.vision.width,
+                                )
+                            })
+                            .collect();
+                        let prompt =
+                            picture_prompt(&Tokenizer::h3(), &prompt, &grids, MAX_PROMPT_TOKENS);
+                        let context = encoder.encode_prompt(&prompt, &embeddings, &[])?.context;
+                        Ok((context, prompt.modalities))
+                    })?;
+                    println!(
+                        "encoded {} prompt tokens with {} pictures in {:.1} s",
+                        context.shape[0],
+                        references.len(),
+                        started.elapsed().as_secs_f64()
+                    );
+                    held.keep_context(key, &context, &modalities);
+                    (context, modalities)
+                }
+            };
             (context, modalities)
         }
         (None, Some(path)) => {
@@ -403,7 +450,20 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if draft_steps > 0 && !references.is_empty() {
         return Err("--draft-steps cannot be combined with references".into());
     }
+    if let Some(path) = options.get("save-context") {
+        let mut metadata = Vec::new();
+        if let Some(prompt) = options.get("prompt") {
+            metadata.push(("prompt", *prompt));
+        }
+        mmh3_core::safetensors::write_f32(
+            Path::new(path),
+            &[("context", &context.shape, &context.data)],
+            &metadata,
+        )?;
+        println!("wrote the context {:?} to {path}", context.shape);
+    }
     let references = encode_references(&options, seed, &references)?;
+    held.make_room(&options, canvas_width * canvas_height)?;
 
     let (mut dit, dit_key) = held.dit(&options)?;
     let config = dit.config();
@@ -450,13 +510,25 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         latent_shape.clone(),
         noise.samples(latent_shape.iter().product()),
     );
-    let silence = Tensor::new(vec![0, 2, 0], Vec::new());
+    let mut inputs = DitInputs {
+        video: latent.clone(),
+        audio: Tensor::new(vec![0, 2, 0], Vec::new()),
+        context,
+        context_modalities,
+        keyframes: Vec::new(),
+        references,
+        sigma: sigmas[0],
+        shift_video: 1.0,
+        shift_audio: 1.0,
+    };
     println!(
         "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
+    let vae_path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
+    let vae_ahead = held.read_decoder_ahead(&vae_path, &options)?;
     // Metal refines the prompt once for every step.
     #[cfg(feature = "metal")]
-    let prepared = dit.prepare_text(&context)?;
+    let prepared = held.with_room(|| dit.prepare_text(&inputs.context))?;
     for step in 0..steps {
         let started = Instant::now();
         // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout is
@@ -470,28 +542,14 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 false => sparse,
             })
             .filter(|sparse| sparse.applies_to_step(step, steps));
-        let inputs = DitInputs {
-            video: latent.clone(),
-            audio: silence.clone(),
-            context: context.clone(),
-            context_modalities: context_modalities.clone(),
-            keyframes: Vec::new(),
-            references: references.clone(),
-            sigma: sigmas[step],
-            shift_video: 1.0,
-            shift_audio: 1.0,
-        };
-        // A kept model may be holding the room a step needs, and a step can run again.
-        let outputs = loop {
+        inputs.video = latent.clone();
+        inputs.sigma = sigmas[step];
+        let outputs = held.with_room(|| {
             #[cfg(feature = "cuda")]
-            let outputs = dit.forward(&inputs, &[], step_sparse.as_ref());
+            return dit.forward(&inputs, &[], step_sparse.as_ref());
             #[cfg(feature = "metal")]
-            let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref());
-            match outputs {
-                Err(error) if error.is_out_of_memory() && held.let_go_of_one() => continue,
-                outputs => break outputs?,
-            }
-        };
+            return prepared.forward(&inputs, &[], step_sparse.as_ref());
+        })?;
         let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
         // The enlargement after the last draft step says its own time, so the step leaves it out.
         let mut enlarging = 0.0;
@@ -550,10 +608,9 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
 
     let started = Instant::now();
-    let path = option_path(&options, "vae", IMAGE_VAE_FILE)?;
-    let pixels = held.decode(&path, &options, &latent)?;
+    let (pixels, timing) = held.decode(&vae_path, &options, &latent, vae_ahead)?;
     println!(
-        "decoded the picture with {path} in {:.1} s",
+        "decoded the picture with {vae_path} in {:.1} s: {timing}",
         started.elapsed().as_secs_f64()
     );
     write_png(&pixels, width, height, out)?;
@@ -604,6 +661,69 @@ impl Held {
         }
     }
 
+    /// The encoded prompt a server kept from an earlier picture of the same prompt and references
+    /// through the same encoder, which spares it the encoder's load and the encode.
+    fn context(
+        &mut self,
+        key: &crate::resident::ContextKey,
+    ) -> Option<(Tensor, Vec<mmh3_core::dit::timestep::Modality>)> {
+        match self {
+            Held::Alone => None,
+            Held::Kept(table) => table.borrow().context(key),
+        }
+    }
+
+    /// Keeps an encoded prompt for the pictures after this one, where the models are kept.
+    fn keep_context(
+        &mut self,
+        key: crate::resident::ContextKey,
+        context: &Tensor,
+        modalities: &[mmh3_core::dit::timestep::Modality],
+    ) {
+        if let Held::Kept(table) = self {
+            table
+                .borrow()
+                .keep_context(key, context.clone(), modalities.to_vec());
+        }
+    }
+
+    /// Where the models are kept, lets go of the kept models the picture does not use, and then
+    /// of the text encoder now that the prompt is encoded, until the device has room for the DiT,
+    /// the adapters and the picture VAE it has yet to read and for the work of the steps on
+    /// `pixels` of canvas, so that a Mac without the room for all three keeps the DiT and the VAE
+    /// between pictures and reads the encoder for each prompt, rather than finding out at the
+    /// first step that ran out of memory.
+    fn make_room(
+        &mut self,
+        options: &std::collections::HashMap<&str, &str>,
+        pixels: usize,
+    ) -> Result<(), Box<dyn Error>> {
+        let Held::Kept(table) = self else {
+            return Ok(());
+        };
+        let dit = SafeTensors::open(Path::new(&option_path(options, "dit", IMAGE_DIT_FILE)?))?;
+        let vae = SafeTensors::open(Path::new(&option_path(options, "vae", IMAGE_VAE_FILE)?))?;
+        let (dit_key, adapters) = dit_key(&dit, options)?;
+        let vae_key = decoder_key(&vae);
+        let mut models = table.borrow();
+        let mut bytes = STEP_ROOM_BASE + STEP_ROOM_PER_PIXEL * pixels;
+        let applied = match models.dit_key() {
+            Some(kept) if dit_key.builds_on(kept) => kept.adapters.len(),
+            _ => {
+                bytes += file_bytes(&dit);
+                0
+            }
+        };
+        for (path, _) in &adapters[applied..] {
+            bytes += file_bytes(&SafeTensors::open(Path::new(path))?);
+        }
+        if !models.has_picture_decoder(vae_key) {
+            bytes += file_bytes(&vae);
+        }
+        models.make_room(bytes, &dit_key, vae_key);
+        Ok(())
+    }
+
     /// The DiT of `--dit` or the models directory, with the key it goes back into the table under
     /// when it is kept. A kept DiT runs INT8 linear layers on CUDA, since NVFP4 ones would stay in
     /// it for the runs after this one.
@@ -629,23 +749,11 @@ impl Held {
         }
         let path = option_path(options, "dit", IMAGE_DIT_FILE)?;
         let file = SafeTensors::open(Path::new(&path))?;
-        let adapters = wanted_adapters(options)?;
-        let key = crate::resident::DitKey {
-            checkpoint: crate::worker::digest(&file),
-            adapters: adapters
-                .iter()
-                .map(|(_, adapter)| (adapter.digest, adapter.strength.to_bits(), adapter.mode))
-                .collect(),
-        };
+        let (key, adapters) = dit_key(&file, options)?;
         let mut models = table.borrow();
         // Adapters only ever add, so a kept DiT whose adapters begin this run's takes the rest.
         let (mut dit, applied) = match models.take_dit() {
-            Some((kept, dit))
-                if kept.checkpoint == key.checkpoint
-                    && key.adapters.starts_with(&kept.adapters) =>
-            {
-                (dit, kept.adapters.len())
-            }
+            Some((kept, dit)) if key.builds_on(&kept) => (dit, kept.adapters.len()),
             other => {
                 drop(other);
                 let started = Instant::now();
@@ -685,7 +793,22 @@ impl Held {
         }
     }
 
-    /// Lets go of the kept model used least, for a step that ran out of memory, and says whether
+    /// Runs `work`, which can run again, letting go of the kept model used least and running it
+    /// again each time the device runs out of memory: a kept model may be holding the room a step
+    /// or the prompt's refinement needs. A run holding nothing else fails as the device did.
+    fn with_room<T, E: Into<Box<dyn Error>>>(
+        &mut self,
+        mut work: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, Box<dyn Error>> {
+        loop {
+            match work().map_err(Into::into) {
+                Err(error) if crate::resident::out_of_memory(&*error) && self.let_go_of_one() => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// Lets go of the kept model used least, for work that ran out of memory, and says whether
     /// there was one.
     fn let_go_of_one(&mut self) -> bool {
         match self {
@@ -694,50 +817,242 @@ impl Held {
         }
     }
 
-    /// Decodes a latent with the picture VAE of `path` into pixels `[3, 1, height, width]`.
+    /// Starts reading the picture VAE of `path` on a thread of its own, so that the read hides
+    /// behind the steps: it uploads the weights between the steps' calls on the device. A run alone
+    /// gets the decoder back through the handle; a server's table keeps it, where the decode finds
+    /// it. A read that fails says so and leaves the decode to read again, having cost the steps
+    /// nothing.
+    fn read_decoder_ahead(
+        &mut self,
+        path: &str,
+        options: &std::collections::HashMap<&str, &str>,
+    ) -> Result<DecoderAhead, Box<dyn Error>> {
+        use crate::resident::Table;
+
+        let device = crate::resident::current_device();
+        let path = path.to_owned();
+        let read: DecoderRead = match self {
+            Held::Alone => {
+                let precision = decoder_precision(options)?;
+                Box::new(move || {
+                    let file = SafeTensors::open(Path::new(&path))?;
+                    Ok(Some(load_decoder(&file, precision)?))
+                })
+            }
+            Held::Kept(table) => {
+                let device = table.device();
+                Box::new(move || {
+                    let file = SafeTensors::open(Path::new(&path))?;
+                    let key = decoder_key(&file);
+                    Table::new(device).with_room(|models| {
+                        models.picture_decoder(Path::new(&path), key).map(|_| ())
+                    })?;
+                    Ok(None)
+                })
+            }
+        };
+        let thread = std::thread::Builder::new()
+            .name("picture VAE".to_owned())
+            .spawn(move || {
+                let started = Instant::now();
+                let decoder = match crate::resident::bind_device(device).and_then(|()| read()) {
+                    Ok(decoder) => decoder,
+                    Err(error) => {
+                        eprintln!("warning: reading the picture VAE during the steps: {error}");
+                        None
+                    }
+                };
+                (decoder, started.elapsed().as_secs_f64())
+            })?;
+        Ok(DecoderAhead { thread })
+    }
+
+    /// Decodes a latent with the picture VAE of `path` into pixels `[3, 1, height, width]`, with
+    /// the decoder `ahead` read during the steps or one read here.
     fn decode(
         &mut self,
         path: &str,
-        #[allow(unused_variables)] options: &std::collections::HashMap<&str, &str>,
+        options: &std::collections::HashMap<&str, &str>,
         latent: &Tensor,
-    ) -> Result<Tensor, Box<dyn Error>> {
-        use crate::resident::VideoDecoder;
-        use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
-
+        ahead: DecoderAhead,
+    ) -> Result<(Tensor, DecodeTiming), Box<dyn Error>> {
+        let waited = Instant::now();
+        let (decoder, mut timing) = match ahead.thread.join() {
+            Ok((decoder, read)) => (
+                decoder,
+                DecodeTiming {
+                    read,
+                    waited: waited.elapsed().as_secs_f64(),
+                    ..DecodeTiming::default()
+                },
+            ),
+            Err(_) => (None, DecodeTiming::default()),
+        };
+        let read = Instant::now();
         let file = SafeTensors::open(Path::new(path))?;
-        match self {
+        let (pixels, decoded, read_back) = match self {
             Held::Alone => {
-                #[allow(unused_mut)]
-                let mut decoder =
-                    VideoDecoder::load(&file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
-                #[cfg(feature = "metal")]
-                decoder.set_precision(
-                    crate::metal::default_linear_precision(),
-                    crate::metal::attention_precision(options)?,
-                )?;
-                Ok(decoder.decode(latent, false)?.pixels)
+                let decoder = match decoder {
+                    Some(decoder) => decoder,
+                    None => load_decoder(&file, decoder_precision(options)?)?,
+                };
+                timing.read += read.elapsed().as_secs_f64();
+                decode_timed(&decoder, latent)?
             }
             Held::Kept(table) => {
-                let key = (
-                    crate::worker::digest(&file),
-                    DEFAULT_TILE_SIZE,
-                    PICTURE_TILE_OVERLAP_MIN,
-                );
+                let key = decoder_key(&file);
                 table.with_room(|models| {
-                    let decoder = models.video_decoder(Path::new(path), key)?;
-                    Ok(decoder.decode(latent, false)?.pixels)
-                })
+                    let decoder = models.picture_decoder(Path::new(path), key)?;
+                    timing.read += read.elapsed().as_secs_f64();
+                    decode_timed(decoder, latent)
+                })?
             }
-        }
+        };
+        timing.decoded = decoded;
+        timing.read_back = read_back;
+        Ok((pixels, timing))
     }
 }
+
+/// The thread reading the picture VAE while the steps run, with the decoder it read for a run
+/// alone and how long it took.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+struct DecoderAhead {
+    thread: std::thread::JoinHandle<(Option<crate::resident::VideoDecoder>, f64)>,
+}
+
+/// The read that thread runs, which gives back the decoder for a run alone.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+type DecoderRead =
+    Box<dyn FnOnce() -> Result<Option<crate::resident::VideoDecoder>, Box<dyn Error>> + Send>;
+
+/// Where the time of a decode went: reading the VAE, which mostly overlaps the steps and only
+/// counts as waited for where it ran past them, the decode on the device and the pixels' way back.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+#[derive(Default)]
+struct DecodeTiming {
+    read: f64,
+    waited: f64,
+    decoded: f64,
+    read_back: f64,
+}
+
+#[cfg(any(feature = "cuda", feature = "metal"))]
+impl std::fmt::Display for DecodeTiming {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "VAE read in {:.1} s during the steps and waited for {:.1} s, decoded in {:.1} s, read \
+             back in {:.1} s",
+            self.read, self.waited, self.decoded, self.read_back
+        )
+    }
+}
+
+/// The bytes of a checkpoint's tensors, which is about what reading it whole takes on the device.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn file_bytes(file: &SafeTensors) -> usize {
+    file.tensors().iter().map(|info| info.byte_count()).sum()
+}
+
+/// What a kept picture VAE is: its checkpoint and the tile geometry a picture decodes in.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decoder_key(file: &SafeTensors) -> crate::resident::VideoDecoderKey {
+    use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
+
+    (
+        crate::worker::digest(file),
+        DEFAULT_TILE_SIZE,
+        PICTURE_TILE_OVERLAP_MIN,
+    )
+}
+
+/// The precisions a run alone decodes with, which on Metal follow `--attention-precision`.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decoder_precision(
+    #[allow(unused_variables)] options: &std::collections::HashMap<&str, &str>,
+) -> Result<DecoderPrecision, Box<dyn Error>> {
+    #[cfg(feature = "metal")]
+    return Ok((
+        crate::metal::default_linear_precision(),
+        crate::metal::attention_precision(options)?,
+    ));
+    #[cfg(feature = "cuda")]
+    Ok(())
+}
+
+#[cfg(feature = "metal")]
+type DecoderPrecision = (mmh3_metal::LinearPrecision, mmh3_metal::AttentionPrecision);
+#[cfg(feature = "cuda")]
+type DecoderPrecision = ();
+
+/// The picture VAE of `file` with its weights on the device, for a run alone.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn load_decoder(
+    file: &SafeTensors,
+    #[allow(unused_variables)] precision: DecoderPrecision,
+) -> Result<crate::resident::VideoDecoder, Box<dyn Error>> {
+    use mmh3_core::vae::{DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN};
+
+    #[allow(unused_mut)]
+    let mut decoder =
+        crate::resident::VideoDecoder::load(file, "", DEFAULT_TILE_SIZE, PICTURE_TILE_OVERLAP_MIN)?;
+    #[cfg(feature = "metal")]
+    decoder.set_precision(precision.0, precision.1)?;
+    Ok(decoder)
+}
+
+/// Decodes `latent`, with the seconds the device took and the seconds the pixels took to come
+/// back. CUDA's decode brings them back itself, so there the first holds both.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn decode_timed(
+    decoder: &crate::resident::VideoDecoder,
+    latent: &Tensor,
+) -> Result<(Tensor, f64, f64), Box<dyn Error>> {
+    let started = Instant::now();
+    #[cfg(feature = "metal")]
+    {
+        let frames = decoder.decode_device(latent)?;
+        mmh3_metal::Device::shared()?.synchronize()?;
+        let decoded = started.elapsed().as_secs_f64();
+        let pixels = frames.to_pixels()?;
+        Ok((pixels, decoded, started.elapsed().as_secs_f64() - decoded))
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let pixels = decoder.decode(latent, false)?.pixels;
+        Ok((pixels, started.elapsed().as_secs_f64(), 0.0))
+    }
+}
+
+/// What the DiT of `file` with the adapters `options` asks for is kept under, with those adapters
+/// and the files they come from.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn dit_key(
+    file: &SafeTensors,
+    options: &std::collections::HashMap<&str, &str>,
+) -> Result<(crate::resident::DitKey, Adapters), Box<dyn Error>> {
+    let adapters = wanted_adapters(options)?;
+    let key = crate::resident::DitKey {
+        checkpoint: crate::worker::digest(file),
+        adapters: adapters
+            .iter()
+            .map(|(_, adapter)| (adapter.digest, adapter.strength.to_bits(), adapter.mode))
+            .collect(),
+    };
+    Ok((key, adapters))
+}
+
+/// Adapters with the files they come from, in the order they apply.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+type Adapters = Vec<(String, mmh3_core::worker::Adapter)>;
 
 /// The patch of `--patch` and the LoRA of `--lora` with the files they come from, in the order they
 /// apply, since they do not commute. A patch applies as adapters at full strength.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 fn wanted_adapters(
     options: &std::collections::HashMap<&str, &str>,
-) -> Result<Vec<(String, mmh3_core::worker::Adapter)>, Box<dyn Error>> {
+) -> Result<Adapters, Box<dyn Error>> {
     use crate::models::model_file;
     use mmh3_core::worker::Adapter;
 
@@ -848,6 +1163,19 @@ fn encode_references(
         started.elapsed().as_secs_f64()
     );
     Ok(latents)
+}
+
+/// What tells one reference from another in a kept prompt: the pixels of both copies the
+/// encoders read.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn reference_digest(reference: &EditReference) -> u64 {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let mut hasher = DefaultHasher::new();
+    for picture in [&reference.encoded, &reference.vision] {
+        (picture.width, picture.height, &picture.pixels).hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// The top left of a latent `[channels, 1, height, width]` in whole 2 × 2 patches.

@@ -3762,11 +3762,7 @@ fn session_dit<'a>(
 ) -> Result<&'a mut Dit, Box<dyn Error>> {
     let wanted = dit_key(open);
     let taken = kept.take_dit();
-    let reusable = matches!(
-        &taken,
-        Some((key, _))
-            if key.checkpoint == wanted.checkpoint && wanted.adapters.starts_with(&key.adapters)
-    );
+    let reusable = matches!(&taken, Some((key, _)) if wanted.builds_on(key));
     let (mut dit, applied) = match reusable {
         true => {
             let (key, dit) = taken.expect("a key matched one");

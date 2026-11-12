@@ -430,10 +430,21 @@ pub fn set_allocation_limit(bytes: usize) {
 pub fn free_bytes() -> Result<usize, CudaError> {
     let device = current_device()?;
     let (free, _) = memory_info()?;
-    Ok(match LIMIT[device].load(Ordering::Relaxed) {
+    Ok(within_limit(device, free))
+}
+
+/// What `free_bytes` answers for `device`, from whichever device this thread computes on.
+pub fn free_bytes_on(device: usize) -> Result<usize, CudaError> {
+    let (free, _) = memory_info_on(device)?;
+    Ok(within_limit(device, free))
+}
+
+/// `free` held to what the limit of `device` leaves.
+fn within_limit(device: usize, free: usize) -> usize {
+    match LIMIT[device].load(Ordering::Relaxed) {
         0 => free,
         limit => free.min(limit.saturating_sub(ALLOCATED[device].load(Ordering::Relaxed))),
-    })
+    }
 }
 
 /// A device allocation, or a view into one that somebody else owns.

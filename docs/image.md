@@ -66,6 +66,8 @@ description of the whole picture, as in [Prompts](#prompts).
 - `--save-latent FILE`: Also writes the final latent, which the INT8 picture VAE is calibrated
   on.
 - `--context FILE`: The text encoder states of a `text.safetensors` in place of a prompt.
+- `--save-context FILE`: Also writes the text encoder states of the prompt as such a file, which
+  `--context` takes on the next run of the same prompt in place of the prompt and its encoder.
 
 The six steps run on the sigmas the checkpoint was distilled for, with the output head of each
 step, and the picture VAE decodes in tiles of 256 pixels that overlap by at least 64, as the
