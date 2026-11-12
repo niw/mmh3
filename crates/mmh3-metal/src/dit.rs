@@ -20,7 +20,7 @@ use mmh3_core::{
         veda::VedaPredictor,
         vsa::VsaPlan,
     },
-    safetensors::SafeTensors,
+    safetensors::{SafeTensors, TensorInfo},
     shard::{ExchangeError, Region, VelocityRows, regions as shard_regions},
     streaming::{Arrangement, Files, Unit, give_up_order},
     tensor::Tensor,
@@ -219,6 +219,28 @@ impl MetalDit {
         Ok(())
     }
 
+    /// Refuses a patch's `final_layer.video_out` that is not a whole bank of output heads when the
+    /// DiT has one. The bank is split once it is read, so `replace` finds no tensor to compare.
+    fn check_output_heads(&self, name: &str, info: &TensorInfo) -> Result<()> {
+        let heads = self.config.step_sigmas.len();
+        let Some(suffix @ ("weight" | "bias")) = name.strip_prefix("final_layer.video_out.") else {
+            return Ok(());
+        };
+        if heads < 2 {
+            return Ok(());
+        }
+        let mut shape = self
+            .weights
+            .shape(&format!("final_layer.video_out.0.{suffix}"))?;
+        shape[0] *= heads;
+        if info.shape != shape {
+            return Err(Error::new(format!(
+                "{name} in the patch is not a bank of {heads} output heads"
+            )));
+        }
+        Ok(())
+    }
+
     /// The video output layer of a step at `sigma`.
     fn video_output(&self, sigma: f32) -> String {
         match self.config.step_sigmas.is_empty() {
@@ -321,6 +343,7 @@ impl MetalDit {
             {
                 continue;
             }
+            self.check_output_heads(name, info)?;
             match (&mut self.stream, Self::unit_index(&self.config, name)) {
                 (Some(stream), Some(unit)) => {
                     self.weights.replace_absent(name, info)?;
@@ -334,6 +357,7 @@ impl MetalDit {
         }
         if replaced > 0 {
             self.time_table = self.weights.host("adaln_t_table")?;
+            Self::split_output_heads(&self.config, &mut self.weights)?;
         }
         let added = self.weights.add_lora(file, strength)? + replaced;
         if added == 0 {

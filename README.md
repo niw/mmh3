@@ -114,15 +114,18 @@ A [server](docs/server.md) that keeps the models loaded takes 26 s with the fast
 
 ### Pictures on Metal
 
-On an M6 with 24 GB, a 4096×4096 picture took:
+A 4096×4096 picture took:
 
-| Settings | Time per step | Time |
-| --- | ---: | ---: |
-| [Faster settings](docs/image.md#faster): 2 draft steps, Sol-Attn and INT8/FP16 attention | 26 s | 165 s |
-| Defaults, FP16 attention | 49 s | 337 s |
+| Mac | Settings | Time per step | Time |
+| --- | --- | ---: | ---: |
+| M6, 24 GB | [Faster settings](docs/image.md#faster): 2 draft steps, Sol-Attn and INT8/FP16 attention | 26 s | 165 s |
+| M6, 24 GB | Defaults, FP16 attention | 49 s | 337 s |
+| M5 Max, 128 GB | 2 [draft steps](docs/draft-steps.md) enlarged bilinearly, Sol-Attn and FP16 attention | 14 s | 89 s |
+| M5 Max, 128 GB | Defaults, FP16 attention | 24 s | 165 s |
 
-The DiT's blocks that do not fit are read from the disk as they run.
-[Image](docs/image.md) has the times of other settings.
+On the M6, the DiT's blocks that do not fit are read from the disk as they run. The M5 Max is a
+14-inch MacBook Pro in High Power Mode on AC power, whose GPU clock moved its times by two thirds to
+one and a half times. [Image](docs/image.md#speed) has the times of other settings.
 
 ## Status
 

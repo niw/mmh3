@@ -383,6 +383,261 @@ fn adapter_lora_matches_a_cpu_weight_update() {
     assert!(dit.add_lora(&lora, strength).is_err());
 }
 
+/// The sigmas MiniMax H3 Image's bank of output heads was distilled on, one per head.
+const IMAGE_SIGMAS: [f32; 6] = [
+    1.0,
+    0.967_523_7,
+    0.887_548_5,
+    0.75,
+    0.532_773_9,
+    0.232_008_87,
+];
+
+/// A tensor as a checkpoint stores it.
+struct Stored {
+    name: String,
+    dtype: mmh3_core::safetensors::DType,
+    shape: Vec<usize>,
+    bytes: Vec<u8>,
+}
+
+/// A checkpoint written for a test, which the DiT reads from its path while it loads.
+struct Checkpoint {
+    file: SafeTensors,
+    path: std::path::PathBuf,
+}
+
+impl Drop for Checkpoint {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn write_checkpoint(tensors: &[Stored], metadata: &[(&str, &str)]) -> Checkpoint {
+    use mmh3_core::json::quote;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let mut entries = vec![format!(
+        "\"__metadata__\":{{{}}}",
+        metadata
+            .iter()
+            .map(|(key, value)| format!("{}:{}", quote(key), quote(value)))
+            .collect::<Vec<_>>()
+            .join(",")
+    )];
+    let mut offset = 0;
+    for tensor in tensors {
+        let end = offset + tensor.bytes.len();
+        entries.push(format!(
+            "{}:{{\"dtype\":\"{}\",\"shape\":{:?},\"data_offsets\":[{offset},{end}]}}",
+            quote(&tensor.name),
+            tensor.dtype.name(),
+            tensor.shape
+        ));
+        offset = end;
+    }
+    let mut header = format!("{{{}}}", entries.join(","));
+    while !header.len().is_multiple_of(8) {
+        header.push(' ');
+    }
+
+    static WRITTEN: AtomicUsize = AtomicUsize::new(0);
+    let path = std::env::temp_dir().join(format!(
+        "mmh3-metal-dit-image-{}-{}.safetensors",
+        std::process::id(),
+        WRITTEN.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::File::create(&path).unwrap();
+    file.write_all(&(header.len() as u64).to_le_bytes())
+        .unwrap();
+    file.write_all(header.as_bytes()).unwrap();
+    for tensor in tensors {
+        file.write_all(&tensor.bytes).unwrap();
+    }
+    Checkpoint {
+        file: SafeTensors::open(&path).unwrap(),
+        path,
+    }
+}
+
+/// The fixture's weights as MiniMax H3 Image's checkpoint holds its own: without the audio stream,
+/// with BF16 AdaLN biases, with ComfyUI's attention hint beside a block, and with a bank of
+/// `heads` output heads, the first the fixture's and the others stored as offsets from it, with
+/// their sigmas in the metadata when `sigmas` is set. With `merged`, the checkpoint instead has
+/// the one head that is the first plus the offset of head `merged`.
+fn image_checkpoint(heads: usize, sigmas: bool, merged: Option<usize>) -> Checkpoint {
+    use mmh3_core::numeric::f32_to_bf16;
+    use mmh3_core::safetensors::DType;
+
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let mut tensors = Vec::new();
+    for info in file.tensors() {
+        let Some(name) = info.name.strip_prefix("weight.") else {
+            continue;
+        };
+        if name.starts_with("audio_patch_proj.") || name.starts_with("final_layer.audio_out.") {
+            continue;
+        }
+        let tensor = Tensor::load(&file, info).unwrap();
+        let (dtype, shape, values) = if name.starts_with("final_layer.video_out.") {
+            let size = tensor.data.len();
+            let offset = |head: usize, index: usize| {
+                ((index * 7 + head * 13) as f32 * 0.61).sin() * 0.05 * head as f32
+            };
+            let first = &tensor.data;
+            let bank: Vec<f32> = match merged {
+                Some(head) => (0..size)
+                    .map(|index| first[index] + offset(head, index))
+                    .collect(),
+                None => (0..heads)
+                    .flat_map(|head| {
+                        (0..size).map(move |index| match head {
+                            0 => first[index],
+                            _ => offset(head, index),
+                        })
+                    })
+                    .collect(),
+            };
+            let mut shape = tensor.shape.clone();
+            shape[0] *= bank.len() / size;
+            let bytes = bank.iter().flat_map(|value| value.to_le_bytes()).collect();
+            (DType::F32, shape, bytes)
+        } else if name.ends_with("adaln_proj.linear.bias") {
+            let bytes = tensor
+                .data
+                .iter()
+                .flat_map(|&value| f32_to_bf16(value).to_le_bytes())
+                .collect();
+            (DType::BF16, tensor.shape.clone(), bytes)
+        } else {
+            (info.dtype, info.shape.clone(), file.data(info).to_vec())
+        };
+        tensors.push(Stored {
+            name: name.to_owned(),
+            dtype,
+            shape,
+            bytes: values,
+        });
+    }
+    let hint = br#"{"sage_attention": false}"#;
+    tensors.push(Stored {
+        name: "blocks.0.attn.comfy_attention.config".to_owned(),
+        dtype: DType::U8,
+        shape: vec![hint.len()],
+        bytes: hint.to_vec(),
+    });
+
+    let config = format!(
+        "{{\"transformer\": {{\"pdd_sigmas\": {:?}}}}}",
+        IMAGE_SIGMAS.iter().chain(&[0.0]).collect::<Vec<_>>()
+    );
+    let named = [("config", config.as_str())];
+    write_checkpoint(&tensors, if sigmas { &named } else { &[] })
+}
+
+/// One step of text-to-image at `sigma` on the fixture's first latent frame.
+fn image_inputs(sigma: f32) -> DitInputs {
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    DitInputs {
+        video: frames(&unbatched(tensor(&file, "input.video")), 0, 1),
+        audio: Tensor::new(vec![0, 2, 0], Vec::new()),
+        context: unbatched(tensor(&file, "input.context")),
+        context_modalities: Vec::new(),
+        keyframes: Vec::new(),
+        references: Vec::new(),
+        sigma,
+        shift_video: 1.0,
+        shift_audio: 1.0,
+    }
+}
+
+#[test]
+fn reads_an_image_checkpoint() {
+    let checkpoint = image_checkpoint(6, true, None);
+    let dit = MetalDit::load(&checkpoint.file, "").unwrap();
+    let config = dit.config();
+    assert_eq!(config.audio_channels, 0);
+    assert_eq!(config.step_sigmas, IMAGE_SIGMAS);
+
+    let unnamed = image_checkpoint(6, false, None);
+    assert!(MetalDit::load(&unnamed.file, "").is_err());
+}
+
+#[test]
+fn projects_each_step_with_its_merged_head() {
+    let bank = MetalDit::load(&image_checkpoint(6, true, None).file, "").unwrap();
+    let mut outputs = Vec::new();
+    for head in [0, 3, 5] {
+        let single = MetalDit::load(&image_checkpoint(1, false, Some(head)).file, "").unwrap();
+        assert!(single.config().step_sigmas.is_empty());
+        let inputs = image_inputs(IMAGE_SIGMAS[head]);
+        let expected = single.forward(&inputs, &[], None).unwrap();
+        let actual = bank.forward(&inputs, &[], None).unwrap();
+        assert_close(&format!("head {head}"), &actual.video, &expected.video);
+        assert!(actual.audio.is_empty());
+        outputs.push(actual.video);
+    }
+    assert!(video_change(&outputs[0], &outputs[1]) > 1e-3);
+
+    // A sigma between two of the bank's takes the nearer head.
+    let near = bank.forward(&image_inputs(0.74), &[], None).unwrap();
+    let single = MetalDit::load(&image_checkpoint(1, false, Some(3)).file, "").unwrap();
+    let expected = single.forward(&image_inputs(0.74), &[], None).unwrap();
+    assert_close("nearest head", &near.video, &expected.video);
+}
+
+#[test]
+fn refuses_inputs_that_do_not_match_the_streams() {
+    let image = MetalDit::load(&image_checkpoint(6, true, None).file, "").unwrap();
+    let file = SafeTensors::open(Path::new(FIXTURE)).unwrap();
+    let mut with_audio = image_inputs(0.5);
+    with_audio.audio = unbatched(tensor(&file, "input.audio"));
+    assert!(image.forward(&with_audio, &[], None).is_err());
+
+    let video = MetalDit::load(&file, "weight.").unwrap();
+    assert_eq!(video.config().audio_channels, 32);
+    let mut silent = image_inputs(0.5);
+    silent.audio = Tensor::new(vec![32, 2, 0], Vec::new());
+    assert!(video.forward(&silent, &[], None).is_err());
+}
+
+/// A patch that replaces the bank of output heads reaches the steps, and one of another shape is
+/// refused.
+#[test]
+fn a_patch_replaces_the_bank_of_output_heads() {
+    use mmh3_core::safetensors::DType;
+
+    let checkpoint = image_checkpoint(6, true, None);
+    let shape = checkpoint
+        .file
+        .get("final_layer.video_out.weight")
+        .unwrap()
+        .shape
+        .clone();
+    let mut dit = MetalDit::load(&checkpoint.file, "").unwrap();
+    let inputs = image_inputs(IMAGE_SIGMAS[3]);
+    let before = dit.forward(&inputs, &[], None).unwrap();
+
+    let bank = |shape: Vec<usize>| {
+        let bytes = vec![0; shape.iter().product::<usize>() * 4];
+        write_checkpoint(
+            &[Stored {
+                name: "diffusion_model.final_layer.video_out.weight".to_owned(),
+                dtype: DType::F32,
+                shape,
+                bytes,
+            }],
+            &[],
+        )
+    };
+    let single = vec![shape[0] / IMAGE_SIGMAS.len(), shape[1]];
+    assert!(dit.add_lora(&bank(single).file, 1.0).is_err());
+    assert_eq!(dit.add_lora(&bank(shape).file, 1.0).unwrap(), 1);
+    let after = dit.forward(&inputs, &[], None).unwrap();
+    assert!(video_change(&before.video, &after.video) > 1e-3);
+}
+
 /// MiniMax H3 Image's DiT: the fixture without its audio layers and with an output head per step,
 /// stacked as ComfyUI's PDD bank, the first head whole and the others as offsets from it. A step
 /// follows the CPU reference of the fixture whose output layer is the head of the step's sigma,

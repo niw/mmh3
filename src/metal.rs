@@ -171,6 +171,19 @@ mod tests {
         }
     }
 
+    /// A command with no worker refuses a precision without sending its user to one.
+    #[test]
+    fn a_run_without_workers_refuses_without_pointing_at_one() {
+        let refusals = [
+            attention_precision(&options(&[("attention-precision", "bf16")])).map(|_| ()),
+            linear_precision(&options(&[("linear-precision", "nvfp4")])).map(|_| ()),
+        ];
+        for refusal in refusals {
+            let error = refusal.unwrap_err().to_string();
+            assert!(!error.contains("--worker"), "refused with {error:?}");
+        }
+    }
+
     /// Sol-Attn, VSA and the patches that bring VSA's gates run here.
     #[test]
     fn a_step_may_attend_sparsely_and_take_a_patch() {
