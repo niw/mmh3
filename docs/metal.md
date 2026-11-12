@@ -1,8 +1,8 @@
 # Metal on macOS
 
-The `metal` backend runs video generation on Apple silicon, using the same model
-checkpoints as the CUDA backend. MP4 output uses VideoToolbox for H.264 video and AAC audio.
-External encoding through ffmpeg is optional.
+The `metal` backend runs video generation on Apple silicon, and picture generation with
+[MiniMax H3 Image](image.md), using the same model checkpoints as the CUDA backend. MP4 output uses
+VideoToolbox for H.264 video and AAC audio. External encoding through ffmpeg is optional.
 
 ## Requirements
 
@@ -103,9 +103,8 @@ Text prompts, precomputed `--context` tensors, adapter LoRAs, patches such as
 [first and last frames](fl2va.md) and [reference pictures, sounds and clips](ref2va.md)
 (`--first-frame`, `--last-frame`, `--reference`, `--reference-audio`, `--reference-video`). Their
 video VAE encoder runs its convolutions in FP16 on the matrix units, so they need macOS 26, and
-VideoToolbox decodes the frames of a reference clip. Pictures from text and edits of reference
-pictures with [MiniMax H3 Image](image.md) run with `mmh3 image`, whose edits need macOS 26 for
-the same encoder. INT8/FP8 attention, NVFP4 and LoRA merge mode are not yet supported.
+VideoToolbox decodes the frames of a reference clip. INT8/FP8 attention, NVFP4 and LoRA merge mode
+are not yet supported.
 The Metal CLI supports `generate`, `image`, `latent`, `device` and checkpoint inspection. The
 `bench` and `check` are not yet available. See [Usage](usage.md) for general command options.
 

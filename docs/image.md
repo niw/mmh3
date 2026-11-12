@@ -4,7 +4,7 @@
 of about 16 megapixels from text. Its DiT is MiniMax H3's without the audio layers, distilled to six
 steps with no guidance, it reads the MiniMax H3 text encoder unchanged, and it decodes with a picture
 VAE of its own. `mmh3 image` generates pictures from text and edits reference pictures on
-[CUDA](cuda.md) and on [Metal](metal.md).
+[CUDA](cuda.md) and [Metal](metal.md).
 
 ## Download
 
@@ -43,16 +43,15 @@ prompt expander before generating.
   [Edit](#edit).
 - `--seed N` (default 0): The seed of the initial noise.
 - `--attention-precision bf16|int8-fp8` (default bf16): INT8/FP8 attention, as in
-  [Performance and accuracy](performance.md). On Metal, `fp16`, `int8-fp16` or `fp32`, as in
-  [Metal](metal.md).
+  [Performance and accuracy](performance.md). On Metal, `fp32|fp16|int8-fp16` as in
+  [Metal](metal.md#options-and-current-limits).
 - `--linear-precision int8|nvfp4` (default int8): [NVFP4 linear layers](nvfp4.md). On Metal,
-  `int8`, `fp16`, `mps-fp16` or `fp32`, as in [Metal](metal.md).
+  `fp32|fp16|int8|mps-fp16` as in [Metal](metal.md#options-and-current-limits).
 - `--draft-steps N` (default 0): Runs the first N steps on a canvas of half the width and height,
   as in [Faster](#faster). The canvas must then be a multiple of 64 on each side, and an edit
   takes none.
 - `--latent-upscaler FILE`: Enlarges the draft with
-  [the latent upscaler](draft-steps.md#latent-upscaler) rather than bilinearly. On Metal, it runs
-  on the matrix units, so it needs macOS 26.
+  [the latent upscaler](draft-steps.md#latent-upscaler) rather than bilinearly.
 - `--attention dense|sol` (default dense), `--sparse-tau X`, `--sparse-start X`: Sol-Attn, as in
   [Usage](usage.md), from the third step by default.
 - `--dit FILE`, `--text-encoder FILE`, `--vae FILE`, `--models DIR`: Checkpoints, as in
@@ -87,8 +86,6 @@ target/release/mmh3 image --out panda.png --width 4096 --height 4096 \
   same seed gives another composition than without draft steps.
 - The four steps at full size run Sol-Attn, which attends to about 17% of the picture.
 - `--linear-precision nvfp4` takes it down to about 30 s, with muted colors and coarser textures.
-- On Metal, leave out `--attention-precision int8-fp8`, which Metal does not take. The draft steps
-  and Sol-Attn run there as in [Speed](#speed).
 
 Sol-Attn costs the most accuracy. Compared on a shop sign, a portrait and a station hall, it
 rewrote the prices on a chalkboard, added stray lettering and painted a second clock, while faces
@@ -99,8 +96,7 @@ at most. For a picture with text, leave `--attention sol` out, which takes about
 ## Edit
 
 With `--reference`, the prompt edits up to 16 pictures, which it refers to as `<Picture 1>`,
-`<Picture 2>` and so on, in the order of the options. On Metal, the picture VAE's encoder runs on
-the matrix units, so edits need macOS 26:
+`<Picture 2>` and so on, in the order of the options:
 
 ```sh
 target/release/mmh3 image --out night.png --width 4096 --height 4096 \
@@ -140,26 +136,26 @@ decodes a 4096×4096 picture in 2.9 s. The whole generation includes loading the
 DiT and the VAE from warm files. At 4096×4096 INT8/FP8 attention changes fine details of the
 picture and keeps its composition. NVFP4 also mutes colors and coarsens textures.
 
-On a 14-inch MacBook Pro with an M5 Max and 128 GB, in High Power Mode on AC power, with the same
-prompt and seed:
+On an M6 with 24 GB, with the same prompt and seed, INT8 linear layers and attention on the matrix
+units, FP16 unless INT8/FP16:
 
-| Picture | Draft steps | Attention | Linear layers | Each step at full size | Whole generation |
-| --- | ---: | --- | --- | ---: | ---: |
-| 2048×2048 | 0 | FP16 | INT8 | 4.3 s | 38 s |
-| 2048×2048 | 2 | FP16 | INT8 | 4.4 s | 30 s |
-| 4096×4096 | 0 | FP16 | INT8 | 24 s | 165 s |
-| 4096×4096 | 0 | Sol-Attn, FP16 | INT8 | 18 s | 153 s |
-| 4096×4096 | 2 | FP16 | INT8 | 27 s | 140 s |
-| 4096×4096 | 2 | Sol-Attn, FP16 | INT8 | 14 s | 89 s |
+| Picture | Draft steps | Attention | Each step at full size | Whole generation |
+| --- | ---: | --- | ---: | ---: |
+| 1024×1024 | 0 | FP16 | 7.1 s | 57 s |
+| 1024×1024 | 2 | INT8/FP16 | 7.0 s | 52 s |
+| 4096×4096 | 0 | FP16 | 49 s | 337 s |
+| 4096×4096 | 2 | FP16 | 49 s | 255 s |
+| 4096×4096 | 0 | Sol-Attn, INT8/FP16 | 26 s | 237 s |
+| 4096×4096 | 2 | Sol-Attn, INT8/FP16 | 26 s | 165 s |
 
-The draft was enlarged bilinearly, and a draft step at 4096×4096 took about 3.5 s. A 2048×2048
-canvas is too short for Sol-Attn, which stays dense there. Metal decodes the
-picture's tiles one at a time, where CUDA decodes them together, in 5 s at 2048×2048 and 18 s at
-4096×4096. The GPU of this MacBook Pro runs at its top clock of about 1.4 GHz only for the first
-second or two of a load and then at about 700 to 800 MHz, held there by the power and cooling of the
-14-inch case whatever the adapter, so the same run took from about two thirds to one and a half
-times these times as the clock moved. A 16-inch MacBook Pro or a Mac Studio with the same chip
-should be faster.
+The last 4096×4096 row is the [faster settings](#faster) with `--attention-precision int8-fp16`,
+Metal's INT8 attention. The 1024×1024 picture is generated on a 2048×2048 canvas, as on CUDA, so a
+2048×2048 picture takes as long and its draft steps are too short for Sol-Attn. A draft step at
+4096×4096 takes about 7 s, the latent upscaler 5 s with its loading, and the picture VAE decodes a
+4096×4096 picture in 35 s. The 21 GB DiT does not fit in the GPU's share of 24 GB, so the Mac keeps
+as many of its blocks as fit beside the step, 31 of the 52 at 2048×2048 and 11 at 4096×4096, and
+reads the others from the disk as they run. Editing needs macOS 26, since the picture VAE's encoder
+runs on the matrix units, as for the [references](ref2va.md) of a video.
 
 ## Accuracy
 
@@ -175,10 +171,6 @@ with the BF16 DiT and the FP32 picture VAE, and `mmh3-tools check` compares mmh3
 The FP16 picture VAE decodes the final latent of the golden data 72 dB PSNR from the reference's
 FP32 decode, and its encoder gives the posterior means of the two references within 4.6e-3 of the
 reference's FP32 encoder.
-
-`mmh3-tools check` runs on CUDA. On Metal, the tests check the decode and the encode of the picture
-VAE against diffusers on small random models, and the DiT's output heads against single heads summed
-by hand.
 
 ## License
 

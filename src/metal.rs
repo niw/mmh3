@@ -32,17 +32,6 @@ pub fn validate_step_options(options: &HashMap<&str, &str>) -> Result<(), Box<dy
         .into());
     }
 
-    validate_linear_precision(options)
-}
-
-/// Reject the precisions this machine cannot run for a command that runs every step itself, and
-/// so has no worker to hand them to.
-pub fn validate_precisions(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
-    attention_precision(options)?;
-    validate_linear_precision(options)
-}
-
-fn validate_linear_precision(options: &HashMap<&str, &str>) -> Result<(), Box<dyn Error>> {
     if let Some(value) = options.get("linear-precision")
         && !["fp32", "fp16", "int8", "mps-fp16"].contains(value)
     {
@@ -98,6 +87,24 @@ pub fn attention_precision(
     })
 }
 
+/// `--linear-precision`, INT8 on the matrix units by default and FP16 through MPS on a Mac without
+/// them.
+pub fn linear_precision(options: &HashMap<&str, &str>) -> Result<LinearPrecision, Box<dyn Error>> {
+    Ok(match options.get("linear-precision").copied() {
+        Some("fp32") => LinearPrecision::Fp32,
+        Some("fp16") => LinearPrecision::Fp16,
+        Some("int8") => LinearPrecision::Int8,
+        Some("mps-fp16") => LinearPrecision::MpsFp16,
+        Some(value) => {
+            return Err(format!(
+                "Metal supports --linear-precision fp32, fp16, int8 or mps-fp16, not {value}"
+            )
+            .into());
+        }
+        None => default_linear_precision(),
+    })
+}
+
 pub fn load_dit(
     options: &HashMap<&str, &str>,
     name: &str,
@@ -107,13 +114,7 @@ pub fn load_dit(
     let path = option_path(options, name, default_file)?;
     let started = std::time::Instant::now();
     let mut dit = MetalDit::load_fitting(&SafeTensors::open(Path::new(&path))?, "")?;
-    let precision = match options.get("linear-precision").copied() {
-        Some("fp16") => LinearPrecision::Fp16,
-        Some("int8") => LinearPrecision::Int8,
-        Some("mps-fp16") => LinearPrecision::MpsFp16,
-        Some(_) => LinearPrecision::Fp32,
-        None => default_linear_precision(),
-    };
+    let precision = linear_precision(options)?;
 
     dit.set_linear_precision(precision)?;
     let attention = attention_precision(options)?;
@@ -166,22 +167,6 @@ mod tests {
             assert!(
                 validate_step_options(&options).is_err(),
                 "--{option} {value} must be refused by the machine that runs the step"
-            );
-        }
-    }
-
-    /// A command with no worker refuses a precision without sending its user to one.
-    #[test]
-    fn a_run_without_workers_refuses_without_pointing_at_one() {
-        for (option, value) in [
-            ("attention-precision", "bf16"),
-            ("linear-precision", "nvfp4"),
-        ] {
-            let options = options(&[(option, value)]);
-            let error = validate_precisions(&options).unwrap_err().to_string();
-            assert!(
-                !error.contains("--worker"),
-                "--{option} {value} is refused with {error:?}"
             );
         }
     }

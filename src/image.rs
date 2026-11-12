@@ -24,7 +24,7 @@ pub const USAGE: &str = "usage:
   mmh3 image (--prompt TEXT | --prompt-file FILE | --context <text.safetensors>) --out <image.png> [--models DIR]
              [--reference FILE]... [--width N] [--height N] [--min-generation-area PIXELS] [--seed N]
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
-             [--attention-precision bf16|int8-fp8] [--linear-precision int8|nvfp4] [--vram-budget GB] [--consistent]
+             [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
 
 image generates a picture with MiniMax H3 Image from a prompt, used as given. The model expects a detailed English
@@ -38,9 +38,9 @@ such as 4096x4096 or 5472x3072. A picture smaller than --min-generation-area pix
 is generated on a larger canvas of the same aspect ratio and resized to the requested size with Lanczos.
 --reference takes a PNG or JPEG picture to edit, which the prompt refers to as <Picture 1>, <Picture 2> and so on,
 in the order of the options, up to 16. The size of the result is still --width and --height.
-On Metal, --linear-precision takes int8 (MPP, default on macOS 26), fp16 (MPP), mps-fp16 (default before macOS 26)
-or fp32, and --attention-precision fp16 (MPP, default on macOS 26), int8-fp16 or fp32.
 --save-latent also writes the final latent, which tools/models/video_vae_int8.py calibrates an INT8 picture VAE on.
+--attention-precision takes bf16 or int8-fp8 on CUDA and fp32, fp16 or int8-fp16 on Metal, and --linear-precision
+int8 or nvfp4 on CUDA and fp32, fp16, int8 or mps-fp16 on Metal.
 --attention sol runs Sol-Attn, a training-free block-sparse attention, as mmh3 generate does.
 --draft-steps runs the first N steps on a canvas of half the width and height, which must then be multiples of 64,
 and enlarges the latent they predict with the latent upscaler of --latent-upscaler, or bilinearly without one.";
@@ -197,8 +197,6 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     )?;
     #[cfg(feature = "cuda")]
     mmh3_cuda::check_device()?;
-    #[cfg(feature = "metal")]
-    crate::metal::validate_precisions(&options)?;
     crate::resident::take_budget(&options)?;
     #[cfg(feature = "cuda")]
     {
@@ -207,6 +205,12 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             mmh3_cuda::nvfp4::check_supported()?;
         }
         crate::models::load_algorithm_cache();
+    }
+    // A wrong precision is refused before anything is read.
+    #[cfg(feature = "metal")]
+    {
+        crate::metal::attention_precision(&options)?;
+        crate::metal::linear_precision(&options)?;
     }
 
     let out = Path::new(options.get("out").ok_or(USAGE)?);
@@ -365,6 +369,9 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     println!(
         "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
+    // Metal refines the prompt once for every step.
+    #[cfg(feature = "metal")]
+    let prepared = dit.prepare_text(&context)?;
     for step in 0..steps {
         let started = Instant::now();
         // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout is
@@ -391,7 +398,11 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         };
         // A kept model may be holding the room a step needs, and a step can run again.
         let outputs = loop {
-            match dit.forward(&inputs, &[], step_sparse.as_ref()) {
+            #[cfg(feature = "cuda")]
+            let outputs = dit.forward(&inputs, &[], step_sparse.as_ref());
+            #[cfg(feature = "metal")]
+            let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref());
+            match outputs {
                 Err(error) if error.is_out_of_memory() && held.let_go_of_one() => continue,
                 outputs => break outputs?,
             }
@@ -431,6 +442,8 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             seconds,
         });
     }
+    #[cfg(feature = "metal")]
+    drop(prepared);
     held.keep_dit(dit, dit_key);
     #[cfg(feature = "cuda")]
     crate::models::save_algorithm_cache();
@@ -487,14 +500,14 @@ impl Held {
             Held::Alone => {
                 #[allow(unused_mut)]
                 let mut encoder = crate::resident::TextEncoder::load_fitting(&file)?;
+                // One prompt reads every layer once, so a Mac that streams the encoder keeps none
+                // of its layers back.
                 #[cfg(feature = "metal")]
                 {
                     encoder.set_precision(
                         crate::metal::default_linear_precision(),
                         crate::metal::attention_precision(options)?,
                     )?;
-                    // One prompt reads every layer once, so a Mac that streams the encoder keeps
-                    // none of its layers back.
                     encoder.read_once();
                 }
                 work(&encoder)
@@ -507,8 +520,8 @@ impl Held {
     }
 
     /// The DiT of `--dit` or the models directory, with the key it goes back into the table under
-    /// when it is kept. A kept DiT runs INT8 linear layers, since NVFP4 ones would stay in it for
-    /// the runs after this one.
+    /// when it is kept. A kept DiT runs INT8 linear layers on CUDA, since NVFP4 ones would stay in
+    /// it for the runs after this one.
     fn dit(
         &mut self,
         options: &std::collections::HashMap<&str, &str>,
@@ -522,6 +535,7 @@ impl Held {
             }
             Held::Kept(table) => table,
         };
+        #[cfg(feature = "cuda")]
         if options
             .get("linear-precision")
             .is_some_and(|precision| *precision != "int8")
@@ -540,11 +554,8 @@ impl Held {
             other => {
                 drop(other);
                 let started = Instant::now();
-                #[allow(unused_mut)]
-                let mut dit = models
+                let dit = models
                     .read_fitting(|| Dit::load(&file, ""), || Dit::load_fitting(&file, ""))?;
-                #[cfg(feature = "metal")]
-                dit.set_linear_precision(crate::metal::default_linear_precision())?;
                 println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
                 dit
             }
@@ -552,7 +563,10 @@ impl Held {
         #[cfg(feature = "cuda")]
         dit.set_attention_precision(attention_precision(options)?);
         #[cfg(feature = "metal")]
-        dit.set_attention_precision(crate::metal::attention_precision(options)?)?;
+        {
+            dit.set_linear_precision(crate::metal::linear_precision(options)?)?;
+            dit.set_attention_precision(crate::metal::attention_precision(options)?)?;
+        }
         Ok((dit, Some(key)))
     }
 
@@ -699,7 +713,7 @@ fn whole_patches(latent: &Tensor) -> Tensor {
 
 #[cfg(not(any(feature = "cuda", feature = "metal")))]
 pub fn run(_arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    Err("image runs on CUDA or Metal".into())
+    Err("image needs a build with CUDA or Metal".into())
 }
 
 /// Writes pixels `[3, 1, height, width]` in [0, 1] as an 8-bit RGB PNG of `width × height`,

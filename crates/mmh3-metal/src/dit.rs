@@ -2,7 +2,7 @@
 //! token layouts.
 use crate::{
     AttentionPrecision, Device, Error, Result,
-    model::{Weights, is_comfy_attention_hint},
+    model::Weights,
     ops::{Array, PackedRows, RowMap, attends_in_half},
     shard::ShardContext,
     sparse::SparsePass,
@@ -41,9 +41,6 @@ pub struct MetalDit {
     config: DitConfig,
     time_table: Tensor,
     inv_freq: Vec<f32>,
-    /// The weight and bias of every head of a bank of output heads, each summed with the first,
-    /// or none for a single head.
-    video_heads: Vec<(Array, Array)>,
     /// The blocks read on the way, when some are.
     stream: Option<RefCell<Stream>>,
     /// Veda's predictor, which `--attention veda` needs.
@@ -133,7 +130,7 @@ impl MetalDit {
             let Some(name) = info.name.strip_prefix(prefix) else {
                 continue;
             };
-            if name.ends_with(".comfy_quant") || is_comfy_attention_hint(name) {
+            if name.ends_with(".comfy_quant") || name.ends_with(".comfy_attention.config") {
                 continue;
             }
             if let Some(unit) = Self::unit_index(&config, name) {
@@ -164,70 +161,69 @@ impl MetalDit {
         Self::from_weights(weights, config, Some(stream))
     }
 
-    fn from_weights(weights: Weights, config: DitConfig, stream: Option<Stream>) -> Result<Self> {
+    fn from_weights(
+        mut weights: Weights,
+        config: DitConfig,
+        stream: Option<Stream>,
+    ) -> Result<Self> {
+        Self::split_output_heads(&config, &mut weights)?;
         let time_table = weights.host("adaln_t_table")?;
         let inv_freq = weights.host("rope.inv_freq")?.data;
-        let video_heads = Self::video_heads(&weights, &config)?;
         Ok(Self {
             weights,
             config,
             time_table,
             inv_freq,
-            video_heads,
             stream: stream.map(RefCell::new),
             veda: None,
         })
     }
 
-    /// A bank of output heads stores its first head whole and every later one as an offset from
-    /// it, as ComfyUI does. Summing them once here, in FP32, leaves a step one product of a single
-    /// head's size.
-    fn video_heads(weights: &Weights, config: &DitConfig) -> Result<Vec<(Array, Array)>> {
+    /// Splits a `final_layer.video_out` that stacks one head per sampling step into
+    /// `final_layer.video_out.{head}`, the layer a step at that head's sigma projects through, in
+    /// FP32. The stack is ComfyUI's PDD head bank: the first head whole and every later one as its
+    /// offset from the first.
+    fn split_output_heads(config: &DitConfig, weights: &mut Weights) -> Result<()> {
         let heads = config.step_sigmas.len();
-        if heads <= 1 {
-            return Ok(Vec::new());
+        if heads < 2 {
+            return Ok(());
         }
-        let (weight, bias) = (
-            weights.host("final_layer.video_out.weight")?,
-            weights.host("final_layer.video_out.bias")?,
-        );
-        let (outputs, inputs) = (config.video_patch_features(), config.hidden);
-        let head = |values: &[f32], head: usize, width: usize| -> Vec<f32> {
-            let first = &values[..width];
-            if head == 0 {
-                return first.to_vec();
+        for suffix in ["weight", "bias"] {
+            let name = format!("final_layer.video_out.{suffix}");
+            if !weights.contains(&name) {
+                continue;
             }
-            first
-                .iter()
-                .zip(&values[head * width..(head + 1) * width])
-                .map(|(&first, &offset)| first + offset)
-                .collect()
-        };
-        (0..heads)
-            .map(|index| {
-                Ok((
-                    Array::from_f32(
-                        &weights.device,
-                        outputs,
-                        inputs,
-                        &head(&weight.data, index, outputs * inputs),
-                    )?,
-                    Array::from_f32(
-                        &weights.device,
-                        1,
-                        outputs,
-                        &head(&bias.data, index, outputs),
-                    )?,
-                ))
-            })
-            .collect()
+            let stacked = weights.host(&name)?;
+            weights.remove(&name);
+            let each = stacked.data.len() / heads;
+            let mut shape = stacked.shape.clone();
+            shape[0] /= heads;
+            let first = &stacked.data[..each];
+            for head in 0..heads {
+                let rows = &stacked.data[head * each..(head + 1) * each];
+                let values: Vec<f32> = match head {
+                    0 => rows.to_vec(),
+                    _ => rows
+                        .iter()
+                        .zip(first)
+                        .map(|(offset, base)| base + offset)
+                        .collect(),
+                };
+                weights.insert_f32(
+                    &format!("final_layer.video_out.{head}.{suffix}"),
+                    shape.clone(),
+                    &values,
+                )?;
+            }
+        }
+        Ok(())
     }
 
-    /// The video projection of the final layer, with the head of `sigma` for a bank of heads.
-    fn project_video(&self, x: &Array, sigma: f32) -> Result<Array> {
-        match self.video_heads.get(self.config.output_head(sigma)) {
-            Some((weight, bias)) => x.linear(weight)?.add(bias),
-            None => self.weights.linear(x, "final_layer.video_out"),
+    /// The video output layer of a step at `sigma`.
+    fn video_output(&self, sigma: f32) -> String {
+        match self.config.step_sigmas.is_empty() {
+            true => "final_layer.video_out".to_owned(),
+            false => format!("final_layer.video_out.{}", self.config.output_head(sigma)),
         }
     }
 
@@ -314,15 +310,6 @@ impl MetalDit {
     /// tensors replaced or added.
     pub fn add_lora(&mut self, file: &SafeTensors, strength: f32) -> Result<usize> {
         const PREFIX: &str = "diffusion_model.";
-        if !self.video_heads.is_empty()
-            && file
-                .get(&format!("{PREFIX}final_layer.video_out.lora_A.weight"))
-                .is_some()
-        {
-            return Err(Error::new(
-                "a LoRA cannot adapt a bank of output heads".into(),
-            ));
-        }
         let mut replaced = 0;
         for info in file.tensors() {
             let Some(name) = info.name.strip_prefix(PREFIX) else {
@@ -347,7 +334,6 @@ impl MetalDit {
         }
         if replaced > 0 {
             self.time_table = self.weights.host("adaln_t_table")?;
-            self.video_heads = Self::video_heads(&self.weights, &self.config)?;
         }
         let added = self.weights.add_lora(file, strength)? + replaced;
         if added == 0 {
@@ -811,6 +797,7 @@ impl MetalDit {
             || inputs.audio.shape.len() != 3
             || inputs.audio.shape[0] != c.audio_channels
             || inputs.audio.shape[1] != 2
+            // A DiT without audio layers takes no audio frames, and one with them some.
             || (inputs.audio.shape[2] == 0) == c.has_audio()
             || !inputs.sigma.is_finite()
             || !(0.0..=1.0).contains(&inputs.sigma)
@@ -933,6 +920,7 @@ impl MetalDit {
         let mut parts = Vec::new();
 
         for segment in &layout.segments {
+            // The audio rows of a DiT without audio layers.
             if segment.is_empty() {
                 continue;
             }
@@ -1111,7 +1099,7 @@ impl MetalDit {
         }
 
         let m = modulation("final_layer.adaln_proj.linear", 2)?;
-        let project = |kind, head: &dyn Fn(&Array) -> Result<Array>| -> Result<Vec<f32>> {
+        let project = |kind, name: &str| -> Result<Vec<f32>> {
             let s = layout.segment(kind);
             let (first, last) = (s.start.max(carried.start), s.end.min(carried.end));
             if first >= last {
@@ -1125,16 +1113,14 @@ impl MetalDit {
             )?;
             let m = m.slice(timesteps.index_of(kind), 1, 0, 2 * width)?;
             let rows = RowMap::new(d, &vec![0; x.shape()[0]])?;
-            head(&x.modulate(&m, &rows, 0, 1)?)?.to_f32()
+            w.linear(&x.modulate(&m, &rows, 0, 1)?, name)?.to_f32()
         };
 
-        let mut video = project(SegmentKind::Video, &|x| self.project_video(x, inputs.sigma))?;
+        let mut video = project(SegmentKind::Video, &self.video_output(inputs.sigma))?;
         if let Some(plan) = &plan {
             video = plan.restore_video(&video, c.video_patch_features());
         }
-        let audio = project(SegmentKind::Audio, &|x| {
-            w.linear(x, "final_layer.audio_out")
-        })?;
+        let audio = project(SegmentKind::Audio, "final_layer.audio_out")?;
         // The rows of one rank cannot be unpatchified on their own, so a share answers with the
         // parts as the projections left them and a leader puts them together.
         //
