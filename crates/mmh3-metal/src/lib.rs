@@ -224,7 +224,7 @@ pub fn set_allocation_limit(bytes: usize) {
 /// Counts `bytes` more in this process's allocations, unless they would take it past its limit.
 fn reserve(bytes: usize) -> Result<()> {
     ALLOCATED
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
             let limit = LIMIT.load(Ordering::Relaxed);
             allocated
                 .checked_add(bytes)
