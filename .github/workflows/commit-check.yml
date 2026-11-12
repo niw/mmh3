@@ -1,0 +1,50 @@
+name: commit-check
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  # NOTE: The runner has no GPU, so FEATURES leaves out CUDA, and make picks the crates without it.
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@v2
+      - run: make check-format
+      - run: make lint FEATURES=server
+      - run: make check-typing FEATURES=server
+      - run: make test FEATURES=server
+
+  # NOTE: The runner has no GPU, so the Metal tests only build.
+  macos:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: astral-sh/setup-uv@v6
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install swiftformat
+      - run: make check-format
+      - run: make lint
+      - run: make check-typing
+      - run: make test TEST_OPTIONS=--no-run
