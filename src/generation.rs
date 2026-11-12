@@ -877,11 +877,11 @@ pub fn sample(
     prepare_after_prompt(&mut prepared_workers, &encoding_slots, options, dit_file);
     // A run with draft steps opens one session for them and another for the steps at full size,
     // since a session holds one shape. The connections to the workers carry over between them.
-    let phases = if settings.draft_steps > 0 {
-        vec![0..settings.draft_steps, settings.draft_steps..steps]
-    } else {
-        vec![0..steps]
-    };
+    let draft_steps = settings.draft_steps;
+    let phases = (draft_steps > 0)
+        .then_some(0..draft_steps)
+        .into_iter()
+        .chain(std::iter::once(draft_steps..steps));
     let mut workers = prepared_workers;
     for phase in phases {
         // Draft steps fall short of the length below which Sol-Attn stays dense, which keeps a

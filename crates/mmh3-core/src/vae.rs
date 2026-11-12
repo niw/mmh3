@@ -270,6 +270,8 @@ pub fn picture_rope_angles(
 
 /// Per-channel mean and standard deviation of the latents of MiniMax H3 Image's picture VAE, from
 /// the `vae/config.json` of MiniMaxAI/MiniMax-H3-Image. Comfy-Org's FP16 file does not carry them.
+/// They keep the digits the config writes them with, which round to the same `f32`.
+#[allow(clippy::excessive_precision)]
 pub const PICTURE_LATENTS_MEAN: [f32; 24] = [
     0.858090341091156,
     -0.9606591463088989,
@@ -297,6 +299,7 @@ pub const PICTURE_LATENTS_MEAN: [f32; 24] = [
     0.7056031823158264,
 ];
 
+#[allow(clippy::excessive_precision)]
 pub const PICTURE_LATENTS_STD: [f32; 24] = [
     1.2223774194717407,
     1.2767263650894165,
