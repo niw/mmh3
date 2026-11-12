@@ -71,6 +71,7 @@ const IMAGE_OPTIONS: &[&str] = &[
     "sparse-start",
     "draft-steps",
     "latent-upscaler",
+    "renoise-sigma",
     "steps",
     "shift",
     "patch",

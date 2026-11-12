@@ -26,7 +26,7 @@ pub const USAGE: &str = "usage:
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
              [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
-             [--steps N] [--shift X] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
+             [--renoise-sigma X] [--steps N] [--shift X] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
 
 image generates a picture with MiniMax H3 Image from a prompt, used as given. The model expects a detailed English
 description of the whole picture. Checkpoints default to their ComfyUI names inside a models directory laid out like
@@ -45,6 +45,8 @@ int8 or nvfp4 on CUDA and fp32, fp16, int8 or mps-fp16 on Metal.
 --attention sol runs Sol-Attn, a training-free block-sparse attention, as mmh3 generate does.
 --draft-steps runs the first N steps on a canvas of half the width and height, which must then be multiples of 64,
 and enlarges the latent they predict with the latent upscaler of --latent-upscaler, or bilinearly without one.
+--renoise-sigma noises the enlarged draft to X rather than to the next sigma, and the steps at full size run on the
+sigmas below X. The draft may then take every step.
 --steps samples in N steps on the uniform grid shifted by --shift, 12 by default, rather than on the six sigmas the
 checkpoint was distilled for, as a few-step LoRA such as PDMD's wants. A step then projects through the output heads
 of the distilled sigmas it spans, weighted by how much of it each one covers. --patch and --lora apply as they do to
@@ -150,6 +152,39 @@ impl EditReference {
     }
 }
 
+/// The schedule of a run whose `draft_steps` first steps of `sigmas` run on the draft canvas, with
+/// the enlarged draft noised to `renoise` and the steps at full size on the sigmas below it. The
+/// draft may take every step of `sigmas`, which leaves one full-size step from `renoise` to 0.
+pub fn renoised_schedule(
+    sigmas: &[f32],
+    draft_steps: usize,
+    renoise: f32,
+) -> Result<Vec<f32>, String> {
+    let steps = sigmas.len() - 1;
+    if draft_steps > steps {
+        return Err(format!(
+            "--draft-steps takes at most the {steps} steps there are"
+        ));
+    }
+    let last_draft = sigmas[draft_steps - 1];
+    if !(renoise > 0.0 && renoise < last_draft) {
+        return Err(format!(
+            "--renoise-sigma must be above 0 and below the last draft step's sigma {last_draft}"
+        ));
+    }
+    Ok(sigmas[..draft_steps]
+        .iter()
+        .copied()
+        .chain([renoise])
+        .chain(
+            sigmas[draft_steps..]
+                .iter()
+                .copied()
+                .filter(|&sigma| sigma < renoise),
+        )
+        .collect())
+}
+
 /// The sigmas a DiT with an output head per step samples on, ending at 0, each rounded through its
 /// FP32 timestep `1 − sigma` and back as the released sampler does.
 pub fn step_schedule(step_sigmas: &[f32]) -> Vec<f32> {
@@ -199,6 +234,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "sparse-start",
             "draft-steps",
             "latent-upscaler",
+            "renoise-sigma",
             "steps",
             "shift",
             "patch",
@@ -263,6 +299,13 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if draft_steps == 0 && options.contains_key("latent-upscaler") {
         return Err("--latent-upscaler enlarges the draft of --draft-steps".into());
     }
+    let renoise_sigma = match options.contains_key("renoise-sigma") {
+        true if draft_steps == 0 => {
+            return Err("--renoise-sigma noises the draft of --draft-steps".into());
+        }
+        true => Some(option_float(&options, "renoise-sigma", 0.0)?),
+        false => None,
+    };
     let sparse = crate::models::sparse_attention(&options, false)?;
     let uniform_steps = match options.contains_key("steps") {
         true => Some(option_number(&options, "steps", 0)?),
@@ -371,21 +414,26 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    let sigmas = match uniform_steps {
+    let mut sigmas = match uniform_steps {
         Some(steps) => {
             let uniform = Schedule::uniform(steps, shift, 1.0).video;
             step_schedule(&uniform[..steps])
         }
         None => step_schedule(&config.step_sigmas),
     };
+    match renoise_sigma {
+        Some(renoise) => sigmas = renoised_schedule(&sigmas, draft_steps, renoise)?,
+        None if draft_steps + 1 >= sigmas.len() => {
+            return Err(format!(
+                "--draft-steps must leave at least one of the {} steps at full size",
+                sigmas.len() - 1
+            )
+            .into());
+        }
+        None => {}
+    }
     dit.set_sample_sigmas(&sigmas);
     let steps = sigmas.len() - 1;
-    if draft_steps >= steps {
-        return Err(format!(
-            "--draft-steps must leave at least one of the {steps} steps at full size"
-        )
-        .into());
-    }
     let (latent_height, latent_width) =
         (canvas_height / SPATIAL_RATIO, canvas_width / SPATIAL_RATIO);
     let latent_shape = match draft_steps {
@@ -889,6 +937,26 @@ mod tests {
         let edge = EditReference::new(&picture(1500, 1024)).unwrap();
         assert_eq!((edge.vision.width, edge.vision.height), (1504, 1024));
         assert!(EditReference::new(&picture(20, 600)).is_err());
+    }
+
+    #[test]
+    fn noises_the_draft_to_the_renoise_sigma() {
+        let sigmas = [1.0, 0.96, 0.857, 0.0];
+        assert_eq!(
+            renoised_schedule(&sigmas, 1, 0.5).unwrap(),
+            vec![1.0, 0.5, 0.0]
+        );
+        assert_eq!(
+            renoised_schedule(&sigmas, 2, 0.9).unwrap(),
+            vec![1.0, 0.96, 0.9, 0.857, 0.0]
+        );
+        assert_eq!(
+            renoised_schedule(&sigmas, 3, 0.5).unwrap(),
+            vec![1.0, 0.96, 0.857, 0.5, 0.0]
+        );
+        assert!(renoised_schedule(&sigmas, 2, 0.96).is_err());
+        assert!(renoised_schedule(&sigmas, 2, 0.0).is_err());
+        assert!(renoised_schedule(&sigmas, 4, 0.5).is_err());
     }
 
     #[test]
