@@ -450,13 +450,23 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         latent_shape.clone(),
         noise.samples(latent_shape.iter().product()),
     );
-    let silence = Tensor::new(vec![0, 2, 0], Vec::new());
+    let mut inputs = DitInputs {
+        video: latent.clone(),
+        audio: Tensor::new(vec![0, 2, 0], Vec::new()),
+        context,
+        context_modalities,
+        keyframes: Vec::new(),
+        references,
+        sigma: sigmas[0],
+        shift_video: 1.0,
+        shift_audio: 1.0,
+    };
     println!(
         "sampling {canvas_width}×{canvas_height} in {steps} steps, {draft_steps} at half size"
     );
     // Metal refines the prompt once for every step.
     #[cfg(feature = "metal")]
-    let prepared = dit.prepare_text(&context)?;
+    let prepared = held.with_room(|| dit.prepare_text(&inputs.context))?;
     for step in 0..steps {
         let started = Instant::now();
         // Draft steps fall short of the length below which Sol-Attn stays dense. Their layout is
@@ -470,28 +480,14 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 false => sparse,
             })
             .filter(|sparse| sparse.applies_to_step(step, steps));
-        let inputs = DitInputs {
-            video: latent.clone(),
-            audio: silence.clone(),
-            context: context.clone(),
-            context_modalities: context_modalities.clone(),
-            keyframes: Vec::new(),
-            references: references.clone(),
-            sigma: sigmas[step],
-            shift_video: 1.0,
-            shift_audio: 1.0,
-        };
-        // A kept model may be holding the room a step needs, and a step can run again.
-        let outputs = loop {
+        inputs.video = latent.clone();
+        inputs.sigma = sigmas[step];
+        let outputs = held.with_room(|| {
             #[cfg(feature = "cuda")]
-            let outputs = dit.forward(&inputs, &[], step_sparse.as_ref());
+            return dit.forward(&inputs, &[], step_sparse.as_ref());
             #[cfg(feature = "metal")]
-            let outputs = prepared.forward(&inputs, &[], step_sparse.as_ref());
-            match outputs {
-                Err(error) if error.is_out_of_memory() && held.let_go_of_one() => continue,
-                outputs => break outputs?,
-            }
-        };
+            return prepared.forward(&inputs, &[], step_sparse.as_ref());
+        })?;
         let (sigma, sigma_next) = (sigmas[step], sigmas[step + 1]);
         // The enlargement after the last draft step says its own time, so the step leaves it out.
         let mut enlarging = 0.0;
@@ -685,7 +681,22 @@ impl Held {
         }
     }
 
-    /// Lets go of the kept model used least, for a step that ran out of memory, and says whether
+    /// Runs `work`, which can run again, letting go of the kept model used least and running it
+    /// again each time the device runs out of memory: a kept model may be holding the room a step
+    /// or the prompt's refinement needs. A run holding nothing else fails as the device did.
+    fn with_room<T, E: Into<Box<dyn Error>>>(
+        &mut self,
+        mut work: impl FnMut() -> Result<T, E>,
+    ) -> Result<T, Box<dyn Error>> {
+        loop {
+            match work().map_err(Into::into) {
+                Err(error) if crate::resident::out_of_memory(&*error) && self.let_go_of_one() => {}
+                result => return result,
+            }
+        }
+    }
+
+    /// Lets go of the kept model used least, for work that ran out of memory, and says whether
     /// there was one.
     fn let_go_of_one(&mut self) -> bool {
         match self {
