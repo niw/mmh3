@@ -80,9 +80,11 @@ is a file longer than the server takes. See [Usage](usage.md) for what the optio
 `POST /v1/images` takes a picture to generate with [Image](image.md) the same way. Its fields are the
 options of `mmh3 image` about what to generate: `prompt`, `prompt-file`, `reference`, `width`,
 `height`, `min-generation-area`, `seed`, `attention-precision`, `attention`, `sparse-tau`,
-`sparse-start`, `draft-steps` and `latent-upscaler`, which takes the name of a file in the models
-directory as a video's does. A field that starts with `<`, as a prompt that refers to `<Picture 1>`
-does, goes to curl with `--form-string`, since curl reads `-F name=<file` from a file.
+`sparse-start`, `draft-steps`, `latent-upscaler`, `renoise-sigma`, `steps`, `shift`, `patch`,
+`lora`, `lora-strength` and `lora-mode`. `latent-upscaler`, `patch` and `lora` take the name of a
+file in the models directory as a video's do. A field that starts with `<`, as a prompt that refers
+to `<Picture 1>` does, goes to curl with `--form-string`, since curl reads `-F name=<file` from a
+file.
 
 ```sh
 curl -X POST http://localhost:8833/v1/images \

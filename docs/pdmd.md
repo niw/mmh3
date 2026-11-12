@@ -36,6 +36,9 @@ With these settings, a complete generation takes:
 | DGX Spark, DiT without a LoRA | 1344×768, 124 frames | 13.5, 13.3 s | |
 | M6 | 672×384, 73 frames | | 45 s |
 
+The LoRA also generates pictures with MiniMax H3 Image, as in
+[Fewer steps](image.md#fewer-steps).
+
 ## How the LoRA is built
 
 [tools/models](../tools/models/README.md#pdmd_lorapy) describes how `tools/models/pdmd_lora.py`

@@ -28,8 +28,7 @@ target/release/mmh3 image --out panda.png --width 4096 --height 4096 \
 ```
 
 The prompt goes to the text encoder as given, with no template. The model expects a detailed English
-description of the whole picture, which MiniMax's own service writes from a short prompt with a
-prompt expander before generating.
+description of the whole picture, as in [Prompts](#prompts).
 
 - `--out FILE` (required): A `.png` file.
 - `--prompt TEXT`, `--prompt-file FILE`: The prompt, cut after 4096 tokens.
@@ -53,8 +52,15 @@ prompt expander before generating.
 - `--latent-upscaler FILE`: Enlarges the draft with
   [the latent upscaler](draft-steps.md#latent-upscaler) rather than bilinearly. On Metal, it runs
   on the matrix units, so it needs macOS 26.
+- `--renoise-sigma X`: Noises the enlarged draft to X rather than to the next step's sigma, and
+  runs the steps at full size on the sigmas below X. The draft may then take every step, as in
+  [Fewer steps](#fewer-steps).
 - `--attention dense|sol` (default dense), `--sparse-tau X`, `--sparse-start X`: Sol-Attn, as in
   [Usage](usage.md), from the third step by default.
+- `--steps N`, `--shift X` (default 12): Samples in N steps on the uniform grid shifted by X rather
+  than on the six sigmas the checkpoint was distilled for, as in [Fewer steps](#fewer-steps).
+- `--patch FILE`, `--lora FILE`, `--lora-strength X`, `--lora-mode adapter|merge`: A patch and a
+  LoRA, as in [Usage](usage.md).
 - `--dit FILE`, `--text-encoder FILE`, `--vae FILE`, `--models DIR`: Checkpoints, as in
   [Models](models.md).
 - `--save-latent FILE`: Also writes the final latent, which the INT8 picture VAE is calibrated
@@ -71,30 +77,79 @@ keeps the models loaded between them.
 
 ## Faster
 
-These settings generate a 4096×4096 picture in about 35 s rather than 63 s on a DGX Spark:
+These settings generate a 4096×4096 picture in about 24 s rather than 62 s on a DGX Spark:
 
 ```sh
-tools/download-models.sh --image --latent-upscaler
+tools/download-models.sh --image --pdmd --latent-upscaler
 target/release/mmh3 image --out panda.png --width 4096 --height 4096 \
-  --draft-steps 2 --latent-upscaler minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
-  --attention sol --attention-precision int8-fp8 \
+  --steps 3 --lora minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors \
+  --draft-steps 3 --renoise-sigma 0.5 \
+  --latent-upscaler minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
+  --attention-precision int8-fp8 \
   --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn, soft golden light filtering through the trees, photorealistic, detailed fur"
 ```
 
-- The first two steps run as [draft steps](draft-steps.md) on a 2048×2048 canvas, still within the
-  sizes the model works at, and settle the composition in a quarter of the tokens. The picture
-  VAE's encoder is the video VAE's, so the latent upscaler of MiniMax H3 enlarges the draft. The
-  same seed gives another composition than without draft steps.
-- The four steps at full size run Sol-Attn, which attends to about 17% of the picture.
-- `--linear-precision nvfp4` takes it down to about 30 s, with muted colors and coarser textures.
+- The [PDMD](pdmd.md) LoRA generates in three steps, as in [Fewer steps](#fewer-steps).
+- All three run as [draft steps](draft-steps.md) on a 2048×2048 canvas, still within the sizes the
+  model works at. The picture VAE's encoder is the video VAE's, so the latent upscaler of MiniMax H3
+  enlarges the draft.
+- One step at full size redraws the enlarged draft from sigma 0.5.
+- `--linear-precision nvfp4` takes about 1 s off, with muted colors and coarser textures.
 - On Metal, `--attention-precision int8-fp16` takes the place of `int8-fp8`, which Metal does not
   take, as in [Speed](#speed).
 
-Sol-Attn costs the most accuracy. Compared on a shop sign, a portrait and a station hall, it
+The same seed gives another composition than the six steps without the LoRA. On a shop front these
+settings kept the lettering of the sign and the chalkboard.
+
+Without a LoRA, `--draft-steps 2` with the latent upscaler, `--attention sol` and
+`--attention-precision int8-fp8` take about 35 s. Sol-Attn, which attends to about 17% of the
+picture, costs the most accuracy there. Compared on a shop sign, a portrait and a station hall, it
 rewrote the prices on a chalkboard, added stray lettering and painted a second clock, while faces
 and hands stayed as they were. With `--sparse-start 0.5` it starts at the fourth step and kept the
 lettering. Draft steps alone kept large lettering and the composition, and moved small lettering
-at most. For a picture with text, leave `--attention sol` out, which takes about 50 s.
+at most.
+
+## Prompts
+
+MiniMax H3 Image draws best from a complete description of the finished picture: what it is for,
+what is in it and where, how it looks, and every word on it in quotes. MiniMax's own service writes
+one from a short request with a prompt expander before it generates, and `mmh3 image` does not, so
+the prompt it takes should already be one.
+
+- MiniMax's
+  [h3-image-prompt-writing](https://github.com/MiniMax-AI/MiniMax-H3-Image/tree/main/skills/h3-image-prompt-writing)
+  skill turns a short request into such a prompt, for text to image and for edits with
+  `<Picture N>`. An agent such as Claude Code loads it as a skill, and its guides
+  `references/t2i-en.txt` and `references/edit-en.txt` read well on their own.
+- [MiniMax-H3-Image-PE](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image-PE) is the prompt expander
+  of MiniMax's service for text to image, a language model of 27B parameters in FP4 that SGLang
+  serves. It writes the description and a suggested aspect ratio from a short request.
+
+## Fewer steps
+
+The [PDMD](pdmd.md) 2-NFE LoRA, distilled on MiniMax H3, works on MiniMax H3 Image too. It runs on
+the uniform grid of `--steps`, shifted by 12:
+
+```sh
+tools/download-models.sh --image --pdmd
+target/release/mmh3 image --out panda.png --width 4096 --height 4096 --steps 3 \
+  --lora minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors \
+  --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn, soft golden light filtering through the trees, photorealistic, detailed fur"
+```
+
+On a DGX Spark, the 4096×4096 picture takes about 40 s in three steps and 29 s in two, against
+62 s in six. Three steps keep the composition and the detail, with a faint woven texture on fur at
+full size. Two steps show it plainly on knitted and flat areas and suit drafts. Leave the LoRA as an
+adapter, since `--lora-mode merge` rounds most of it away in the INT8 weights.
+
+Draft steps leave out the woven texture. The [faster settings](#faster) run all three steps on the
+half-size canvas and redraw the enlarged draft from sigma 0.5 in one step at full size.
+`--draft-steps 2` without `--renoise-sigma` instead runs the last of the three at full size from its
+own sigma of 0.857, which takes as long and keeps less fine detail, such as the crust of bread or
+single hairs. A higher `--renoise-sigma` redraws more of the draft and a lower one less.
+
+A step off the six distilled sigmas projects through the output heads of the distilled steps it
+spans, averaged by how much of it each one covers, as ComfyUI takes them.
 
 ## Edit
 
@@ -120,18 +175,21 @@ reference goes twice into the generation, as the reference pipeline takes it:
 
 On a DGX Spark, with the prompt above and seed 1:
 
-| Picture | Draft steps | Attention | Linear layers | Each step at full size | Whole generation |
-| --- | ---: | --- | --- | ---: | ---: |
-| 1024×1024 | 0 | BF16 | INT8 | 1.4 s | 18 s |
-| 1024×1024 | 2 | INT8/FP8 | INT8 | 1.3 s | 16 s |
-| 4096×4096 | 0 | BF16 | INT8 | 8.8 s | 63 s |
-| 4096×4096 | 0 | INT8/FP8 | INT8 | 7.3 s | 54 s |
-| 4096×4096 | 0 | INT8/FP8 | NVFP4 | 6.2 s | 47 s |
-| 4096×4096 | 0 | Sol-Attn, BF16 | INT8 | 5.3 s | 49 s |
-| 4096×4096 | 2 | BF16 | INT8 | 8.8 s | 50 s |
-| 4096×4096 | 2 | Sol-Attn, BF16 | INT8 | 5.3 s | 37 s |
-| 4096×4096 | 2 | Sol-Attn, INT8/FP8 | INT8 | 4.9 s | 35 s |
-| 4096×4096 | 2 | Sol-Attn, INT8/FP8 | NVFP4 | 3.7 s | 30 s |
+| Picture | Steps | Draft steps | Attention | Linear layers | Each step at full size | Whole generation |
+| --- | --- | ---: | --- | --- | ---: | ---: |
+| 1024×1024 | 6 | 0 | BF16 | INT8 | 1.4 s | 18 s |
+| 1024×1024 | 6 | 2 | INT8/FP8 | INT8 | 1.3 s | 16 s |
+| 4096×4096 | 6 | 0 | BF16 | INT8 | 8.8 s | 63 s |
+| 4096×4096 | 6 | 0 | INT8/FP8 | INT8 | 7.3 s | 54 s |
+| 4096×4096 | 6 | 0 | INT8/FP8 | NVFP4 | 6.2 s | 47 s |
+| 4096×4096 | 6 | 0 | Sol-Attn, BF16 | INT8 | 5.3 s | 49 s |
+| 4096×4096 | 6 | 2 | BF16 | INT8 | 8.8 s | 50 s |
+| 4096×4096 | 6 | 2 | Sol-Attn, BF16 | INT8 | 5.3 s | 37 s |
+| 4096×4096 | 6 | 2 | Sol-Attn, INT8/FP8 | INT8 | 4.9 s | 35 s |
+| 4096×4096 | 6 | 2 | Sol-Attn, INT8/FP8 | NVFP4 | 3.7 s | 30 s |
+| 4096×4096 | 3, PDMD | 0 | BF16 | INT8 | 8.9 s | 40 s |
+| 4096×4096 | 3, PDMD | 3 | INT8/FP8 | INT8 | 7.4 s | 24 s |
+| 4096×4096 | 3, PDMD | 3 | INT8/FP8 | NVFP4 | 6.1 s | 23 s |
 
 The 1024×1024 picture is generated on a 2048×2048 canvas, as `--min-generation-area` sets by
 default, so its draft steps run on a 1024×1024 canvas, too short for Sol-Attn. A draft step at
@@ -151,9 +209,10 @@ units, FP16 unless INT8/FP16:
 | 4096×4096 | 2 | FP16 | 49 s | 255 s |
 | 4096×4096 | 0 | Sol-Attn, INT8/FP16 | 26 s | 237 s |
 | 4096×4096 | 2 | Sol-Attn, INT8/FP16 | 26 s | 165 s |
+| 4096×4096, 3 PDMD steps | 3 | INT8/FP16 | 59 s | 140 s |
 
-The last 4096×4096 row is the [faster settings](#faster) with `--attention-precision int8-fp16`,
-Metal's INT8 attention. The 1024×1024 picture is generated on a 2048×2048 canvas, as on CUDA, so a
+The last row is the [faster settings](#faster) with `--attention-precision int8-fp16`, Metal's INT8
+attention. The 1024×1024 picture is generated on a 2048×2048 canvas, as on CUDA, so a
 2048×2048 picture takes as long and its draft steps are too short for Sol-Attn. A draft step at
 4096×4096 takes about 7 s, the latent upscaler 5 s with its loading, and the picture VAE decodes a
 4096×4096 picture in 35 s. The 21 GB DiT does not fit in the GPU's share of 24 GB, so the Mac keeps

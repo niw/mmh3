@@ -39,15 +39,17 @@ target/release/mmh3 image --models models --out out.png \
   --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn."
 ```
 
-These settings generate a 4096×4096 picture in about 35 s on a DGX Spark, with
-[draft steps](docs/draft-steps.md) and Sol-Attn, which can change the details and the composition.
-See [Image](docs/image.md#faster) for what they change.
+These settings generate a 4096×4096 picture in about 24 s on a DGX Spark, in three steps of the
+[PDMD](docs/pdmd.md) LoRA on a half-size canvas and one at full size, which can change the details
+and the composition. See [Image](docs/image.md#faster) for what they change.
 
 ```sh
-tools/download-models.sh --image --latent-upscaler
+tools/download-models.sh --image --pdmd --latent-upscaler
 target/release/mmh3 image --models models --out out.png --width 4096 --height 4096 \
-  --draft-steps 2 --latent-upscaler minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
-  --attention sol --attention-precision int8-fp8 \
+  --steps 3 --lora minimax_h3_pdmd_2step_lora_rank128_bf16.safetensors \
+  --draft-steps 3 --renoise-sigma 0.5 \
+  --latent-upscaler minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors \
+  --attention-precision int8-fp8 \
   --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn."
 ```
 
@@ -104,12 +106,12 @@ On a DGX Spark, a 4096×4096 picture took:
 
 | Settings | Time per step | Time |
 | --- | ---: | ---: |
-| [Faster settings](docs/image.md#faster): 2 draft steps, Sol-Attn and INT8/FP8 attention | 4.9 s | 35 s |
-| The same with [NVFP4 linear layers](docs/nvfp4.md) | 3.7 s | 30 s |
-| Defaults, BF16 attention | 8.8 s | 63 s |
+| [Faster settings](docs/image.md#faster): 3 PDMD steps as draft steps, INT8/FP8 attention | 7.4 s | 24 s |
+| The same with [NVFP4 linear layers](docs/nvfp4.md) | 6.1 s | 23 s |
+| Defaults, six steps, BF16 attention | 8.8 s | 63 s |
 
-MiniMax H3 Image generates in six steps, and the times per step are those of a step at full size.
-A [server](docs/server.md) that keeps the models loaded takes 26 s with the faster settings.
+The times per step are those of a step at full size, of which the faster settings run one.
+A [server](docs/server.md) that keeps the models loaded takes 15 s with the faster settings.
 [Image](docs/image.md) has the times of other settings.
 
 ### Pictures on Metal
@@ -118,7 +120,7 @@ A 4096×4096 picture took:
 
 | Mac | Settings | Time per step | Time |
 | --- | --- | ---: | ---: |
-| M6, 24 GB | [Faster settings](docs/image.md#faster): 2 draft steps, Sol-Attn and INT8/FP16 attention | 26 s | 165 s |
+| M6, 24 GB | [Faster settings](docs/image.md#faster): 3 PDMD steps as draft steps, INT8/FP16 attention | 59 s | 140 s |
 | M6, 24 GB | Defaults, FP16 attention | 49 s | 337 s |
 | M5 Max, 128 GB | 2 [draft steps](docs/draft-steps.md) enlarged bilinearly, Sol-Attn and FP16 attention | 14 s | 89 s |
 | M5 Max, 128 GB | Defaults, FP16 attention | 24 s | 165 s |
