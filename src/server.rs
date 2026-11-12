@@ -355,6 +355,9 @@ pub fn serve(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         .route("/v1/generations/{id}/events", get(events))
         .route("/v1/generations/{id}/video", get(video))
         .route("/v1/generations/{id}/image", get(image))
+        // Each field holds itself to FIELD_BYTES or FILE_BYTES as it is read, which axum's limit on
+        // the whole body, 2 MB, would cut short of any picture worth editing.
+        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(server);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -539,11 +542,14 @@ async fn read_fields(
                 return Err(Failure::asked(&format!("{name} takes text, not a file")));
             }
             (kind, None) => {
-                let bytes = field.bytes().await.map_err(Failure::form)?;
-                if bytes.len() as u64 > FIELD_BYTES {
-                    return Err(Failure::asked("a field longer than this takes"));
+                let mut bytes = Vec::new();
+                while let Some(chunk) = field.chunk().await.map_err(Failure::form)? {
+                    if (bytes.len() + chunk.len()) as u64 > FIELD_BYTES {
+                        return Err(Failure::asked("a field longer than this takes"));
+                    }
+                    bytes.extend_from_slice(&chunk);
                 }
-                let text = String::from_utf8(bytes.to_vec())
+                let text = String::from_utf8(bytes)
                     .map_err(|_| Failure::asked("a form field that is not text"))?;
                 match kind {
                     FieldKind::ModelFile(directories) => {
