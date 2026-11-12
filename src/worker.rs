@@ -3607,7 +3607,7 @@ fn accept_sparse_attention(
 
 /// One of the leader's LoRAs or patches, in its own order.
 #[cfg(feature = "cuda")]
-fn add_adapter(
+pub(crate) fn add_adapter(
     dit: &mut Dit,
     file: &SafeTensors,
     adapter: &mmh3_core::worker::Adapter,
@@ -3621,7 +3621,7 @@ fn add_adapter(
 }
 
 #[cfg(feature = "metal")]
-fn add_adapter(
+pub(crate) fn add_adapter(
     dit: &mut Dit,
     file: &SafeTensors,
     adapter: &mmh3_core::worker::Adapter,

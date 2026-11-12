@@ -12,7 +12,7 @@ use mmh3_core::picture::Picture;
 use std::error::Error;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 use {
-    crate::cli::{option_number, option_values, parse_options},
+    crate::cli::{option_float, option_number, option_values, parse_options},
     crate::models::{TEXT_ENCODER_FILE, option_path},
     mmh3_core::safetensors::SafeTensors,
     mmh3_core::tensor::Tensor,
@@ -26,6 +26,7 @@ pub const USAGE: &str = "usage:
              [--dit FILE] [--text-encoder FILE] [--vae FILE] [--save-latent <latent.safetensors>]
              [--attention-precision PRECISION] [--linear-precision PRECISION] [--vram-budget GB] [--consistent]
              [--attention dense|sol] [--sparse-tau X] [--sparse-start X] [--draft-steps N] [--latent-upscaler FILE]
+             [--steps N] [--shift X] [--patch FILE] [--lora FILE] [--lora-strength X] [--lora-mode adapter|merge]
 
 image generates a picture with MiniMax H3 Image from a prompt, used as given. The model expects a detailed English
 description of the whole picture. Checkpoints default to their ComfyUI names inside a models directory laid out like
@@ -43,7 +44,11 @@ in the order of the options, up to 16. The size of the result is still --width a
 int8 or nvfp4 on CUDA and fp32, fp16, int8 or mps-fp16 on Metal.
 --attention sol runs Sol-Attn, a training-free block-sparse attention, as mmh3 generate does.
 --draft-steps runs the first N steps on a canvas of half the width and height, which must then be multiples of 64,
-and enlarges the latent they predict with the latent upscaler of --latent-upscaler, or bilinearly without one.";
+and enlarges the latent they predict with the latent upscaler of --latent-upscaler, or bilinearly without one.
+--steps samples in N steps on the uniform grid shifted by --shift, 12 by default, rather than on the six sigmas the
+checkpoint was distilled for, as a few-step LoRA such as PDMD's wants. A step then projects through the output heads
+of the distilled sigmas it spans, weighted by how much of it each one covers. --patch and --lora apply as they do to
+mmh3 generate.";
 
 /// The DiT of MiniMax H3 Image inside the models directory.
 pub const IMAGE_DIT_FILE: &str =
@@ -57,6 +62,9 @@ const MAX_PROMPT_TOKENS: usize = 4096;
 const DEFAULT_SIDE: usize = 2048;
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const DEFAULT_MIN_GENERATION_AREA: usize = 2048 * 2048;
+/// The shift of the grid of `--steps`, the one PDMD's LoRA was distilled on.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+const DEFAULT_SHIFT: f32 = 12.0;
 /// The most reference pictures an edit takes.
 #[cfg(any(feature = "cuda", feature = "metal"))]
 const MAX_REFERENCES: usize = 16;
@@ -155,7 +163,7 @@ pub fn step_schedule(step_sigmas: &[f32]) -> Vec<f32> {
 #[cfg(any(feature = "cuda", feature = "metal"))]
 pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     use mmh3_core::dit::inputs::DitInputs;
-    use mmh3_core::dit::sampler::euler_step;
+    use mmh3_core::dit::sampler::{Schedule, euler_step};
     use mmh3_core::generation::VIDEO_LATENT_CHANNELS;
     use mmh3_core::random::NormalSampler;
     use mmh3_core::tokenizer::Tokenizer;
@@ -191,6 +199,12 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             "sparse-start",
             "draft-steps",
             "latent-upscaler",
+            "steps",
+            "shift",
+            "patch",
+            "lora",
+            "lora-strength",
+            "lora-mode",
         ],
         &["consistent"],
         USAGE,
@@ -211,6 +225,11 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     {
         crate::metal::attention_precision(&options)?;
         crate::metal::linear_precision(&options)?;
+        if let Some(mode) = options.get("lora-mode")
+            && *mode != "adapter"
+        {
+            return Err(format!("Metal runs --lora-mode adapter, not {mode}").into());
+        }
     }
 
     let out = Path::new(options.get("out").ok_or(USAGE)?);
@@ -245,6 +264,17 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("--latent-upscaler enlarges the draft of --draft-steps".into());
     }
     let sparse = crate::models::sparse_attention(&options, false)?;
+    let uniform_steps = match options.contains_key("steps") {
+        true => Some(option_number(&options, "steps", 0)?),
+        false => None,
+    };
+    if uniform_steps == Some(0) {
+        return Err("--steps must be at least 1".into());
+    }
+    if uniform_steps.is_none() && options.contains_key("shift") {
+        return Err("--shift shifts the grid of --steps".into());
+    }
+    let shift = option_float(&options, "shift", DEFAULT_SHIFT)?;
 
     let prompt = match (options.get("prompt"), options.get("prompt-file")) {
         (Some(prompt), None) => Some((*prompt).to_owned()),
@@ -332,7 +362,7 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     }
     let references = encode_references(&options, seed, &references)?;
 
-    let (dit, dit_key) = held.dit(&options)?;
+    let (mut dit, dit_key) = held.dit(&options)?;
     let config = dit.config();
     if config.has_audio() || config.step_sigmas.is_empty() {
         return Err(
@@ -341,7 +371,14 @@ pub fn run(arguments: &[String]) -> Result<(), Box<dyn Error>> {
                 .into(),
         );
     }
-    let sigmas = step_schedule(&config.step_sigmas);
+    let sigmas = match uniform_steps {
+        Some(steps) => {
+            let uniform = Schedule::uniform(steps, shift, 1.0).video;
+            step_schedule(&uniform[..steps])
+        }
+        None => step_schedule(&config.step_sigmas),
+    };
+    dit.set_sample_sigmas(&sigmas);
     let steps = sigmas.len() - 1;
     if draft_steps >= steps {
         return Err(format!(
@@ -544,22 +581,45 @@ impl Held {
         }
         let path = option_path(options, "dit", IMAGE_DIT_FILE)?;
         let file = SafeTensors::open(Path::new(&path))?;
+        let adapters = wanted_adapters(options)?;
         let key = crate::resident::DitKey {
             checkpoint: crate::worker::digest(&file),
-            adapters: Vec::new(),
+            adapters: adapters
+                .iter()
+                .map(|(_, adapter)| (adapter.digest, adapter.strength.to_bits(), adapter.mode))
+                .collect(),
         };
         let mut models = table.borrow();
-        let mut dit = match models.take_dit() {
-            Some((kept, dit)) if kept == key => dit,
+        // Adapters only ever add, so a kept DiT whose adapters begin this run's takes the rest.
+        let (mut dit, applied) = match models.take_dit() {
+            Some((kept, dit))
+                if kept.checkpoint == key.checkpoint
+                    && key.adapters.starts_with(&kept.adapters) =>
+            {
+                (dit, kept.adapters.len())
+            }
             other => {
                 drop(other);
                 let started = Instant::now();
                 let dit = models
                     .read_fitting(|| Dit::load(&file, ""), || Dit::load_fitting(&file, ""))?;
                 println!("loaded {path} in {:.1} s", started.elapsed().as_secs_f64());
-                dit
+                (dit, 0)
             }
         };
+        for (adapter_path, adapter) in &adapters[applied..] {
+            let started = Instant::now();
+            let layers = crate::worker::add_adapter(
+                &mut dit,
+                &SafeTensors::open(Path::new(adapter_path))?,
+                adapter,
+            )?;
+            println!(
+                "added {adapter_path} to {layers} layers at strength {} in {:.1} s",
+                adapter.strength,
+                started.elapsed().as_secs_f64()
+            );
+        }
         #[cfg(feature = "cuda")]
         dit.set_attention_precision(attention_precision(options)?);
         #[cfg(feature = "metal")]
@@ -622,6 +682,52 @@ impl Held {
             }
         }
     }
+}
+
+/// The patch of `--patch` and the LoRA of `--lora` with the files they come from, in the order they
+/// apply, since they do not commute. A patch applies as adapters at full strength.
+#[cfg(any(feature = "cuda", feature = "metal"))]
+fn wanted_adapters(
+    options: &std::collections::HashMap<&str, &str>,
+) -> Result<Vec<(String, mmh3_core::worker::Adapter)>, Box<dyn Error>> {
+    use crate::models::model_file;
+    use mmh3_core::worker::Adapter;
+
+    let wanted = [
+        (
+            model_file(options, "patch", &["patches", "loras"])?,
+            1.0,
+            "adapter",
+        ),
+        (
+            model_file(options, "lora", &["loras"])?,
+            option_float(options, "lora-strength", 1.0)?,
+            options.get("lora-mode").copied().unwrap_or("adapter"),
+        ),
+    ];
+    let mut adapters = Vec::new();
+    for (path, strength, mode) in wanted {
+        let Some(path) = path else {
+            continue;
+        };
+        let mode = match mode {
+            "adapter" => Adapter::ADAPTER,
+            "merge" => Adapter::MERGE,
+            other => {
+                return Err(format!("--lora-mode must be adapter or merge, not {other}").into());
+            }
+        };
+        let digest = crate::worker::digest(&SafeTensors::open(Path::new(&path))?);
+        adapters.push((
+            path,
+            Adapter {
+                digest,
+                strength,
+                mode,
+            },
+        ));
+    }
+    Ok(adapters)
 }
 
 /// The attention precision of `--attention-precision`, BF16 by default.

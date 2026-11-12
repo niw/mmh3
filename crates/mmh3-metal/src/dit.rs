@@ -45,6 +45,8 @@ pub struct MetalDit {
     stream: Option<RefCell<Stream>>,
     /// Veda's predictor, which `--attention veda` needs.
     veda: Option<VedaWeights>,
+    /// The sigmas a run samples on, which decide the output heads of a DiT with one per step.
+    sample_sigmas: Vec<f32>,
 }
 
 /// The block-sparse attention of one block.
@@ -176,6 +178,7 @@ impl MetalDit {
             inv_freq,
             stream: stream.map(RefCell::new),
             veda: None,
+            sample_sigmas: Vec::new(),
         })
     }
 
@@ -241,11 +244,22 @@ impl MetalDit {
         Ok(())
     }
 
-    /// The video output layer of a step at `sigma`.
-    fn video_output(&self, sigma: f32) -> String {
+    /// Takes the sigmas a run samples on, ending at 0. A DiT with an output head per step blends
+    /// the heads each step spans, as `DitConfig::step_heads` says.
+    pub fn set_sample_sigmas(&mut self, sigmas: &[f32]) {
+        self.sample_sigmas = sigmas.to_vec();
+    }
+
+    /// The video output layers of a step at `sigma`, each with its weight.
+    fn video_outputs(&self, sigma: f32) -> Vec<(String, f32)> {
         match self.config.step_sigmas.is_empty() {
-            true => "final_layer.video_out".to_owned(),
-            false => format!("final_layer.video_out.{}", self.config.output_head(sigma)),
+            true => vec![("final_layer.video_out".to_owned(), 1.0)],
+            false => self
+                .config
+                .step_heads(&self.sample_sigmas, sigma)
+                .into_iter()
+                .map(|(head, weight)| (format!("final_layer.video_out.{head}"), weight))
+                .collect(),
         }
     }
 
@@ -1140,7 +1154,19 @@ impl MetalDit {
             w.linear(&x.modulate(&m, &rows, 0, 1)?, name)?.to_f32()
         };
 
-        let mut video = project(SegmentKind::Video, &self.video_output(inputs.sigma))?;
+        let mut video = Vec::new();
+        for (layer, weight) in self.video_outputs(inputs.sigma) {
+            let projected = project(SegmentKind::Video, &layer)?;
+            match video.is_empty() {
+                true if weight == 1.0 => video = projected,
+                true => video = projected.iter().map(|value| weight * value).collect(),
+                false => {
+                    for (sum, value) in video.iter_mut().zip(projected) {
+                        *sum += weight * value;
+                    }
+                }
+            }
+        }
         if let Some(plan) = &plan {
             video = plan.restore_video(&video, c.video_patch_features());
         }

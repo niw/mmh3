@@ -44,16 +44,38 @@ impl DitConfig {
         self.audio_channels > 0
     }
 
-    /// The output head of a step at `sigma`: the one distilled for the nearest sigma, and 0 for a
-    /// single head.
-    pub fn output_head(&self, sigma: f32) -> usize {
-        self.step_sigmas
-            .iter()
-            .enumerate()
-            .min_by(|(_, left), (_, right)| {
-                (*left - sigma).abs().total_cmp(&(*right - sigma).abs())
-            })
-            .map_or(0, |(head, _)| head)
+    /// The output heads a step at `sigma` of `schedule` projects through, each with its weight, as
+    /// ComfyUI takes them. The step spans the intervals of the distilled grid between the grid
+    /// points nearest `sigma` and the schedule's next sigma, and takes the mean of their heads
+    /// weighted by the length of each interval. On the distilled schedule this is the one head of
+    /// the step. Without a schedule, the head distilled for the nearest sigma, and 0 for a single
+    /// head.
+    pub fn step_heads(&self, schedule: &[f32], sigma: f32) -> Vec<(usize, f32)> {
+        let nearest = |points: &[f32], value: f32| {
+            points
+                .iter()
+                .enumerate()
+                .min_by(|(_, left), (_, right)| {
+                    (*left - value).abs().total_cmp(&(*right - value).abs())
+                })
+                .map_or(0, |(index, _)| index)
+        };
+        let heads = self.step_sigmas.len();
+        if heads < 2 || schedule.is_empty() {
+            return vec![(nearest(&self.step_sigmas, sigma), 1.0)];
+        }
+        let grid: Vec<f32> = self.step_sigmas.iter().copied().chain([0.0]).collect();
+        let next = schedule[(nearest(schedule, sigma) + 1).min(schedule.len() - 1)];
+        let start = nearest(&grid, sigma).min(heads - 1);
+        let stop = nearest(&grid, next).max(start + 1);
+        let lengths: Vec<f64> = (start..stop)
+            .map(|index| f64::from(grid[index]) - f64::from(grid[index + 1]))
+            .collect();
+        let total: f64 = lengths.iter().sum();
+        (start..stop)
+            .zip(lengths)
+            .map(|(head, length)| (head, (length / total) as f32))
+            .collect()
     }
 
     /// The shape of a DiT read from its checkpoint header alone, with no weights uploaded
@@ -172,7 +194,7 @@ mod tests {
     }
 
     #[test]
-    fn picks_the_head_of_the_nearest_sigma() {
+    fn picks_the_heads_a_step_spans() {
         let mut config = DitConfig::from_shapes(|name| {
             Some(match name {
                 "video_patch_proj.weight" => vec![8, 96],
@@ -189,10 +211,25 @@ mod tests {
         })
         .unwrap();
         assert!(!config.has_audio());
-        assert_eq!(config.output_head(0.3), 0);
+        assert_eq!(config.step_heads(&[], 0.3), vec![(0, 1.0)]);
         config.step_sigmas = vec![1.0, 0.75, 0.25];
-        assert_eq!(config.output_head(1.0), 0);
-        assert_eq!(config.output_head(0.7), 1);
-        assert_eq!(config.output_head(0.2), 2);
+        assert_eq!(config.step_heads(&[], 1.0), vec![(0, 1.0)]);
+        assert_eq!(config.step_heads(&[], 0.7), vec![(1, 1.0)]);
+        assert_eq!(config.step_heads(&[], 0.2), vec![(2, 1.0)]);
+        // The distilled schedule takes one head a step.
+        let distilled = [1.0, 0.75, 0.25, 0.0];
+        for (step, &sigma) in distilled[..3].iter().enumerate() {
+            assert_eq!(config.step_heads(&distilled, sigma), vec![(step, 1.0)]);
+        }
+        // A longer step blends the heads it spans by the lengths of their intervals.
+        let shorter = [1.0, 0.7, 0.0];
+        assert_eq!(config.step_heads(&shorter, 1.0), vec![(0, 1.0)]);
+        assert_eq!(
+            config.step_heads(&shorter, 0.7),
+            vec![(1, 0.5 / 0.75), (2, 0.25 / 0.75)]
+        );
+        // A step shorter than an interval still takes one head.
+        let finer = [1.0, 0.95, 0.9, 0.0];
+        assert_eq!(config.step_heads(&finer, 0.95), vec![(0, 1.0)]);
     }
 }

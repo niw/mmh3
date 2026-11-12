@@ -71,6 +71,12 @@ const IMAGE_OPTIONS: &[&str] = &[
     "sparse-start",
     "draft-steps",
     "latent-upscaler",
+    "steps",
+    "shift",
+    "patch",
+    "lora",
+    "lora-strength",
+    "lora-mode",
 ];
 /// The options of a picture whose value is a file, which a request uploads.
 const IMAGE_FILE_OPTIONS: &[&str] = &["prompt-file", "reference"];
@@ -941,6 +947,10 @@ mod tests {
             image_field_kind("latent-upscaler"),
             Ok(FieldKind::ModelFile(["latent_upscale_models"]))
         ));
+        assert!(matches!(
+            image_field_kind("lora"),
+            Ok(FieldKind::ModelFile(["loras"]))
+        ));
         for name in [
             "dit",
             "vae",
@@ -948,8 +958,7 @@ mod tests {
             "out",
             "save-latent",
             "linear-precision",
-            "steps",
-            "lora",
+            "sampler",
         ] {
             assert!(image_field_kind(name).is_err(), "{name}");
         }

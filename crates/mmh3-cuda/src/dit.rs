@@ -406,6 +406,8 @@ pub struct CudaDit {
     inverse_frequencies: Vec<f32>,
     /// Veda's predictor, which `--attention veda` needs.
     veda: Option<VedaWeights>,
+    /// The sigmas a run samples on, which decide the output heads of a DiT with one per step.
+    sample_sigmas: Vec<f32>,
     buffers: RefCell<ForwardBuffers>,
 }
 
@@ -540,6 +542,7 @@ impl CudaDit {
             adaln_table: host_tensor(file, &format!("{prefix}adaln_t_table"))?,
             inverse_frequencies: host_tensor(file, &format!("{prefix}rope.inv_freq"))?.data,
             veda: None,
+            sample_sigmas: Vec::new(),
             buffers: RefCell::default(),
         })
     }
@@ -590,11 +593,22 @@ impl CudaDit {
         Ok(())
     }
 
-    /// The video output layer of a step at `sigma`.
-    fn video_output(&self, sigma: f32) -> String {
+    /// Takes the sigmas a run samples on, ending at 0. A DiT with an output head per step blends
+    /// the heads each step spans, as `DitConfig::step_heads` says.
+    pub fn set_sample_sigmas(&mut self, sigmas: &[f32]) {
+        self.sample_sigmas = sigmas.to_vec();
+    }
+
+    /// The video output layers of a step at `sigma`, each with its weight.
+    fn video_outputs(&self, sigma: f32) -> Vec<(String, f32)> {
         match self.config.step_sigmas.is_empty() {
-            true => "final_layer.video_out".to_owned(),
-            false => format!("final_layer.video_out.{}", self.config.output_head(sigma)),
+            true => vec![("final_layer.video_out".to_owned(), 1.0)],
+            false => self
+                .config
+                .step_heads(&self.sample_sigmas, sigma)
+                .into_iter()
+                .map(|(head, weight)| (format!("final_layer.video_out.{head}"), weight))
+                .collect(),
         }
     }
 
@@ -633,6 +647,7 @@ impl CudaDit {
             adaln_table: self.adaln_table.clone(),
             inverse_frequencies: self.inverse_frequencies.clone(),
             veda: self.veda.as_ref().map(VedaWeights::copied).transpose()?,
+            sample_sigmas: self.sample_sigmas.clone(),
             buffers: RefCell::default(),
         })
     }
@@ -2901,11 +2916,19 @@ impl CudaDit {
             )?;
             Ok(output.to_f32()?)
         };
-        let mut video_velocity = project(
-            video,
-            &self.video_output(inputs.sigma),
-            config.video_patch_features(),
-        )?;
+        let mut video_velocity = Vec::new();
+        for (layer, weight) in self.video_outputs(inputs.sigma) {
+            let projected = project(video, &layer, config.video_patch_features())?;
+            match video_velocity.is_empty() {
+                true if weight == 1.0 => video_velocity = projected,
+                true => video_velocity = projected.iter().map(|value| weight * value).collect(),
+                false => {
+                    for (sum, value) in video_velocity.iter_mut().zip(projected) {
+                        *sum += weight * value;
+                    }
+                }
+            }
+        }
         let audio_velocity = project(audio, "final_layer.audio_out", config.audio_channels)?;
         if context.is_some() {
             // The rows of one rank cannot be unpatchified on their own, and in VSA's order they are
