@@ -65,6 +65,7 @@ import math
 import os
 import sys
 import time
+from typing import Any
 
 import torch
 from safetensors.torch import save_file
@@ -240,6 +241,7 @@ def vsa_block_patch(block, sparsity, plans):
     attn = block.attn
 
     def attention(x, rope_freqs=None, transformer_options=None):
+        assert rope_freqs is not None and transformer_options is not None
         layout = transformer_options["minimax_h3_layout"]
         key = (layout.signature, tuple(layout.segments))
         if key not in plans:
@@ -382,7 +384,7 @@ def main():
         return
 
     frames, _, _ = temporal_shape(arguments.frames)
-    keyframes = []
+    keyframes: list[dict[str, Any]] = []
     if arguments.first_frame or arguments.last_frame:
         import numpy
         from comfy_extras.nodes_minimax_h3 import _resize

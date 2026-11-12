@@ -1,0 +1,9 @@
+[environment]
+extra-paths = ["tools/models"]
+python-platform = "linux"
+
+[src]
+include = ["tools"]
+
+[rules]
+import-not-found = "ignore"

@@ -49,6 +49,7 @@ def main():
         arguments.diffusers, "scripts", "convert_minimax_h3_to_diffusers.py"
     )
     spec = importlib.util.spec_from_file_location("convert_minimax_h3", script)
+    assert spec is not None and spec.loader is not None
     convert = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(convert)
 

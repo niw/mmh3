@@ -137,6 +137,7 @@ def main():
     pixel_std = torch.tensor(PIXEL_STD, device=device).view(1, -1, 1, 1)
     pictures, means, reference_latents = [], [], []
     for path in args.reference:
+        assert vae is not None
         image = ImageOps.exif_transpose(Image.open(path)).convert("RGB")
         size = bound_short_edge(*image.size, *REFERENCE_SHORT_EDGE, 32)
         if image.size != size:
