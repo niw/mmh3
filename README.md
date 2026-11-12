@@ -2,7 +2,7 @@
 
 mmh3 is an inference engine dedicated to the MiniMax H3 family, written in Rust with CUDA and Metal
 kernels and running without PyTorch or ComfyUI. It generates videos with audio with
-[MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) and pictures with
+[MiniMax H3](https://huggingface.co/MiniMaxAI/MiniMax-H3) and images with
 [MiniMax H3 Image](https://huggingface.co/MiniMaxAI/MiniMax-H3-Image). The tokenizer, the Qwen3-VL
 text encoder, the diffusion transformer, the samplers and the VAEs are written in this repository
 and tuned for the shapes of these models.
@@ -30,8 +30,8 @@ make generate
 `make download-models` downloads the models into `models`, and `make generate` writes a video with
 audio from a sample prompt to `out.mp4`. See [Usage](docs/usage.md) for the other settings.
 
-These commands download MiniMax H3 Image and write a picture to `out.png`. See
-[Image](docs/image.md) for its settings and for editing pictures.
+These commands download MiniMax H3 Image and write an image to `out.png`. See
+[Image](docs/image.md) for its settings and for editing images.
 
 ```sh
 tools/download-models.sh --image
@@ -39,7 +39,7 @@ target/release/mmh3 image --models models --out out.png \
   --prompt "A red panda in a knitted scarf sits on a mossy log in a misty pine forest at dawn."
 ```
 
-These settings generate a 4096×4096 picture in about 24 s on a DGX Spark, in three steps of the
+These settings generate a 4096×4096 image in about 24 s on a DGX Spark, in three steps of the
 [PDMD](docs/pdmd.md) LoRA on a half-size canvas and one at full size, which can change the details
 and the composition. See [Image](docs/image.md#faster) for what they change.
 
@@ -100,9 +100,9 @@ Each generated a 672×384, 73-frame video, 3.0 seconds at 24 fps. On the M6, the
 [PDMD](docs/pdmd.md) LoRA generated a video of the same size in 45 s, and the 4-step
 [DMAD](docs/dmad.md) LoRA in 76 s.
 
-### Pictures on CUDA
+### Images on CUDA
 
-On a DGX Spark, a 4096×4096 picture took:
+On a DGX Spark, a 4096×4096 image took:
 
 | Settings | Time per step | Time |
 | --- | ---: | ---: |
@@ -114,9 +114,9 @@ The times per step are those of a step at full size, of which the faster setting
 A [server](docs/server.md) that keeps the models loaded takes 15 s with the faster settings.
 [Image](docs/image.md) has the times of other settings.
 
-### Pictures on Metal
+### Images on Metal
 
-A 4096×4096 picture took:
+A 4096×4096 image took:
 
 | Mac | Settings | Time per step | Time |
 | --- | --- | ---: | ---: |
@@ -136,12 +136,12 @@ one and a half times. [Image](docs/image.md#speed) has the times of other settin
 - Text to video with audio (T2VA) works end to end, one video at a time. Native MP4 and WebM
   generation and complete video/audio decoding have been verified on GB10.
 - Videos from a first frame, a last frame or both ([FL2VA](docs/fl2va.md)) work too.
-- Videos from reference pictures, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
+- Videos from reference images, sounds and clips ([Ref2VA](docs/ref2va.md)) work with the ref2va
   DiT, reading reference clips from MP4 files.
 
-### Pictures
+### Images
 
-- Pictures of about 16 megapixels from text, and edits of up to 16 reference pictures
+- Images of about 16 megapixels from text, and edits of up to 16 reference images
   ([Image](docs/image.md)), work with `mmh3 image` on CUDA and have been checked against diffusers'
   pipeline. They work on Metal too, where editing needs macOS 26.
 
@@ -158,7 +158,7 @@ one and a half times. [Image](docs/image.md#speed) has the times of other settin
   and from a machine with neither. Shares follow what each machine measures itself to do. Between
   two DGX Sparks a 768p run takes about a quarter less, and a Mac that hands every step to a Spark
   rather than taking one itself generates about twenty-five times faster than it does alone.
-- An [HTTP server](docs/server.md) takes a video or a picture as a form and keeps its models
+- An [HTTP server](docs/server.md) takes a video or an image as a form and keeps its models
   loaded between the generations it runs, so the second one against a warm server starts at its
   first step. It has no authentication of its own and waits on loopback.
 

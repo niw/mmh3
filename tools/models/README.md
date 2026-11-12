@@ -126,15 +126,15 @@ alone gives about 58.9 dB.
 | Smoothing and GPTQ, 48 tiles | 60.8 dB |
 | Smoothing and GPTQ, 96 tiles (the defaults) | 60.9 dB |
 
-### The picture VAE of MiniMax H3 Image
+### The image VAE of MiniMax H3 Image
 
-Given the FP16 picture VAE of Comfy-Org/MiniMax-H3-Image, the tool builds
+Given the FP16 image VAE of Comfy-Org/MiniMax-H3-Image, the tool builds
 `vae/minimax_h3_image_vae_int8_convrot.safetensors` the same way, from the 24 blocks of its decoder.
-A tile is then 16 × 16 positions of one picture, and the latent statistics, which Comfy-Org's file
+A tile is then 16 × 16 positions of one image, and the latent statistics, which Comfy-Org's file
 does not carry, come from the release. The file is 768 MB.
 
 The calibration latents come from `mmh3 image --save-latent`. The results below use the eight
-pictures of the prompts in `image_vae_calibration_prompts.txt`, each line a size and a prompt, with
+images of the prompts in `image_vae_calibration_prompts.txt`, each line a size and a prompt, with
 seeds 11 to 18. With `MMH3_MODELS` set as for `mmh3`:
 
 ```sh
@@ -152,18 +152,18 @@ uv run tools/models/video_vae_int8.py \
   --out models/vae/minimax_h3_image_vae_int8_convrot.safetensors
 ```
 
-On a DGX Spark the eight pictures take about 9 minutes, and the tool 22 seconds and 2.5 GB of host
-memory. Against the FP16 decode, the pixels of three pictures of about 16 megapixels outside the
+On a DGX Spark the eight images take about 9 minutes, and the tool 22 seconds and 2.5 GB of host
+memory. Against the FP16 decode, the pixels of three images of about 16 megapixels outside the
 calibration are, on average:
 
-| INT8 picture VAE | PSNR |
+| INT8 image VAE | PSNR |
 | --- | ---: |
 | Rounding to nearest (`--method rtn --no-smoothing`) | 61.0 dB |
 | Smoothing and GPTQ, 96 tiles (the defaults) | 63.4 dB |
 
-A 4096×4096 picture decodes in 2.4 s rather than 2.6 s, since the FP16 products of this decoder
-already run close to the INT8 ones on a GB10. `mmh3 image` keeps decoding with the FP16 picture VAE
-unless `--vae` names the INT8 one, and a server's `--image-vae` does the same for its pictures.
+A 4096×4096 image decodes in 2.4 s rather than 2.6 s, since the FP16 products of this decoder
+already run close to the INT8 ones on a GB10. `mmh3 image` keeps decoding with the FP16 image VAE
+unless `--vae` names the INT8 one, and a server's `--image-vae` does the same for its images.
 
 ## taomate_lora.py
 
@@ -201,7 +201,7 @@ a LoRA.
 | `--energy 0.98` | 64, 128 for 14 fc2 layers | 656 MB | 4.8e-2 |
 | `--rank 64` | 64 | 620 MB | 5.2e-2 |
 
-Three sampling steps turn small numeric differences into different pictures, so the final latents
+Three sampling steps turn small numeric differences into different images, so the final latents
 of these variants differ as much as those of the adapter's own A and B rounded to BF16 without the
 SVD. One dense step at sigma 1 tells them apart better. There, against rank 128, the video velocity
 of every variant deviates by about 0.24 to 0.26 of TaoMate's own change of the velocity, as much as

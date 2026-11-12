@@ -19,7 +19,7 @@ with the Hugging Face CLI (`hf`), or with curl when hf is not installed:
 With `--video-vae fp16`, the script downloads the FP16 video VAE,
 `vae/minimax_h3_video_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3, instead of the INT8 one.
 `--ref2va` also downloads the ref2va DiT and its 8-step Turbo LoRA for [reference
-pictures](ref2va.md), `--no-fasth3` skips the [FastH3](fasth3.md) patch, `--lightx2v-turbo` also
+images](ref2va.md), `--no-fasth3` skips the [FastH3](fasth3.md) patch, `--lightx2v-turbo` also
 downloads the [Turbo LoRA](lightx2v-turbo.md),
 `loras/minimax_h3_fl2v_turbo_4step_v1.2_768p_comfyui_bf16.safetensors` from
 lightx2v/Minimax-h3-Turbo, `--taomate` also downloads the [TaoMate-H3](taomate.md) LoRA,
@@ -33,7 +33,7 @@ also downloads the [DMAD](dmad.md) LoRA,
 Veda-Sparse/Minimax-H3-T2VA-Veda-8NFE-600Step-Preview, `--latent-upscaler` also downloads the
 latent upscaler of [draft steps](draft-steps.md),
 `latent_upscale_models/minimax_h3_latent_upscaler_3d_conv_v1_bf16.safetensors` from
-LBH-123-AI/Minimax_h3_latent_Upscaler, `--image` also downloads the DiT and the picture VAE of
+LBH-123-AI/Minimax_h3_latent_Upscaler, `--image` also downloads the DiT and the image VAE of
 [Image](image.md), `diffusion_models/minimax_h3_image_pruned_int8_convrot.safetensors` and
 `vae/minimax_h3_image_vae_fp16.safetensors` from Comfy-Org/MiniMax-H3-Image, and `--models DIR`
 downloads into another directory.

@@ -123,7 +123,7 @@ the text encoder derived from Qwen3-VL, optional LoRAs such as lightx2v's MiniMa
 Turbo LoRA, and LBH-123-AI's latent upscaler (Apache License, Version 2.0).
 
 MiniMax H3 Image by MiniMax (MiniMax-H3-Image Community License Agreement).
-The latent statistics of its picture VAE, in `crates/mmh3-core/src/vae.rs` and
+The latent statistics of its image VAE, in `crates/mmh3-core/src/vae.rs` and
 `tools/models/video_vae_int8.py`, come from the `vae/config.json` of
 MiniMaxAI/MiniMax-H3-Image, since Comfy-Org's file does not carry them and the
 weights need them.

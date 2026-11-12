@@ -49,12 +49,12 @@ through ffmpeg on a GPU or in a container without NVENC.
 - `--width N`, `--height N` (default 1344, 768): Canvas size, multiples of 32. MiniMax H3 is
   trained with a 768-pixel short edge.
 - `--frames N` (default 124): Frame count at 24 fps, rounded up to the next 17n + 5.
-- `--first-frame FILE`, `--last-frame FILE` (default none): PNG or JPEG pictures the video starts
-  from and ends on. Without `--width` and `--height` the first picture sets the canvas. See
+- `--first-frame FILE`, `--last-frame FILE` (default none): PNG or JPEG images the video starts
+  from and ends on. Without `--width` and `--height` the first image sets the canvas. See
   [First and last frames](fl2va.md) for the prompt they need.
-- `--reference FILE` (default none, repeatable): A PNG or JPEG picture the prompt refers to as
+- `--reference FILE` (default none, repeatable): A PNG or JPEG image the prompt refers to as
   `<Picture 1>`, `<Picture 2>` and so on, in the order of the options. Switches the default DiT to
-  the ref2va one. See [Reference pictures and sounds](ref2va.md).
+  the ref2va one. See [Reference images and sounds](ref2va.md).
 - `--reference-audio FILE` (default none, repeatable): A sound the prompt refers to as `<Audio 1>`,
   `<Audio 2>` and so on, in the order of the options, from a WAV, FLAC, MP3, AAC, ALAC, Ogg Vorbis,
   MP4 or Matroska file, resampled to the audio VAE's 32 kHz. Switches the default DiT to the ref2va
@@ -132,7 +132,7 @@ through ffmpeg on a GPU or in a container without NVENC.
 
 ## Prompts
 
-MiniMax H3 follows long, structured prompts well, with the picture, the sound and the music
+MiniMax H3 follows long, structured prompts well, with the image, the sound and the music
 described separately, one section per line:
 
 ```text

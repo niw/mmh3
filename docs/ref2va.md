@@ -1,7 +1,7 @@
-# Reference pictures, sounds and clips
+# Reference images, sounds and clips
 
 MiniMax H3 has a second DiT for reference to video generation (Ref2VA): the prompt refers to
-pictures, videos and sounds, and the video takes people, animals, places or styles from them. mmh3
+images, videos and sounds, and the video takes people, animals, places or styles from them. mmh3
 runs it with all three.
 
 ## Download
@@ -16,10 +16,10 @@ the audio and video VAEs that `generate` decodes with hold their encoders too.
 
 ## Generate
 
-`--reference` takes a PNG or JPEG file and repeats, up to nine pictures as the official pipeline
+`--reference` takes a PNG or JPEG file and repeats, up to nine images as the official pipeline
 allows. The prompt calls them `<Picture 1>`, `<Picture 2>` and so on, in the order of the options.
 The official prompt guide (`skills/h3-prompt-writing/references/ref-en.txt` in
-MiniMaxAI/MiniMax-H3) writes Ref2VA prompts in six sections, which define what each picture brings
+MiniMaxAI/MiniMax-H3) writes Ref2VA prompts in six sections, which define what each image brings
 and then describe the video:
 
 ```text
@@ -88,22 +88,22 @@ unless `--width` and `--height` say otherwise, as the references do not set it. 
 
 ## How it works
 
-- Each picture keeps its aspect ratio and is scaled down, never up, to the canvas's area, each side
+- Each image keeps its aspect ratio and is scaled down, never up, to the canvas's area, each side
   rounded to a multiple of 32 pixels and resized with Pillow's Lanczos filter. This is the `match`
   sizing of ComfyUI's MiniMaxH3ReferenceToVideo, which the Turbo LoRA was trained with. The
-  official pipeline scales every picture to a 2048-pixel short edge instead, several times more
+  official pipeline scales every image to a 2048-pixel short edge instead, several times more
   rows.
-- The text encoder sees the pictures as `<Picture i>: ` vision blocks before the prompt, like the
+- The text encoder sees the images as `<Picture i>: ` vision blocks before the prompt, like the
   keyframes of [first and last frame generation](fl2va.md), about 1,000 tokens each at 768p.
-- The video VAE's encoder turns each picture into one latent frame, sampled from its posterior with
+- The video VAE's encoder turns each image into one latent frame, sampled from its posterior with
   0.1% of noise mixed in.
 - The DiT sees these latents as rows after the text, each on a latent grid of its own and on one
   unit of the time axis of its own, and never denoises them. The target video starts on the time
   axis after them.
 - A sound gets its `<Audio j>: ` label in the prompt and nothing more, since MiniMax H3 has no
-  audio tower. The labels follow the pictures, the order of the official presentation.
+  audio tower. The labels follow the images, the order of the official presentation.
 - The audio VAE's encoder turns a sound into 40 latent frames per second, the posterior mean with
-  no noise mixed in. Those rows sit after the pictures, two per latent frame for the stereo
+  no noise mixed in. Those rows sit after the images, two per latent frame for the stereo
   channels, on as many units of the time axis as the sound has frames, and they are never
   denoised either.
 - A sound is padded with silence to a whole latent frame, which is what the official pipeline
@@ -116,7 +116,7 @@ unless `--width` and `--height` say otherwise, as the references do not set it. 
   the 17n + 5 frames the VAE's clips cover.
 - The text encoder sees a clip at two frames per second, two frames to a vision block, each block
   after a `<T.T seconds>` label and all of them after `<Video k>: `. The two frames take a
-  temporal slot each of the block's patches, where a picture repeats itself.
+  temporal slot each of the block's patches, where an image repeats itself.
 - The video VAE's encoder turns the clip into one latent frame per four, in groups of seventeen
   frames that give five latent frames each, less the three the reference drops from the end.
 - The DiT sees a clip's soundtrack rows first and then its video rows, both from the same point of
@@ -132,10 +132,10 @@ A generation took:
 | --- | --- | --- | --- | ---: | ---: |
 | DGX Spark | 1344×768, 124 frames | the kitten and the street above | Turbo LoRA, 8 steps | 17.7 s | 177.9 s |
 | DGX Spark | 1344×768, 124 frames | the kitten and the street above | 20 steps, the first 4 dense | | 424.8 s |
-| DGX Spark | 1344×768, 124 frames | a 448×256 picture | | 14.4 s | |
-| DGX Spark | 1344×768, 124 frames | a 448×256 picture and a two-second sound | | 14.4 s | |
+| DGX Spark | 1344×768, 124 frames | a 448×256 image | | 14.4 s | |
+| DGX Spark | 1344×768, 124 frames | a 448×256 image and a two-second sound | | 14.4 s | |
 | DGX Spark | 1344×768, 124 frames | a 22-frame 448×256 clip | Turbo LoRA, 8 steps | 15.1 s | about 150 s |
-| M6 | 448×256, 73 frames | a 448×256 picture, a 39-frame 448×256 clip with its soundtrack and a two-second sound | Turbo LoRA, 8 steps | 10 s | 101 s |
+| M6 | 448×256, 73 frames | a 448×256 image, a 39-frame 448×256 clip with its soundtrack and a two-second sound | Turbo LoRA, 8 steps | 10 s | 101 s |
 
 Encoding the references took:
 
@@ -147,14 +147,14 @@ Encoding the references took:
 | DGX Spark | a 22-frame 448×256 clip | 0.5 s |
 | DGX Spark | a 22-frame 1344×768 clip | 9.3 s |
 | DGX Spark | a 124-frame 1344×768 clip | 37 s |
-| M6 | the prompt with a picture, a clip and a sound | 5.7 s |
-| M6 | a 448×256 picture | 0.3 s |
+| M6 | the prompt with an image, a clip and a sound | 5.7 s |
+| M6 | a 448×256 image | 0.3 s |
 | M6 | a 39-frame 448×256 clip | 3.8 s |
 | M6 | a two-second sound | 0.2 s |
 
-The two pictures add about 4,500 rows to the sequence with their vision blocks. A sound is far
-cheaper than a picture: it brings no vision tokens, and a two-second one adds 160 rows, two per
-latent frame at 40 frames per second, against about 2,300 rows for a 768p picture.
+The two images add about 4,500 rows to the sequence with their vision blocks. A sound is far
+cheaper than an image: it brings no vision tokens, and a two-second one adds 160 rows, two per
+latent frame at 40 frames per second, against about 2,300 rows for a 768p image.
 
 A clip costs what its own size and length ask for. A 22-frame clip of 448×256 adds 784 video rows,
 74 audio rows and one vision block. The same 22 frames at 1344×768 bring about 37,000 rows, as many
@@ -163,15 +163,15 @@ as the target itself, so a long reference at full size is expensive both to enco
 A clip's last group of seventeen frames goes through the encoder with only the five frames its two
 kept latent frames read, which the causal encoder makes exact.
 
-Against ComfyUI in FP32 at 448×256 with two reference pictures, one of them 128×256, the DiT's
+Against ComfyUI in FP32 at 448×256 with two reference images, one of them 128×256, the DiT's
 velocity is within 1.1e-2 for video and 1.9e-2 for audio, as close as with keyframes. With one
-reference picture and a two-second sound, the sound's posterior mean is within 1.3e-5 of a strict
+reference image and a two-second sound, the sound's posterior mean is within 1.3e-5 of a strict
 FP32 encode (2.7e-3 of ComfyUI's default, which uses TF32 convolutions), the condition rows deviate
-as much per block as reference pictures alone, and the velocity is within 2.0e-2 for video and
+as much per block as reference images alone, and the velocity is within 2.0e-2 for video and
 4.0e-2 for audio.
 
 A reference clip is right where it can be checked exactly: on a tiny model built from ComfyUI's
-own code, a forward with a picture, a clip with its soundtrack and a sound matches ComfyUI's to a
+own code, a forward with an image, a clip with its soundtrack and a sound matches ComfyUI's to a
 cosine of 0.9999999, so the rows of every kind sit where the reference puts them. The frames mmh3
 demuxes and decodes itself land within one level of 255 of ComfyUI's decode of the same file, and
 the clip's latent is within 1.7e-3 of ComfyUI's encode of the same frames. With the released
