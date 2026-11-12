@@ -67,16 +67,17 @@ fn matches_diffusers_golden_decode() {
         PICTURE_TILE_OVERLAP_MIN,
     )
     .unwrap();
-    // FP32 throughout differs from the reference by summation order alone. FP16 attention rounds
-    // its inputs to 11 bits, which the ImageNet scale of about a quarter shrinks in the pixels.
-    let mut precisions = vec![(AttentionPrecision::Fp32, 1e-5)];
+    // FP32 throughout differs from the reference by summation order alone. FP16 attention and
+    // products round their inputs to 11 bits, which the ImageNet scale of about a quarter shrinks
+    // in the pixels. The products take FP16 at the INT8 precision too, since the weights are FP16.
+    let mut precisions = vec![(LinearPrecision::Fp32, AttentionPrecision::Fp32, 1e-5)];
     if Device::shared().unwrap().supports_tensor_ops() {
-        precisions.push((AttentionPrecision::Fp16, 5e-4));
+        precisions.push((LinearPrecision::Fp32, AttentionPrecision::Fp16, 5e-4));
+        precisions.push((LinearPrecision::Fp16, AttentionPrecision::Fp16, 5e-4));
+        precisions.push((LinearPrecision::Int8, AttentionPrecision::Fp16, 5e-4));
     }
-    for (attention, tolerance) in precisions {
-        decoder
-            .set_precision(LinearPrecision::Fp32, attention)
-            .unwrap();
+    for (linear, attention, tolerance) in precisions {
+        decoder.set_precision(linear, attention).unwrap();
         // 2 × 3 tiles whose overlaps take the slack, and 1 × 2 tiles of 192 × 256 pixels.
         for suffix in ["", "_small"] {
             let latent = tensor(&file, &format!("input.latent{suffix}"));
@@ -84,7 +85,7 @@ fn matches_diffusers_golden_decode() {
             let pixels = decoder.decode(&latent, false).unwrap().pixels;
             let worst = worst_error(&pixels, &expected);
             eprintln!(
-                "{attention:?} latent{suffix} {:?}: max error {worst:.3e}",
+                "{linear:?}/{attention:?} latent{suffix} {:?}: max error {worst:.3e}",
                 latent.shape
             );
             assert!(worst <= tolerance, "max error {worst}");

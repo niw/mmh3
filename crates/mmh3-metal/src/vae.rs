@@ -18,6 +18,10 @@ use std::cell::OnceCell;
 
 pub use mmh3_core::vae::{DEFAULT_TILE_OVERLAP_MIN, DEFAULT_TILE_SIZE};
 
+/// Tokens of a picture's tiles that decode together: about sixty tiles of 256 pixels, well past the
+/// sixteen or so beyond which a larger batch is hardly faster, at about a gigabyte of activations.
+const BATCH_TOKENS: usize = 16384;
+
 /// What a decode is told when it asks for a chunk: the canvas another machine decoded, nothing
 /// when the chunk was never handed out and this machine is to decode it, or why a chunk that was
 /// handed out never came back. Only the middle answer is a reason to read the weights.
@@ -48,7 +52,8 @@ pub struct MetalVideoDecoder {
     latents_std: Vec<f32>,
     tile_size: usize,
     overlap: usize,
-    /// The precisions of the transformer's INT8 layers and attention, FP32 unless set.
+    /// The precisions of the transformer's INT8 layers, a picture VAE's FP16 ones and the
+    /// attention, FP32 unless set.
     precision: (LinearPrecision, AttentionPrecision),
 }
 
@@ -248,8 +253,9 @@ impl MetalVideoDecoder {
         Ok(self.weights.get_or_init(|| weights))
     }
 
-    /// Select the precisions of the transformer's INT8 layers and of its attention, whether the
-    /// weights are on the device yet or not.
+    /// Select the precisions of the transformer's INT8 layers, of a picture VAE's FP16 ones, which
+    /// take FP16 inputs at `Fp16` and `Int8`, and of its attention, whether the weights are on the
+    /// device yet or not.
     pub fn set_precision(
         &mut self,
         linear: LinearPrecision,
@@ -268,25 +274,33 @@ impl MetalVideoDecoder {
         self.patch_frames == 1
     }
 
-    fn tile(
+    /// Decodes `tiles` tiles of `frames × height × width` latent tokens together. `latent_rows`
+    /// holds each token's channels for every tile in turn, `[token][tile][channel]`, which is how
+    /// the transformer keeps them: every product takes all the tiles' rows at once, and a token's
+    /// rows of all the tiles side by side make one row of the attention, whose heads are then
+    /// every tile's. Returns the pixels `[tile][3][frames × height × 16 × width × 16]`.
+    fn tiles(
         &self,
         latent_rows: &[f32],
+        tiles: usize,
         frames: usize,
         height: usize,
         width: usize,
     ) -> Result<Array> {
         let w = self.weights()?;
         let patches = frames * height * width;
-        let rows = Array::from_f32(&w.device, patches, self.channels, latent_rows)?;
+        let rows = Array::from_f32(&w.device, patches * tiles, self.channels, latent_rows)?;
         let rows = w.linear(&w.linear(&rows, "post_quant_conv")?, "decoder.x_embedder")?;
         let registers = w
             .array("decoder.register_tokens")?
             .reshape(self.registers, self.dim)?;
+        let registers = Array::concat(&vec![registers; tiles], true)?
+            .reshape(self.registers * tiles, self.dim)?;
         let mut x = Array::concat(
-            &[rows, registers, Array::zeros(&w.device, 1, self.dim)?],
+            &[rows, registers, Array::zeros(&w.device, tiles, self.dim)?],
             false,
         )?;
-        let tokens = x.rows;
+        let tokens = x.rows / tiles;
         let heads = self.dim / 64;
         let angles = match self.is_picture() {
             true => picture_rope_angles(height, width, self.registers + 1, 8, 100.0),
@@ -294,12 +308,28 @@ impl MetalVideoDecoder {
         };
         let angles = Array::from_f32(&w.device, tokens, angles.len() / tokens, &angles)?;
         let ones = Array::from_f32(&w.device, 1, 64, &[1.0; 64])?;
+        // The FP16 and INT8 precisions put the products on the matrix units, where a picture VAE's
+        // FP16 weights go as they are, with FP16 inputs and FP32 sums; the residual and the norms
+        // stay FP32. A video VAE's FP16 file keeps the FP32 products its decode was checked with.
+        let fp16 = self.is_picture()
+            && matches!(
+                w.linear_precision,
+                LinearPrecision::Fp16 | LinearPrecision::Int8
+            );
+        let linear = |x: &Array, name: &str| -> Result<Array> {
+            if fp16 && w.is_half(name) {
+                w.linear_fp16(x, name)
+            } else {
+                w.linear(x, name)
+            }
+        };
         // Each head's query, key and value lie side by side, and the query and key norms have no
         // weights of their own.
         let attend = |qkv: &Array, p: &str| -> Result<Array> {
-            w.linear(
-                &qkv.attention_inputs(
-                    heads,
+            let attended = qkv
+                .reshape(tokens, tiles * 3 * self.dim)?
+                .attention_inputs(
+                    tiles * heads,
                     (&ones, &ones),
                     1e-5,
                     Some(&angles),
@@ -307,7 +337,9 @@ impl MetalVideoDecoder {
                     true,
                     false,
                 )?
-                .attend()?,
+                .attend()?;
+            linear(
+                &attended.reshape(tokens * tiles, self.dim)?,
                 &format!("{p}.attn.to_out"),
             )
         };
@@ -326,7 +358,7 @@ impl MetalVideoDecoder {
             });
         if fused {
             let zeros = Array::zeros(&w.device, 1, self.dim)?;
-            let rows = RowMap::new(&w.device, &vec![0; tokens])?;
+            let rows = RowMap::new(&w.device, &vec![0; x.rows])?;
             let mut pending: Option<(Array, Array)> = None;
             for i in 0..self.layers {
                 let p = format!("decoder.transformer_blocks.{i}");
@@ -366,29 +398,34 @@ impl MetalVideoDecoder {
         } else {
             for i in 0..self.layers {
                 let p = format!("decoder.transformer_blocks.{i}");
-                let qkv = w.linear(
+                let qkv = linear(
                     &w.norm(&x, &format!("{p}.norm1"), 1e-5)?,
                     &format!("{p}.attn.to_qkv"),
                 )?;
                 let attended = attend(&qkv, &p)?;
                 x = x.add_scaled(&attended, &w.vector(&format!("{p}.scale1"))?)?;
                 let normed = w.norm(&x, &format!("{p}.norm2"), 1e-5)?;
-                let w1 = format!("{p}.ff.w1");
+                let (w1, w2) = (format!("{p}.ff.w1"), format!("{p}.ff.w2"));
                 let delta = if w.is_int8(&w1) {
-                    w.linear(&w.linear_swiglu(&normed, &w1)?, &format!("{p}.ff.w2"))?
+                    w.linear(&w.linear_swiglu(&normed, &w1)?, &w2)?
+                } else if fp16 && w.is_half(&w2) {
+                    linear(&linear(&normed, &w1)?.swiglu()?, &w2)?
                 } else {
-                    w.linear_gated(&w.linear(&normed, &w1)?, &format!("{p}.ff.w2"))?
+                    w.linear_gated(&linear(&normed, &w1)?, &w2)?
                 };
                 x = x.add_scaled(&delta, &w.vector(&format!("{p}.scale2"))?)?;
             }
         }
 
         let features = 3 * self.patch_frames * SPATIAL_RATIO * SPATIAL_RATIO;
-        let projected = w
-            .linear(&w.norm(&x, "decoder.norm_out", 1e-5)?, "decoder.proj_out")?
-            .slice(0, patches, 0, features)?;
+        let projected = linear(&w.norm(&x, "decoder.norm_out", 1e-5)?, "decoder.proj_out")?.slice(
+            0,
+            patches * tiles,
+            0,
+            features,
+        )?;
         let (f, h, wp) = (frames * self.patch_frames, height * 16, width * 16);
-        let pixels = Array::empty(&w.device, 3, f * h * wp)?;
+        let pixels = Array::empty(&w.device, tiles * 3, f * h * wp)?;
         w.device.run(
             "video_unpatch",
             &[&projected.buffer, &pixels.buffer],
@@ -398,6 +435,7 @@ impl MetalVideoDecoder {
                 h as u32,
                 wp as u32,
                 self.patch_frames as u32,
+                tiles as u32,
             ],
             pixels.len(),
             false,
@@ -617,30 +655,52 @@ impl MetalVideoDecoder {
         let canvas = Array::empty(device, 3, canvas_frames * plane)?;
         let mut first_tile = None;
         let mut previous: Vec<Option<Array>> = vec![None; columns.starts.len()];
+        let mut left_tile: Option<Array> = None;
 
-        for (row, &top) in rows.starts.iter().enumerate() {
-            let mut left_tile: Option<Array> = None;
-            for (column, &left) in columns.starts.iter().enumerate() {
-                let mut values = Vec::with_capacity(cf * (th / 16) * (tw / 16) * channels);
-                for t in 0..cf {
-                    for y in 0..th / 16 {
-                        for x in 0..tw / 16 {
+        // A picture's tiles of a few hundred tokens each leave most of the matrix units idle, so
+        // they decode as many at a time as fill BATCH_TOKENS. A video's go one at a time.
+        let per_batch = if self.is_picture() {
+            let tokens = cf * (th / 16) * (tw / 16) + self.registers + 1;
+            (BATCH_TOKENS / tokens).max(1)
+        } else {
+            1
+        };
+        let places: Vec<(usize, usize)> = (0..rows.starts.len())
+            .flat_map(|row| (0..columns.starts.len()).map(move |column| (row, column)))
+            .collect();
+        for batch in places.chunks(per_batch) {
+            let mut values =
+                Vec::with_capacity(cf * (th / 16) * (tw / 16) * batch.len() * channels);
+            for t in 0..cf {
+                for y in 0..th / 16 {
+                    for x in 0..tw / 16 {
+                        for &(row, column) in batch {
                             for c in 0..channels {
                                 let index = ((c * latent_frames
                                     + (chunk * 5 + t).min(latent_frames - 1))
                                     * lh
-                                    + top / 16
+                                    + rows.starts[row] / 16
                                     + y)
                                     * lw
-                                    + left / 16
+                                    + columns.starts[column] / 16
                                     + x;
                                 values.push(latent.data[index] * std[c] + mean[c]);
                             }
                         }
                     }
                 }
+            }
+            let decoded = self.tiles(&values, batch.len(), cf, th / 16, tw / 16)?;
 
-                let tile = self.tile(&values, cf, th / 16, tw / 16)?;
+            for (index, &(row, column)) in batch.iter().enumerate() {
+                let (top, left) = (rows.starts[row], columns.starts[column]);
+                if column == 0 {
+                    left_tile = None;
+                }
+                let tile = match batch.len() {
+                    1 => decoded.clone(),
+                    _ => decoded.slice(3 * index, 3, 0, decoded.cols)?,
+                };
                 if capture_first_tile && row == 0 && column == 0 {
                     first_tile = Some(Tensor::new(vec![3, canvas_frames, th, tw], tile.to_f32()?));
                 }

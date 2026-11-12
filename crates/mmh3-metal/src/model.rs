@@ -423,6 +423,33 @@ impl Weights {
             .is_some_and(|(dtype, _)| dtype == DType::I8)
     }
 
+    /// Whether a layer's weights are FP16, which `linear_fp16` reads as they are.
+    pub(crate) fn is_half(&self, name: &str) -> bool {
+        self.describe(&format!("{name}.weight"))
+            .is_some_and(|(dtype, _)| dtype == DType::F16)
+    }
+
+    /// `linear` of a layer with FP16 weights on the matrix units, its input rounded to FP16.
+    pub(crate) fn linear_fp16(&self, x: &Array, name: &str) -> Result<Array> {
+        let w = self.weight(&format!("{name}.weight"))?;
+        if w.dtype != DType::F16 || w.shape.len() != 2 || w.shape[1] != x.cols {
+            return Err(Error::new(format!(
+                "{name}: an FP16 product needs FP16 weights of the input's width"
+            )));
+        }
+        let bias = format!("{name}.bias");
+        let bias = if self.contains(&bias) {
+            Some(self.vector(&bias)?)
+        } else {
+            None
+        };
+        x.pack(Packing::Plain, LinearPrecision::Fp16)?.product_half(
+            &w.buffer,
+            w.shape[0],
+            bias.as_ref(),
+        )
+    }
+
     pub fn contains(&self, name: &str) -> bool {
         self.tensors.contains_key(name) || self.absent.contains_key(name)
     }
