@@ -69,14 +69,32 @@ The tests run the CUDA kernels and models on small fixtures and compare them wit
 and CPU references. The CUDA crates are empty off Linux, so `cargo test --workspace` needs no CUDA
 toolchain there. On macOS, `--features metal` takes the place of `cuda,mp4`.
 
-## Formatting
+`make test` runs the tests with the features of `make build`. `TEST_OPTIONS` passes options to
+`cargo test`, such as `--no-run` to only build the tests where no GPU is available.
+
+## Formatting and checks
 
 ```sh
 make format
+make check-format
+make lint
+make check-typing
 ```
 
 `make format` formats the Rust code with rustfmt, the Python tools with ruff, the Swift code with
-swiftformat and the C++, CUDA and Metal code with clang-format. ruff and clang-format run through
-`uvx` of [uv](https://docs.astral.sh/uv/) at pinned versions, so they need no separate
-installation. swiftformat only runs where it is installed, since the Swift code builds on macOS
-alone.
+swiftformat and the C++, CUDA and Metal code with clang-format. `make check-format` checks that the
+code is formatted that way, without changing it. `make lint` lints the Rust code with clippy and the
+Python tools with ruff. `make check-typing` type checks the Rust code with `cargo check` and the
+Python tools with [ty](https://docs.astral.sh/ty/). ty.toml leaves the imports of ComfyUI and other
+packages unresolved, so ty checks the tools without installing them.
+
+ruff, ty and clang-format run through `uvx` of [uv](https://docs.astral.sh/uv/) at pinned
+versions, so they need no separate installation. swiftformat only runs where it is installed, since
+the Swift code builds on macOS alone.
+
+The Rust checks and tests take the features of `make build`. Where no CUDA toolchain is installed
+on Linux, `FEATURES=server` leaves out the CUDA crates, for example `make lint FEATURES=server`.
+
+GitHub Actions runs these checks and the tests on each pull request and each push to master, on
+Linux without CUDA and on macOS with Metal. The runners have no GPU, so the Metal tests only build
+there.
