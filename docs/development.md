@@ -97,4 +97,5 @@ on Linux, `FEATURES=server` leaves out the CUDA crates, for example `make lint F
 
 GitHub Actions runs these checks and the tests on each pull request and each push to master, on
 Linux without CUDA and on macOS with Metal. The Linux runner has no GPU, so the CUDA tests do not
-run there.
+run there. The paravirtual GPU of the macOS runner has no matrix units, so the Metal tests leave
+out their FP16 checks there, and the video encoder tests, which need the matrix units, skip.
