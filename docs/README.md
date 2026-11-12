@@ -10,9 +10,9 @@ Setting a machine up:
 Running a generation:
 
 - [Usage](usage.md): the options of `mmh3 generate`, and prompts.
-- [First and last frames](fl2va.md): generating from pictures.
-- [Reference pictures, sounds and clips](ref2va.md): generating from what a prompt refers to.
-- [Image](image.md): generating and editing pictures with `mmh3 image`.
+- [First and last frames](fl2va.md): generating from images.
+- [Reference images, sounds and clips](ref2va.md): generating from what a prompt refers to.
+- [Image](image.md): generating and editing images with `mmh3 image`.
 - [Distributed generation](distributed.md): splitting a generation across machines.
 - [Server](server.md): asking for a generation over HTTP, and keeping the models loaded.
 - [Output](output.md): MP4, WebM and ffmpeg, and their encoders.
