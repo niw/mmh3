@@ -1,10 +1,42 @@
 name: commit-check
 
+# NOTE: The checks run only when the files they read change, so that a change to the documents
+# does not take one of the few macOS jobs that run at once.
 on:
   pull_request:
+    paths:
+      - .clang-format
+      - .clang-format-ignore
+      - .github/workflows/commit-check.yml
+      - .swiftformat
+      - Cargo.lock
+      - Cargo.toml
+      - Makefile
+      - crates/**
+      - ruff.toml
+      - src/**
+      - tests/**
+      - tools/**
+      - ty.toml
+      - "!**.md"
   push:
     branches:
       - master
+    paths:
+      - .clang-format
+      - .clang-format-ignore
+      - .github/workflows/commit-check.yml
+      - .swiftformat
+      - Cargo.lock
+      - Cargo.toml
+      - Makefile
+      - crates/**
+      - ruff.toml
+      - src/**
+      - tests/**
+      - tools/**
+      - ty.toml
+      - "!**.md"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
